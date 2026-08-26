@@ -14,7 +14,6 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
-    # Корректная обработка граничных случаев
     zero_loss = (avg_loss == 0) & (avg_gain > 0)
     zero_both = (avg_loss == 0) & (avg_gain == 0)
 
@@ -22,7 +21,7 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     rsi = 100.0 - (100.0 / (1.0 + rs))
 
     rsi = rsi.where(~zero_loss, 100.0)
-    rsi = rsi.where(~zero_both, 50.0)  # Плоский рынок = нейтральные 50.0
+    rsi = rsi.where(~zero_both, 50.0)
     return rsi.fillna(50.0)
 
 
@@ -145,20 +144,16 @@ def detect_divergences(
         direction = None
 
         if is_low:
-            # 1. Regular Bullish: Price Lower Low + Indicator Higher Low
             if p2_price < p1_price and p2v > p1v:
                 typ = f"REGULAR_BULLISH_{indicator.upper()}"
                 direction = "LONG"
-            # 2. Hidden Bullish: Price Higher Low + Indicator Lower Low
             elif p2_price > p1_price and p2v < p1v:
                 typ = f"HIDDEN_BULLISH_{indicator.upper()}"
                 direction = "LONG"
         else:
-            # 3. Regular Bearish: Price Higher High + Indicator Lower High
             if p2_price > p1_price and p2v < p1v:
                 typ = f"REGULAR_BEARISH_{indicator.upper()}"
                 direction = "SHORT"
-            # 4. Hidden Bearish: Price Lower High + Indicator Higher High
             elif p2_price < p1_price and p2v > p1v:
                 typ = f"HIDDEN_BEARISH_{indicator.upper()}"
                 direction = "SHORT"
@@ -279,12 +274,53 @@ def detect_squeeze_release(
     }]
 
 
-def build_15m_trigger(df15: pd.DataFrame, direction: str) -> bool:
+def build_15m_trigger(df15: pd.DataFrame, direction: str, min_vol_mult: float = 1.0) -> bool:
+    """15M-триггер с валидацией пробоя ценой и подтверждением всплеска объема."""
     if len(df15) < 2:
         return False
+
     d = str(direction).upper()
     h = df15.iloc[-1]
     p = df15.iloc[-2]
+
+    # 1. Пробой локального экстремума
+    price_confirmed = (float(h.close) > float(p.high)) if d == "LONG" else (float(h.close) < float(p.low))
+    if not price_confirmed:
+        return False
+
+    # 2. Объемное подтверждение (Volume Filter)
+    if "volume" in df15.columns and len(df15) >= 20 and min_vol_mult > 0:
+        vol_sma = df15["volume"].iloc[-21:-1].mean()
+        if pd.notna(vol_sma) and vol_sma > 0:
+            if float(h.volume) < vol_sma * min_vol_mult:
+                return False
+
+    return True
+
+
+def check_btc_regime(btc_1h_df: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    """Защита от торговли альткоинами против агрессивного импульса Bitcoin."""
+    if len(btc_1h_df) < 5:
+        return True, "INSUFFICIENT_DATA"
+
+    close = btc_1h_df["close"]
+    last_close = float(close.iloc[-1])
+    prev_1h = float(close.iloc[-2])
+    prev_4h = float(close.iloc[-5])
+
+    chg_1h_pct = ((last_close - prev_1h) / prev_1h) * 100.0
+    chg_4h_pct = ((last_close - prev_4h) / prev_4h) * 100.0
+
+    d = direction.upper()
     if d == "LONG":
-        return float(h.close) > float(p.high)
-    return float(h.close) < float(p.low)
+        if chg_1h_pct < -1.2:
+            return False, f"BTC_DUMPING_1H ({chg_1h_pct:.2f}%)"
+        if chg_4h_pct < -2.5:
+            return False, f"BTC_DUMPING_4H ({chg_4h_pct:.2f}%)"
+    elif d == "SHORT":
+        if chg_1h_pct > 1.5:
+            return False, f"BTC_PUMPING_1H (+{chg_1h_pct:.2f}%)"
+        if chg_4h_pct > 3.0:
+            return False, f"BTC_PUMPING_4H (+{chg_4h_pct:.2f}%)"
+
+    return True, "OK"
