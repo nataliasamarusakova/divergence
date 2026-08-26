@@ -2,205 +2,205 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
+import logging
+import math
+import os
 import time
-from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
+from typing import Any
 from urllib.parse import urlencode
 
-import pandas as pd
 import requests
 
+log = logging.getLogger("event_engine.bingx")
+API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
+SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
+BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
+MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
+LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
+MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "50"))
+SYMBOL_MAP = {}
+try:
+    import json
+    SYMBOL_MAP = json.loads(os.environ.get("BINGX_SYMBOL_MAP", "{}"))
+except Exception:
+    SYMBOL_MAP = {}
 
-@dataclass(frozen=True)
-class Contract:
-    symbol: str
-    min_qty: float
-    qty_precision: int
-    price_precision: int
-    status: str
-    api_state_open: bool
-    tick_size: float | None = None
-    min_trade_usdt: float = 0.0
+CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
+KLINE_PATH = "/openApi/swap/v3/quote/klines"
+ORDER_PATH = "/openApi/swap/v2/trade/order"
+POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
+LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 
-
-class BingXClient:
-    def __init__(self, api_key: str, secret_key: str, environment: str = 'vst', recv_window: int = 5000):
-        self.api_key = api_key
-        self.secret_key = secret_key
-        self.recv_window = recv_window
-        if environment.lower() == 'live':
-            self.base = 'https://open-api.bingx.com'
-            self.fallback = 'https://open-api.bingx.pro'
-        else:
-            self.base = 'https://open-api-vst.bingx.com'
-            self.fallback = 'https://open-api-vst.bingx.pro'
-        self.session = requests.Session()
-        self.session.headers.update({'X-BX-APIKEY': self.api_key})
-
-    def _request(self, method: str, path: str, params: dict | None = None, signed: bool = True):
-        params = dict(params or {})
-        if signed:
-            params.setdefault('timestamp', int(time.time() * 1000))
-            params.setdefault('recvWindow', self.recv_window)
-            query = urlencode(sorted(params.items()), doseq=True)
-            signature = hmac.new(self.secret_key.encode(), query.encode(), hashlib.sha256).hexdigest()
-            url = f'{self.base}{path}?{query}&signature={signature}'
-        else:
-            query = urlencode(params, doseq=True)
-            url = f'{self.base}{path}' + (f'?{query}' if query else '')
-
-        try:
-            response = self.session.request(method, url, timeout=20)
-        except requests.RequestException:
-            fb = self.fallback
-            url = f'{fb}{path}?{query}&signature={signature}' if signed else f'{fb}{path}' + (f'?{query}' if query else '')
-            response = self.session.request(method, url, timeout=20)
-
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get('code') not in (0, '0'):
-            raise RuntimeError(f"BingX API error {payload.get('code')}: {payload.get('msg')}")
-        return payload.get('data')
-
-    def klines(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        data = self._request('GET', '/openApi/swap/v3/quote/klines', {
-            'symbol': symbol,
-            'interval': interval,
-            'limit': limit,
-        }, signed=True)
-        rows = []
-        now = int(time.time() * 1000)
-        for row in data or []:
-            if not isinstance(row, (list, tuple)) or len(row) < 7:
-                continue
-            try:
-                if int(row[6]) > now:
-                    continue
-                rows.append({
-                    'open_time': int(row[0]),
-                    'open': float(row[1]),
-                    'high': float(row[2]),
-                    'low': float(row[3]),
-                    'close': float(row[4]),
-                    'volume': float(row[5]),
-                    'close_time': int(row[6]),
-                    'quote_volume': float(row[7]) if len(row) > 7 else None,
-                    'trades_count': int(row[8]) if len(row) > 8 else None,
-                    'taker_buy_base': float(row[9]) if len(row) > 9 else None,
-                    'taker_buy_quote': float(row[10]) if len(row) > 10 else None,
-                })
-            except (TypeError, ValueError):
-                continue
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        df = df.sort_values('close_time').drop_duplicates('close_time').reset_index(drop=True)
-        valid = (
-            df['quote_volume'].notna()
-            & df['taker_buy_base'].notna()
-            & df['taker_buy_quote'].notna()
-            & (df['taker_buy_base'] <= df['volume'] * 1.001 + 1e-9)
-            & (df['taker_buy_quote'] <= df['quote_volume'] * 1.001 + 1e-9)
-        )
-        df['taker_flow_valid'] = valid
-        df['bar_delta_usdt'] = 2 * df['taker_buy_quote'] - df['quote_volume']
-        df.loc[~valid, ['bar_delta_usdt']] = float('nan')
-        df['cvd_segment_id'] = (~valid).cumsum()
-        df['bingx_cvd'] = float('nan')
-        for seg, idx in df.groupby('cvd_segment_id').groups.items():
-            idx_list = list(idx)
-            good = df.loc[idx_list, 'taker_flow_valid'].fillna(False)
-            good_idx = [i for i, ok in zip(idx_list, good) if bool(ok)]
-            if good_idx:
-                df.loc[good_idx, 'bingx_cvd'] = df.loc[good_idx, 'bar_delta_usdt'].cumsum()
-        return df
-
-    def contracts(self) -> list[Contract]:
-        data = self._request('GET', '/openApi/swap/v2/quote/contracts', {})
-        out: list[Contract] = []
-        for c in data or []:
-            try:
-                symbol = str(c.get('symbol', ''))
-                if not symbol:
-                    continue
-                api_open_raw = c.get('apiStateOpen')
-                api_open = str(api_open_raw).lower() in {'1', 'true', 'open'} if api_open_raw is not None else True
-                status = str(c.get('status') or '')
-                out.append(Contract(
-                    symbol=symbol,
-                    min_qty=float(c.get('tradeMinQuantity') or c.get('minQty') or 0),
-                    qty_precision=int(c.get('quantityPrecision') or 0),
-                    price_precision=int(c.get('pricePrecision') or 0),
-                    status=status,
-                    api_state_open=api_open,
-                    tick_size=float(c.get('tickSize')) if c.get('tickSize') else None,
-                    min_trade_usdt=float(c.get('tradeMinUSDT') or c.get('minNotional') or 0),
-                ))
-            except (TypeError, ValueError):
-                continue
-        return out
-
-    def set_leverage(self, symbol: str, leverage: int, side: str) -> dict:
-        return self._request('POST', '/openApi/swap/v2/trade/leverage', {
-            'symbol': symbol,
-            'leverage': leverage,
-            'side': side,
-        })
+CACHE = {"ts": 0.0, "data": {}, "by_display_name": {}}
+TTL = 3600
 
 
-    def query_order(self, symbol: str, client_order_id: str) -> dict | None:
-        try:
-            return self._request('GET', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'clientOrderId': client_order_id,
-            })
-        except RuntimeError as exc:
-            msg = str(exc).lower()
-            if 'not found' in msg or 'no order' in msg or 'order does not exist' in msg:
-                return None
-            raise
-
-    def place_market_with_protection(self, symbol: str, direction: str, quantity: float,
-                                     sl_price: float, tp_price: float,
-                                     client_order_id: str,
-                                     price_precision: int) -> dict:
-        side = 'BUY' if direction == 'LONG' else 'SELL'
-        position_side = 'LONG' if direction == 'LONG' else 'SHORT'
-        stop = f'{sl_price:.{price_precision}f}'
-        take = f'{tp_price:.{price_precision}f}'
-        payload = {
-            'symbol': symbol,
-            'side': side,
-            'positionSide': position_side,
-            'type': 'MARKET',
-            'quantity': quantity,
-            'clientOrderId': client_order_id[:40],
-            'workingType': 'MARK_PRICE',
-            'stopLoss': json.dumps({
-                'type': 'STOP_MARKET',
-                'stopPrice': float(stop),
-                'workingType': 'MARK_PRICE',
-            }, separators=(',', ':')),
-            'takeProfit': json.dumps({
-                'type': 'TAKE_PROFIT_MARKET',
-                'stopPrice': float(take),
-                'workingType': 'MARK_PRICE',
-            }, separators=(',', ':')),
-        }
-        return self._request('POST', '/openApi/swap/v2/trade/order', payload)
+def _sign(params: dict[str, Any]) -> str:
+    qs = urlencode(params)
+    return hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 
+def _request(method: str, path: str, params: dict[str, Any] | None = None, signed: bool = True):
+    params = dict(params or {})
+    headers = {}
+    if signed:
+        if not API_KEY or not SECRET_KEY:
+            return {"code": -1, "msg": "missing BingX credentials"}
+        params["timestamp"] = str(int(time.time() * 1000))
+        params["signature"] = _sign(params)
+        headers["X-BX-APIKEY"] = API_KEY
+    try:
+        r = requests.request("GET" if method == "GET" else method, BASE_URL + path, params=params, headers=headers, timeout=15)
+        return r.json()
+    except Exception as exc:
+        return {"code": -1, "msg": str(exc)}
 
-def quantize_price(price: float, precision: int, tick_size: float | None = None) -> float:
-    if tick_size and tick_size > 0:
-        units = Decimal(str(price)) / Decimal(str(tick_size))
-        units = units.quantize(Decimal('1'), rounding=ROUND_DOWN)
-        return float(units * Decimal(str(tick_size)))
-    q = Decimal(1).scaleb(-precision)
-    return float(Decimal(str(price)).quantize(q, rounding=ROUND_DOWN))
 
-def quantize_qty(qty: float, precision: int) -> float:
-    q = Decimal(1).scaleb(-precision)
-    return float(Decimal(str(qty)).quantize(q, rounding=ROUND_DOWN))
+def refresh_contracts() -> dict[str, Any]:
+    resp = _request("GET", CONTRACTS_PATH, signed=False)
+    if resp.get("code") != 0:
+        raise RuntimeError(f"BingX contracts error: {resp.get('msg')}")
+    data, by_name = {}, {}
+    for c in resp.get("data", []) or []:
+        sym = str(c.get("symbol", "")).strip().upper()
+        name = str(c.get("displayName", "")).strip().upper()
+        if sym: data[sym] = c
+        if name: by_name[name] = c
+    CACHE.update(ts=time.time(), data=data, by_display_name=by_name)
+    log.info("BingX contracts=%d", len(data))
+    return data
+
+
+def contracts() -> dict[str, dict]:
+    if CACHE["data"] and time.time() - CACHE["ts"] < TTL:
+        return CACHE["data"]
+    try:
+        return refresh_contracts()
+    except Exception:
+        return CACHE["data"]
+
+
+def get_contract(symbol: str) -> dict | None:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+    mapped = SYMBOL_MAP.get(s)
+    if mapped:
+        c = contracts().get(str(mapped).strip().upper())
+        if c: return c
+    direct = s if s.endswith("-USDT") else f"{s.replace('-', '')}-USDT"
+    c = contracts().get(direct)
+    if c: return c
+    base = s.replace("-USDT", "").replace("-", "")
+    for c in CACHE["data"].values():
+        name = str(c.get("displayName", "")).upper().replace("-", "")
+        cs = str(c.get("symbol", "")).upper()
+        if name == f"{base}-USDT" or name == base or cs.endswith(f"{base}-USDT"):
+            return c
+    return CACHE["by_display_name"].get(f"{base}-USDT")
+
+
+def to_bx_symbol(symbol: str) -> str | None:
+    c = get_contract(symbol)
+    if not c:
+        return None
+    return str(c.get("symbol", "")).upper()
+
+
+def contract_exists(symbol: str) -> bool:
+    c = get_contract(symbol)
+    return bool(c and c.get("status") == 1 and str(c.get("apiStateOpen", "")).lower() == "true")
+
+
+def classify_contract(contract: dict | None) -> str:
+    if not contract:
+        return "unknown"
+    s = str(contract.get("symbol", "")).upper()
+    if s.startswith(("NCSK", "NCSI")): return "equity"
+    if s.startswith("NCCO"): return "commodity"
+    if s.startswith("NCFX"): return "forex"
+    return "crypto"
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        raise ValueError(f"No BingX contract for {symbol}")
+    resp = _request("GET", KLINE_PATH, {"symbol": bx, "interval": interval, "limit": limit}, signed=False)
+    if resp.get("code") != 0:
+        raise RuntimeError(f"BingX klines error {bx}/{interval}: {resp.get('msg')}")
+    rows = resp.get("data") or []
+    out = []
+    now = int(time.time() * 1000)
+    duration_ms = {"15m": 15*60*1000, "1h": 60*60*1000}.get(interval)
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 11:
+            continue
+        ot = int(row[0]); ct = int(row[6]) if row[6] is not None else ot + duration_ms
+        if ct > now: continue
+        open_, high, low, close, volume = map(float, row[1:6])
+        quote = float(row[7]); taker_b = float(row[9]); taker_q = float(row[10])
+        if min(open_, high, low, close) <= 0 or volume < 0 or quote < 0: continue
+        if taker_b < 0 or taker_q < 0 or taker_b > volume*1.001 or taker_q > quote*1.001: continue
+        delta_usdt = 2*taker_q - quote
+        out.append({"open_time": ot, "close_time": ct, "open": open_, "high": high, "low": low, "close": close, "volume": volume, "quote_volume": quote, "taker_buy_quote": taker_q, "bar_delta_usdt": delta_usdt})
+    out.sort(key=lambda x: x["close_time"])
+    return out
+
+
+def _set_leverage(bx_symbol: str, leverage: int) -> bool:
+    for side in ("LONG", "BOTH"):
+        resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
+        if resp.get("code") == 0: return True
+    return False
+
+
+def get_positions() -> list[dict]:
+    resp = _request("GET", POSITION_PATH, {}, signed=True)
+    if resp.get("code") != 0: return []
+    data = resp.get("data") or []
+    return data if isinstance(data, list) else []
+
+
+def has_open_position(symbol: str, direction: str) -> bool:
+    bx = to_bx_symbol(symbol)
+    if not bx: return False
+    want = "LONG" if direction.upper() == "LONG" else "SHORT"
+    for p in get_positions():
+        if str(p.get("symbol", "")).upper() != bx: continue
+        side = str(p.get("positionSide", p.get("positionAmt", ""))).upper()
+        try: amt = float(p.get("positionAmt", p.get("positionAmt", 0)) or 0)
+        except Exception: amt = 0
+        if amt != 0 and (want in side or (want == "LONG" and amt > 0) or (want == "SHORT" and amt < 0)):
+            return True
+    return False
+
+
+def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
+    bx = to_bx_symbol(symbol)
+    if not bx: return {"status": "error", "error": "contract_not_found"}
+    c = get_contract(symbol) or {}
+    if not contract_exists(symbol): return {"status": "error", "error": "contract_unavailable", "symbol": bx}
+    if has_open_position(symbol, direction): return {"status": "existing_position", "symbol": bx}
+    prec = int(c.get("quantityPrecision") or 0)
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
+    mult = float(c.get("multiplier") or 1)
+    max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
+    leverage = min(LEVERAGE, max_lev)
+    qty = (MARGIN_USDT * leverage) / max(price * mult, 1e-12)
+    q = (Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN) if prec >= 0 else Decimal(str(qty)))
+    qty = float(q)
+    if qty < min_qty:
+        need = math.ceil((min_qty * price * mult) / max(MARGIN_USDT, 1e-9))
+        leverage = min(max(need, leverage), max_lev)
+        qty = (MARGIN_USDT * leverage) / max(price * mult, 1e-12)
+        q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+        qty = float(q)
+    if qty <= 0 or qty < min_qty: return {"status": "error", "error": f"qty={qty} < min_qty={min_qty}"}
+    _set_leverage(bx, leverage)
+    side = "BUY" if direction.upper() == "LONG" else "SELL"
+    params = {"symbol": bx, "side": side, "positionSide": direction.upper(), "type": "MARKET", "quantity": f"{qty:.{prec}f}", "clientOrderId": f"EVT_OPEN_{trade_id[:24]}"}
+    resp = _request("POST", ORDER_PATH, params)
+    if resp.get("code") != 0: return {"status": "error", "error": str(resp.get("msg")), "symbol": bx}
+    return {"status": "opened", "symbol": bx, "qty": qty, "leverage": leverage, "response": resp}

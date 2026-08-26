@@ -1,500 +1,246 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from io import StringIO
+import logging
+import os
 import re
+import time
+from dataclasses import dataclass
 from typing import Any
 
-import pandas as pd
-import requests
+from bs4 import BeautifulSoup
+
+log = logging.getLogger("event_engine.coinalyze")
+
+COINALYZE_URL = os.environ.get("COINALYZE_URL", "https://coinalyze.net/").strip()
+COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "").strip()
+COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "").strip()
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
+DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "debug_page.html")
 
 
-@dataclass
+@dataclass(frozen=True)
 class CoinalyzeRow:
     symbol: str
-    price: float | None = None
-    price_chg_24h: float | None = None
-    volume_24h: float | None = None
-    open_interest: float | None = None
-    oi_chg_24h_pct: float | None = None
-    oi_chg_4h_pct: float | None = None
-    funding_oiw: float | None = None
-    predicted_funding_oiw: float | None = None
-    short_liq_24h: float | None = None
-    long_liq_24h: float | None = None
-    ls_ratio_1h: float | None = None
-    ls_ratio_1d: float | None = None
-    oi_vol_ratio: float | None = None
+    name: str
+    price: float | None
+    price_chg24: float | None
+    volume24: float | None
+    oi: float | None
+    oi_chg24_pct: float | None
+    oi_chg4h_pct: float | None
+    oi_vol_ratio: float | None
+    oi_mktcap_ratio: float | None
+    fr_oiw: float | None
+    pfr_oiw: float | None
+    liq_short24: float | None
+    liq_long24: float | None
+    ls_accounts: float | None
+    btc_corr7d: float | None
+    cvd24: float | None
+    lls24: float | None
+    raw: dict[str, Any]
 
 
-def _num(value: Any) -> float | None:
+def parse_number(value: Any) -> float | None:
     if value is None:
         return None
-
-    s = str(value).strip()
-
-    if not s or s.lower() in {"nan", "none", "n/a", "-", "—"}:
+    s = str(value).strip().replace(",", "").replace("$", "").replace("%", "")
+    if not s or s.lower() in {"nan", "none", "-", "—", "n/a"}:
         return None
-
-    s = (
-        s.replace(",", "")
-         .replace("$", "")
-         .replace("%", "")
-         .strip()
-    )
-
-    multiplier = 1.0
-
-    if s:
-        suffix = s[-1].upper()
-
-        if suffix in {"K", "M", "B", "T"}:
-            multiplier = {
-                "K": 1e3,
-                "M": 1e6,
-                "B": 1e9,
-                "T": 1e12,
-            }[suffix]
-
-            s = s[:-1].strip()
-
+    mult = 1.0
+    if s[-1:].upper() in {"K", "M", "B", "T"}:
+        mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[s[-1].upper()]
+        s = s[:-1].strip()
     try:
-        return float(s) * multiplier
-    except (TypeError, ValueError):
+        return float(s) * mult
+    except ValueError:
         return None
 
 
-def _norm_column(value: Any) -> str:
-    s = str(value).strip().lower()
-
-    s = re.sub(
-        r"[^a-z0-9]+",
-        "_",
-        s,
+def _setup_browser_context(p):
+    from playwright_stealth import stealth_sync
+    browser = p.chromium.launch(headless=True)
+    ctx = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
     )
-
-    s = s.strip("_")
-
-    aliases = {
-        "coin": "coin",
-        "price": "price",
-
-        "chg_24h": "price_chg_24h",
-        "price_change_24h": "price_chg_24h",
-        "price_chg_24h": "price_chg_24h",
-
-        "mkt_cap": "market_cap",
-        "market_capitalisation": "market_cap",
-        "market_capitalization": "market_cap",
-
-        "vol_24h": "volume_24h",
-        "volume_24h": "volume_24h",
-
-        "open_interest": "open_interest",
-
-        "oi_chg_24h": "oi_chg_24h_pct",
-        "oi_chg_24h_pct": "oi_chg_24h_pct",
-        "open_interest_change_24h": "oi_chg_24h_pct",
-        "open_interest_change_24h_pct": "oi_chg_24h_pct",
-
-        "oi_chg_4h": "oi_chg_4h_pct",
-        "oi_chg_4h_pct": "oi_chg_4h_pct",
-        "open_interest_change_4h": "oi_chg_4h_pct",
-        "open_interest_change_4h_pct": "oi_chg_4h_pct",
-
-        "oi_vol24h": "oi_vol_ratio",
-        "oi_vol_24h": "oi_vol_ratio",
-        "oi_volume_24h": "oi_vol_ratio",
-        "oi_volume_ratio": "oi_vol_ratio",
-
-        "fr_avg_oi_w": "funding_oiw",
-        "fr_avg_oiw": "funding_oiw",
-        "funding_rate_average_oi_weighted": "funding_oiw",
-
-        "pfr_avg_oi_w": "predicted_funding_oiw",
-        "pfr_avg_oiw": "predicted_funding_oiw",
-        "predicted_funding_rate_average_oi_weighted": "predicted_funding_oiw",
-
-        "short_liqs_24h": "short_liq_24h",
-        "short_liquidations_24h": "short_liq_24h",
-
-        "long_liqs_24h": "long_liq_24h",
-        "long_liquidations_24h": "long_liq_24h",
-
-        "l_s_ratio_1h": "ls_ratio_1h",
-        "long_short_accounts_ratio_1h": "ls_ratio_1h",
-
-        "l_s_ratio_1d": "ls_ratio_1d",
-        "long_short_accounts_ratio_1d": "ls_ratio_1d",
-    }
-
-    return aliases.get(s, s)
+    cookies = []
+    if COINALYZE_P_SID:
+        cookies.append({"name": "p_sid", "value": COINALYZE_P_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
+    if COINALYZE_CHAT_SID:
+        cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
+    cookies.append({"name": "cookies_accepted", "value": "1", "domain": "coinalyze.net", "path": "/", "secure": True})
+    if cookies:
+        ctx.add_cookies(cookies)
+    page = ctx.new_page()
+    stealth_sync(page)
+    return browser, page
 
 
-def normalize_discovery_symbol(symbol: str) -> str:
-    """
-    Coinalyze может показывать:
-        BTC
-        ETH
-        SOL
-        1000FLOKI
-        10000SATS
+def _load_page(page, url: str) -> str:
+    page.goto(url, wait_until="networkidle", timeout=60_000)
+    page.wait_for_timeout(3_000)
+    content = page.content()
+    if "Attention Required" in content:
+        log.warning("Cloudflare challenge detected, waiting")
+        page.wait_for_timeout(10_000)
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    page.wait_for_selector("tbody tr", timeout=25_000)
+    prev = len(page.query_selector_all("tbody tr"))
+    for attempt in range(15):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(700)
+        cur = len(page.query_selector_all("tbody tr"))
+        if page.query_selector(".pagination") is not None:
+            log.info("Coinalyze pagination detected after scroll %d; rows=%d", attempt + 1, cur)
+            break
+        if cur != prev:
+            log.info("Coinalyze scroll %d: rows %d -> %d", attempt + 1, prev, cur)
+        if cur == prev and attempt >= 3:
+            break
+        prev = cur
+    try:
+        page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        pass
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+    final_count = len(page.query_selector_all("tbody tr"))
+    log.info("Coinalyze page rows=%d pagination=%s", final_count, bool(page.query_selector(".pagination")))
+    return page.content()
 
-    Для BingX нам нужен базовый asset:
-        BTC
-        ETH
-        SOL
-        FLOKI
-        SATS
-    """
 
-    s = str(symbol).strip().upper()
+def click_next_page(page, current_page_num: int) -> bool:
+    pag = page.query_selector(".pagination")
+    if not pag:
+        return False
+    first_row = page.query_selector("tbody tr")
+    before = first_row.get_attribute("data-coin") if first_row else None
+    target = None
+    for el in pag.query_selector_all("a, button, li"):
+        if (el.inner_text() or "").strip() == str(current_page_num + 1):
+            target = el
+            break
+    if target is None:
+        target = pag.query_selector("[aria-label='Next'], .next, a[rel='next']")
+    if target is None:
+        return False
+    target.click()
+    page.wait_for_timeout(1500)
+    for _ in range(10):
+        row = page.query_selector("tbody tr")
+        after = row.get_attribute("data-coin") if row else None
+        if after and after != before:
+            return True
+        page.wait_for_timeout(500)
+    return False
 
-    # 1000FLOKI -> FLOKI
-    for prefix in ("10000", "1000"):
-        if s.startswith(prefix):
-            tail = s[len(prefix):]
 
-            if re.fullmatch(r"[A-Z][A-Z0-9._-]{1,20}", tail):
-                return tail
+def get_page_urls(html_text: str) -> list[str]:
+    soup = BeautifulSoup(html_text, "lxml")
+    pagination = soup.select_one(".pagination")
+    if not pagination:
+        return [COINALYZE_URL]
+    urls = [COINALYZE_URL]
+    for a in pagination.select("a[href]"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        full = f"https://coinalyze.net{href}" if href.startswith("/") else href
+        if full not in urls:
+            urls.append(full)
+    return urls[:MAX_PAGES]
 
-    return s
 
-
-def _extract_ticker_from_text(value: Any) -> str | None:
-    """
-    Пример:
-        'Bitcoin BTC' -> BTC
-        'Ethereum ETH' -> ETH
-        'Solana SOL' -> SOL
-        'Ripple XRP' -> XRP
-        '1000FLOKI' -> 1000FLOKI
-    """
-
-    if value is None:
-        return None
-
-    text = str(value).strip().upper()
-
-    if not text or text in {"NAN", "NONE"}:
-        return None
-
-    # Сначала ищем короткий тикер в конце строки:
-    # Bitcoin BTC
-    # Solana SOL
-    # Ripple XRP
-    match = re.search(
-        r"(?:^|\s)([A-Z0-9]{2,20})$",
-        text,
-    )
-
-    if match:
-        token = match.group(1)
-
-        blacklist = {
-            "PRICE",
-            "VOLUME",
-            "OPEN",
-            "INTEREST",
-            "COIN",
-            "USDT",
-            "USD",
-            "PERPETUAL",
-            "CONTRACT",
+def parse_table(html_text: str) -> list[CoinalyzeRow]:
+    soup = BeautifulSoup(html_text, "lxml")
+    rows = soup.select("tbody tr")
+    out: list[CoinalyzeRow] = []
+    for tr in rows:
+        symbol = (tr.get("data-coin") or "").strip().upper()
+        tds = tr.find_all("td")
+        if not symbol or len(tds) < 23:
+            continue
+        spans = tds[1].find_all("span")
+        name = spans[0].get_text(strip=True) if spans else symbol
+        raw = {
+            "price": parse_number(tds[2].get_text(" ", strip=True)),
+            "price_chg24": parse_number(tds[3].get_text(" ", strip=True)),
+            "mktcap": parse_number(tds[4].get_text(" ", strip=True)),
+            "volume24": parse_number(tds[5].get_text(" ", strip=True)),
+            "oi": parse_number(tds[6].get_text(" ", strip=True)),
+            "oi_chg24_pct": parse_number(tds[7].get_text(" ", strip=True)),
+            "oi_chg4h_pct": parse_number(tds[9].get_text(" ", strip=True)),
+            "oi_vol_ratio": parse_number(tds[11].get_text(" ", strip=True)),
+            "oi_mktcap_ratio": parse_number(tds[12].get_text(" ", strip=True)),
+            "fr_oiw": parse_number(tds[15].get_text(" ", strip=True)),
+            "pfr_oiw": parse_number(tds[16].get_text(" ", strip=True)),
+            "liq_short24": parse_number(tds[17].get_text(" ", strip=True)),
+            "liq_long24": parse_number(tds[18].get_text(" ", strip=True)),
+            "ls_accounts": parse_number(tds[19].get_text(" ", strip=True)),
+            "btc_corr7d": parse_number(tds[20].get_text(" ", strip=True)),
+            "cvd24": parse_number(tds[21].get_text(" ", strip=True)),
+            "lls24": parse_number(tds[22].get_text(" ", strip=True)),
         }
-
-        if token not in blacklist:
-            return normalize_discovery_symbol(token)
-
-    # Если строка сама является тикером:
-    if re.fullmatch(
-        r"[A-Z0-9][A-Z0-9._-]{1,20}",
-        text,
-    ):
-        return normalize_discovery_symbol(text)
-
-    return None
+        out.append(CoinalyzeRow(symbol=symbol, name=name, raw=raw, **raw))
+    return out
 
 
-def _find_symbol(row: pd.Series) -> str | None:
-    """
-    В первую очередь используем колонку Coin.
-    """
-
-    # Самое надежное:
-    if "coin" in row.index:
-        symbol = _extract_ticker_from_text(
-            row.get("coin")
-        )
-
-        if symbol:
-            return symbol
-
-    # Fallback: смотрим первые несколько ячеек.
-    for value in row.tolist()[:6]:
-        symbol = _extract_ticker_from_text(value)
-
-        if symbol:
-            return symbol
-
-    return None
-
-
-class CoinalyzeClient:
-
-    def __init__(self, url: str):
-        self.url = url
-
-        self.session = requests.Session()
-
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(X11; Linux x86_64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/150.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,"
-                "application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-
-    def _load_static_html(self) -> str:
-        response = self.session.get(
-            self.url,
-            timeout=30,
-        )
-
-        response.raise_for_status()
-
-        return response.text
-
-    def _load_rendered_html(self) -> str:
+def fetch_data() -> list[CoinalyzeRow]:
+    all_rows: list[CoinalyzeRow] = []
+    seen: set[str] = set()
+    page_errors = []
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser, page = _setup_browser_context(p)
         try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise RuntimeError(
-                "Playwright is required for rendered Coinalyze fallback."
-            ) from exc
-
-        with sync_playwright() as pw:
-
-            browser = pw.chromium.launch(
-                headless=True
-            )
-
-            page = browser.new_page(
-                viewport={
-                    "width": 1920,
-                    "height": 1080,
-                }
-            )
-
-            page.goto(
-                self.url,
-                wait_until="networkidle",
-                timeout=60_000,
-            )
-
-            page.wait_for_timeout(2_000)
-
-            html = page.content()
-
-            browser.close()
-
-        return html
-
-    @staticmethod
-    def _select_table(
-        tables: list[pd.DataFrame],
-    ) -> pd.DataFrame | None:
-
-        for table in tables:
-
-            columns = {
-                _norm_column(c)
-                for c in table.columns
-            }
-
-            has_price = (
-                "price" in columns
-            )
-
-            has_volume = (
-                "volume_24h" in columns
-            )
-
-            has_oi = (
-                "open_interest" in columns
-            )
-
-            if (
-                has_price
-                and (has_volume or has_oi)
-            ):
-                return table
-
-        return None
-
-    def fetch(self) -> list[CoinalyzeRow]:
-
-        html = self._load_static_html()
-
-        try:
-            tables = pd.read_html(
-                StringIO(html)
-            )
-        except ValueError:
-            tables = []
-
-        table = self._select_table(
-            tables
-        )
-
-        # Если таблица не присутствует в static HTML,
-        # пробуем реальный browser rendering.
-        if table is None:
-
-            print(
-                "[COINALYZE] "
-                "static HTML table not found; "
-                "using Playwright"
-            )
-
-            rendered = self._load_rendered_html()
-
+            html = _load_page(page, COINALYZE_URL)
             try:
-                tables = pd.read_html(
-                    StringIO(rendered)
-                )
-            except ValueError as exc:
-                raise RuntimeError(
-                    "Unable to parse Coinalyze rendered table."
-                ) from exc
-
-            table = self._select_table(
-                tables
-            )
-
-        if table is None:
-
-            print(
-                "[COINALYZE] "
-                "No suitable table found."
-            )
-
-            return []
-
-        # Нормализуем названия колонок.
-        table = table.copy()
-
-        table.columns = [
-            _norm_column(c)
-            for c in table.columns
-        ]
-
-        print(
-            "[COINALYZE] columns="
-            + ",".join(table.columns)
-        )
-
-        rows: list[CoinalyzeRow] = []
-
-        for _, row in table.iterrows():
-
-            symbol = _find_symbol(
-                row
-            )
-
-            if not symbol:
-                continue
-
-            item = CoinalyzeRow(
-                symbol=symbol,
-
-                price=_num(
-                    row.get("price")
-                ),
-
-                price_chg_24h=_num(
-                    row.get("price_chg_24h")
-                ),
-
-                volume_24h=_num(
-                    row.get("volume_24h")
-                ),
-
-                open_interest=_num(
-                    row.get("open_interest")
-                ),
-
-                oi_chg_24h_pct=_num(
-                    row.get("oi_chg_24h_pct")
-                ),
-
-                oi_chg_4h_pct=_num(
-                    row.get("oi_chg_4h_pct")
-                ),
-
-                funding_oiw=_num(
-                    row.get("funding_oiw")
-                ),
-
-                predicted_funding_oiw=_num(
-                    row.get(
-                        "predicted_funding_oiw"
-                    )
-                ),
-
-                short_liq_24h=_num(
-                    row.get("short_liq_24h")
-                ),
-
-                long_liq_24h=_num(
-                    row.get("long_liq_24h")
-                ),
-
-                ls_ratio_1h=_num(
-                    row.get("ls_ratio_1h")
-                ),
-
-                ls_ratio_1d=_num(
-                    row.get("ls_ratio_1d")
-                ),
-
-                oi_vol_ratio=_num(
-                    row.get("oi_vol_ratio")
-                ),
-            )
-
-            rows.append(item)
-
-        print(
-            f"[COINALYZE] parsed_rows={len(rows)}"
-        )
-
-        if rows:
-            print(
-                "[COINALYZE] symbols="
-                + ",".join(
-                    row.symbol
-                    for row in rows[:30]
-                )
-            )
-
-            print(
-                "[COINALYZE] sample="
-                + str([
-                    {
-                        "symbol": r.symbol,
-                        "volume_24h": r.volume_24h,
-                        "open_interest": r.open_interest,
-                    }
-                    for r in rows[:5]
-                ])
-            )
-
-        return rows
+                with open(DEBUG_HTML_FILE, "w", encoding="utf-8") as f:
+                    f.write(html)
+            except OSError:
+                pass
+            rows = parse_table(html)
+            for r in rows:
+                if r.symbol not in seen:
+                    all_rows.append(r); seen.add(r.symbol)
+            log.info("Coinalyze page 1: %d rows", len(rows))
+            page_urls = get_page_urls(html)
+            log.info("Coinalyze pagination: %d pages", len(page_urls))
+            if len(page_urls) > 1:
+                for i, url in enumerate(page_urls[1:], start=2):
+                    try:
+                        html = _load_page(page, url)
+                        rows = parse_table(html)
+                        added = 0
+                        for r in rows:
+                            if r.symbol not in seen:
+                                all_rows.append(r); seen.add(r.symbol); added += 1
+                        log.info("Coinalyze page %d: +%d new rows", i, added)
+                    except Exception as exc:
+                        page_errors.append({"page": i, "url": url, "error": str(exc)[:200]})
+                        log.exception("Coinalyze page %d failed", i)
+            elif page.query_selector(".pagination") is not None:
+                page_num = 1
+                while page_num < MAX_PAGES and click_next_page(page, page_num):
+                    page.wait_for_selector("tbody tr", timeout=15_000)
+                    page.wait_for_timeout(500)
+                    html = page.content()
+                    rows = parse_table(html)
+                    added = 0
+                    for r in rows:
+                        if r.symbol not in seen:
+                            all_rows.append(r); seen.add(r.symbol); added += 1
+                    page_num += 1
+                    log.info("Coinalyze click page %d: +%d new rows", page_num, added)
+        finally:
+            browser.close()
+    if page_errors:
+        log.warning("Coinalyze scrape incomplete: %d page errors", len(page_errors))
+    log.info("Coinalyze total unique rows=%d", len(all_rows))
+    return all_rows
