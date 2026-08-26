@@ -314,12 +314,16 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
                     "takerBuyBaseVolume",
                     "taker_buy_base",
                     "takerBuyBase",
+                    "takerBuyBaseVolume",
+                    "buyVolume",
                 )
-
+                
                 taker_quote_raw = pick(
                     "takerBuyQuoteVolume",
                     "taker_buy_quote",
                     "takerBuyQuote",
+                    "takerBuyQuoteVolume",
+                    "buyQuoteVolume",
                 )
 
                 quote_volume = (
