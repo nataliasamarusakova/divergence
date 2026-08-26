@@ -649,18 +649,6 @@ def install_protection(
         f"signature_params={sorted(parameters)!r}"
     )
 
-    # ------------------------------------------------------------------------
-    # CURRENT IMPLEMENTATION:
-    #
-    # symbol
-    # direction
-    # avg_price
-    # qty
-    # stop_loss_pct
-    # tp_levels
-    # trade_id
-    # ------------------------------------------------------------------------
-
     if {
         "avg_price",
         "qty",
@@ -711,17 +699,6 @@ def install_protection(
                 ),
             }
 
-    # ------------------------------------------------------------------------
-    # COMPATIBILITY:
-    #
-    # symbol
-    # direction
-    # position
-    # setup
-    # sl_pct
-    # tp_levels
-    # ------------------------------------------------------------------------
-
     if {
         "position",
         "setup",
@@ -770,10 +747,6 @@ def install_protection(
                     type(exc).__name__
                 ),
             }
-
-    # ------------------------------------------------------------------------
-    # LAST FALLBACK
-    # ------------------------------------------------------------------------
 
     try:
 
@@ -1138,10 +1111,6 @@ def execute_new_position(
         f"event={event_id}"
     )
 
-    # =========================================================================
-    # OPEN MARKET
-    # =========================================================================
-
     try:
 
         opened = open_market(
@@ -1212,10 +1181,6 @@ def execute_new_position(
         )
     ).lower()
 
-    # =========================================================================
-    # OPEN FAILED
-    # =========================================================================
-
     if open_status not in {
         "opened",
         "success",
@@ -1268,10 +1233,6 @@ def execute_new_position(
         f"order={order_id} "
         f"raw={opened!r}"
     )
-
-    # =========================================================================
-    # WAIT FOR POSITION
-    # =========================================================================
 
     try:
 
@@ -1429,10 +1390,6 @@ def execute_new_position(
         f"order={order_id}"
     )
 
-    # =========================================================================
-    # PROTECTION PLAN
-    # =========================================================================
-
     try:
 
         sl_pct, tp_levels = (
@@ -1474,10 +1431,6 @@ def execute_new_position(
         f"avg_price={avg_price} "
         f"qty={qty}"
     )
-
-    # =========================================================================
-    # INSTALL PROTECTION
-    # =========================================================================
 
     protection = install_protection(
         symbol=symbol,
@@ -1545,7 +1498,7 @@ def execute_new_position(
         f"status={final_status} "
         f"position_confirmed=true "
         f"protection_status="
-        f"{protection.get('status')} "
+        f"{protection.get('status')}"
     )
 
     return {
@@ -1813,6 +1766,16 @@ def main() -> None:
 
     executed_event_ids = load_ids(
         TRADES
+    )
+
+    telegram_sent_event_ids = load_ids(
+        ACTIONS
+    )
+
+    print(
+        f"[TELEGRAM_STATE] "
+        f"sent_event_ids="
+        f"{len(telegram_sent_event_ids)}"
     )
 
     trades_this_cycle = 0
@@ -2367,10 +2330,6 @@ def main() -> None:
                         )
                     )
 
-                    # =========================================================
-                    # SAVE TRADE RESULT
-                    # =========================================================
-
                     record_trade(
                         {
                             "event_id":
@@ -2405,17 +2364,6 @@ def main() -> None:
                         )
                     )
 
-                    # =========================================================
-                    # CRITICAL:
-                    #
-                    # НЕ считать event executed при:
-                    #
-                    # OPEN_FAILED
-                    # OPEN_EXCEPTION
-                    # POSITION_WAIT_FAILED
-                    # POSITION_NOT_CONFIRMED
-                    # =========================================================
-
                     execution_confirmed = (
                         status
                         in {
@@ -2446,10 +2394,6 @@ def main() -> None:
                             f"event={event_id} "
                             f"status={status}"
                         )
-
-                    # =========================================================
-                    # SUCCESS
-                    # =========================================================
 
                     if status == (
                         "opened_protected"
@@ -2487,10 +2431,6 @@ def main() -> None:
                             f"order="
                             f"{execution_result.get('order_id')}"
                         )
-
-                    # =========================================================
-                    # OPEN FAILED
-                    # =========================================================
 
                     elif status == (
                         "OPEN_FAILED"
@@ -2612,33 +2552,97 @@ def main() -> None:
 
                     print(
                         f"[TELEGRAM_FORMAT_FALLBACK] "
-                        f"{symbol}: {exc}"
+                        f"{symbol}: "
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
                     )
 
-                stats[
-                    "telegram_attempts"
-                ] += 1
+                # =============================================================
+                # TELEGRAM IDEMPOTENCY
+                # =============================================================
 
-                try:
+                telegram_already_sent = (
+                    event_id
+                    in telegram_sent_event_ids
+                )
 
-                    sent = send_tg(
-                        msg
-                    )
-
-                except Exception as exc:
+                if telegram_already_sent:
 
                     sent = False
 
+                    stats[
+                        "telegram_suppressed_duplicate"
+                    ] += 1
+
                     print(
-                        f"[TELEGRAM_ERROR] "
-                        f"{symbol}: {exc}"
+                        f"[TELEGRAM_SUPPRESS_DUPLICATE] "
+                        f"symbol={symbol} "
+                        f"event={event_id} "
+                        f"direction={direction} "
+                        f"reason=event_id_already_sent"
                     )
 
-                if sent:
+                else:
 
                     stats[
-                        "telegram_sent"
+                        "telegram_attempts"
                     ] += 1
+
+                    print(
+                        f"[TELEGRAM_ATTEMPT] "
+                        f"symbol={symbol} "
+                        f"event={event_id} "
+                        f"direction={direction} "
+                        f"execution_status="
+                        f"{execution_result.get('status')} "
+                        f"protection_status="
+                        f"{execution_result.get('protection_status')}"
+                    )
+
+                    try:
+
+                        sent = bool(
+                            send_tg(
+                                msg
+                            )
+                        )
+
+                    except Exception as exc:
+
+                        sent = False
+
+                        print(
+                            f"[TELEGRAM_ERROR] "
+                            f"symbol={symbol} "
+                            f"event={event_id} "
+                            f"exception="
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        )
+
+                    if sent:
+
+                        stats[
+                            "telegram_sent"
+                        ] += 1
+
+                        telegram_sent_event_ids.add(
+                            event_id
+                        )
+
+                        print(
+                            f"[TELEGRAM_SENT] "
+                            f"symbol={symbol} "
+                            f"event={event_id}"
+                        )
+
+                    else:
+
+                        print(
+                            f"[TELEGRAM_NOT_SENT] "
+                            f"symbol={symbol} "
+                            f"event={event_id}"
+                        )
 
                 record_action(
                     {
@@ -2655,6 +2659,10 @@ def main() -> None:
                         "telegram_sent":
                             bool(
                                 sent
+                            ),
+                        "telegram_suppressed_duplicate":
+                            bool(
+                                telegram_already_sent
                             ),
                         "execution_status":
                             execution_result.get(
