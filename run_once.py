@@ -23,6 +23,7 @@ from event_engine.signals import (
     detect_divergences,
     detect_squeeze_release,
     build_15m_trigger,
+    check_btc_regime,
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health
@@ -71,7 +72,6 @@ def load_ids(path: Path) -> set[str]:
 
 
 def load_successful_trade_ids(path: Path) -> set[str]:
-    """Считывает только успешно открытые сделки, позволяя retry при временных сбоях API."""
     if not path.exists():
         return set()
     ids: set[str] = set()
@@ -106,6 +106,62 @@ def record_trade(obj: dict) -> None:
 
 def record_action(obj: dict) -> None:
     append_jsonl(ACTIONS, obj)
+
+
+def calculate_setup_score(
+    ev: dict,
+    coinalyze_row: Any,
+    df_15m: pd.DataFrame,
+) -> float:
+    """Рассчитывает композитный скоринг качества сделки (0-100 баллов)."""
+    score = 50.0
+    fact = ev.get("event_fact", {})
+    direction = str(ev.get("direction", "LONG")).upper()
+
+    # 1. Сила расхождения цены и индикатора относительно ATR
+    delta_atr = float(fact.get("price_delta_atr", 0))
+    if delta_atr >= 1.0:
+        score += 15.0
+    elif delta_atr >= 0.5:
+        score += 10.0
+
+    # 2. Подтверждение CVD дельтой
+    if "CVD" in ev.get("event_type", ""):
+        score += 15.0
+
+    # 3. Сжатие в Squeeze
+    if "VOLATILITY_SQUEEZE_RELEASE" in ev.get("event_type", ""):
+        comp_ratio = float(fact.get("compression_ratio", 1.0))
+        if comp_ratio < 0.65:
+            score += 15.0
+        duration = int(fact.get("squeeze_duration_bars", 0))
+        if duration >= 5:
+            score += 10.0
+
+    # 4. Деривативный перекос Coinalyze (Funding Rate Skew)
+    if coinalyze_row is not None:
+        fr = getattr(coinalyze_row, "fr_oiw", None)
+        if fr is not None:
+            if direction == "LONG" and fr < 0:
+                score += 15.0  # Топливо для шорт-сквиза
+            elif direction == "SHORT" and fr > 0.02:
+                score += 15.0  # Топливо для лонг-сквиза
+            elif direction == "LONG" and fr > 0.05:
+                score -= 15.0  # Опасный перегретый лонг
+            elif direction == "SHORT" and fr < -0.05:
+                score -= 15.0  # Опасный перегретый шорт
+
+    # 5. Всплеск объема на свече триггера 15M
+    if "volume" in df_15m.columns and len(df_15m) >= 20:
+        recent_avg = df_15m["volume"].iloc[-21:-1].mean()
+        if pd.notna(recent_avg) and recent_avg > 0:
+            vol_ratio = float(df_15m["volume"].iloc[-1]) / float(recent_avg)
+            if vol_ratio >= 1.5:
+                score += 10.0
+            elif vol_ratio >= 1.2:
+                score += 5.0
+
+    return max(0.0, min(100.0, score))
 
 
 def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict:
@@ -313,42 +369,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     }
 
 
-def build_fallback_signal_message(
-    ev: dict,
-    symbol: str,
-    name: str,
-    setup: dict,
-    execution_result: dict,
-    price: float,
-) -> str:
-    direction = str(ev.get("direction", "")).upper()
-    label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
-    sl = setup.get("invalidation_price")
-    tp = setup.get("target_price")
-    rr = setup.get("realized_rr", setup.get("target_rr", 2.0))
-
-    return (
-        f"{label}\n\n"
-        f"<b>{name or symbol}</b> (<code>{symbol}</code>)\n\n"
-        f"Event: <code>{ev.get('event_type')}</code>\n"
-        f"TF: <b>{ev.get('timeframe', '1h')}</b> + trigger 15m\n"
-        f"Price: <code>{price:.8g}</code>\n"
-        f"Detected: <code>{ev.get('timestamps', {}).get('detected_at_ts')}</code>\n\n"
-        f"<b>SETUP</b>\n"
-        f"Entry: <code>{price:.8g}</code>\n"
-        f"SL: <code>{sl:.8g}</code>\n"
-        f"TP: <code>{tp:.8g}</code>\n"
-        f"Realized R:R: <code>{rr:.2f}</code>\n\n"
-        f"<b>EXECUTION</b>\n"
-        f"Mode: <code>{EXECUTION_MODE}</code>\n"
-        f"Status: <code>{execution_result.get('status')}</code>\n"
-        f"Order: <code>{execution_result.get('order_id') or '—'}</code>\n\n"
-        f"⚡ Event-driven — 5×5m lifecycle is NOT used"
-    )
-
-
 def main() -> None:
-    # 1. Сначала опрашиваем открытые позиции (проверяем тейки и стопы)
+    # 1. Опрос открытых позиций (тейки, стопы, безубыток)
     if EXECUTION_ENABLED:
         try:
             update_active_trades()
@@ -357,30 +379,22 @@ def main() -> None:
 
     stats = {
         "coinalyze_rows": 0,
-        "candidates_before_limit": 0,
         "candidates": 0,
-        "bingx_mapped": 0,
-        "bingx_unmapped": 0,
-        "klines_1h_ok": 0,
-        "klines_15m_ok": 0,
-        "rsi_events": 0,
-        "cvd_events": 0,
-        "squeeze_events": 0,
-        "events_total": 0,
-        "events_recent": 0,
-        "events_duplicate": 0,
-        "events_cvd_gate_rejected": 0,
-        "trigger_pass": 0,
-        "trigger_rejected": 0,
-        "setup_rejected": 0,
-        "setups": 0,
+        "valid_signals": 0,
+        "btc_filter_blocked": 0,
         "execution_attempts": 0,
         "trades": 0,
-        "telegram_attempts": 0,
-        "telegram_sent": 0,
-        "telegram_suppressed_duplicate": 0,
         "scan_errors": 0,
     }
+
+    # 2. Получение и анализ рынка BTC
+    btc_regime_df = None
+    try:
+        btc_klines = fetch_klines("BTC-USDT", "1h", limit=10)
+        if btc_klines:
+            btc_regime_df = pd.DataFrame(btc_klines)
+    except Exception as exc:
+        print(f"[BTC_FETCH_ERROR] {exc}")
 
     rows = fetch_data()
     stats["coinalyze_rows"] = len(rows)
@@ -394,65 +408,38 @@ def main() -> None:
     candidates: List[Any] = []
     for r in rows:
         try:
-            if r.price is None or r.price <= 0:
+            if r.price is None or r.price <= 0 or r.volume24 is None or r.volume24 < MIN_VOL or r.oi is None or r.oi < MIN_OI:
                 continue
-            if r.volume24 is None or r.volume24 < MIN_VOL:
+            if not get_contract(r.symbol):
                 continue
-            if r.oi is None or r.oi < MIN_OI:
-                continue
-
-            contract = get_contract(r.symbol)
-            if not contract:
-                stats["bingx_unmapped"] += 1
-                continue
-
-            stats["bingx_mapped"] += 1
             candidates.append(r)
-        except Exception as exc:
-            stats["scan_errors"] += 1
-            print(f"[CANDIDATE_ERROR] {getattr(r, 'symbol', '?')}: {exc}")
+        except Exception:
+            continue
 
-    stats["candidates_before_limit"] = len(candidates)
     candidates = candidates[:MAX_CANDIDATES]
     stats["candidates"] = len(candidates)
-
-    print(
-        f"[ENGINE] Coinalyze candidates={len(candidates)} "
-        f"execution={EXECUTION_ENABLED} env={EXECUTION_MODE}"
-    )
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
     telegram_sent_event_ids = load_ids(ACTIONS)
 
-    trades_this_cycle = 0
+    opportunities: List[dict] = []
 
+    # 3. Сбор и валидация всех сигналов цикла
     for r in candidates:
         symbol = r.symbol
         try:
             k1 = fetch_klines(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
             k15 = fetch_klines(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
 
-            if len(k1) < 60 or len(k15) < 10:
+            if len(k1) < 60 or len(k15) < 20:
                 continue
-
-            stats["klines_1h_ok"] += 1
-            stats["klines_15m_ok"] += 1
 
             d1 = add_cvd(pd.DataFrame(k1))
             d15 = pd.DataFrame(k15)
 
             divergence_events = detect_divergences(d1, symbol, "1h")
             squeeze_events = detect_squeeze_release(d1, symbol, "1h", min_squeeze_bars=3)
-
-            rsi_events = [e for e in divergence_events if "_RSI" in e.get("event_type", "")]
-            cvd_events = [e for e in divergence_events if "BINGX_CVD" in e.get("event_type", "")]
-
-            stats["rsi_events"] += len(rsi_events)
-            stats["cvd_events"] += len(cvd_events)
-            stats["squeeze_events"] += len(squeeze_events)
-            stats["events_total"] += len(divergence_events) + len(squeeze_events)
-
             all_events = divergence_events + squeeze_events
 
             for ev in all_events:
@@ -471,193 +458,144 @@ def main() -> None:
                 if age < 0 or age > MAX_AGE:
                     continue
 
-                stats["events_recent"] += 1
-
-                if event_id in seen_events:
-                    stats["events_duplicate"] += 1
-                else:
+                if event_id not in seen_events:
                     emit_event(ev)
                     seen_events.add(event_id)
 
-                if REQUIRE_CVD and "_RSI" in ev.get("event_type", ""):
-                    pivot_1 = ev.get("timestamps", {}).get("pivot_1_ts")
-                    pivot_2 = ev.get("timestamps", {}).get("pivot_2_ts")
-                    matched_cvd = any(
-                        (
-                            other.get("direction") == direction
-                            and other.get("timestamps", {}).get("pivot_1_ts") == pivot_1
-                            and other.get("timestamps", {}).get("pivot_2_ts") == pivot_2
-                        )
-                        for other in cvd_events
-                    )
-                    if not matched_cvd:
-                        stats["events_cvd_gate_rejected"] += 1
+                # 4. Проверка BTC тренда (Crash Filter)
+                if btc_regime_df is not None and symbol != "BTC-USDT":
+                    btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
+                    if not btc_ok:
+                        stats["btc_filter_blocked"] += 1
                         continue
 
-                # Окно синхронизации 15M триггера
+                # 5. Проверка окна и 15M триггера с подтверждением объема
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
                 if trigger_delay_min < -15 or trigger_delay_min > MAX_AGE:
-                    stats["trigger_rejected"] += 1
                     continue
 
-                trigger = build_15m_trigger(d15, direction)
-                if REQUIRE_TRIGGER and not trigger:
-                    stats["trigger_rejected"] += 1
+                if REQUIRE_TRIGGER and not build_15m_trigger(d15, direction, min_vol_mult=1.05):
                     continue
-
-                stats["trigger_pass"] += 1
 
                 fact = ev.get("event_fact", {})
-                price_raw = fact.get("detection_close_price") or fact.get("close") or getattr(r, "price", None)
-                if price_raw is None:
-                    stats["setup_rejected"] += 1
-                    continue
+                price = float(fact.get("detection_close_price") or fact.get("close") or r.price)
+                setup = build_event_setup(ev=ev, df_1h=d1, entry_price=price)
 
-                price = float(price_raw)
+                # 6. Расчет композитного скоринга (0-100)
+                score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15)
 
-                try:
-                    setup = build_event_setup(ev=ev, df_1h=d1, entry_price=price)
-                except Exception:
-                    stats["setup_rejected"] += 1
-                    continue
-
-                stats["setups"] += 1
-
-                if event_id in executed_event_ids:
-                    if EXECUTION_ENABLED:
-                        execution_result = reconcile_existing_position(
-                            symbol=symbol,
-                            direction=direction,
-                            setup=setup,
-                            event_id=event_id,
-                        )
-                    else:
-                        execution_result = {
-                            "status": "ALREADY_EXECUTED",
-                            "mode": EXECUTION_MODE,
-                            "order_id": None,
-                            "protection_status": "NOT_CHECKED_EXECUTION_DISABLED",
-                        }
-                elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
-                    stats["execution_attempts"] += 1
-                    execution_result = execute_new_position(
-                        symbol=symbol,
-                        direction=direction,
-                        price=price,
-                        setup=setup,
-                        event_id=event_id,
-                    )
-
-                    record_trade({
-                        "event_id": event_id,
-                        "symbol": symbol,
-                        "direction": direction,
-                        "price": price,
-                        "event_type": ev.get("event_type"),
-                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                        "result": execution_result,
-                        "setup": setup,
-                    })
-
-                    status = str(execution_result.get("status", ""))
-                    if status in {"opened_protected", "opened_protection_check_required", "opened"}:
-                        executed_event_ids.add(event_id)
-                        trades_this_cycle += 1
-                        stats["trades"] += 1
-
-                        # Регистрируем открытую сделку в трекере для отслеживания тейков и стопов
-                        try:
-                            register_active_trade(
-                                event_id=event_id,
-                                symbol=symbol,
-                                name=getattr(r, "name", None) or symbol,
-                                direction=direction,
-                                entry_price=float(execution_result.get("position", {}).get("avgPrice", price)),
-                                qty=float(execution_result.get("position", {}).get("positionAmt", 0)),
-                                tp_orders=execution_result.get("protection", {}).get("tp_orders", []),
-                                sl_result=execution_result.get("protection", {}).get("sl_result", {}),
-                                event_type=ev.get("event_type", ""),
-                                coinalyze_row=r,
-                            )
-                        except Exception as exc:
-                            print(f"[REGISTER_ACTIVE_TRADE_ERROR] {symbol}: {exc}")
-
-                elif not EXECUTION_ENABLED:
-                    execution_result = {
-                        "status": "DISABLED",
-                        "mode": EXECUTION_MODE,
-                        "order_id": None,
-                        "protection_status": "NOT_ATTEMPTED",
-                    }
-                else:
-                    execution_result = {
-                        "status": "TRADE_LIMIT_REACHED",
-                        "mode": EXECUTION_MODE,
-                        "order_id": None,
-                    }
-
-                label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
-                try:
-                    msg = format_signal(
-                        ev,
-                        setup=setup,
-                        coinalyze_row=r,
-                        execution=execution_result,
-                    )
-                    if not (msg.startswith("🚨 LONG SIGNAL") or msg.startswith("🔻 SHORT SIGNAL")):
-                        msg = f"{label}\n\n" + msg
-                except Exception:
-                    msg = build_fallback_signal_message(
-                        ev=ev,
-                        symbol=symbol,
-                        name=getattr(r, "name", None) or symbol,
-                        setup=setup,
-                        execution_result=execution_result,
-                        price=price,
-                    )
-
-                is_real_execution = execution_result.get("status") in {"opened_protected", "opened", "opened_protection_check_required"}
-                telegram_already_sent = (event_id in telegram_sent_event_ids) and not is_real_execution
-
-                if telegram_already_sent:
-                    sent = False
-                    stats["telegram_suppressed_duplicate"] += 1
-                else:
-                    stats["telegram_attempts"] += 1
-                    try:
-                        sent = bool(send_tg(msg))
-                    except Exception:
-                        sent = False
-
-                    if sent:
-                        stats["telegram_sent"] += 1
-                        telegram_sent_event_ids.add(event_id)
-
-                record_action({
+                opportunities.append({
+                    "event": ev,
                     "event_id": event_id,
                     "symbol": symbol,
                     "direction": direction,
-                    "event_type": ev.get("event_type"),
-                    "telegram_sent": bool(sent),
-                    "telegram_suppressed_duplicate": bool(telegram_already_sent),
-                    "execution_status": execution_result.get("status"),
-                    "protection_status": execution_result.get("protection_status"),
-                    "order_id": execution_result.get("order_id"),
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    "price": price,
+                    "setup": setup,
+                    "score": score,
+                    "coinalyze_row": r,
                 })
 
         except Exception as exc:
             stats["scan_errors"] += 1
             print(f"[SCAN_ERROR] {symbol}: {exc}")
 
+    stats["valid_signals"] = len(opportunities)
+
+    # 7. Ранжирование кандидатов по качеству (Score)
+    opportunities.sort(key=lambda x: x["score"], reverse=True)
+
+    trades_this_cycle = 0
+
+    # 8. Исполнение ТОП-сигналов с наивысшим баллом
+    for opp in opportunities:
+        event_id = opp["event_id"]
+        symbol = opp["symbol"]
+        direction = opp["direction"]
+        price = opp["price"]
+        setup = opp["setup"]
+        score = opp["score"]
+        r = opp["coinalyze_row"]
+        ev = opp["event"]
+
+        if event_id in executed_event_ids:
+            execution_result = reconcile_existing_position(symbol=symbol, direction=direction, setup=setup, event_id=event_id) if EXECUTION_ENABLED else {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
+        elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
+            stats["execution_attempts"] += 1
+            execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
+
+            record_trade({
+                "event_id": event_id,
+                "symbol": symbol,
+                "direction": direction,
+                "price": price,
+                "score": score,
+                "event_type": ev.get("event_type"),
+                "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                "result": execution_result,
+                "setup": setup,
+            })
+
+            status = str(execution_result.get("status", ""))
+            if status in {"opened_protected", "opened_protection_check_required", "opened"}:
+                executed_event_ids.add(event_id)
+                trades_this_cycle += 1
+                stats["trades"] += 1
+
+                try:
+                    register_active_trade(
+                        event_id=event_id,
+                        symbol=symbol,
+                        name=getattr(r, "name", None) or symbol,
+                        direction=direction,
+                        entry_price=float(execution_result.get("position", {}).get("avgPrice", price)),
+                        qty=float(execution_result.get("position", {}).get("positionAmt", 0)),
+                        tp_orders=execution_result.get("protection", {}).get("tp_orders", []),
+                        sl_result=execution_result.get("protection", {}).get("sl_result", {}),
+                        event_type=ev.get("event_type", ""),
+                        coinalyze_row=r,
+                        score=score,
+                    )
+                except Exception as exc:
+                    print(f"[REGISTER_ACTIVE_TRADE_ERROR] {symbol}: {exc}")
+
+        elif not EXECUTION_ENABLED:
+            execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
+        else:
+            execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
+
+        # 9. Форматирование Telegram алерта с отображением Score
+        label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
+        msg = format_signal(ev, setup=setup, coinalyze_row=r, execution=execution_result, score=score)
+        if not (msg.startswith("🚨 LONG SIGNAL") or msg.startswith("🔻 SHORT SIGNAL")):
+            msg = f"{label}\n\n" + msg
+
+        is_real_execution = execution_result.get("status") in {"opened_protected", "opened", "opened_protection_check_required"}
+        telegram_already_sent = (event_id in telegram_sent_event_ids) and not is_real_execution
+
+        sent = False
+        if not telegram_already_sent:
+            try:
+                sent = bool(send_tg(msg))
+            except Exception:
+                sent = False
+            if sent:
+                telegram_sent_event_ids.add(event_id)
+
+        record_action({
+            "event_id": event_id,
+            "symbol": symbol,
+            "direction": direction,
+            "score": score,
+            "event_type": ev.get("event_type"),
+            "telegram_sent": bool(sent),
+            "execution_status": execution_result.get("status"),
+            "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+        })
+
     try:
-        append_shadow_health(
-            events_path=EVENTS,
-            health_path=HEALTH,
-            trades_path=TRADES,
-        )
+        append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES)
     except Exception as exc:
         print(f"[SHADOW_HEALTH_ERROR] {exc}")
 
