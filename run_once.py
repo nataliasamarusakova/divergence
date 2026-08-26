@@ -97,7 +97,7 @@ MAX_AGE = int(
 MAX_TRADES = int(
     os.environ.get(
         "MAX_TRADES_PER_CYCLE",
-        "1",
+        "3",
     )
 )
 
