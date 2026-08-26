@@ -79,12 +79,49 @@ def main():
                      f"Event: <code>{reason}</code>\nTF: 1H + trigger 15m\n"
                      f"Price: <code>{price:.8g}</code>\n"
                      f"Vol24H: <code>{r.volume24:,.0f}</code>\nOI: <code>{r.oi:,.0f}</code>")
+                execution_result = None
+                if EXECUTION_ENABLED and trades < MAX_TRADES:
+                    trade_id = ev["event_id"].replace("EVT_", "")
+                    execution_result = open_market(r.symbol, ev["direction"], price, trade_id)
+                    record_trade({
+                        "event_id": ev["event_id"],
+                        "symbol": r.symbol,
+                        "direction": ev["direction"],
+                        "price": price,
+                        "result": execution_result,
+                    })
+                    if execution_result.get("status") == "opened":
+                        trades += 1
+
+                # Telegram is sent after the execution attempt so the message
+                # clearly states whether VST actually opened the position.
+                try:
+                    from event_engine.telegram import format_signal
+                    msg = format_signal(
+                        ev,
+                        setup={
+                            "entry_reference": price,
+                            "invalidation_price": None,
+                            "target_price": None,
+                            "rr": None,
+                        },
+                        coinalyze_row=r,
+                        execution=execution_result,
+                    )
+                except Exception:
+                    # Keep the notification path alive even if optional formatting fails.
+                    status = execution_result.get("status") if execution_result else "NOT_ATTEMPTED"
+                    msg = (
+                        f"{label}\n"
+                        f"<b>{r.name}</b> ({r.symbol})\n"
+                        f"Event: <code>{reason}</code>\n"
+                        f"TF: 1H + trigger 15m\n"
+                        f"Price: <code>{price:.8g}</code>\n"
+                        f"Vol24H: <code>{r.volume24:,.0f}</code>\n"
+                        f"OI: <code>{r.oi:,.0f}</code>\n"
+                        f"Execution: <code>{status}</code>"
+                    )
                 send_tg(msg)
-                if EXECUTION_ENABLED and trades<MAX_TRADES:
-                    trade_id=ev["event_id"].replace("EVT_","")
-                    result=open_market(r.symbol,ev["direction"],price,trade_id)
-                    record_trade({"event_id":ev["event_id"],"symbol":r.symbol,"direction":ev["direction"],"price":price,"result":result})
-                    if result.get("status")=="opened": trades+=1
         except Exception as exc:
             print(f"[SCAN_ERROR] {r.symbol}: {exc}")
     print(f"[ENGINE] trades_this_cycle={trades}")
