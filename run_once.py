@@ -38,7 +38,7 @@ MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "500000"))
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
-MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "45"))
+MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "1"))
 
 
