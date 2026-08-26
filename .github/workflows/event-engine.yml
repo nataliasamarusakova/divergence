@@ -15,6 +15,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,11 +38,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
       - name: Install Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
 
       - name: Syntax check
-        run: python -m compileall -q event_engine run_once.py
+        run: |
+          python -m compileall -q event_engine run_once.py
 
       - name: Clean Python cache
         run: |
@@ -56,36 +66,59 @@ jobs:
           COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
           COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
           BINGX_ENV: vst
           BINGX_BASE_URL: https://open-api-vst.bingx.com
           BINGX_MARGIN_USDT: "1"
           BINGX_LEVERAGE: "10"
+          BINGX_POSITION_MODE: HEDGE
+
           EXECUTION_ENABLED: "true"
           EXECUTION_MODE: vst
+
           REQUIRE_CVD_CONFIRMATION: "false"
           REQUIRE_15M_TRIGGER: "true"
+
           MAX_EVENT_AGE_MIN: "90"
           MAX_TRADES_PER_CYCLE: "1"
+
           MIN_VOLUME_24H: "1000000"
           MIN_OPEN_INTEREST: "500000"
           MAX_CANDIDATES: "40"
+
           KLINE_LIMIT_1H: "250"
           KLINE_LIMIT_15M: "250"
+
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+
         run: python run_once.py
 
       - name: Commit state
         if: always()
         run: |
+          set -e
+
           git config user.name "actions-user"
           git config user.email "actions@github.com"
-          git add data/*.jsonl debug_page.html 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git fetch origin main
-            git rebase origin/main || git rebase --abort
-            git push origin HEAD:main
+
+          git add data/*.jsonl 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No state changes"
+            exit 0
           fi
+
+          git commit -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          git fetch origin main
+
+          if ! git rebase origin/main; then
+            echo "Rebase failed"
+            git rebase --abort || true
+            exit 1
+          fi
+
+          git push origin HEAD:main
