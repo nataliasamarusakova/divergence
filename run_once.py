@@ -395,35 +395,83 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             poll_interval=0.5,
         )
     except Exception as exc:
-        return {"status": "POSITION_WAIT_FAILED", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "error": str(exc)}
+        return {
+            "status": "POSITION_WAIT_FAILED",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+            "error": str(exc),
+        }
 
+    # Exchange position is the sole source of truth for actual average price and
+    # quantity. Never install protection against the requested order quantity.
     if not isinstance(position, dict) or str(position.get("status", "")).lower() != "found":
-        return {"status": "POSITION_NOT_CONFIRMED", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "position": position}
+        return {
+            "status": "POSITION_NOT_CONFIRMED",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+            "position": position,
+        }
 
     try:
+        actual_qty = abs(float(position.get("positionAmt", 0) or 0))
+        actual_avg_price = float(position.get("avgPrice", 0) or position.get("entryPrice", 0) or 0)
+    except (TypeError, ValueError):
+        actual_qty = 0.0
+        actual_avg_price = 0.0
+
+    if actual_qty <= 0 or actual_avg_price <= 0:
+        return {
+            "status": "POSITION_INVALID",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+            "position": position,
+        }
+
+    try:
+        # Setup may have been calculated from signal price; protection percentages
+        # are retained, but actual exchange avgPrice is authoritative for all prices.
         sl_pct, tp_levels = build_tp_levels(setup, direction)
     except Exception as exc:
-        return {"status": "PROTECTION_SETUP_INVALID", "mode": EXECUTION_MODE, "order_id": order_id, "position": position, "open_result": opened, "error": str(exc)}
+        return {
+            "status": "PROTECTION_SETUP_INVALID",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "position": position,
+            "open_result": opened,
+            "error": str(exc),
+        }
 
     protection = install_protection(
         symbol=symbol,
         direction=direction,
-        position=position,
+        position={**position, "positionAmt": actual_qty, "avgPrice": actual_avg_price},
         setup=setup,
         sl_pct=sl_pct,
         tp_levels=tp_levels,
         trade_id=trade_id,
     )
 
-    protection_status = str(protection.get("status", "")).lower()
-    final_status = "opened_protected" if protection_status in {"ok", "protected", "created", "reconciled", "success", "ready"} else "opened_protection_check_required"
+    protection_status = str(protection.get("status", "")).upper()
+    if protection_status == "PROTECTED":
+        final_status = "opened_protected"
+    elif protection_status == "SL_ONLY":
+        final_status = "opened_protection_check_required"
+    else:
+        final_status = "opened_protection_check_required"
 
     return {
         "status": final_status,
         "mode": EXECUTION_MODE,
         "order_id": order_id,
         "open_result": opened,
-        "position": position,
+        "position": {
+            **position,
+            "positionAmt": actual_qty,
+            "avgPrice": actual_avg_price,
+        },
         "protection": protection,
         "sl_pct": sl_pct,
         "tp_levels": tp_levels,
@@ -596,7 +644,7 @@ def main() -> None:
             })
 
             status = str(execution_result.get("status", ""))
-            if status in {"opened_protected", "opened_protection_check_required", "opened"}:
+            if status == "opened_protected":
                 executed_event_ids.add(event_id)
                 trades_this_cycle += 1
                 stats["trades"] += 1
@@ -662,3 +710,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
