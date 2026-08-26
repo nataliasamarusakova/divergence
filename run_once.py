@@ -72,6 +72,7 @@ def load_ids(path: Path) -> set[str]:
 
 
 def load_successful_trade_ids(path: Path) -> set[str]:
+    """Считывает только успешно открытые сделки, позволяя retry при временных сбоях API."""
     if not path.exists():
         return set()
     ids: set[str] = set()
@@ -118,18 +119,15 @@ def calculate_setup_score(
     fact = ev.get("event_fact", {})
     direction = str(ev.get("direction", "LONG")).upper()
 
-    # 1. Сила расхождения цены и индикатора относительно ATR
     delta_atr = float(fact.get("price_delta_atr", 0))
     if delta_atr >= 1.0:
         score += 15.0
     elif delta_atr >= 0.5:
         score += 10.0
 
-    # 2. Подтверждение CVD дельтой
     if "CVD" in ev.get("event_type", ""):
         score += 15.0
 
-    # 3. Сжатие в Squeeze
     if "VOLATILITY_SQUEEZE_RELEASE" in ev.get("event_type", ""):
         comp_ratio = float(fact.get("compression_ratio", 1.0))
         if comp_ratio < 0.65:
@@ -138,20 +136,18 @@ def calculate_setup_score(
         if duration >= 5:
             score += 10.0
 
-    # 4. Деривативный перекос Coinalyze (Funding Rate Skew)
     if coinalyze_row is not None:
         fr = getattr(coinalyze_row, "fr_oiw", None)
         if fr is not None:
             if direction == "LONG" and fr < 0:
-                score += 15.0  # Топливо для шорт-сквиза
+                score += 15.0
             elif direction == "SHORT" and fr > 0.02:
-                score += 15.0  # Топливо для лонг-сквиза
+                score += 15.0
             elif direction == "LONG" and fr > 0.05:
-                score -= 15.0  # Опасный перегретый лонг
+                score -= 15.0
             elif direction == "SHORT" and fr < -0.05:
-                score -= 15.0  # Опасный перегретый шорт
+                score -= 15.0
 
-    # 5. Всплеск объема на свече триггера 15M
     if "volume" in df_15m.columns and len(df_15m) >= 20:
         recent_avg = df_15m["volume"].iloc[-21:-1].mean()
         if pd.notna(recent_avg) and recent_avg > 0:
@@ -370,7 +366,6 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 
 def main() -> None:
-    # 1. Опрос открытых позиций (тейки, стопы, безубыток)
     if EXECUTION_ENABLED:
         try:
             update_active_trades()
@@ -387,7 +382,6 @@ def main() -> None:
         "scan_errors": 0,
     }
 
-    # 2. Получение и анализ рынка BTC
     btc_regime_df = None
     try:
         btc_klines = fetch_klines("BTC-USDT", "1h", limit=10)
@@ -425,7 +419,6 @@ def main() -> None:
 
     opportunities: List[dict] = []
 
-    # 3. Сбор и валидация всех сигналов цикла
     for r in candidates:
         symbol = r.symbol
         try:
@@ -462,14 +455,12 @@ def main() -> None:
                     emit_event(ev)
                     seen_events.add(event_id)
 
-                # 4. Проверка BTC тренда (Crash Filter)
                 if btc_regime_df is not None and symbol != "BTC-USDT":
-                    btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
+                    btc_ok, _ = check_btc_regime(btc_regime_df, direction)
                     if not btc_ok:
                         stats["btc_filter_blocked"] += 1
                         continue
 
-                # 5. Проверка окна и 15M триггера с подтверждением объема
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
@@ -482,8 +473,6 @@ def main() -> None:
                 fact = ev.get("event_fact", {})
                 price = float(fact.get("detection_close_price") or fact.get("close") or r.price)
                 setup = build_event_setup(ev=ev, df_1h=d1, entry_price=price)
-
-                # 6. Расчет композитного скоринга (0-100)
                 score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15)
 
                 opportunities.append({
@@ -502,13 +491,10 @@ def main() -> None:
             print(f"[SCAN_ERROR] {symbol}: {exc}")
 
     stats["valid_signals"] = len(opportunities)
-
-    # 7. Ранжирование кандидатов по качеству (Score)
     opportunities.sort(key=lambda x: x["score"], reverse=True)
 
     trades_this_cycle = 0
 
-    # 8. Исполнение ТОП-сигналов с наивысшим баллом
     for opp in opportunities:
         event_id = opp["event_id"]
         symbol = opp["symbol"]
@@ -565,7 +551,6 @@ def main() -> None:
         else:
             execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
 
-        # 9. Форматирование Telegram алерта с отображением Score
         label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
         msg = format_signal(ev, setup=setup, coinalyze_row=r, execution=execution_result, score=score)
         if not (msg.startswith("🚨 LONG SIGNAL") or msg.startswith("🔻 SHORT SIGNAL")):
@@ -604,4 +589,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(
