@@ -43,6 +43,11 @@ jobs:
       - name: Syntax check
         run: python -m compileall -q event_engine run_once.py
 
+      - name: Clean Python cache
+        run: |
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+          find . -type f -name "*.pyc" -delete
+
       - name: Run tests
         run: python -m pytest -q
 
