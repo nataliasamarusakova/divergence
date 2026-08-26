@@ -1,5 +1,3 @@
-# run_once.py
-
 from __future__ import annotations
 
 import json
@@ -267,8 +265,49 @@ def install_protection(
         return {"status": "PROTECTION_EXCEPTION", "error": str(exc)}
 
 
+def _tp_orders_to_tracker(tp_orders: list[dict]) -> list[dict]:
+    """Normalize existing exchange TP orders into tracker-compatible dictionaries."""
+    out: list[dict] = []
+    for order in tp_orders:
+        cid = str(order.get("clientOrderId", "")).upper()
+        leg = next((x for x in ("tp1", "tp2", "tp3") if x.upper() in cid), None)
+        if not leg:
+            continue
+        out.append({
+            "leg": leg,
+            "status": "already_exists",
+            "order_id": str(order.get("orderId", "")),
+            "price": float(order.get("stopPrice", 0) or order.get("price", 0) or 0),
+            "qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
+        })
+    return out
+
+
+def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
+    if not sl_orders:
+        return {}
+    sl = sl_orders[0]
+    return {
+        "status": "already_exists",
+        "order_id": str(sl.get("orderId", "")),
+        "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
+        "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or 0),
+    }
+
+
+def _expected_tp_leg_count(position_qty: float, symbol: str) -> int:
+    """Return the number of TP legs this position can validly support."""
+    contract = get_contract(symbol) or {}
+    try:
+        min_qty = float(contract.get("tradeMinQuantity") or contract.get("minQty") or 0)
+    except (TypeError, ValueError):
+        min_qty = 0.0
+    # Mirrors ensure_directional_protection(): small positions collapse to one full-size TP.
+    return 1 if min_qty > 0 and position_qty < min_qty * 3 else 3
+
+
 def reconcile_all_open_positions() -> None:
-    """Проверяет ВСЕ реально открытые позиции на BingX и автоматически ставит недостающие SL/TP."""
+    """Repair missing protection only; never recreate already-complete protection."""
     try:
         positions = get_positions()
     except Exception as exc:
@@ -293,17 +332,56 @@ def reconcile_all_open_positions() -> None:
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
 
-        # 1. Проверяем состояние защиты; ensure_directional_protection() сама
-        #    дозаведёт только отсутствующие legs и не будет создавать дубликаты наших TP.
+        # First read only. A read error is not evidence that protection is absent.
         prot = get_open_protection_directional(bx_symbol, direction)
-        if prot.get("status") == "error":
-            print(f"[RECONCILIATION] Cannot inspect protection for {bx_symbol}: {prot.get('error')}")
+        if prot.get("status") != "ok":
+            print(f"[RECONCILIATION] Cannot inspect protection for {bx_symbol}: {prot.get('error', 'unknown error')}")
             continue
-        sl_orders = prot.get("sl_orders", [])
-        tp_orders = prot.get("tp_orders", [])
-        print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection: SL={len(sl_orders)} TP={len(tp_orders)}; reconciling...")
 
-        # 2. Вычисляем безопасные SL / TP по 1H ATR
+        sl_orders = list(prot.get("sl_orders", []))
+        tp_orders = list(prot.get("tp_orders", []))
+        expected_tp_count = _expected_tp_leg_count(qty, bx_symbol)
+        known_tp_legs = {
+            leg
+            for order in tp_orders
+            for leg in ("tp1", "tp2", "tp3")
+            if leg.upper() in str(order.get("clientOrderId", "")).upper()
+        }
+
+        # Nothing is missing: DO NOT call ensure_directional_protection(),
+        # DO NOT recalculate ATR, DO NOT touch exchange orders, DO NOT send Telegram.
+        protection_complete = bool(sl_orders) and len(known_tp_legs) >= expected_tp_count
+        if protection_complete:
+            print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection OK: SL=1 TP={len(known_tp_legs)}; no changes")
+            tracker_tp = _tp_orders_to_tracker(tp_orders)
+            tracker_sl = _sl_order_to_tracker(sl_orders)
+            if tracker_tp and tracker_sl:
+                tracked = update_active_trade_protection(
+                    symbol=bx_symbol,
+                    direction=direction,
+                    tp_orders=tracker_tp,
+                    sl_result=tracker_sl,
+                )
+                if not tracked:
+                    register_active_trade(
+                        event_id=f"RECON_{bx_symbol}_{direction}",
+                        symbol=bx_symbol.replace("-USDT", ""),
+                        name=bx_symbol.replace("-USDT", ""),
+                        direction=direction,
+                        entry_price=avg_price,
+                        qty=qty,
+                        tp_orders=tracker_tp,
+                        sl_result=tracker_sl,
+                        event_type="RECONCILED_POSITION",
+                    )
+            continue
+
+        print(
+            f"[RECONCILIATION] {bx_symbol} ({direction}) protection incomplete: "
+            f"SL={len(sl_orders)} TP={len(known_tp_legs)}/{expected_tp_count}; repairing only missing protection..."
+        )
+
+        # Compute fallback protection only when something is actually missing.
         sl_pct = 2.0
         tp_pct = 4.0
         try:
@@ -313,7 +391,14 @@ def reconcile_all_open_positions() -> None:
                 for col in ("high", "low", "close"):
                     df1[col] = pd.to_numeric(df1[col], errors="coerce")
                 prev_close = df1["close"].shift(1)
-                tr = pd.concat([df1["high"] - df1["low"], (df1["high"] - prev_close).abs(), (df1["low"] - prev_close).abs()], axis=1).max(axis=1)
+                tr = pd.concat(
+                    [
+                        df1["high"] - df1["low"],
+                        (df1["high"] - prev_close).abs(),
+                        (df1["low"] - prev_close).abs(),
+                    ],
+                    axis=1,
+                ).max(axis=1)
                 atr = tr.rolling(14, min_periods=14).mean().iloc[-1]
                 if pd.notna(atr) and float(atr) > 0:
                     risk_pct = max(0.50, min(float(atr) / avg_price * 100.0, 5.00))
@@ -328,7 +413,6 @@ def reconcile_all_open_positions() -> None:
             {"leg": "tp3", "pnl_pct": round(tp_pct, 6), "close_fraction": 0.40},
         ]
 
-        # 3. Устанавливаем защиту на BingX
         res = ensure_directional_protection(
             symbol=bx_symbol,
             direction=direction,
@@ -336,20 +420,29 @@ def reconcile_all_open_positions() -> None:
             qty=qty,
             stop_loss_pct=sl_pct,
             tp_levels=tp_levels,
-            trade_id=f"REC_{int(time.time())}",
+            trade_id=f"REC_{bx_symbol}_{direction}",
         )
 
-        status = res.get("status")
-        print(f"[RECONCILIATION] Результат защиты {bx_symbol}: {status}")
+        status = str(res.get("status", "")).upper()
+        created_sl = str(res.get("sl_result", {}).get("status", "")).lower() == "created"
+        created_tp = any(str(x.get("status", "")).lower() == "created" for x in res.get("tp_orders", []))
+        changed = created_sl or created_tp
+
+        print(f"[RECONCILIATION] {bx_symbol} result={status} changed={changed}")
 
         if status in {"PROTECTED", "SL_ONLY"}:
-            updated_existing = update_active_trade_protection(
-                symbol=bx_symbol,
-                direction=direction,
-                tp_orders=res.get("tp_orders", []),
-                sl_result=res.get("sl_result", {}),
-            )
-            if not updated_existing:
+            updated_existing = False
+            repaired_tp = res.get("tp_orders", [])
+            repaired_sl = res.get("sl_result", {})
+            if repaired_tp and repaired_sl:
+                updated_existing = update_active_trade_protection(
+                    symbol=bx_symbol,
+                    direction=direction,
+                    tp_orders=repaired_tp,
+                    sl_result=repaired_sl,
+                )
+
+            if not updated_existing and repaired_tp and repaired_sl:
                 register_active_trade(
                     event_id=f"RECON_{bx_symbol}_{direction}",
                     symbol=bx_symbol.replace("-USDT", ""),
@@ -357,19 +450,22 @@ def reconcile_all_open_positions() -> None:
                     direction=direction,
                     entry_price=avg_price,
                     qty=qty,
-                    tp_orders=res.get("tp_orders", []),
-                    sl_result=res.get("sl_result", {}),
+                    tp_orders=repaired_tp,
+                    sl_result=repaired_sl,
                     event_type="RECONCILED_POSITION",
                 )
-            send_tg(
-                f"🛡 <b>[ЗАЩИТА УСТАНОВЛЕНА] {bx_symbol}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"Позиция на бирже успешно защищена:\n"
-                f"• Направление: <b>{direction}</b>\n"
-                f"• Цена входа: <code>{avg_price:.8g}</code>\n"
-                f"• SL: <code>{sl_pct:.2f}%</code>\n"
-                f"• TP: <code>+{tp_pct:.2f}%</code> (каскад)"
-            )
+
+            # Telegram is emitted ONLY when this reconciliation actually changed protection.
+            if changed:
+                send_tg(
+                    f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Недостающая защита восстановлена:\n"
+                    f"• Направление: <b>{direction}</b>\n"
+                    f"• Цена входа: <code>{avg_price:.8g}</code>\n"
+                    f"• SL: <code>{sl_pct:.2f}%</code>\n"
+                    f"• TP: <code>+{tp_pct:.2f}%</code> (каскад)"
+                )
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
