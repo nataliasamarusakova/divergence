@@ -7,6 +7,7 @@ import math
 import os
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from typing import Any
 from urllib.parse import urlencode
@@ -50,6 +51,9 @@ CACHE = {
 
 TTL = 3600
 
+# Local clock correction derived from BingX HTTP Date header after timestamp errors.
+SERVER_TIME_OFFSET_MS = 0
+
 # Оптимизированная сессия с Keep-Alive
 SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=2, backoff_factor=0.3))
@@ -66,34 +70,78 @@ def _sign(params: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _apply_request_timestamp(params: dict[str, Any]) -> None:
+    params.pop("signature", None)
+    params["timestamp"] = str(int(time.time() * 1000) + SERVER_TIME_OFFSET_MS)
+    params["signature"] = _sign(params)
+
+
+def _update_server_time_offset(response: requests.Response) -> bool:
+    global SERVER_TIME_OFFSET_MS
+    date_header = response.headers.get("Date")
+    if not date_header:
+        return False
+    try:
+        server_ms = int(parsedate_to_datetime(date_header).timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    local_ms = int(time.time() * 1000)
+    SERVER_TIME_OFFSET_MS = server_ms - local_ms
+    log.warning("[BINGX_TIME_SYNC] server_offset_ms=%d", SERVER_TIME_OFFSET_MS)
+    return True
+
+
 def _request(
     method: str,
     path: str,
     params: dict[str, Any] | None = None,
     signed: bool = True,
 ):
-    params = dict(params or {})
+    base_params = dict(params or {})
     headers = {}
+    max_timestamp_retries = 1 if signed else 0
 
     if signed:
         if not API_KEY or not SECRET_KEY:
             return {"code": -1, "msg": "missing BingX credentials"}
-
-        params["timestamp"] = str(int(time.time() * 1000))
-        params["signature"] = _sign(params)
         headers["X-BX-APIKEY"] = API_KEY
 
-    try:
-        response = SESSION.request(
-            method=method,
-            url=BASE_URL + path,
-            params=params,
-            headers=headers,
-            timeout=10,
-        )
-        return response.json()
-    except Exception as exc:
-        return {"code": -1, "msg": str(exc)}
+    for attempt in range(max_timestamp_retries + 1):
+        request_params = dict(base_params)
+        if signed:
+            _apply_request_timestamp(request_params)
+
+        try:
+            response = SESSION.request(
+                method=method,
+                url=BASE_URL + path,
+                params=request_params,
+                headers=headers,
+                timeout=10,
+            )
+            payload = response.json()
+        except Exception as exc:
+            return {"code": -1, "msg": str(exc)}
+
+        try:
+            code = int(payload.get("code"))
+        except (TypeError, ValueError, AttributeError):
+            code = None
+
+        # 109400 is a signed-request timestamp error. Re-sync from the HTTP Date
+        # header and retry exactly once. This is safe because the original request
+        # was rejected with the timestamp error, not accepted for execution.
+        if (
+            signed
+            and code == 109400
+            and attempt < max_timestamp_retries
+            and _update_server_time_offset(response)
+        ):
+            continue
+
+        return payload
+
+    return {"code": -1, "msg": "request retry exhausted"}
 
 
 def refresh_contracts() -> dict[str, Any]:
@@ -728,6 +776,37 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
     return normalized
 
 
+def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, price_precision: int) -> bool:
+    expected_leg = str(expected_leg).upper()
+    client_id = str(order.get("clientOrderId", "")).upper()
+    if expected_leg and expected_leg in client_id:
+        return True
+
+    order_type = str(order.get("type", "")).upper()
+    if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+        return False
+
+    actual_price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
+    if actual_price <= 0:
+        return False
+    return _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
+
+
+def _current_close_price(symbol: str) -> float | None:
+    try:
+        rows = fetch_klines(symbol, "1m", limit=2)
+    except Exception as exc:
+        log.warning("[BINGX_TP_PRICE_CHECK] failed to read current price for %s: %s", symbol, exc)
+        return None
+    if not rows:
+        return None
+    try:
+        price = float(rows[-1].get("close", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
 def ensure_directional_protection(
     symbol: str,
     direction: str,
@@ -874,14 +953,21 @@ def ensure_directional_protection(
         }
 
     tp_results = []
+    current_price = None
+    current_price_checked = False
     for level, tp_qty in zip(tp_levels_norm, desired_qtys):
         leg = level["leg"]
         pnl_pct = level["pnl_pct"]
 
+        tp_price = (
+            avg_price * (1.0 + pnl_pct / 100.0)
+            if direction == "LONG"
+            else avg_price * (1.0 - pnl_pct / 100.0)
+        )
+
         existing_leg = None
         for order in existing_tp:
-            cid = str(order.get("clientOrderId", ""))
-            if leg.upper() in cid.upper():
+            if _tp_leg_from_order(order, leg, tp_price, price_precision):
                 existing_leg = order
                 break
 
@@ -903,11 +989,46 @@ def ensure_directional_protection(
             })
             continue
 
-        tp_price = (
-            avg_price * (1.0 + pnl_pct / 100.0)
-            if direction == "LONG"
-            else avg_price * (1.0 - pnl_pct / 100.0)
+        # BingX rejects a TAKE_PROFIT trigger that is already on the wrong side
+        # of the current market. Do not repeatedly POST the same impossible order.
+        if not current_price_checked:
+            current_price = _current_close_price(symbol)
+            current_price_checked = True
+        if current_price is None:
+            tp_results.append({
+                "leg": leg,
+                "status": "deferred",
+                "reason": "current_price_unavailable",
+                "price": tp_price,
+                "qty": tp_qty,
+                "pnl_pct": pnl_pct,
+            })
+            continue
+
+        trigger_invalid = (
+            direction == "LONG" and tp_price <= current_price
+        ) or (
+            direction == "SHORT" and tp_price >= current_price
         )
+        if trigger_invalid:
+            log.warning(
+                "[BINGX_TP_DEFERRED] %s %s price=%s current=%s: trigger already crossed",
+                symbol,
+                leg,
+                _format_price(tp_price, price_precision),
+                _format_price(current_price, price_precision),
+            )
+            tp_results.append({
+                "leg": leg,
+                "status": "deferred",
+                "reason": "trigger_already_crossed",
+                "price": tp_price,
+                "current_price": current_price,
+                "qty": tp_qty,
+                "pnl_pct": pnl_pct,
+            })
+            continue
+
         client_order_id = build_tp_client_order_id(leg, trade_id)
         params = {
             "symbol": bx_symbol,
