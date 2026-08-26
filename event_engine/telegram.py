@@ -37,10 +37,8 @@ def send(text: str) -> bool:
             payload = r.json()
             if not payload.get("ok"):
                 all_ok = False
-                print(f"[TELEGRAM] API rejected chat_id={chat_id}: {payload}")
-        except Exception as exc:
+        except Exception:
             all_ok = False
-            print(f"[TELEGRAM] send failed chat_id={chat_id}: {exc}")
     return all_ok
 
 
@@ -49,6 +47,7 @@ def format_signal(
     setup: Optional[dict[str, Any]] = None,
     coinalyze_row: Any = None,
     execution: Optional[dict[str, Any]] = None,
+    score: Optional[float] = None,
 ) -> str:
     direction = str(event.get("direction", "")).upper()
     title = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
@@ -59,13 +58,15 @@ def format_signal(
     def esc(v: Any) -> str:
         return html.escape("—" if v is None else str(v), quote=False)
 
+    score_str = f" · Score: <b>{score:.0f}/100</b>" if score is not None else ""
+
     lines = [
-        f"<b>{title}</b>",
+        f"<b>{title}</b>{score_str}",
         "",
         f"<b>{esc(getattr(coinalyze_row, 'name', None) or event.get('symbol'))}</b> "
         f"(<code>{esc(event.get('symbol'))}</code>)",
         f"Event: <code>{esc(event.get('event_type'))}</code>",
-        f"TF: <b>{esc(event.get('timeframe', '1h'))}</b> + trigger 15m",
+        f"TF: <b>{esc(event.get('timeframe', '1h'))}</b> + trigger 15m (Vol Confirmed)",
         f"Price: <code>{esc(fact.get('detection_close_price'))}</code>",
         f"Detected: <code>{esc(ts.get('detected_at_ts'))}</code>",
     ]
@@ -89,17 +90,11 @@ def format_signal(
 
     if coinalyze_row is not None:
         oi_chg = getattr(coinalyze_row, "oi_chg4h_pct", None)
-        if oi_chg is not None:
-            if abs(oi_chg) > 1000:
-                oi_chg_str = f"${oi_chg:,.0f}"
-            else:
-                oi_chg_str = f"{oi_chg:.2f}%"
-        else:
-            oi_chg_str = "—"
+        oi_chg_str = f"${oi_chg:,.0f}" if oi_chg is not None and abs(oi_chg) > 1000 else (f"{oi_chg:.2f}%" if oi_chg is not None else "—")
 
         lines += [
             "",
-            "<b>Coinalyze</b>",
+            "<b>Coinalyze Derivatives</b>",
             f"Vol24H: <code>{esc(getattr(coinalyze_row, 'volume24', None))}</code>",
             f"OI: <code>{esc(getattr(coinalyze_row, 'oi', None))}</code>",
             f"OI Chg 4H: <code>{esc(oi_chg_str)}</code>",
@@ -113,7 +108,7 @@ def format_signal(
             "<b>SETUP</b>",
             f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
             f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
-            f"TP (Final): <code>{esc(setup.get('target_price'))}</code>",
+            f"TP: <code>{esc(setup.get('target_price'))}</code>",
             f"R:R (Realized): <code>{esc(rr)}</code>",
         ]
 
