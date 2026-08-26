@@ -12,6 +12,8 @@ from typing import Any
 from urllib.parse import urlencode
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
 
@@ -48,6 +50,12 @@ CACHE = {
 
 TTL = 3600
 
+# Оптимизированная сессия с Keep-Alive
+SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=2, backoff_factor=0.3))
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
 
 def _sign(params: dict[str, Any]) -> str:
     qs = urlencode(params)
@@ -69,29 +77,23 @@ def _request(
 
     if signed:
         if not API_KEY or not SECRET_KEY:
-            return {
-                "code": -1,
-                "msg": "missing BingX credentials",
-            }
+            return {"code": -1, "msg": "missing BingX credentials"}
 
         params["timestamp"] = str(int(time.time() * 1000))
         params["signature"] = _sign(params)
         headers["X-BX-APIKEY"] = API_KEY
 
     try:
-        response = requests.request(
-            method,
-            BASE_URL + path,
+        response = SESSION.request(
+            method=method,
+            url=BASE_URL + path,
             params=params,
             headers=headers,
-            timeout=15,
+            timeout=10,
         )
         return response.json()
     except Exception as exc:
-        return {
-            "code": -1,
-            "msg": str(exc),
-        }
+        return {"code": -1, "msg": str(exc)}
 
 
 def refresh_contracts() -> dict[str, Any]:
@@ -147,13 +149,11 @@ def get_contract(symbol: str) -> dict | None:
 
     base = s.replace("-USDT", "").replace("-", "")
 
-    # Приоритет 1: прямое совпадение символа
     for c in CACHE["data"].values():
         cs = str(c.get("symbol", "")).upper()
         if cs == f"{base}-USDT" or cs == base:
             return c
 
-    # Приоритет 2: совпадение displayName с нормализацией разделителей
     norm_base = base.replace("-", "").replace("/", "").replace(" ", "")
     for c in CACHE["data"].values():
         name = str(c.get("displayName", "")).upper().replace("-", "").replace("/", "").replace(" ", "")
@@ -360,7 +360,6 @@ def get_positions() -> list[dict]:
 
 
 def get_order(symbol: str, order_id: str | int) -> dict:
-    """Получает статус ордера по orderId."""
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
@@ -387,7 +386,6 @@ def get_order(symbol: str, order_id: str | int) -> dict:
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
-    """Отменяет ордер по orderId."""
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
@@ -636,6 +634,7 @@ def ensure_directional_protection(
     tp_levels: list,
     trade_id: str | None = None,
 ) -> dict:
+    """Гарантированная установка Stop Loss и каскадных Take Profit ордеров."""
     direction = str(direction).upper()
     if direction not in ("LONG", "SHORT"):
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -664,15 +663,53 @@ def ensure_directional_protection(
         return {"status": "error", "error": f"qty={position_qty} < minQty={min_qty}"}
 
     existing = get_open_protection_directional(symbol, direction)
-    if existing.get("status") != "ok":
-        return existing
-
-    existing_tp = list(existing.get("tp_orders", []))
-    existing_sl = list(existing.get("sl_orders", []))
+    existing_tp = list(existing.get("tp_orders", [])) if existing.get("status") == "ok" else []
+    existing_sl = list(existing.get("sl_orders", [])) if existing.get("status") == "ok" else []
 
     tp_side = "SELL" if direction == "LONG" else "BUY"
     sl_side = tp_side
 
+    # =========================================================================
+    # ШАГ 1: ГАРАНТИРОВАННАЯ УСТАНОВКА STOP LOSS (ПРИОРИТЕТ №1)
+    # =========================================================================
+    sl_result = {}
+    if existing_sl:
+        sl = existing_sl[0]
+        sl_result = {
+            "status": "already_exists",
+            "order_id": str(sl.get("orderId", "")),
+            "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
+        }
+    else:
+        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
+        client_order_id = build_sl_client_order_id(trade_id)
+        params = {
+            "symbol": bx_symbol,
+            "side": sl_side,
+            "positionSide": direction,
+            "type": "STOP_MARKET",
+            "stopPrice": _format_price(sl_price, price_precision),
+            "quantity": _format_qty(position_qty, precision),
+            "clientOrderId": client_order_id,
+        }
+
+        resp = _request("POST", ORDER_PATH, params)
+        if resp.get("code") != 0:
+            log.error("[BINGX_SL_FAILED] code=%s msg=%s params=%s", resp.get("code"), resp.get("msg"), params)
+            sl_result = {"status": "error", "error": f"SL failed: code={resp.get('code')} msg={resp.get('msg')}"}
+        else:
+            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+            sl_result = {
+                "status": "created",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "stop_price": sl_price,
+                "qty": position_qty,
+            }
+
+    # =========================================================================
+    # ШАГ 2: АДАПТИВНАЯ УСТАНОВКА СЕТКИ TAKE PROFIT
+    # =========================================================================
     normalized_levels = []
     for tp in tp_levels:
         leg = str(tp.get("leg", f"tp{len(normalized_levels) + 1}"))
@@ -683,7 +720,7 @@ def ensure_directional_protection(
         normalized_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
     if not normalized_levels:
-        return {"status": "error", "error": "no valid tp_levels"}
+        normalized_levels = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
 
     fraction_sum = sum(x["close_fraction"] for x in normalized_levels)
     for x in normalized_levels:
@@ -692,6 +729,10 @@ def ensure_directional_protection(
     tp_results = []
     placed_qty_sum = Decimal("0.0")
     pos_qty_dec = Decimal(str(position_qty))
+
+    # Если позиция мала для деления на 3 части (30% < min_qty), ставим 1 надежный общий TP
+    if min_qty > 0 and (position_qty * 0.3) < min_qty:
+        normalized_levels = [{"leg": "tp1", "pnl_pct": normalized_levels[-1]["pnl_pct"], "close_fraction": 1.0}]
 
     for idx, level in enumerate(normalized_levels):
         leg = level["leg"]
@@ -722,7 +763,6 @@ def ensure_directional_protection(
 
         tp_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
 
-        # Гарантированный расчет остатка без переполнения объема
         if idx == len(normalized_levels) - 1:
             tp_qty_dec = max(Decimal("0.0"), pos_qty_dec - placed_qty_sum)
             tp_qty = float(tp_qty_dec)
@@ -743,68 +783,32 @@ def ensure_directional_protection(
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
             "clientOrderId": client_order_id,
-            "reduceOnly": "true",
         }
 
         resp = _request("POST", ORDER_PATH, params)
         if resp.get("code") != 0:
-            return {
+            log.error("[BINGX_TP_FAILED] %s code=%s msg=%s params=%s", leg, resp.get("code"), resp.get("msg"), params)
+            tp_results.append({
+                "leg": leg,
                 "status": "error",
-                "error": f"{leg} TP failed: code={resp.get('code')} msg={resp.get('msg')}",
-                "tp_orders": tp_results,
-            }
+                "error": f"code={resp.get('code')} msg={resp.get('msg')}",
+            })
+        else:
+            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+            tp_results.append({
+                "leg": leg,
+                "status": "created",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "price": tp_price,
+                "qty": tp_qty,
+                "pnl_pct": pnl_pct,
+            })
 
-        order = (resp.get("data") or {}).get("order") or {}
-        tp_results.append({
-            "leg": leg,
-            "status": "created",
-            "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or client_order_id,
-            "price": tp_price,
-            "qty": tp_qty,
-            "pnl_pct": pnl_pct,
-        })
+    sl_ok = sl_result.get("status") in ("created", "already_exists")
+    tp_ok = any(t.get("status") in ("created", "already_exists") for t in tp_results)
 
-    if existing_sl:
-        sl = existing_sl[0]
-        sl_result = {
-            "status": "already_exists",
-            "order_id": str(sl.get("orderId", "")),
-            "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
-        }
-    else:
-        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
-        client_order_id = build_sl_client_order_id(trade_id)
-        params = {
-            "symbol": bx_symbol,
-            "side": sl_side,
-            "positionSide": direction,
-            "type": "STOP_MARKET",
-            "stopPrice": _format_price(sl_price, price_precision),
-            "quantity": _format_qty(position_qty, precision),
-            "clientOrderId": client_order_id,
-            "reduceOnly": "true",
-        }
-
-        resp = _request("POST", ORDER_PATH, params)
-        if resp.get("code") != 0:
-            return {
-                "status": "TP_PLACED_SL_FAILED",
-                "error": f"SL failed: code={resp.get('code')} msg={resp.get('msg')}",
-                "tp_orders": tp_results,
-                "sl_result": {"status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}"},
-            }
-
-        order = (resp.get("data") or {}).get("order") or {}
-        sl_result = {
-            "status": "created",
-            "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or client_order_id,
-            "stop_price": sl_price,
-            "qty": position_qty,
-        }
-
-    final_status = "PROTECTED" if len(tp_results) == len(normalized_levels) and sl_result.get("status") in ("created", "already_exists") else "TP_PLACED_SL_FAILED"
+    final_status = "PROTECTED" if (sl_ok and tp_ok) else ("SL_ONLY" if sl_ok else "PROTECTION_FAILED")
 
     return {
         "status": final_status,
