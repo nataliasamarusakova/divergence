@@ -14,7 +14,9 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    # Защита от NaN при безоткатном вертикальном пампе (avg_loss == 0)
+    return rsi.fillna(100.0)
 
 
 def _bbands(series: pd.Series, n: int = 20, std: float = 2.0):
@@ -273,8 +275,9 @@ def detect_squeeze_release(
 def build_15m_trigger(df15: pd.DataFrame, direction: str) -> bool:
     if len(df15) < 2:
         return False
+    d = str(direction).upper()
     h = df15.iloc[-1]
     p = df15.iloc[-2]
-    if direction == "LONG":
+    if d == "LONG":
         return float(h.close) > float(p.high)
     return float(h.close) < float(p.low)
