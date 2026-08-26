@@ -125,27 +125,184 @@ def classify_contract(contract: dict | None) -> str:
 
 def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
     bx = to_bx_symbol(symbol)
+
     if not bx:
         raise ValueError(f"No BingX contract for {symbol}")
-    resp = _request("GET", KLINE_PATH, {"symbol": bx, "interval": interval, "limit": limit}, signed=False)
-    if resp.get("code") != 0:
-        raise RuntimeError(f"BingX klines error {bx}/{interval}: {resp.get('msg')}")
+
+    resp = _request(
+        "GET",
+        KLINE_PATH,
+        {
+            "symbol": bx,
+            "interval": interval,
+            "limit": limit,
+        },
+        signed=False,
+    )
+
+    code = resp.get("code")
+
+    if code not in (0, "0"):
+        raise RuntimeError(
+            f"BingX klines error "
+            f"{bx}/{interval}: "
+            f"code={code} "
+            f"msg={resp.get('msg')}"
+        )
+
     rows = resp.get("data") or []
-    out = []
+
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            f"Unexpected BingX klines payload "
+            f"{bx}/{interval}: "
+            f"data_type={type(rows).__name__}"
+        )
+
+    print(
+        f"[BINGX_KLINES_RAW] "
+        f"symbol={bx} "
+        f"interval={interval} "
+        f"rows={len(rows)} "
+        f"first_len={len(rows[0]) if rows and isinstance(rows[0], (list, tuple)) else 0}"
+    )
+
+    out: list[dict] = []
+
     now = int(time.time() * 1000)
-    duration_ms = {"15m": 15*60*1000, "1h": 60*60*1000}.get(interval)
+
+    duration_ms = {
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+    }.get(interval)
+
     for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) < 11:
+
+        if not isinstance(row, (list, tuple)):
             continue
-        ot = int(row[0]); ct = int(row[6]) if row[6] is not None else ot + duration_ms
-        if ct > now: continue
-        open_, high, low, close, volume = map(float, row[1:6])
-        quote = float(row[7]); taker_b = float(row[9]); taker_q = float(row[10])
-        if min(open_, high, low, close) <= 0 or volume < 0 or quote < 0: continue
-        if taker_b < 0 or taker_q < 0 or taker_b > volume*1.001 or taker_q > quote*1.001: continue
-        delta_usdt = 2*taker_q - quote
-        out.append({"open_time": ot, "close_time": ct, "open": open_, "high": high, "low": low, "close": close, "volume": volume, "quote_volume": quote, "taker_buy_quote": taker_q, "bar_delta_usdt": delta_usdt})
-    out.sort(key=lambda x: x["close_time"])
+
+        # OHLCV + close_time are mandatory.
+        # Taker fields are optional.
+        if len(row) < 7:
+            continue
+
+        try:
+            ot = int(row[0])
+
+            ct = (
+                int(row[6])
+                if row[6] is not None
+                else (
+                    ot + duration_ms
+                    if duration_ms
+                    else ot
+                )
+            )
+
+            if ct > now:
+                continue
+
+            open_ = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
+
+        except (TypeError, ValueError, IndexError):
+            continue
+
+        # Basic OHLCV validation.
+        if (
+            open_ <= 0
+            or high <= 0
+            or low <= 0
+            or close <= 0
+            or volume < 0
+        ):
+            continue
+
+        if (
+            high < low
+            or high < open_
+            or high < close
+            or low > open_
+            or low > close
+        ):
+            continue
+
+        quote = None
+        taker_b = None
+        taker_q = None
+
+        # Extended fields are optional.
+        if len(row) >= 8:
+            try:
+                quote = float(row[7])
+            except (TypeError, ValueError):
+                quote = None
+
+        if len(row) >= 10:
+            try:
+                taker_b = float(row[9])
+            except (TypeError, ValueError):
+                taker_b = None
+
+        if len(row) >= 11:
+            try:
+                taker_q = float(row[10])
+            except (TypeError, ValueError):
+                taker_q = None
+
+        taker_flow_valid = False
+        delta_usdt = None
+
+        # CVD is valid only when the complete taker flow is present.
+        if (
+            quote is not None
+            and taker_b is not None
+            and taker_q is not None
+            and quote >= 0
+            and taker_b >= 0
+            and taker_q >= 0
+            and taker_b <= volume * 1.001 + 1e-9
+            and taker_q <= quote * 1.001 + 1e-9
+        ):
+            taker_flow_valid = True
+            delta_usdt = (
+                2.0 * taker_q
+                - quote
+            )
+
+        out.append(
+            {
+                "open_time": ot,
+                "close_time": ct,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "quote_volume": quote,
+                "taker_buy_base": taker_b,
+                "taker_buy_quote": taker_q,
+                "taker_flow_valid": taker_flow_valid,
+                "bar_delta_usdt": delta_usdt,
+            }
+        )
+
+    out.sort(
+        key=lambda x: x["close_time"]
+    )
+
+    print(
+        f"[BINGX_KLINES_PARSED] "
+        f"symbol={bx} "
+        f"interval={interval} "
+        f"bars={len(out)} "
+        f"taker_valid="
+        f"{sum(1 for x in out if x['taker_flow_valid'])}"
+    )
+
     return out
 
 
