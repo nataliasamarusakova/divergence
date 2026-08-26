@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 
 from event_engine.coinalyze import fetch_data
-
 from event_engine.bingx import (
     refresh_contracts,
     get_contract,
@@ -19,18 +18,13 @@ from event_engine.bingx import (
     get_position_directional,
     ensure_directional_protection,
 )
-
 from event_engine.signals import (
     add_cvd,
     detect_divergences,
     detect_squeeze_release,
     build_15m_trigger,
 )
-
-from event_engine.telegram import (
-    send as send_tg,
-    format_signal,
-)
+from event_engine.telegram import send as send_tg, format_signal
 
 
 logging.basicConfig(
@@ -38,36 +32,23 @@ logging.basicConfig(
     format="%(message)s",
 )
 
-
 DATA = Path("data")
-DATA.mkdir(
-    exist_ok=True
-)
+DATA.mkdir(exist_ok=True)
 
 EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
 
-
 MAX_CANDIDATES = int(
-    os.environ.get(
-        "MAX_CANDIDATES",
-        "40",
-    )
+    os.environ.get("MAX_CANDIDATES", "40")
 )
 
 MIN_VOL = float(
-    os.environ.get(
-        "MIN_VOLUME_24H",
-        "1000000",
-    )
+    os.environ.get("MIN_VOLUME_24H", "1000000")
 )
 
 MIN_OI = float(
-    os.environ.get(
-        "MIN_OPEN_INTEREST",
-        "500000",
-    )
+    os.environ.get("MIN_OPEN_INTEREST", "500000")
 )
 
 EXECUTION_ENABLED = (
@@ -121,10 +102,7 @@ EXECUTION_MODE = os.environ.get(
 # FILE HELPERS
 # ============================================================================
 
-def load_ids(
-    path: Path,
-) -> set[str]:
-
+def load_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
 
@@ -138,19 +116,14 @@ def load_ids(
             continue
 
         try:
-            value = json.loads(
-                line
-            ).get(
-                "event_id"
-            )
-
+            obj = json.loads(line)
         except Exception:
             continue
 
+        value = obj.get("event_id")
+
         if value:
-            ids.add(
-                str(value)
-            )
+            ids.add(str(value))
 
     return ids
 
@@ -159,7 +132,6 @@ def append_jsonl(
     path: Path,
     obj: dict,
 ) -> None:
-
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -169,7 +141,6 @@ def append_jsonl(
         "a",
         encoding="utf-8",
     ) as f:
-
         f.write(
             json.dumps(
                 obj,
@@ -179,30 +150,21 @@ def append_jsonl(
         )
 
 
-def emit_event(
-    ev: dict,
-) -> None:
-
+def emit_event(ev: dict) -> None:
     append_jsonl(
         EVENTS,
         ev,
     )
 
 
-def record_trade(
-    obj: dict,
-) -> None:
-
+def record_trade(obj: dict) -> None:
     append_jsonl(
         TRADES,
         obj,
     )
 
 
-def record_action(
-    obj: dict,
-) -> None:
-
+def record_action(obj: dict) -> None:
     append_jsonl(
         ACTIONS,
         obj,
@@ -244,33 +206,29 @@ def build_event_setup(
         )
 
     candidates = [
-        ev.get(
-            "setup"
-        ),
-        ev.get(
-            "event_fact"
-        ),
+        ev.get("setup"),
+        ev.get("event_fact"),
         ev,
     ]
 
     invalidation = None
     target = None
 
-    for source in candidates:
+    for src in candidates:
 
         if not isinstance(
-            source,
+            src,
             dict,
         ):
             continue
 
         if invalidation is None:
-            invalidation = source.get(
+            invalidation = src.get(
                 "invalidation_price"
             )
 
         if target is None:
-            target = source.get(
+            target = src.get(
                 "target_price"
             )
 
@@ -290,19 +248,15 @@ def build_event_setup(
         if direction == "LONG":
 
             valid_geometry = (
-                invalidation
-                < entry_price
-                and target
-                > entry_price
+                invalidation < entry_price
+                and target > entry_price
             )
 
         else:
 
             valid_geometry = (
-                invalidation
-                > entry_price
-                and target
-                < entry_price
+                invalidation > entry_price
+                and target < entry_price
             )
 
         if valid_geometry:
@@ -331,7 +285,10 @@ def build_event_setup(
                 else None
             )
 
-            if rr is not None and rr > 0:
+            if (
+                rr is not None
+                and rr > 0
+            ):
 
                 return {
                     "entry_reference": entry_price,
@@ -340,10 +297,6 @@ def build_event_setup(
                     "rr": rr,
                     "trigger_ok": True,
                 }
-
-    # ----------------------------------------------------------------------
-    # ATR fallback
-    # ----------------------------------------------------------------------
 
     df = df_1h.copy()
 
@@ -369,23 +322,18 @@ def build_event_setup(
 
     tr = pd.concat(
         [
-            df["high"]
-            - df["low"],
-
+            df["high"] - df["low"],
             (
                 df["high"]
                 - prev_close
             ).abs(),
-
             (
                 df["low"]
                 - prev_close
             ).abs(),
         ],
         axis=1,
-    ).max(
-        axis=1
-    )
+    ).max(axis=1)
 
     atr = (
         tr
@@ -405,9 +353,7 @@ def build_event_setup(
             "ATR unavailable"
         )
 
-    atr = float(
-        atr
-    )
+    atr = float(atr)
 
     risk_pct = (
         atr
@@ -475,31 +421,22 @@ def build_event_setup(
 def build_tp_levels(
     setup: dict,
     direction: str,
-) -> Tuple[
-    float,
-    List[dict],
-]:
+) -> Tuple[float, List[dict]]:
 
     direction = str(
         direction
     ).upper()
 
     entry = float(
-        setup[
-            "entry_reference"
-        ]
+        setup["entry_reference"]
     )
 
     sl_price = float(
-        setup[
-            "invalidation_price"
-        ]
+        setup["invalidation_price"]
     )
 
     final_tp_price = float(
-        setup[
-            "target_price"
-        ]
+        setup["target_price"]
     )
 
     if direction == "LONG":
@@ -533,14 +470,12 @@ def build_tp_levels(
 
     if sl_pct <= 0:
         raise ValueError(
-            f"Invalid SL geometry: "
-            f"{sl_price}"
+            f"Invalid SL geometry: {sl_price}"
         )
 
     if tp_pct <= 0:
         raise ValueError(
-            f"Invalid TP geometry: "
-            f"{final_tp_price}"
+            f"Invalid TP geometry: {final_tp_price}"
         )
 
     tp_levels = [
@@ -577,96 +512,7 @@ def build_tp_levels(
 
 
 # ============================================================================
-# PROTECTION HELPERS
-# ============================================================================
-
-def _protection_is_ok(
-    result: dict,
-) -> bool:
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-        return False
-
-    return (
-        str(
-            result.get(
-                "status",
-                "",
-            )
-        ).upper()
-        == "PROTECTED"
-    )
-
-
-def _protection_summary(
-    result: dict,
-) -> str:
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-        return "UNKNOWN"
-
-    status = result.get(
-        "status",
-        "UNKNOWN",
-    )
-
-    tp_orders = (
-        result.get(
-            "tp_orders"
-        )
-        or []
-    )
-
-    sl_result = (
-        result.get(
-            "sl_result"
-        )
-        or {}
-    )
-
-    tp_ok = sum(
-        1
-        for item in tp_orders
-        if str(
-            item.get(
-                "status",
-                "",
-            )
-        ).lower()
-        in {
-            "created",
-            "already_exists",
-        }
-    )
-
-    sl_ok = (
-        str(
-            sl_result.get(
-                "status",
-                "",
-            )
-        ).lower()
-        in {
-            "created",
-            "already_exists",
-        }
-    )
-
-    return (
-        f"status={status} "
-        f"tp={tp_ok}/{len(tp_orders)} "
-        f"sl={'OK' if sl_ok else 'FAIL'}"
-    )
-
-
-# ============================================================================
-# EXISTING POSITION RECONCILIATION
+# PROTECTION
 # ============================================================================
 
 def reconcile_existing_position(
@@ -691,26 +537,19 @@ def reconcile_existing_position(
 
         position = (
             get_position_directional(
+                symbol=symbol,
+                direction=direction,
+            )
+        )
+
+    except TypeError:
+
+        position = (
+            get_position_directional(
                 symbol,
                 direction,
             )
         )
-
-    except Exception as exc:
-
-        return {
-            "status": (
-                "RECONCILE_POSITION_ERROR"
-            ),
-            "mode": EXECUTION_MODE,
-            "order_id": None,
-            "protection_status": (
-                "UNKNOWN"
-            ),
-            "error": str(
-                exc
-            ),
-        }
 
     if not isinstance(
         position,
@@ -719,12 +558,13 @@ def reconcile_existing_position(
 
         return {
             "status": (
-                "ALREADY_EXECUTED"
+                "ALREADY_EXECUTED_"
+                "POSITION_NOT_FOUND"
             ),
             "mode": EXECUTION_MODE,
             "order_id": None,
             "protection_status": (
-                "NOT_FOUND"
+                "NOT_VERIFIED"
             ),
         }
 
@@ -734,44 +574,23 @@ def reconcile_existing_position(
 
         return {
             "status": (
-                "ALREADY_EXECUTED"
+                "ALREADY_EXECUTED_"
+                "POSITION_NOT_FOUND"
             ),
             "mode": EXECUTION_MODE,
             "order_id": None,
-            "position": position,
             "protection_status": (
-                "NOT_FOUND"
+                "NOT_VERIFIED"
             ),
+            "position": position,
         }
-
-    avg_price = float(
-        position.get(
-            "avgPrice",
-            0,
-        )
-        or position.get(
-            "entryPrice",
-            0,
-        )
-        or 0
-    )
-
-    qty = abs(
-        float(
-            position.get(
-                "positionAmt",
-                0,
-            )
-            or 0
-        )
-    )
 
     print(
         f"[POSITION_FOUND] "
         f"{symbol} "
         f"direction={direction} "
-        f"avgPrice={avg_price} "
-        f"qty={qty}"
+        f"position="
+        f"{position}"
     )
 
     try:
@@ -783,77 +602,116 @@ def reconcile_existing_position(
             )
         )
 
-        protection = (
+    except Exception as exc:
+
+        return {
+            "status": (
+                "ALREADY_EXECUTED_"
+                "PROTECTION_SETUP_INVALID"
+            ),
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "position": position,
+            "protection_status": (
+                "INVALID_SETUP"
+            ),
+            "error": str(exc),
+        }
+
+    try:
+
+        protection_result = (
             ensure_directional_protection(
                 symbol=symbol,
                 direction=direction,
-                avg_price=avg_price,
-                qty=qty,
+                avg_price=float(
+                    position[
+                        "avgPrice"
+                    ]
+                ),
+                qty=float(
+                    position[
+                        "positionAmt"
+                    ]
+                ),
                 stop_loss_pct=sl_pct,
                 tp_levels=tp_levels,
-                trade_id=event_id.replace(
+                trade_id=(
+                    event_id
+                    .replace(
+                        "EVT_",
+                        "",
+                    )
+                ),
+            )
+        )
+
+    except TypeError:
+
+        protection_result = (
+            ensure_directional_protection(
+                symbol,
+                direction,
+                float(
+                    position[
+                        "avgPrice"
+                    ]
+                ),
+                float(
+                    position[
+                        "positionAmt"
+                    ]
+                ),
+                sl_pct,
+                tp_levels,
+                event_id.replace(
                     "EVT_",
                     "",
                 ),
             )
         )
 
-    except Exception as exc:
+    if not isinstance(
+        protection_result,
+        dict,
+    ):
 
-        print(
-            f"[PROTECTION_RECONCILE_ERROR] "
-            f"{symbol}: {exc}"
-        )
-
-        return {
-            "status": (
-                "ALREADY_EXECUTED"
+        protection_result = {
+            "status": "UNKNOWN",
+            "raw": repr(
+                protection_result
             ),
-            "mode": EXECUTION_MODE,
-            "order_id": None,
-            "position": position,
-            "protection_status": (
-                "ERROR"
-            ),
-            "protection": {
-                "status": (
-                    "PROTECTION_EXCEPTION"
-                ),
-                "error": str(
-                    exc
-                ),
-            },
         }
 
-    protected = _protection_is_ok(
-        protection
-    )
+    protection_status = str(
+        protection_result.get(
+            "status",
+            "",
+        )
+    ).upper()
 
     print(
         f"[PROTECTION_RECONCILE_RESULT] "
         f"{symbol} "
         f"{direction} "
-        f"{_protection_summary(protection)}"
+        f"status={protection_status} "
+        f"tp={len(protection_result.get('tp_orders', []))}/3 "
+        f"sl="
+        f"{'OK' if protection_result.get('sl_result') else 'CHECK'}"
     )
 
     return {
-        "status": (
-            "ALREADY_EXECUTED"
-        ),
+        "status": "ALREADY_EXECUTED",
         "mode": EXECUTION_MODE,
         "order_id": None,
         "position": position,
-        "protection": protection,
-        "protection_status": (
-            "PROTECTED"
-            if protected
-            else "INCOMPLETE"
-        ),
+        "protection": protection_result,
+        "protection_status": protection_status,
     }
 
 
 # ============================================================================
-# NEW POSITION EXECUTION
+# NEW EXECUTION
 # ============================================================================
 
 def execute_new_position(
@@ -881,10 +739,6 @@ def execute_new_position(
         f"event={event_id}"
     )
 
-    # ----------------------------------------------------------------------
-    # MARKET ENTRY
-    # ----------------------------------------------------------------------
-
     try:
 
         opened = open_market(
@@ -900,9 +754,7 @@ def execute_new_position(
             "status": "OPEN_EXCEPTION",
             "mode": EXECUTION_MODE,
             "order_id": None,
-            "error": str(
-                exc
-            ),
+            "error": str(exc),
         }
 
     if not isinstance(
@@ -911,14 +763,10 @@ def execute_new_position(
     ):
 
         return {
-            "status": (
-                "OPEN_INVALID_RESPONSE"
-            ),
+            "status": "OPEN_INVALID_RESPONSE",
             "mode": EXECUTION_MODE,
             "order_id": None,
-            "raw": repr(
-                opened
-            ),
+            "raw": repr(opened),
         }
 
     open_status = str(
@@ -943,29 +791,8 @@ def execute_new_position(
             "open_result": opened,
         }
 
-    order_id = (
-        opened.get(
-            "order_id"
-        )
-        or (
-            (
-                opened.get(
-                    "response"
-                )
-                or {}
-            )
-            .get(
-                "data",
-                {},
-            )
-            .get(
-                "order",
-                {},
-            )
-            .get(
-                "orderId"
-            )
-        )
+    order_id = opened.get(
+        "order_id"
     )
 
     print(
@@ -975,20 +802,41 @@ def execute_new_position(
         f"order={order_id}"
     )
 
-    # ----------------------------------------------------------------------
-    # WAIT REAL POSITION
-    # ----------------------------------------------------------------------
-
     try:
 
         position = (
             wait_for_position_fill_directional(
-                symbol,
-                direction,
-                timeout_sec=30,
-                poll_interval=1.0,
+                symbol=symbol,
+                direction=direction,
+                timeout_sec=15,
+                poll_interval=0.5,
             )
         )
+
+    except TypeError:
+
+        try:
+
+            position = (
+                wait_for_position_fill_directional(
+                    symbol,
+                    direction,
+                    15,
+                    0.5,
+                )
+            )
+
+        except Exception as exc:
+
+            return {
+                "status": (
+                    "POSITION_WAIT_FAILED"
+                ),
+                "mode": EXECUTION_MODE,
+                "order_id": order_id,
+                "open_result": opened,
+                "error": str(exc),
+            }
 
     except Exception as exc:
 
@@ -999,26 +847,13 @@ def execute_new_position(
             "mode": EXECUTION_MODE,
             "order_id": order_id,
             "open_result": opened,
-            "error": str(
-                exc
-            ),
+            "error": str(exc),
         }
 
     if not isinstance(
         position,
         dict,
-    ):
-
-        return {
-            "status": (
-                "POSITION_NOT_CONFIRMED"
-            ),
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "open_result": opened,
-        }
-
-    if position.get(
+    ) or position.get(
         "status"
     ) != "found":
 
@@ -1032,61 +867,12 @@ def execute_new_position(
             "position": position,
         }
 
-    avg_price = float(
-        position.get(
-            "avgPrice",
-            0,
-        )
-        or position.get(
-            "entryPrice",
-            0,
-        )
-        or 0
-    )
-
-    actual_qty = abs(
-        float(
-            position.get(
-                "positionAmt",
-                0,
-            )
-            or 0
-        )
-    )
-
-    if avg_price <= 0:
-
-        return {
-            "status": (
-                "POSITION_INVALID_AVG_PRICE"
-            ),
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "position": position,
-        }
-
-    if actual_qty <= 0:
-
-        return {
-            "status": (
-                "POSITION_INVALID_QTY"
-            ),
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "position": position,
-        }
-
     print(
         f"[POSITION_CONFIRMED] "
         f"{symbol} "
         f"direction={direction} "
-        f"avgPrice={avg_price} "
-        f"qty={actual_qty}"
+        f"position={position}"
     )
-
-    # ----------------------------------------------------------------------
-    # PROTECTION PLAN
-    # ----------------------------------------------------------------------
 
     try:
 
@@ -1106,22 +892,16 @@ def execute_new_position(
             "mode": EXECUTION_MODE,
             "order_id": order_id,
             "position": position,
-            "error": str(
-                exc
-            ),
+            "error": str(exc),
         }
 
     print(
         f"[PROTECTION_PLAN] "
         f"{symbol} "
         f"direction={direction} "
-        f"sl_pct={sl_pct:.6f} "
+        f"sl_pct={sl_pct:.4f} "
         f"tp_levels={tp_levels}"
     )
-
-    # ----------------------------------------------------------------------
-    # INSTALL SL + TP
-    # ----------------------------------------------------------------------
 
     try:
 
@@ -1129,13 +909,54 @@ def execute_new_position(
             ensure_directional_protection(
                 symbol=symbol,
                 direction=direction,
-                avg_price=avg_price,
-                qty=actual_qty,
+                avg_price=float(
+                    position[
+                        "avgPrice"
+                    ]
+                ),
+                qty=float(
+                    position[
+                        "positionAmt"
+                    ]
+                ),
                 stop_loss_pct=sl_pct,
                 tp_levels=tp_levels,
                 trade_id=trade_id,
             )
         )
+
+    except TypeError:
+
+        try:
+
+            protection = (
+                ensure_directional_protection(
+                    symbol,
+                    direction,
+                    float(
+                        position[
+                            "avgPrice"
+                        ]
+                    ),
+                    float(
+                        position[
+                            "positionAmt"
+                        ]
+                    ),
+                    sl_pct,
+                    tp_levels,
+                    trade_id,
+                )
+            )
+
+        except Exception as exc:
+
+            protection = {
+                "status": (
+                    "PROTECTION_EXCEPTION"
+                ),
+                "error": str(exc),
+            }
 
     except Exception as exc:
 
@@ -1143,9 +964,7 @@ def execute_new_position(
             "status": (
                 "PROTECTION_EXCEPTION"
             ),
-            "error": str(
-                exc
-            ),
+            "error": str(exc),
         }
 
     if not isinstance(
@@ -1154,49 +973,80 @@ def execute_new_position(
     ):
 
         protection = {
-            "status": (
-                "PROTECTION_INVALID_RESPONSE"
-            ),
-            "raw": repr(
-                protection
-            ),
+            "status": "UNKNOWN",
+            "raw": repr(protection),
         }
 
-    protected = _protection_is_ok(
-        protection
+    protection_status = str(
+        protection.get(
+            "status",
+            "",
+        )
+    ).upper()
+
+    tp_count = len(
+        protection.get(
+            "tp_orders",
+            [],
+        )
+    )
+
+    sl_exists = bool(
+        protection.get(
+            "sl_result"
+        )
     )
 
     print(
         f"[PROTECTION_RESULT] "
         f"{symbol} "
         f"direction={direction} "
-        f"{_protection_summary(protection)}"
+        f"status={protection_status} "
+        f"tp={tp_count}/3 "
+        f"sl="
+        f"{'OK' if sl_exists else 'CHECK'}"
     )
 
-    return {
-        "status": (
+    if protection_status == "PROTECTED":
+        final_status = (
             "opened_protected"
-            if protected
-            else
+        )
+
+    elif (
+        protection_status
+        == "TP_PLACED_SL_FAILED"
+    ):
+        final_status = (
             "opened_protection_check_required"
-        ),
+        )
+
+    elif (
+        protection_status
+        == "PROTECTION_FAILED"
+    ):
+        final_status = (
+            "opened_protection_check_required"
+        )
+
+    else:
+        final_status = (
+            "opened_protection_check_required"
+        )
+
+    return {
+        "status": final_status,
         "mode": EXECUTION_MODE,
         "order_id": order_id,
         "open_result": opened,
         "position": position,
         "protection": protection,
-        "protection_status": (
-            "PROTECTED"
-            if protected
-            else "INCOMPLETE"
-        ),
         "sl_pct": sl_pct,
         "tp_levels": tp_levels,
     }
 
 
 # ============================================================================
-# TELEGRAM FALLBACK
+# TELEGRAM
 # ============================================================================
 
 def build_fallback_signal_message(
@@ -1240,33 +1090,28 @@ def build_fallback_signal_message(
         f"Event: "
         f"<code>{ev.get('event_type')}</code>\n"
         f"TF: "
-        f"<b>{ev.get('timeframe', '1h')}</b>"
-        f" + trigger 15m\n"
-        f"Price: <code>{price:.8g}</code>\n"
+        f"<b>{ev.get('timeframe', '1h')}</b> "
+        f"+ trigger 15m\n"
+        f"Price: "
+        f"<code>{price:.8g}</code>\n"
         f"Detected: "
         f"<code>"
         f"{ev.get('timestamps', {}).get('detected_at_ts')}"
         f"</code>\n\n"
         f"<b>SETUP</b>\n"
-        f"Entry: <code>{price:.8g}</code>\n"
-        f"SL: <code>"
-        f"{sl:.8g}"
-        f"</code>\n"
-        f"TP: <code>"
-        f"{tp:.8g}"
-        f"</code>\n"
-        f"R:R: <code>"
-        f"{rr:.2f}"
-        f"</code>\n\n"
+        f"Entry: "
+        f"<code>{price:.8g}</code>\n"
+        f"SL: "
+        f"<code>{sl:.8g}</code>\n"
+        f"TP: "
+        f"<code>{tp:.8g}</code>\n"
+        f"R:R: "
+        f"<code>{rr:.2f}</code>\n\n"
         f"<b>EXECUTION</b>\n"
         f"Mode: "
         f"<code>{EXECUTION_MODE}</code>\n"
         f"Status: "
         f"<code>{execution_result.get('status')}</code>\n"
-        f"Protection: "
-        f"<code>"
-        f"{execution_result.get('protection_status', '—')}"
-        f"</code>\n"
         f"Order: "
         f"<code>"
         f"{execution_result.get('order_id') or '—'}"
@@ -1305,12 +1150,9 @@ def main() -> None:
         "trades": 0,
         "telegram_attempts": 0,
         "telegram_sent": 0,
+        "telegram_suppressed_duplicate": 0,
         "scan_errors": 0,
     }
-
-    # ----------------------------------------------------------------------
-    # COINALYZE
-    # ----------------------------------------------------------------------
 
     rows = fetch_data()
 
@@ -1323,11 +1165,8 @@ def main() -> None:
         f"Coinalyze rows={len(rows)}"
     )
 
-    # ----------------------------------------------------------------------
-    # BINGX CONTRACTS
-    # ----------------------------------------------------------------------
-
     try:
+
         refresh_contracts()
 
     except Exception as exc:
@@ -1341,34 +1180,32 @@ def main() -> None:
             f"contracts refresh error={exc}"
         )
 
-    candidates: List[
-        Any
-    ] = []
+    candidates: List[Any] = []
 
-    for row in rows:
+    for r in rows:
 
         try:
 
             if (
-                row.price is None
-                or row.price <= 0
+                r.price is None
+                or r.price <= 0
             ):
                 continue
 
             if (
-                row.volume24 is None
-                or row.volume24 < MIN_VOL
+                r.volume24 is None
+                or r.volume24 < MIN_VOL
             ):
                 continue
 
             if (
-                row.oi is None
-                or row.oi < MIN_OI
+                r.oi is None
+                or r.oi < MIN_OI
             ):
                 continue
 
             contract = get_contract(
-                row.symbol
+                r.symbol
             )
 
             if not contract:
@@ -1379,9 +1216,9 @@ def main() -> None:
 
                 print(
                     f"[MAP] NO_BINGX "
-                    f"coinalyze={row.symbol} "
+                    f"coinalyze={r.symbol} "
                     f"name="
-                    f"{getattr(row, 'name', '')}"
+                    f"{getattr(r, 'name', '')}"
                 )
 
                 continue
@@ -1392,16 +1229,14 @@ def main() -> None:
 
             print(
                 f"[MAP] OK "
-                f"coinalyze={row.symbol} "
+                f"coinalyze={r.symbol} "
                 f"bingx="
-                f"{contract.get('symbol', row.symbol)} "
+                f"{contract.get('symbol', r.symbol)} "
                 f"displayName="
                 f"{contract.get('displayName', '')}"
             )
 
-            candidates.append(
-                row
-            )
+            candidates.append(r)
 
         except Exception as exc:
 
@@ -1411,15 +1246,13 @@ def main() -> None:
 
             print(
                 f"[CANDIDATE_ERROR] "
-                f"{getattr(row, 'symbol', '?')}: "
+                f"{getattr(r, 'symbol', '?')}: "
                 f"{exc}"
             )
 
     stats[
         "candidates_before_limit"
-    ] = len(
-        candidates
-    )
+    ] = len(candidates)
 
     candidates = candidates[
         :MAX_CANDIDATES
@@ -1427,9 +1260,7 @@ def main() -> None:
 
     stats[
         "candidates"
-    ] = len(
-        candidates
-    )
+    ] = len(candidates)
 
     print(
         f"[ENGINE] "
@@ -1437,8 +1268,7 @@ def main() -> None:
         f"{len(candidates)} "
         f"execution="
         f"{EXECUTION_ENABLED} "
-        f"env="
-        f"{EXECUTION_MODE}"
+        f"env={EXECUTION_MODE}"
     )
 
     seen_events = load_ids(
@@ -1451,19 +1281,11 @@ def main() -> None:
 
     trades_this_cycle = 0
 
-    # =========================================================================
-    # SYMBOL LOOP
-    # =========================================================================
+    for r in candidates:
 
-    for row in candidates:
-
-        symbol = row.symbol
+        symbol = r.symbol
 
         try:
-
-            # ----------------------------------------------------------------
-            # KLINES
-            # ----------------------------------------------------------------
 
             k1 = fetch_klines(
                 symbol,
@@ -1492,7 +1314,8 @@ def main() -> None:
                 print(
                     f"[DATA_REJECT] "
                     f"{symbol} "
-                    f"1H bars={len(k1)} < 60"
+                    f"1H bars={len(k1)} "
+                    f"< 60"
                 )
 
                 continue
@@ -1502,7 +1325,8 @@ def main() -> None:
                 print(
                     f"[DATA_REJECT] "
                     f"{symbol} "
-                    f"15m bars={len(k15)} < 10"
+                    f"15m bars={len(k15)} "
+                    f"< 10"
                 )
 
                 continue
@@ -1516,18 +1340,12 @@ def main() -> None:
             ] += 1
 
             d1 = add_cvd(
-                pd.DataFrame(
-                    k1
-                )
+                pd.DataFrame(k1)
             )
 
             d15 = pd.DataFrame(
                 k15
             )
-
-            # ----------------------------------------------------------------
-            # EVENTS
-            # ----------------------------------------------------------------
 
             divergence_events = (
                 detect_divergences(
@@ -1546,22 +1364,20 @@ def main() -> None:
             )
 
             rsi_events = [
-                event
-                for event
-                in divergence_events
+                e
+                for e in divergence_events
                 if "_RSI"
-                in event.get(
+                in e.get(
                     "event_type",
                     "",
                 )
             ]
 
             cvd_events = [
-                event
-                for event
-                in divergence_events
+                e
+                for e in divergence_events
                 if "BINGX_CVD"
-                in event.get(
+                in e.get(
                     "event_type",
                     "",
                 )
@@ -1599,19 +1415,18 @@ def main() -> None:
             print(
                 f"[EVENT_SCAN] "
                 f"{symbol} "
-                f"RSI={len(rsi_events)} "
-                f"CVD={len(cvd_events)} "
-                f"SQUEEZE={len(squeeze_events)}"
+                f"RSI="
+                f"{len(rsi_events)} "
+                f"CVD="
+                f"{len(cvd_events)} "
+                f"SQUEEZE="
+                f"{len(squeeze_events)}"
             )
 
             all_events = (
                 divergence_events
                 + squeeze_events
             )
-
-            # ----------------------------------------------------------------
-            # EVENT LOOP
-            # ----------------------------------------------------------------
 
             for ev in all_events:
 
@@ -1648,10 +1463,6 @@ def main() -> None:
                     )
 
                     continue
-
-                # ------------------------------------------------------------
-                # EVENT AGE
-                # ------------------------------------------------------------
 
                 detected_at = int(
                     ev.get(
@@ -1694,16 +1505,12 @@ def main() -> None:
                     "events_recent"
                 ] += 1
 
-                # ------------------------------------------------------------
-                # PERSIST EVENT
-                # ------------------------------------------------------------
-
-                already_seen = (
+                was_already_executed = (
                     event_id
-                    in seen_events
+                    in executed_event_ids
                 )
 
-                if already_seen:
+                if event_id in seen_events:
 
                     stats[
                         "events_duplicate"
@@ -1711,17 +1518,11 @@ def main() -> None:
 
                 else:
 
-                    emit_event(
-                        ev
-                    )
+                    emit_event(ev)
 
                     seen_events.add(
                         event_id
                     )
-
-                # ------------------------------------------------------------
-                # CVD CONFIRMATION
-                # ------------------------------------------------------------
 
                 if (
                     REQUIRE_CVD
@@ -1732,16 +1533,17 @@ def main() -> None:
                     )
                 ):
 
-                    timestamps = ev.get(
+                    pivot_1 = ev.get(
                         "timestamps",
                         {},
-                    )
-
-                    pivot_1 = timestamps.get(
+                    ).get(
                         "pivot_1_ts"
                     )
 
-                    pivot_2 = timestamps.get(
+                    pivot_2 = ev.get(
+                        "timestamps",
+                        {},
+                    ).get(
                         "pivot_2_ts"
                     )
 
@@ -1787,13 +1589,11 @@ def main() -> None:
 
                         continue
 
-                # ------------------------------------------------------------
-                # 15M TRIGGER
-                # ------------------------------------------------------------
-
-                trigger = build_15m_trigger(
-                    d15,
-                    direction,
+                trigger = (
+                    build_15m_trigger(
+                        d15,
+                        direction,
+                    )
                 )
 
                 if (
@@ -1821,29 +1621,23 @@ def main() -> None:
                     "trigger_pass"
                 ] += 1
 
-                # ------------------------------------------------------------
-                # ENTRY PRICE
-                # ------------------------------------------------------------
-
-                event_fact = ev.get(
+                fact = ev.get(
                     "event_fact",
                     {},
                 )
 
-                price_raw = (
-                    event_fact.get(
-                        "detection_close_price"
-                    )
+                price_raw = fact.get(
+                    "detection_close_price"
                 )
 
                 if price_raw is None:
 
                     price_raw = (
-                        event_fact.get(
+                        fact.get(
                             "close"
                         )
                         or getattr(
-                            row,
+                            r,
                             "price",
                             None,
                         )
@@ -1869,16 +1663,14 @@ def main() -> None:
                     price_raw
                 )
 
-                # ------------------------------------------------------------
-                # SETUP
-                # ------------------------------------------------------------
-
                 try:
 
-                    setup = build_event_setup(
-                        ev=ev,
-                        df_1h=d1,
-                        entry_price=price,
+                    setup = (
+                        build_event_setup(
+                            ev=ev,
+                            df_1h=d1,
+                            entry_price=price,
+                        )
                     )
 
                 except Exception as exc:
@@ -1920,10 +1712,10 @@ def main() -> None:
                 ]
 
                 # ============================================================
-                # EVENT ALREADY EXECUTED
+                # EXISTING EVENT
                 # ============================================================
 
-                if event_id in executed_event_ids:
+                if was_already_executed:
 
                     if EXECUTION_ENABLED:
 
@@ -1939,14 +1731,14 @@ def main() -> None:
                     else:
 
                         execution_result = {
-                            "status": (
-                                "ALREADY_EXECUTED"
-                            ),
-                            "mode": EXECUTION_MODE,
-                            "order_id": None,
-                            "protection_status": (
-                                "NOT_CHECKED"
-                            ),
+                            "status":
+                                "ALREADY_EXECUTED",
+                            "mode":
+                                EXECUTION_MODE,
+                            "order_id":
+                                None,
+                            "protection_status":
+                                "NOT_CHECKED",
                         }
 
                     print(
@@ -1958,7 +1750,7 @@ def main() -> None:
                     )
 
                 # ============================================================
-                # NEW EXECUTION
+                # NEW EVENT
                 # ============================================================
 
                 elif (
@@ -1983,23 +1775,33 @@ def main() -> None:
 
                     record_trade(
                         {
-                            "event_id": event_id,
-                            "symbol": symbol,
-                            "direction": direction,
-                            "price": price,
-                            "event_type": ev.get(
-                                "event_type"
-                            ),
-                            "ts": int(
-                                pd.Timestamp.utcnow()
-                                .timestamp()
-                                * 1000
-                            ),
-                            "result": (
-                                execution_result
-                            ),
-                            "setup": setup,
+                            "event_id":
+                                event_id,
+                            "symbol":
+                                symbol,
+                            "direction":
+                                direction,
+                            "price":
+                                price,
+                            "event_type":
+                                ev.get(
+                                    "event_type"
+                                ),
+                            "ts":
+                                int(
+                                    pd.Timestamp.utcnow()
+                                    .timestamp()
+                                    * 1000
+                                ),
+                            "result":
+                                execution_result,
+                            "setup":
+                                setup,
                         }
+                    )
+
+                    executed_event_ids.add(
+                        event_id
                     )
 
                     status = str(
@@ -2009,31 +1811,12 @@ def main() -> None:
                         )
                     )
 
-                    protection_status = str(
-                        execution_result.get(
-                            "protection_status",
-                            "",
-                        )
-                    )
-
-                    # --------------------------------------------------------
-                    # CRITICAL:
-                    # event is considered executed ONLY if protected.
-                    # --------------------------------------------------------
-
-                    if (
-                        status
-                        == "opened_protected"
-                        and
-                        protection_status
-                        == "PROTECTED"
+                    if status == (
+                        "opened_protected"
                     ):
 
-                        executed_event_ids.add(
-                            event_id
-                        )
-
                         trades_this_cycle += 1
+
                         stats[
                             "trades"
                         ] += 1
@@ -2046,146 +1829,168 @@ def main() -> None:
                             f"{execution_result.get('order_id')}"
                         )
 
+                    elif status.startswith(
+                        "opened_"
+                    ):
+
+                        trades_this_cycle += 1
+
+                        stats[
+                            "trades"
+                        ] += 1
+
+                        print(
+                            f"[EXECUTION_OPENED] "
+                            f"{symbol} "
+                            f"direction={direction} "
+                            f"status={status}"
+                        )
+
                     else:
 
                         print(
-                            f"[EXECUTION_NOT_PROTECTED] "
+                            f"[EXECUTION_RESULT] "
                             f"{symbol} "
-                            f"direction={direction} "
-                            f"status={status} "
-                            f"protection="
-                            f"{protection_status}"
+                            f"status={status}"
                         )
-
-                # ============================================================
-                # EXECUTION DISABLED
-                # ============================================================
 
                 elif not EXECUTION_ENABLED:
 
                     execution_result = {
-                        "status": "DISABLED",
-                        "mode": EXECUTION_MODE,
-                        "order_id": None,
-                        "protection_status": (
-                            "NOT_ATTEMPTED"
-                        ),
+                        "status":
+                            "DISABLED",
+                        "mode":
+                            EXECUTION_MODE,
+                        "order_id":
+                            None,
                     }
-
-                # ============================================================
-                # TRADE LIMIT
-                # ============================================================
 
                 else:
 
                     execution_result = {
-                        "status": (
-                            "TRADE_LIMIT_REACHED"
-                        ),
-                        "mode": EXECUTION_MODE,
-                        "order_id": None,
-                        "protection_status": (
-                            "NOT_ATTEMPTED"
-                        ),
+                        "status":
+                            "TRADE_LIMIT_REACHED",
+                        "mode":
+                            EXECUTION_MODE,
+                        "order_id":
+                            None,
                     }
 
-                # ------------------------------------------------------------
+                # ============================================================
                 # TELEGRAM
-                # ------------------------------------------------------------
+                # ============================================================
 
-                label = (
-                    "🚨 LONG SIGNAL"
-                    if direction == "LONG"
-                    else "🔻 SHORT SIGNAL"
-                )
+                # Уже исполненный event НИКОГДА
+                # не отправляем повторно как новый сигнал.
+                if was_already_executed:
 
-                try:
-
-                    message = format_signal(
-                        ev,
-                        setup=setup,
-                        coinalyze_row=row,
-                        execution=execution_result,
-                    )
-
-                    if not (
-                        message.startswith(
-                            "🚨 LONG SIGNAL"
-                        )
-                        or
-                        message.startswith(
-                            "🔻 SHORT SIGNAL"
-                        )
-                    ):
-
-                        message = (
-                            label
-                            + "\n\n"
-                            + message
-                        )
-
-                except Exception as exc:
-
-                    message = (
-                        build_fallback_signal_message(
-                            ev=ev,
-                            symbol=symbol,
-                            name=(
-                                getattr(
-                                    row,
-                                    "name",
-                                    None,
-                                )
-                                or symbol
-                            ),
-                            setup=setup,
-                            execution_result=(
-                                execution_result
-                            ),
-                            price=price,
-                        )
-                    )
-
-                    print(
-                        f"[TELEGRAM_FORMAT_FALLBACK] "
-                        f"{symbol}: {exc}"
-                    )
-
-                stats[
-                    "telegram_attempts"
-                ] += 1
-
-                try:
-
-                    sent = send_tg(
-                        message
-                    )
-
-                except Exception as exc:
-
-                    sent = False
-
-                    print(
-                        f"[TELEGRAM_ERROR] "
-                        f"{symbol}: {exc}"
-                    )
-
-                if sent:
                     stats[
-                        "telegram_sent"
+                        "telegram_suppressed_duplicate"
                     ] += 1
+
+                    print(
+                        f"[TELEGRAM_SUPPRESS_DUPLICATE] "
+                        f"{symbol} "
+                        f"event={event_id}"
+                    )
+
+                else:
+
+                    label = (
+                        "🚨 LONG SIGNAL"
+                        if direction == "LONG"
+                        else "🔻 SHORT SIGNAL"
+                    )
+
+                    try:
+
+                        msg = format_signal(
+                            ev,
+                            setup=setup,
+                            coinalyze_row=r,
+                            execution=execution_result,
+                        )
+
+                        if not (
+                            msg.startswith(
+                                "🚨 LONG SIGNAL"
+                            )
+                            or msg.startswith(
+                                "🔻 SHORT SIGNAL"
+                            )
+                        ):
+
+                            msg = (
+                                f"{label}\n\n"
+                                + msg
+                            )
+
+                    except Exception as exc:
+
+                        msg = (
+                            build_fallback_signal_message(
+                                ev=ev,
+                                symbol=symbol,
+                                name=(
+                                    getattr(
+                                        r,
+                                        "name",
+                                        None,
+                                    )
+                                    or symbol
+                                ),
+                                setup=setup,
+                                execution_result=(
+                                    execution_result
+                                ),
+                                price=price,
+                            )
+                        )
+
+                        print(
+                            f"[TELEGRAM_FORMAT_FALLBACK] "
+                            f"{symbol}: {exc}"
+                        )
+
+                    stats[
+                        "telegram_attempts"
+                    ] += 1
+
+                    try:
+
+                        sent = send_tg(
+                            msg
+                        )
+
+                    except Exception as exc:
+
+                        sent = False
+
+                        print(
+                            f"[TELEGRAM_ERROR] "
+                            f"{symbol}: {exc}"
+                        )
+
+                    if sent:
+
+                        stats[
+                            "telegram_sent"
+                        ] += 1
 
                 record_action(
                     {
-                        "event_id": event_id,
-                        "symbol": symbol,
-                        "direction": direction,
-                        "event_type": ev.get(
-                            "event_type"
-                        ),
-                        "telegram_sent": bool(
-                            sent
-                        ),
+                        "event_id":
+                            event_id,
+                        "symbol":
+                            symbol,
+                        "direction":
+                            direction,
+                        "event_type":
+                            ev.get(
+                                "event_type"
+                            ),
+                        "telegram_sent":
+                            not was_already_executed,
                         "execution_status":
                             execution_result.get(
                                 "status"
@@ -2194,11 +1999,14 @@ def main() -> None:
                             execution_result.get(
                                 "protection_status"
                             ),
-                        "ts": int(
-                            pd.Timestamp.utcnow()
-                            .timestamp()
-                            * 1000
-                        ),
+                        "duplicate_suppressed":
+                            was_already_executed,
+                        "ts":
+                            int(
+                                pd.Timestamp.utcnow()
+                                .timestamp()
+                                * 1000
+                            ),
                     }
                 )
 
@@ -2210,8 +2018,7 @@ def main() -> None:
 
             print(
                 f"[SCAN_ERROR] "
-                f"{symbol}: "
-                f"{exc}"
+                f"{symbol}: {exc}"
             )
 
     print(
@@ -2224,7 +2031,8 @@ def main() -> None:
         "[ENGINE_SUMMARY] "
         + " ".join(
             f"{key}={value}"
-            for key, value in stats.items()
+            for key, value
+            in stats.items()
         )
     )
 
