@@ -11,8 +11,8 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    avg_loss = loss.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -120,7 +120,6 @@ def detect_divergences(
         if detected >= len(work):
             return
 
-        # CVD Integrity Check: must be within the same continuous valid taker segment
         if indicator == "bingx_cvd":
             span = work.iloc[p1i : detected + 1]
             if not span["bar_delta_usdt"].notna().all() or work.cvd_segment_id.iloc[p1i] != work.cvd_segment_id.iloc[detected]:
@@ -184,7 +183,6 @@ def detect_divergences(
             },
         })
 
-    # Multi-pivot scan: check adjacent (step=1) and dominant (step=2)
     def scan_pivots(pivots: list[int], is_low: bool):
         num_piv = len(pivots)
         for i in range(num_piv):
@@ -221,20 +219,17 @@ def detect_squeeze_release(
     if len(b) < min_squeeze_bars + 2 or pd.isna(bb_u.iloc[-1]) or pd.isna(kc_u.iloc[-1]):
         return []
 
-    # Valid release: current bar left squeeze, previous bar was inside squeeze
     is_currently_in = bool(in_sq.iloc[-1])
     was_previously_in = bool(in_sq.iloc[-2])
     if is_currently_in or not was_previously_in:
         return []
 
-    # Measure actual compression duration
     sq_duration = 0
     idx = len(in_sq) - 2
     while idx >= 0 and in_sq.iloc[idx]:
         sq_duration += 1
         idx -= 1
 
-    # Filter out single-bar noisy squeeze churn
     if sq_duration < min_squeeze_bars:
         return []
 
