@@ -1,12 +1,10 @@
-"""
-tracker.py
-"""
-
+# tracker.py
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from decimal import Decimal
@@ -16,6 +14,7 @@ from typing import Any
 from event_engine.bingx import (
     get_position_directional,
     get_order,
+    get_open_protection_directional,
     cancel_order,
     fetch_klines,
     to_bx_symbol,
@@ -45,7 +44,31 @@ def _load_active_trades() -> dict[str, dict]:
 
 def _save_active_trades(trades: dict[str, dict]) -> None:
     ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ACTIVE_TRADES_PATH.write_text(json.dumps(trades, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
+    payload = json.dumps(trades, ensure_ascii=False, indent=2)
+    tmp_path.write_text(payload, encoding="utf-8")
+    os.replace(tmp_path, ACTIVE_TRADES_PATH)
+
+
+def update_active_trade_protection(
+    symbol: str,
+    direction: str,
+    tp_orders: list[dict],
+    sl_result: dict,
+) -> bool:
+    """Update protection on an existing tracked position without resetting lifecycle statistics."""
+    trades = _load_active_trades()
+    want_symbol = str(symbol).upper().replace("-USDT", "")
+    want_direction = str(direction).upper()
+    for trade in trades.values():
+        trade_symbol = str(trade.get("symbol", "")).upper().replace("-USDT", "")
+        trade_direction = str(trade.get("direction", "")).upper()
+        if trade_symbol == want_symbol and trade_direction == want_direction:
+            trade["tp_orders"] = tp_orders
+            trade["sl_order"] = sl_result
+            _save_active_trades(trades)
+            return True
+    return False
 
 
 def register_active_trade(
@@ -93,6 +116,10 @@ def register_active_trade(
         "score": score,
         "event_type": event_type,
         "research": research,
+        "tp_filled_qty": {},
+        "realized_pnl_qty": 0.0,
+        "realized_pnl_weighted_sum": 0.0,
+        "last_tp_exec_price": None,
     }
     _save_active_trades(trades)
 
@@ -172,17 +199,15 @@ def format_trade_closed_message(
 
 
 def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None) -> dict:
-    """Переносит Stop Loss на точку входа (Break-Even) без reduceOnly."""
+    """Create and verify the BE stop before cancelling the existing SL."""
     bx = to_bx_symbol(symbol)
     contract = get_contract(symbol) or {}
     precision = int(contract.get("quantityPrecision") or 0)
     price_precision = int(contract.get("pricePrecision") or 4)
 
-    # 1. Отменяем старый стоп-лосс
-    if old_sl_id:
-        cancel_order(symbol, old_sl_id)
+    if qty <= 0 or entry_price <= 0 or not bx:
+        return {"status": "error", "error": "invalid BE parameters", "order_id": "", "stop_price": entry_price}
 
-    # 2. Ставим новый STOP_MARKET на цену входа
     sl_side = "SELL" if direction.upper() == "LONG" else "BUY"
     client_order_id = f"EVT_BE_{uuid.uuid4().hex.upper()[:16]}"
     params = {
@@ -194,17 +219,60 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
         "quantity": _format_qty(qty, precision),
         "clientOrderId": client_order_id,
     }
-    resp = _request("POST", ORDER_PATH, params)
-    order = (resp.get("data") or {}).get("order") or {}
-    return {
-        "status": "created" if resp.get("code") == 0 else "error",
-        "order_id": str(order.get("orderId", "")),
+
+    try:
+        resp = _request("POST", ORDER_PATH, params)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "order_id": "", "stop_price": entry_price}
+
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": f"BE stop failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}",
+            "order_id": "",
+            "stop_price": entry_price,
+        }
+
+    order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+    new_order_id = str(order.get("orderId", ""))
+    if not new_order_id:
+        return {"status": "error", "error": "BE stop response has no orderId", "order_id": "", "stop_price": entry_price}
+
+    verified = get_open_protection_directional(symbol, direction)
+    if verified.get("status") != "ok":
+        return {
+            "status": "error",
+            "error": verified.get("error", "BE stop verification failed"),
+            "order_id": new_order_id,
+            "stop_price": entry_price,
+        }
+
+    found = any(str(o.get("orderId", "")) == new_order_id for o in verified.get("sl_orders", []))
+    if not found:
+        return {
+            "status": "error",
+            "error": "BE stop was created but is not visible on exchange; old SL was kept",
+            "order_id": new_order_id,
+            "stop_price": entry_price,
+        }
+
+    old_cancel = None
+    if old_sl_id and str(old_sl_id) != new_order_id:
+        old_cancel = cancel_order(symbol, old_sl_id)
+
+    result = {
+        "status": "created" if not isinstance(old_cancel, dict) or old_cancel.get("code") in (None, 0) else "created_old_sl_cancel_failed",
+        "order_id": new_order_id,
+        "client_order_id": order.get("clientOrderId") or client_order_id,
         "stop_price": entry_price,
     }
+    if old_cancel is not None and isinstance(old_cancel, dict) and old_cancel.get("code") != 0:
+        result["old_sl_cancel_error"] = old_cancel.get("msg") or old_cancel
+    return result
 
 
 def update_active_trades() -> None:
-    """Опрашивает открытые позиции, фиксирует TP, двигает BE и логирует закрытие."""
+    """Poll exchange positions/orders, track partial TP fills, move BE safely and close trades."""
     trades = _load_active_trades()
     if not trades:
         return
@@ -214,66 +282,106 @@ def update_active_trades() -> None:
 
     for event_id, t in trades.items():
         symbol = t["symbol"]
-        direction = t["direction"]
-        entry_price = t["entry_price"]
-        init_qty = t["initial_qty"]
-        rem_qty = t["remaining_qty"]
+        direction = str(t["direction"]).upper()
+        entry_price = float(t["entry_price"])
+        init_qty = float(t["initial_qty"])
+        rem_qty = float(t["remaining_qty"])
         hit_legs = set(t.get("hit_legs", []))
+        filled_by_leg = {str(k): float(v) for k, v in (t.get("tp_filled_qty") or {}).items()}
+        realized_qty = float(t.get("realized_pnl_qty", 0.0) or 0.0)
+        realized_weighted = float(t.get("realized_pnl_weighted_sum", 0.0) or 0.0)
 
         pos = get_position_directional(symbol, direction)
-        pos_amt = float(pos.get("positionAmt", 0) or 0) if pos.get("status") == "found" else 0.0
+        pos_status = str(pos.get("status", "")).lower()
+
+        # An API error/timeout is not proof that the position is closed. Preserve state.
+        if pos_status not in {"found", "not_found"}:
+            log.warning("[TRACKER_POSITION_UNCERTAIN] %s %s: %s", symbol, direction, pos.get("error") or pos_status)
+            updated_trades[event_id] = t
+            continue
+
+        pos_amt = float(pos.get("positionAmt", 0) or 0) if pos_status == "found" else 0.0
 
         cur_price = entry_price
+        current_pnl = 0.0
         try:
             k1m = fetch_klines(symbol, "1m", limit=60)
             if k1m:
-                cur_high = max(b["high"] for b in k1m)
-                cur_low = min(b["low"] for b in k1m)
+                cur_high = max(float(b["high"]) for b in k1m)
+                cur_low = min(float(b["low"]) for b in k1m)
                 cur_price = float(k1m[-1]["close"])
-
                 if direction == "LONG":
                     max_p = ((cur_high - entry_price) / entry_price) * 100.0
                     min_p = ((cur_low - entry_price) / entry_price) * 100.0
+                    current_pnl = ((cur_price - entry_price) / entry_price) * 100.0
                 else:
                     max_p = ((entry_price - cur_low) / entry_price) * 100.0
                     min_p = ((entry_price - cur_high) / entry_price) * 100.0
+                    current_pnl = ((entry_price - cur_price) / entry_price) * 100.0
 
-                t["peak_pnl_pct"] = max(t.get("peak_pnl_pct", 0.0), max_p)
-                t["max_drawdown_pct"] = min(t.get("max_drawdown_pct", 0.0), min_p)
-        except Exception:
-            pass
+                peak_before = float(t.get("peak_pnl_pct", 0.0) or 0.0)
+                peak_now = max(peak_before, max_p, current_pnl)
+                t["peak_pnl_pct"] = peak_now
+                drawdown_now = min_p - peak_now
+                t["max_drawdown_pct"] = min(float(t.get("max_drawdown_pct", 0.0) or 0.0), drawdown_now)
+        except Exception as exc:
+            log.warning("[TRACKER_KLINE_ERROR] %s: %s", symbol, exc)
 
-        # 1. Проверка Take Profit ордеров
+        # 1. Track TP fills, including PARTIALLY_FILLED quantities.
         for tp in t.get("tp_orders", []):
-            leg = tp.get("leg")
+            leg = str(tp.get("leg", ""))
             order_id = tp.get("order_id")
-            if not order_id or leg in hit_legs:
+            if not order_id:
                 continue
 
             order_info = get_order(symbol, order_id)
-            if order_info.get("order_status") == "FILLED":
+            if order_info.get("status") == "error":
+                continue
+
+            order_status = str(order_info.get("order_status", "")).upper()
+            if order_status not in {"PARTIALLY_FILLED", "FILLED"}:
+                continue
+
+            executed_qty = max(0.0, float(order_info.get("executed_qty", 0.0) or 0.0))
+            previous_qty = max(0.0, float(filled_by_leg.get(leg, 0.0) or 0.0))
+            delta_qty = max(0.0, executed_qty - previous_qty)
+            if delta_qty <= 0:
+                if order_status == "FILLED" and leg not in hit_legs:
+                    hit_legs.add(leg)
+                continue
+
+            exec_price = float(order_info.get("avg_price") or tp.get("price") or cur_price)
+            pnl_tp = float(tp.get("pnl_pct") or (
+                ((exec_price - entry_price) / entry_price * 100.0)
+                if direction == "LONG"
+                else ((entry_price - exec_price) / entry_price * 100.0)
+            ))
+
+            rem_qty = max(0.0, rem_qty - delta_qty)
+            realized_qty += delta_qty
+            realized_weighted += delta_qty * pnl_tp
+            filled_by_leg[leg] = executed_qty
+            t["remaining_qty"] = rem_qty
+            t["realized_pnl_qty"] = realized_qty
+            t["realized_pnl_weighted_sum"] = realized_weighted
+            t["last_tp_exec_price"] = exec_price
+
+            if order_status == "FILLED" and leg not in hit_legs:
                 hit_legs.add(leg)
-                exec_price = float(order_info.get("avg_price") or tp.get("price") or cur_price)
-                closed_qty = float(order_info.get("executed_qty") or tp.get("qty") or (init_qty * 0.3))
-
-                rem_qty = max(0.0, rem_qty - closed_qty)
-                t["remaining_qty"] = rem_qty
                 rem_pct = (rem_qty / init_qty * 100.0) if init_qty > 0 else 0.0
-                pnl_tp = tp.get("pnl_pct", abs((exec_price - entry_price) / entry_price * 100.0))
-
                 send_tg(format_tp_hit_message(
                     name=t["name"],
                     symbol=symbol,
                     leg=leg,
                     pnl_pct=pnl_tp,
                     exec_price=exec_price,
-                    closed_qty=closed_qty,
+                    closed_qty=delta_qty,
                     remaining_qty=rem_qty,
                     remaining_pct=rem_pct,
                 ))
 
-                # Автоматический перенос в безубыток при взятии TP1
-                if leg == "tp1" and not t.get("be_activated"):
+                # Move SL to BE only if there is still quantity to protect.
+                if leg == "tp1" and not t.get("be_activated") and rem_qty > 0:
                     new_sl = _move_sl_to_break_even(
                         symbol=symbol,
                         direction=direction,
@@ -281,54 +389,74 @@ def update_active_trades() -> None:
                         qty=rem_qty,
                         old_sl_id=t.get("sl_order", {}).get("order_id"),
                     )
-                    t["sl_order"] = new_sl
-                    t["be_activated"] = True
-                    send_tg(format_be_message(t["name"], symbol, entry_price))
+                    if new_sl.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                        t["sl_order"] = new_sl
+                        t["be_activated"] = True
+                        send_tg(format_be_message(t["name"], symbol, entry_price))
+                    else:
+                        log.error("[TRACKER_BE_FAILED] %s %s: %s", symbol, direction, new_sl.get("error"))
 
         t["hit_legs"] = list(hit_legs)
+        t["tp_filled_qty"] = filled_by_leg
 
-        # 2. Проверка закрытия позиции
-        if pos_amt <= 0 or rem_qty <= 0:
-            duration_min = (now_ms - t["entry_ts"]) / 60000.0
-            exit_price = cur_price
-
-            sl_order_id = t.get("sl_order", {}).get("order_id")
-            sl_info = get_order(symbol, sl_order_id) if sl_order_id else {}
-
-            if sl_info.get("order_status") == "FILLED":
-                exit_reason = "BREAK_EVEN" if t.get("be_activated") and abs(float(sl_info.get("avg_price", 0)) - entry_price) / entry_price < 0.003 else "STOP_LOSS"
-                exit_price = float(sl_info.get("avg_price") or exit_price)
-            elif len(hit_legs) >= len(t.get("tp_orders", [])) and len(hit_legs) > 0:
-                exit_reason = "TAKE_PROFIT_FULL"
-            else:
-                exit_reason = "POSITION_CLOSED"
-
-            final_pnl = ((exit_price - entry_price) / entry_price * 100.0) if direction == "LONG" else ((entry_price - exit_price) / entry_price * 100.0)
-
-            send_tg(format_trade_closed_message(
-                name=t["name"],
-                symbol=symbol,
-                direction=direction,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                pnl_pct=final_pnl,
-                duration_min=duration_min,
-                peak_pnl=t.get("peak_pnl_pct", 0.0),
-                max_drawdown=t.get("max_drawdown_pct", 0.0),
-                exit_reason=exit_reason,
-                event_type=t.get("event_type", "DIVERGENCE"),
-                research=t.get("research", {}),
-            ))
-
-            # Очистка висячих ордеров
-            for tp in t.get("tp_orders", []):
-                if tp.get("leg") not in hit_legs and tp.get("order_id"):
-                    cancel_order(symbol, tp["order_id"])
-            if sl_order_id:
-                cancel_order(symbol, sl_order_id)
-
+        # 2. Close only when the exchange explicitly says the position is gone,
+        # or when all tracked quantity has definitely been filled by TP orders.
+        closed_by_tp = rem_qty <= 0 and realized_qty > 0
+        position_gone = pos_status == "not_found"
+        if not position_gone and not closed_by_tp:
+            updated_trades[event_id] = t
             continue
 
-        updated_trades[event_id] = t
+        duration_min = (now_ms - t["entry_ts"]) / 60000.0
+        exit_price = float(t.get("last_tp_exec_price") or cur_price)
+        sl_order_id = t.get("sl_order", {}).get("order_id")
+        sl_info = get_order(symbol, sl_order_id) if sl_order_id else {}
+        if sl_info.get("status") == "ok" and sl_info.get("order_status") == "FILLED":
+            exit_price = float(sl_info.get("avg_price") or exit_price)
+            exit_reason = (
+                "BREAK_EVEN"
+                if t.get("be_activated") and entry_price > 0 and abs(exit_price - entry_price) / entry_price < 0.003
+                else "STOP_LOSS"
+            )
+        elif closed_by_tp and hit_legs:
+            exit_reason = "TAKE_PROFIT_FULL"
+        else:
+            exit_reason = "POSITION_CLOSED"
+
+        # If a stop/other close removed the remaining quantity after partial TP,
+        # include that remaining quantity in the weighted PnL.
+        if position_gone and rem_qty > 0 and init_qty > 0:
+            exit_pnl = (
+                ((exit_price - entry_price) / entry_price * 100.0)
+                if direction == "LONG"
+                else ((entry_price - exit_price) / entry_price * 100.0)
+            )
+            realized_weighted += rem_qty * exit_pnl
+            realized_qty += rem_qty
+            rem_qty = 0.0
+
+        final_pnl = (realized_weighted / init_qty) if init_qty > 0 and realized_qty > 0 else current_pnl
+
+        send_tg(format_trade_closed_message(
+            name=t["name"],
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            pnl_pct=final_pnl,
+            duration_min=duration_min,
+            peak_pnl=t.get("peak_pnl_pct", 0.0),
+            max_drawdown=t.get("max_drawdown_pct", 0.0),
+            exit_reason=exit_reason,
+            event_type=t.get("event_type", "DIVERGENCE"),
+            research=t.get("research", {}),
+        ))
+
+        # Cleanup only orders that are still tracked as open.
+        for tp in t.get("tp_orders", []):
+            if tp.get("leg") not in hit_legs and tp.get("order_id"):
+                cancel_order(symbol, tp["order_id"])
+        if sl_order_id:
+            cancel_order(symbol, sl_order_id)
 
     _save_active_trades(updated_trades)
