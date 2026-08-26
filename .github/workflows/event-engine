@@ -1,0 +1,129 @@
+name: Event Driven Trader
+
+on:
+  repository_dispatch:
+    types: [run_event_engine]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: event-driven-trader
+  cancel-in-progress: false
+
+jobs:
+  event-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: event-engine-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m compileall -q event_engine run_once.py
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run event-driven engine
+        env:
+          COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          BINGX_ENV: vst
+          BINGX_MARGIN_USDT: '1'
+          BINGX_LEVERAGE: '10'
+          BINGX_POSITION_MODE: 'HEDGE'
+          EXECUTION_ENABLED: 'true'
+          EXECUTION_MODE: vst
+          TG_ENABLED: 'true'
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+          MIN_VOLUME_24H: '1000000'
+          MIN_OPEN_INTEREST: '500000'
+          MAX_CANDIDATES: '40'
+          KLINE_LIMIT_1H: '250'
+          KLINE_LIMIT_15M: '250'
+          REQUIRE_CVD_CONFIRMATION: 'true'
+          REQUIRE_15M_TRIGGER: 'true'
+          MAX_EVENT_AGE_MIN: '45'
+          MAX_TRADES_PER_CYCLE: '1'
+        run: python run_once.py
+
+      - name: Append health snapshot
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from event_engine.shadow_health import append_health
+          append_health(Path('data/events.jsonl'), Path('data/outcomes.jsonl'), Path('data/shadow_health.jsonl'))
+          PY
+
+      - name: Commit state
+        if: always()
+        run: |
+          set -e
+          git config user.name 'actions-user'
+          git config user.email 'actions@github.com'
+          git add data/*.json data/*.jsonl 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo 'No state changes'
+            exit 0
+          fi
+          git commit -m "event-engine state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for n in 1 2 3; do
+            git fetch origin main
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo 'Push successful'
+                exit 0
+              fi
+            else
+              git rebase --abort || true
+            fi
+            sleep $((n * 5))
+          done
+          exit 1
+
+      - name: Telegram workflow failure
+        if: failure()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          token = os.getenv('TG_BOT_TOKEN','').strip()
+          chats = [x.strip() for x in os.getenv('TG_CHAT_IDS','').replace(';',',').split(',') if x.strip()]
+          if token:
+              for chat in chats:
+                  try:
+                      requests.post(
+                          f'https://api.telegram.org/bot{token}/sendMessage',
+                          data={'chat_id': chat, 'text': '⚠️ Event-driven trader workflow failed. Check GitHub Actions logs.'},
+                          timeout=10,
+                      )
+                  except Exception:
+                      pass
+          PY
