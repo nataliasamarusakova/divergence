@@ -226,7 +226,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.4253673627223472,
-    "max_drawdown_pct": -4.040989945862341,
+    "max_drawdown_pct": -4.427687548337206,
     "score": 65.0,
     "event_type": "HIDDEN_BEARISH_RSI",
     "research": {
@@ -306,7 +306,7 @@
         "status": "deferred",
         "reason": "trigger_already_crossed",
         "price": 0.578049997302,
-        "current_price": 0.6039,
+        "current_price": 0.6026,
         "qty": 4.6,
         "pnl_pct": 2.910806
       },
@@ -604,11 +604,13 @@
     "entry_ts": 1787782569769,
     "tp_orders": [
       {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092736786199044096",
-        "price": 0.00741,
-        "qty": 564.0
+        "leg": "tp1",
+        "status": "deferred",
+        "reason": "trigger_already_crossed",
+        "price": 0.006339071403989999,
+        "current_price": 0.006646,
+        "qty": 417.0,
+        "pnl_pct": 2.226599
       },
       {
         "leg": "tp2",
@@ -618,23 +620,23 @@
         "qty": 403.0
       },
       {
-        "leg": "tp1",
+        "leg": "tp3",
         "status": "already_exists",
-        "order_id": "2092736783682461696",
-        "price": 0.006604,
-        "qty": 323.0
+        "order_id": "2092736786199044096",
+        "price": 0.00741,
+        "qty": 564.0
       }
     ],
     "sl_order": {
       "status": "already_exists",
       "order_id": "2092736787511861248",
       "stop_price": 0.005891,
-      "qty": 1612.0
+      "qty": 1289.0
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 5.531365908724406,
-    "max_drawdown_pct": -6.434446057087568,
+    "peak_pnl_pct": 9.982260925657148,
+    "max_drawdown_pct": -8.272859216255435,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
@@ -719,7 +721,7 @@
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 0.13442762133860645,
+    "peak_pnl_pct": 0.2985708221310174,
     "max_drawdown_pct": -0.9282581010329625,
     "score": 60.0,
     "event_type": "REGULAR_BULLISH_RSI",
@@ -897,25 +899,22 @@
     "tp_orders": [
       {
         "leg": "tp3",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2092760749482532864",
-        "client_order_id": "EVT_TP3_27AE30B353CE4C20",
-        "price": 7.60743875152,
-        "qty": 1.0,
-        "pnl_pct": 2.360586
+        "price": 7.607,
+        "qty": 1.0
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2092760745955123200",
-      "client_order_id": "EVT_SL_D6C19D24CACA463F",
-      "stop_price": 7.3442806323344,
+      "stop_price": 7.344,
       "qty": 1.0
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 0.0,
-    "max_drawdown_pct": 0.0,
+    "peak_pnl_pct": 0.34983853606027715,
+    "max_drawdown_pct": -1.4935414424111915,
     "score": 65.0,
     "event_type": "REGULAR_BULLISH_RSI",
     "research": {
@@ -924,6 +923,51 @@
       "liq_long24": 0.0047,
       "ls_accounts": 0.0092,
       "oi": 108600000.0
+    },
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null
+  },
+  "EVT_2D90DC0327ECEE0D": {
+    "event_id": "EVT_2D90DC0327ECEE0D",
+    "symbol": "LTC",
+    "name": "Litecoin",
+    "direction": "LONG",
+    "entry_price": 50.42,
+    "initial_qty": 0.1,
+    "remaining_qty": 0.1,
+    "entry_ts": 1787788345344,
+    "tp_orders": [
+      {
+        "leg": "tp3",
+        "status": "created",
+        "order_id": "2092762118071345152",
+        "client_order_id": "EVT_TP3_78EFD3FFA3B84274",
+        "price": 51.351118745,
+        "qty": 0.1,
+        "pnl_pct": 1.846725
+      }
+    ],
+    "sl_order": {
+      "status": "created",
+      "order_id": "2092762115626065920",
+      "client_order_id": "EVT_SL_30D6804C3E1C4433",
+      "stop_price": 49.95444070215498,
+      "qty": 0.1
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "peak_pnl_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "score": 60.0,
+    "event_type": "REGULAR_BULLISH_RSI",
+    "research": {
+      "fr_oiw": 0.031,
+      "liq_short24": 0.0125,
+      "liq_long24": 0.0093,
+      "ls_accounts": 0.0104,
+      "oi": 122000000.0
     },
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
