@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,12 @@ from event_engine.bingx import (
     get_order,
     cancel_order,
     fetch_klines,
+    to_bx_symbol,
+    get_contract,
+    _format_price,
+    _format_qty,
+    _request,
+    ORDER_PATH,
 )
 from event_engine.telegram import send as send_tg
 
@@ -46,8 +54,9 @@ def register_active_trade(
     sl_result: dict,
     event_type: str,
     coinalyze_row: Any = None,
+    score: float = 50.0,
 ) -> None:
-    """Регистрирует открытую позицию для отслеживания жизненного цикла."""
+    """Регистрирует открытую позицию для сопровождения жизненного цикла."""
     trades = _load_active_trades()
     now_ms = int(time.time() * 1000)
 
@@ -73,13 +82,14 @@ def register_active_trade(
         "tp_orders": tp_orders,
         "sl_order": sl_result,
         "hit_legs": [],
+        "be_activated": False,
         "peak_pnl_pct": 0.0,
         "max_drawdown_pct": 0.0,
+        "score": score,
         "event_type": event_type,
         "research": research,
     }
     _save_active_trades(trades)
-    log.info("Registered active trade %s (%s)", symbol, event_id)
 
 
 def format_tp_hit_message(
@@ -92,7 +102,6 @@ def format_tp_hit_message(
     remaining_qty: float,
     remaining_pct: float,
 ) -> str:
-    """Форматирует алерт при взятии промежуточного тейка."""
     return (
         f"💰 <b>{name} ({symbol})</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -101,6 +110,15 @@ def format_tp_hit_message(
         f"Цена исполнения: <code>{exec_price:.8g}</code>\n"
         f"Закрыто: <code>{closed_qty:.6f}</code>\n"
         f"Осталось: <code>{remaining_qty:.6f} ({remaining_pct:.1f}%)</code>"
+    )
+
+
+def format_be_message(name: str, symbol: str, entry_price: float) -> str:
+    return (
+        f"🛡 <b>{name} ({symbol}) — БЕЗУБЫТОК</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"TP1 взят! Стоп-лосс перенесен на точку входа: <code>{entry_price:.8g}</code>\n"
+        f"Текущий риск по сделке: <b>0.00%</b>"
     )
 
 
@@ -118,7 +136,6 @@ def format_trade_closed_message(
     event_type: str,
     research: dict,
 ) -> str:
-    """Форматирует финальный алерт при полном закрытии сделки."""
     is_win = pnl_pct >= 0
     emoji = "💚" if is_win else "💔"
     pnl_sign = "+" if pnl_pct > 0 else ""
@@ -149,8 +166,41 @@ def format_trade_closed_message(
     return "\n".join(lines)
 
 
+def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None) -> dict:
+    """Переносит Stop Loss на точку входа (Break-Even)."""
+    bx = to_bx_symbol(symbol)
+    contract = get_contract(symbol) or {}
+    precision = int(contract.get("quantityPrecision") or 0)
+    price_precision = int(contract.get("pricePrecision") or 4)
+
+    # 1. Отменяем старый стоп-лосс
+    if old_sl_id:
+        cancel_order(symbol, old_sl_id)
+
+    # 2. Ставим новый STOP_MARKET на цену входа
+    sl_side = "SELL" if direction.upper() == "LONG" else "BUY"
+    client_order_id = f"EVT_BE_{uuid.uuid4().hex.upper()[:16]}"
+    params = {
+        "symbol": bx,
+        "side": sl_side,
+        "positionSide": direction.upper(),
+        "type": "STOP_MARKET",
+        "stopPrice": _format_price(entry_price, price_precision),
+        "quantity": _format_qty(qty, precision),
+        "clientOrderId": client_order_id,
+        "reduceOnly": "true",
+    }
+    resp = _request("POST", ORDER_PATH, params)
+    order = (resp.get("data") or {}).get("order") or {}
+    return {
+        "status": "created" if resp.get("code") == 0 else "error",
+        "order_id": str(order.get("orderId", "")),
+        "stop_price": entry_price,
+    }
+
+
 def update_active_trades() -> None:
-    """Опрашивает все активные позиции, регистрирует исполнение TP и выходы по SL."""
+    """Опрашивает открытые позиции, фиксирует TP, двигает BE и логирует закрытие."""
     trades = _load_active_trades()
     if not trades:
         return
@@ -166,11 +216,9 @@ def update_active_trades() -> None:
         rem_qty = t["remaining_qty"]
         hit_legs = set(t.get("hit_legs", []))
 
-        # 1. Проверяем текущее наличие позиции на бирже
         pos = get_position_directional(symbol, direction)
         pos_amt = float(pos.get("positionAmt", 0) or 0) if pos.get("status") == "found" else 0.0
 
-        # 2. Обновляем экстремумы цены (MFE / MAE)
         cur_price = entry_price
         try:
             k1m = fetch_klines(symbol, "1m", limit=60)
@@ -191,7 +239,7 @@ def update_active_trades() -> None:
         except Exception:
             pass
 
-        # 3. Проверяем статусы ордеров Take Profit
+        # 1. Проверка Take Profit ордеров
         for tp in t.get("tp_orders", []):
             leg = tp.get("leg")
             order_id = tp.get("order_id")
@@ -209,7 +257,7 @@ def update_active_trades() -> None:
                 rem_pct = (rem_qty / init_qty * 100.0) if init_qty > 0 else 0.0
                 pnl_tp = tp.get("pnl_pct", abs((exec_price - entry_price) / entry_price * 100.0))
 
-                msg = format_tp_hit_message(
+                send_tg(format_tp_hit_message(
                     name=t["name"],
                     symbol=symbol,
                     leg=leg,
@@ -218,12 +266,24 @@ def update_active_trades() -> None:
                     closed_qty=closed_qty,
                     remaining_qty=rem_qty,
                     remaining_pct=rem_pct,
-                )
-                send_tg(msg)
+                ))
+
+                # Автоматический перенос в безубыток при взятии TP1
+                if leg == "tp1" and not t.get("be_activated"):
+                    new_sl = _move_sl_to_break_even(
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=entry_price,
+                        qty=rem_qty,
+                        old_sl_id=t.get("sl_order", {}).get("order_id"),
+                    )
+                    t["sl_order"] = new_sl
+                    t["be_activated"] = True
+                    send_tg(format_be_message(t["name"], symbol, entry_price))
 
         t["hit_legs"] = list(hit_legs)
 
-        # 4. Проверяем, закрыта ли позиция полностью
+        # 2. Проверка закрытия позиции
         if pos_amt <= 0 or rem_qty <= 0:
             duration_min = (now_ms - t["entry_ts"]) / 60000.0
             exit_price = cur_price
@@ -232,19 +292,16 @@ def update_active_trades() -> None:
             sl_info = get_order(symbol, sl_order_id) if sl_order_id else {}
 
             if sl_info.get("order_status") == "FILLED":
-                exit_reason = "STOP_LOSS"
+                exit_reason = "BREAK_EVEN" if t.get("be_activated") and abs(float(sl_info.get("avg_price", 0)) - entry_price) / entry_price < 0.003 else "STOP_LOSS"
                 exit_price = float(sl_info.get("avg_price") or exit_price)
             elif len(hit_legs) >= len(t.get("tp_orders", [])) and len(hit_legs) > 0:
                 exit_reason = "TAKE_PROFIT_FULL"
             else:
                 exit_reason = "POSITION_CLOSED"
 
-            if direction == "LONG":
-                final_pnl = ((exit_price - entry_price) / entry_price) * 100.0
-            else:
-                final_pnl = ((entry_price - exit_price) / entry_price) * 100.0
+            final_pnl = ((exit_price - entry_price) / entry_price * 100.0) if direction == "LONG" else ((entry_price - exit_price) / entry_price * 100.0)
 
-            close_msg = format_trade_closed_message(
+            send_tg(format_trade_closed_message(
                 name=t["name"],
                 symbol=symbol,
                 direction=direction,
@@ -257,10 +314,9 @@ def update_active_trades() -> None:
                 exit_reason=exit_reason,
                 event_type=t.get("event_type", "DIVERGENCE"),
                 research=t.get("research", {}),
-            )
-            send_tg(close_msg)
+            ))
 
-            # Отменяем оставшиеся открытые ордера по закрытой сделке
+            # Очистка висячих ордеров
             for tp in t.get("tp_orders", []):
                 if tp.get("leg") not in hit_legs and tp.get("order_id"):
                     cancel_order(symbol, tp["order_id"])
