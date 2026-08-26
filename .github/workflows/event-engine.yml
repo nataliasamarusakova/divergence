@@ -17,9 +17,6 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # ==============================================================
-      # CHECKOUT
-      # ==============================================================
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -27,17 +24,11 @@ jobs:
           ref: main
           persist-credentials: true
 
-      # ==============================================================
-      # PYTHON
-      # ==============================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ==============================================================
-      # PIP CACHE
-      # ==============================================================
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -46,141 +37,72 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      # ==============================================================
-      # INSTALL DEPENDENCIES
-      # ==============================================================
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ==============================================================
-      # PLAYWRIGHT CACHE
-      # ==============================================================
-      - name: Cache Playwright browsers
-        id: playwright-cache
+      - name: Cache Playwright browser binaries
+        id: cache-playwright-browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            playwright-${{ runner.os }}-
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      # ==============================================================
-      # PLAYWRIGHT
-      #
-      # ВАЖНО:
-      # Даже при cache-hit браузер должен существовать.
-      # Поэтому install запускаем всегда.
-      # ==============================================================
-      - name: Install Chromium
+      - name: Install Playwright Chromium
+        if: steps.cache-playwright-browsers.outputs.cache-hit != 'true'
         run: |
           playwright install --with-deps chromium
 
-      # ==============================================================
-      # SYNTAX
-      # ==============================================================
       - name: Syntax check
         run: |
           python -m compileall -q event_engine run_once.py
 
-      # ==============================================================
-      # CLEAN PYTHON CACHE
-      # ==============================================================
       - name: Clean Python cache
         run: |
           find . -type d -name "__pycache__" -prune -exec rm -rf {} +
           find . -type f -name "*.pyc" -delete
 
-      # ==============================================================
-      # TESTS
-      # ==============================================================
       - name: Run tests
         run: |
           python -m pytest -q
 
-      # ==============================================================
-      # ENGINE
-      # ==============================================================
       - name: Run engine
         env:
-          # ----------------------------------------------------------
-          # COINALYZE
-          # ----------------------------------------------------------
           COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
           COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
 
-          # ----------------------------------------------------------
-          # BINGX VST
-          # ----------------------------------------------------------
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-
           BINGX_ENV: vst
           BINGX_BASE_URL: https://open-api-vst.bingx.com
-
           BINGX_MARGIN_USDT: "1"
           BINGX_LEVERAGE: "10"
           BINGX_POSITION_MODE: HEDGE
 
-          # ----------------------------------------------------------
-          # EXECUTION
-          # ----------------------------------------------------------
           EXECUTION_ENABLED: "true"
           EXECUTION_MODE: vst
 
-          # ----------------------------------------------------------
-          # SIGNAL CONDITIONS
-          # ----------------------------------------------------------
           REQUIRE_CVD_CONFIRMATION: "false"
           REQUIRE_15M_TRIGGER: "true"
 
-          # ----------------------------------------------------------
-          # EVENT AGE
-          # ----------------------------------------------------------
           MAX_EVENT_AGE_MIN: "90"
-
-          # ----------------------------------------------------------
-          # RISK / EXECUTION LIMIT
-          # ----------------------------------------------------------
           MAX_TRADES_PER_CYCLE: "1"
 
-          # ----------------------------------------------------------
-          # COINALYZE FILTERS
-          # ----------------------------------------------------------
           MIN_VOLUME_24H: "1000000"
           MIN_OPEN_INTEREST: "500000"
           MAX_CANDIDATES: "40"
 
-          # ----------------------------------------------------------
-          # BINGX KLINES
-          # ----------------------------------------------------------
           KLINE_LIMIT_1H: "250"
           KLINE_LIMIT_15M: "250"
 
-          # ----------------------------------------------------------
-          # TELEGRAM
-          # ----------------------------------------------------------
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
 
         run: |
           python run_once.py
 
-      # ==============================================================
-      # COMMIT / PUSH STATE
-      #
-      # Сохраняем data/*.jsonl.
-      #
-      # Важный момент:
-      # 1. commit
-      # 2. fetch origin/main
-      # 3. проверяем clean tree
-      # 4. rebase
-      # 5. push
-      # 6. retry при race condition
-      # ==============================================================
       - name: Commit state
         if: always()
         shell: bash
@@ -190,53 +112,24 @@ jobs:
           git config user.name "actions-user"
           git config user.email "actions@github.com"
 
-          echo "=== Git status before commit ==="
           git status --short
 
-          # ----------------------------------------------------------
-          # Добавляем состояние event engine.
-          # ----------------------------------------------------------
           git add data/*.jsonl 2>/dev/null || true
 
-          # ----------------------------------------------------------
-          # Если изменений нет — ничего не делаем.
-          # ----------------------------------------------------------
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
           fi
 
-          # ----------------------------------------------------------
-          # Первый commit.
-          # ----------------------------------------------------------
           git commit \
             -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # ----------------------------------------------------------
-          # Push с retry.
-          # ----------------------------------------------------------
           max_attempts=5
 
           for attempt in $(seq 1 "$max_attempts"); do
-            echo
-            echo "=================================================="
-            echo "Push attempt ${attempt}/${max_attempts}"
-            echo "=================================================="
-
-            # --------------------------------------------------------
-            # Всегда получаем самый свежий main.
-            # --------------------------------------------------------
             git fetch origin main
 
-            # --------------------------------------------------------
-            # Проверяем, что tree действительно чистый.
-            # --------------------------------------------------------
             if [ -n "$(git status --porcelain)" ]; then
-              echo "Working tree is not clean."
-
-              git status --short
-
-              # На случай дополнительных изменений.
               git add -A
 
               if ! git diff --cached --quiet; then
@@ -245,12 +138,7 @@ jobs:
               fi
             fi
 
-            # --------------------------------------------------------
-            # Rebase на свежий origin/main.
-            # --------------------------------------------------------
             if ! git rebase origin/main; then
-              echo "Rebase failed."
-
               git rebase --abort 2>/dev/null || true
 
               if [ "$attempt" -lt "$max_attempts" ]; then
@@ -258,25 +146,17 @@ jobs:
                 continue
               fi
 
-              echo "ERROR: rebase failed after ${max_attempts} attempts."
               exit 1
             fi
 
-            # --------------------------------------------------------
-            # Push.
-            # --------------------------------------------------------
             if git push origin HEAD:main; then
-              echo
-              echo "State pushed successfully."
+              echo "State pushed successfully"
               exit 0
             fi
-
-            echo "Push rejected."
 
             if [ "$attempt" -lt "$max_attempts" ]; then
               sleep $((attempt * 3))
             fi
           done
 
-          echo "ERROR: unable to push state after ${max_attempts} attempts."
           exit 1
