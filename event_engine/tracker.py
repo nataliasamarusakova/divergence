@@ -167,7 +167,7 @@ def format_trade_closed_message(
 
 
 def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None) -> dict:
-    """Переносит Stop Loss на точку входа (Break-Even)."""
+    """Переносит Stop Loss на точку входа (Break-Even) без reduceOnly."""
     bx = to_bx_symbol(symbol)
     contract = get_contract(symbol) or {}
     precision = int(contract.get("quantityPrecision") or 0)
@@ -188,7 +188,6 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
         "stopPrice": _format_price(entry_price, price_precision),
         "quantity": _format_qty(qty, precision),
         "clientOrderId": client_order_id,
-        "reduceOnly": "true",
     }
     resp = _request("POST", ORDER_PATH, params)
     order = (resp.get("data") or {}).get("order") or {}
