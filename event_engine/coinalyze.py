@@ -1,7 +1,5 @@
+# coinalyze.py
 
-"""
-coinalyze.py
-"""
 
 from __future__ import annotations
 
