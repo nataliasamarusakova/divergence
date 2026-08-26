@@ -2,51 +2,41 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import math
 import os
 import time
+import uuid
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 from urllib.parse import urlencode
 
 import requests
 
-
 log = logging.getLogger("event_engine.bingx")
-
 
 API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-
 BASE_URL = os.environ.get(
     "BINGX_BASE_URL",
     "https://open-api-vst.bingx.com",
 ).rstrip("/")
 
 MARGIN_USDT = float(
-    os.environ.get(
-        "BINGX_MARGIN_USDT",
-        "1",
-    )
+    os.environ.get("BINGX_MARGIN_USDT", "1")
 )
-
 LEVERAGE = int(
-    os.environ.get(
-        "BINGX_LEVERAGE",
-        "10",
-    )
+    os.environ.get("BINGX_LEVERAGE", "10")
+)
+MAX_LEVERAGE = int(
+    os.environ.get("BINGX_MAX_LEVERAGE", "50")
 )
 
-MAX_LEVERAGE = int(
-    os.environ.get(
-        "BINGX_MAX_LEVERAGE",
-        "50",
-    )
-)
+SYMBOL_MAP = {}
 
 try:
+    import json
+
     SYMBOL_MAP = json.loads(
         os.environ.get(
             "BINGX_SYMBOL_MAP",
@@ -60,13 +50,12 @@ except Exception:
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
 ORDER_PATH = "/openApi/swap/v2/trade/order"
-OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 POSITION_PATH = os.environ.get(
     "BINGX_POSITIONS_PATH",
     "/openApi/swap/v2/user/positions",
 )
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
-
+OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 
 CACHE = {
     "ts": 0.0,
@@ -77,14 +66,9 @@ CACHE = {
 TTL = 3600
 
 
-# ============================================================================
-# GENERIC HELPERS
-# ============================================================================
-
-def _sign(
-    params: dict[str, Any],
-) -> str:
+def _sign(params: dict[str, Any]) -> str:
     qs = urlencode(params)
+
     return hmac.new(
         SECRET_KEY.encode(),
         qs.encode(),
@@ -97,7 +81,7 @@ def _request(
     path: str,
     params: dict[str, Any] | None = None,
     signed: bool = True,
-) -> dict:
+):
     params = dict(params or {})
     headers = {}
 
@@ -112,9 +96,7 @@ def _request(
             int(time.time() * 1000)
         )
 
-        params["signature"] = _sign(
-            params
-        )
+        params["signature"] = _sign(params)
 
         headers["X-BX-APIKEY"] = API_KEY
 
@@ -127,13 +109,7 @@ def _request(
             timeout=15,
         )
 
-        try:
-            return response.json()
-        except Exception:
-            return {
-                "code": response.status_code,
-                "msg": response.text,
-            }
+        return response.json()
 
     except Exception as exc:
         return {
@@ -142,203 +118,41 @@ def _request(
         }
 
 
-def _normalize_orders_list(
-    response: dict,
-) -> list[dict]:
-    """
-    BingX responses can expose lists under several wrappers.
-    Normalize them to list[dict].
-    """
-
-    if not isinstance(
-        response,
-        dict,
-    ):
-        return []
-
-    data = response.get("data")
-
-    if isinstance(
-        data,
-        list,
-    ):
-        return [
-            x
-            for x in data
-            if isinstance(
-                x,
-                dict,
-            )
-        ]
-
-    if isinstance(
-        data,
-        dict,
-    ):
-        for key in (
-            "positions",
-            "position",
-            "orders",
-            "order",
-            "list",
-        ):
-            value = data.get(key)
-
-            if isinstance(
-                value,
-                list,
-            ):
-                return [
-                    x
-                    for x in value
-                    if isinstance(
-                        x,
-                        dict,
-                    )
-                ]
-
-            if isinstance(
-                value,
-                dict,
-            ):
-                return [value]
-
-        return [data]
-
-    return []
-
-
-def _contracts() -> dict[str, dict]:
-    """
-    Compatibility alias used by protection code.
-    """
-    return contracts()
-
-
-def _round_qty(
-    qty: float,
-    precision: int,
-) -> float:
-    if qty <= 0:
-        return 0.0
-
-    exponent = Decimal("1").scaleb(
-        -int(precision)
-    )
-
-    rounded = Decimal(
-        str(qty)
-    ).quantize(
-        exponent,
-        rounding=ROUND_DOWN,
-    )
-
-    return float(
-        rounded
-    )
-
-
-def _format_qty(
-    qty: float,
-    precision: int,
-) -> str:
-    precision = max(
-        0,
-        int(precision),
-    )
-
-    return f"{float(qty):.{precision}f}"
-
-
-def _format_price(
-    price: float,
-    precision: int,
-) -> str:
-    precision = max(
-        0,
-        int(precision),
-    )
-
-    return f"{float(price):.{precision}f}"
-
-
-def build_tp_client_order_id(
-    leg: str,
-    trade_id: str | None,
-) -> str:
-    suffix = str(
-        trade_id or "NOID"
-    )[:16]
-
-    return (
-        f"EVT_{suffix}_"
-        f"{str(leg).upper()}"
-    )[:32]
-
-
-def build_sl_client_order_id(
-    trade_id: str | None,
-) -> str:
-    suffix = str(
-        trade_id or "NOID"
-    )[:20]
-
-    return (
-        f"EVT_{suffix}_SL"
-    )[:32]
-
-
-# ============================================================================
-# CONTRACTS
-# ============================================================================
-
 def refresh_contracts() -> dict[str, Any]:
-    response = _request(
+    resp = _request(
         "GET",
         CONTRACTS_PATH,
         signed=False,
     )
 
-    if response.get("code") != 0:
+    if resp.get("code") != 0:
         raise RuntimeError(
             f"BingX contracts error: "
-            f"{response.get('msg')}"
+            f"{resp.get('msg')}"
         )
 
     data = {}
     by_name = {}
 
-    for contract in (
-        response.get("data") or []
-    ):
-        symbol = str(
-            contract.get(
-                "symbol",
-                "",
-            )
+    for c in resp.get("data", []) or []:
+        sym = str(
+            c.get("symbol", "")
         ).strip().upper()
 
-        display_name = str(
-            contract.get(
-                "displayName",
-                "",
-            )
+        name = str(
+            c.get("displayName", "")
         ).strip().upper()
 
-        if symbol:
-            data[symbol] = contract
+        if sym:
+            data[sym] = c
 
-        if display_name:
-            by_name[
-                display_name
-            ] = contract
+        if name:
+            by_name[name] = c
 
     CACHE.update(
-        {
-            "ts": time.time(),
-            "data": data,
-            "by_display_name": by_name,
-        }
+        ts=time.time(),
+        data=data,
+        by_display_name=by_name,
     )
 
     log.info(
@@ -352,9 +166,7 @@ def refresh_contracts() -> dict[str, Any]:
 def contracts() -> dict[str, dict]:
     if (
         CACHE["data"]
-        and time.time()
-        - CACHE["ts"]
-        < TTL
+        and time.time() - CACHE["ts"] < TTL
     ):
         return CACHE["data"]
 
@@ -367,7 +179,6 @@ def contracts() -> dict[str, dict]:
 def get_contract(
     symbol: str,
 ) -> dict | None:
-
     s = (
         symbol or ""
     ).strip().upper()
@@ -375,19 +186,17 @@ def get_contract(
     if not s:
         return None
 
-    mapped = SYMBOL_MAP.get(
-        s
-    )
+    mapped = SYMBOL_MAP.get(s)
 
     if mapped:
-        contract = contracts().get(
-            str(
-                mapped
-            ).strip().upper()
+        c = contracts().get(
+            str(mapped)
+            .strip()
+            .upper()
         )
 
-        if contract:
-            return contract
+        if c:
+            return c
 
     direct = (
         s
@@ -395,59 +204,45 @@ def get_contract(
         else f"{s.replace('-', '')}-USDT"
     )
 
-    contract = contracts().get(
-        direct
-    )
+    c = contracts().get(direct)
 
-    if contract:
-        return contract
+    if c:
+        return c
 
     base = (
-        s.replace(
-            "-USDT",
-            "",
-        )
-        .replace(
-            "-",
-            "",
-        )
+        s.replace("-USDT", "")
+        .replace("-", "")
     )
 
-    for contract in CACHE[
-        "data"
-    ].values():
-
-        display_name = str(
-            contract.get(
-                "displayName",
-                "",
+    for c in CACHE["data"].values():
+        name = (
+            str(
+                c.get(
+                    "displayName",
+                    "",
+                )
             )
-        ).upper().replace(
-            "-",
-            "",
+            .upper()
+            .replace("-", "")
         )
 
-        contract_symbol = str(
-            contract.get(
+        cs = str(
+            c.get(
                 "symbol",
                 "",
             )
         ).upper()
 
         if (
-            display_name
-            == f"{base}USDT"
-            or display_name
-            == base
-            or contract_symbol.endswith(
+            name == f"{base}-USDT"
+            or name == base
+            or cs.endswith(
                 f"{base}-USDT"
             )
         ):
-            return contract
+            return c
 
-    return CACHE[
-        "by_display_name"
-    ].get(
+    return CACHE["by_display_name"].get(
         f"{base}-USDT"
     )
 
@@ -455,115 +250,75 @@ def get_contract(
 def to_bx_symbol(
     symbol: str,
 ) -> str | None:
+    c = get_contract(symbol)
 
-    contract = get_contract(
-        symbol
-    )
-
-    if not contract:
+    if not c:
         return None
 
-    value = str(
-        contract.get(
+    return str(
+        c.get(
             "symbol",
             "",
         )
-    ).strip().upper()
-
-    return value or None
+    ).upper()
 
 
 def contract_exists(
     symbol: str,
 ) -> bool:
+    c = get_contract(symbol)
 
-    contract = get_contract(
-        symbol
-    )
-
-    if not contract:
-        return False
-
-    status_ok = (
-        str(
-            contract.get(
-                "status",
+    return bool(
+        c
+        and c.get("status") == 1
+        and str(
+            c.get(
+                "apiStateOpen",
                 "",
             )
-        ) == "1"
-        or contract.get(
-            "status"
-        ) == 1
-    )
-
-    api_open = str(
-        contract.get(
-            "apiStateOpen",
-            "",
-        )
-    ).lower()
-
-    return (
-        status_ok
-        and api_open == "true"
+        ).lower()
+        == "true"
     )
 
 
 def classify_contract(
     contract: dict | None,
 ) -> str:
-
     if not contract:
         return "unknown"
 
-    symbol = str(
+    s = str(
         contract.get(
             "symbol",
             "",
         )
     ).upper()
 
-    if symbol.startswith(
-        (
-            "NCSK",
-            "NCSI",
-        )
-    ):
+    if s.startswith(("NCSK", "NCSI")):
         return "equity"
 
-    if symbol.startswith(
-        "NCCO"
-    ):
+    if s.startswith("NCCO"):
         return "commodity"
 
-    if symbol.startswith(
-        "NCFX"
-    ):
+    if s.startswith("NCFX"):
         return "forex"
 
     return "crypto"
 
-
-# ============================================================================
-# KLINES
-# ============================================================================
 
 def fetch_klines(
     symbol: str,
     interval: str,
     limit: int = 250,
 ) -> list[dict]:
-
-    bx = to_bx_symbol(
-        symbol
-    )
+    bx = to_bx_symbol(symbol)
 
     if not bx:
         raise ValueError(
             f"No BingX contract for {symbol}"
         )
 
-    response = _request(
+    resp = _request(
         "GET",
         KLINE_PATH,
         {
@@ -574,49 +329,30 @@ def fetch_klines(
         signed=False,
     )
 
-    code = response.get(
-        "code"
-    )
+    code = resp.get("code")
 
-    if code not in (
-        0,
-        "0",
-    ):
+    if code not in (0, "0"):
         raise RuntimeError(
             f"BingX klines error "
             f"{bx}/{interval}: "
             f"code={code} "
-            f"msg={response.get('msg')}"
+            f"msg={resp.get('msg')}"
         )
 
-    rows = (
-        response.get(
-            "data"
-        )
-        or []
-    )
+    rows = resp.get("data") or []
 
-    if not isinstance(
-        rows,
-        list,
-    ):
-        raise RuntimeError(
-            f"Unexpected BingX klines payload "
-            f"{bx}/{interval}: "
-            f"data_type="
-            f"{type(rows).__name__}"
-        )
-
-    if rows and isinstance(
-        rows[0],
-        dict,
-    ):
+    if rows and isinstance(rows[0], dict):
         print(
             "[BINGX_KLINE_FIELDS]",
             bx,
-            sorted(
-                rows[0].keys()
-            ),
+            sorted(rows[0].keys()),
+        )
+
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            f"Unexpected BingX klines payload "
+            f"{bx}/{interval}: "
+            f"data_type={type(rows).__name__}"
         )
 
     first_shape = "empty"
@@ -627,20 +363,14 @@ def fetch_klines(
             (list, tuple),
         ):
             first_shape = (
-                f"array_len="
-                f"{len(rows[0])}"
+                f"array_len={len(rows[0])}"
             )
-        elif isinstance(
-            rows[0],
-            dict,
-        ):
+        elif isinstance(rows[0], dict):
             first_shape = "dict"
         else:
-            first_shape = (
-                type(
-                    rows[0]
-                ).__name__
-            )
+            first_shape = type(
+                rows[0]
+            ).__name__
 
     print(
         f"[BINGX_KLINES_RAW] "
@@ -648,6 +378,12 @@ def fetch_klines(
         f"interval={interval} "
         f"rows={len(rows)} "
         f"first_shape={first_shape}"
+    )
+
+    out: list[dict] = []
+
+    now_ms = int(
+        time.time() * 1000
     )
 
     duration_ms = {
@@ -662,66 +398,32 @@ def fetch_klines(
         "6h": 21_600_000,
         "12h": 43_200_000,
         "1d": 86_400_000,
-    }.get(
-        interval
-    )
-
-    now_ms = int(
-        time.time() * 1000
-    )
-
-    output = []
+    }.get(interval)
 
     for row in rows:
-
-        # ==============================================================
-        # ARRAY
-        # ==============================================================
-
         if isinstance(
             row,
             (list, tuple),
         ):
-
             if len(row) < 6:
                 continue
 
             try:
-                open_time = int(
-                    row[0]
-                )
-
-                open_price = float(
-                    row[1]
-                )
-
-                high = float(
-                    row[2]
-                )
-
-                low = float(
-                    row[3]
-                )
-
-                close = float(
-                    row[4]
-                )
-
-                volume = float(
-                    row[5]
-                )
+                open_time = int(row[0])
+                open_price = float(row[1])
+                high = float(row[2])
+                low = float(row[3])
+                close = float(row[4])
+                volume = float(row[5])
 
                 if (
                     len(row) >= 7
                     and row[6] is not None
                 ):
-                    close_time = int(
-                        row[6]
-                    )
+                    close_time = int(row[6])
                 else:
                     close_time = (
-                        open_time
-                        + duration_ms
+                        open_time + duration_ms
                         if duration_ms
                         else open_time
                     )
@@ -779,24 +481,15 @@ def fetch_klines(
             ):
                 continue
 
-        # ==============================================================
-        # DICT
-        # ==============================================================
-
-        elif isinstance(
-            row,
-            dict,
-        ):
-
-            def pick(
-                *names,
-            ):
+        elif isinstance(row, dict):
+            def pick(*names):
                 for name in names:
                     if (
                         name in row
                         and row[name] is not None
                     ):
                         return row[name]
+
                 return None
 
             try:
@@ -809,33 +502,23 @@ def fetch_klines(
                 )
 
                 open_price = float(
-                    pick(
-                        "open"
-                    )
+                    pick("open")
                 )
 
                 high = float(
-                    pick(
-                        "high"
-                    )
+                    pick("high")
                 )
 
                 low = float(
-                    pick(
-                        "low"
-                    )
+                    pick("low")
                 )
 
                 close = float(
-                    pick(
-                        "close"
-                    )
+                    pick("close")
                 )
 
                 volume = float(
-                    pick(
-                        "volume"
-                    )
+                    pick("volume")
                 )
 
                 raw_close_time = pick(
@@ -844,13 +527,10 @@ def fetch_klines(
                 )
 
                 close_time = (
-                    int(
-                        raw_close_time
-                    )
+                    int(raw_close_time)
                     if raw_close_time is not None
                     else (
-                        open_time
-                        + duration_ms
+                        open_time + duration_ms
                         if duration_ms
                         else open_time
                     )
@@ -877,25 +557,19 @@ def fetch_klines(
                 )
 
                 quote_volume = (
-                    float(
-                        quote_volume_raw
-                    )
+                    float(quote_volume_raw)
                     if quote_volume_raw is not None
                     else None
                 )
 
                 taker_buy_base = (
-                    float(
-                        taker_base_raw
-                    )
+                    float(taker_base_raw)
                     if taker_base_raw is not None
                     else None
                 )
 
                 taker_buy_quote = (
-                    float(
-                        taker_quote_raw
-                    )
+                    float(taker_quote_raw)
                     if taker_quote_raw is not None
                     else None
                 )
@@ -910,16 +584,8 @@ def fetch_klines(
         else:
             continue
 
-        # ==============================================================
-        # CLOSED CANDLE
-        # ==============================================================
-
         if close_time > now_ms:
             continue
-
-        # ==============================================================
-        # OHLC VALIDATION
-        # ==============================================================
 
         if (
             open_price <= 0
@@ -939,10 +605,6 @@ def fetch_klines(
         ):
             continue
 
-        # ==============================================================
-        # TAKER FLOW
-        # ==============================================================
-
         taker_flow_valid = (
             quote_volume is not None
             and taker_buy_base is not None
@@ -951,11 +613,9 @@ def fetch_klines(
             and taker_buy_base >= 0
             and taker_buy_quote >= 0
             and taker_buy_base
-            <= volume * 1.001
-            + 1e-8
+            <= volume * 1.001 + 1e-8
             and taker_buy_quote
-            <= quote_volume * 1.001
-            + 1e-8
+            <= quote_volume * 1.001 + 1e-8
         )
 
         if taker_flow_valid:
@@ -966,7 +626,7 @@ def fetch_klines(
         else:
             bar_delta_usdt = None
 
-        output.append(
+        out.append(
             {
                 "open_time": open_time,
                 "close_time": close_time,
@@ -983,58 +643,45 @@ def fetch_klines(
             }
         )
 
-    output.sort(
+    out.sort(
         key=lambda x: x["close_time"]
     )
 
     deduped = []
     seen_close_times = set()
 
-    for bar in output:
-        close_time = bar[
-            "close_time"
-        ]
+    for bar in out:
+        ct = bar["close_time"]
 
-        if close_time in seen_close_times:
+        if ct in seen_close_times:
             continue
 
-        seen_close_times.add(
-            close_time
-        )
-        deduped.append(
-            bar
-        )
+        seen_close_times.add(ct)
+        deduped.append(bar)
 
-    output = deduped
+    out = deduped
 
     print(
         f"[BINGX_KLINES_PARSED] "
         f"symbol={bx} "
         f"interval={interval} "
-        f"bars={len(output)} "
+        f"bars={len(out)} "
         f"taker_valid="
-        f"{sum(1 for x in output if x['taker_flow_valid'])}"
+        f"{sum(1 for x in out if x['taker_flow_valid'])}"
     )
 
-    return output
+    return out
 
-
-# ============================================================================
-# LEVERAGE / POSITIONS
-# ============================================================================
 
 def _set_leverage(
     bx_symbol: str,
     leverage: int,
 ) -> bool:
-
-    success = False
-
     for side in (
         "LONG",
-        "SHORT",
+        "BOTH",
     ):
-        response = _request(
+        resp = _request(
             "POST",
             LEVERAGE_PATH,
             {
@@ -1046,51 +693,136 @@ def _set_leverage(
             },
         )
 
-        if response.get(
-            "code"
-        ) == 0:
-            success = True
+        if resp.get("code") == 0:
+            return True
 
-    return success
+    return False
+
+
+def _normalize_orders_list(
+    resp: dict,
+) -> list[dict]:
+    data = resp.get("data")
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in (
+            "orders",
+            "positions",
+            "order",
+            "position",
+        ):
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return value
+
+            if isinstance(value, dict):
+                return [value]
+
+    return []
 
 
 def get_positions() -> list[dict]:
-
-    response = _request(
+    resp = _request(
         "GET",
         POSITION_PATH,
         {},
         signed=True,
     )
 
-    if response.get(
-        "code"
-    ) != 0:
+    if resp.get("code") != 0:
         return []
 
-    return _normalize_orders_list(
-        response
-    )
+    return _normalize_orders_list(resp)
 
 
-def get_position_directional(
+def has_open_position(
     symbol: str,
     direction: str,
-) -> dict:
+) -> bool:
+    bx = to_bx_symbol(symbol)
 
-    bx_symbol = to_bx_symbol(
-        symbol
+    if not bx:
+        return False
+
+    want = (
+        "LONG"
+        if direction.upper() == "LONG"
+        else "SHORT"
     )
 
+    for p in get_positions():
+        if str(
+            p.get(
+                "symbol",
+                "",
+            )
+        ).upper() != bx:
+            continue
+
+        side = str(
+            p.get(
+                "positionSide",
+                p.get(
+                    "positionAmt",
+                    "",
+                ),
+            )
+        ).upper()
+
+        try:
+            amt = float(
+                p.get(
+                    "positionAmt",
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            amt = 0
+
+        if (
+            amt != 0
+            and (
+                want in side
+                or (
+                    want == "LONG"
+                    and amt > 0
+                )
+                or (
+                    want == "SHORT"
+                    and amt < 0
+                )
+            )
+        ):
+            return True
+
+    return False
+
+
+def _new_open_client_order_id(
+    bx_symbol: str,
+) -> str:
+    prefix = "EVT_OPEN"
+    token = uuid.uuid4().hex.upper()[:20]
+
+    return (
+        f"{prefix}_{token}"
+    )
+
+
+def open_market(
+    symbol: str,
+    direction: str,
+    price: float,
+    trade_id: str,
+) -> dict:
     direction = str(
         direction
     ).upper()
-
-    if not bx_symbol:
-        return {
-            "status": "error",
-            "error": "contract_not_found",
-        }
 
     if direction not in (
         "LONG",
@@ -1099,52 +831,344 @@ def get_position_directional(
         return {
             "status": "error",
             "error": (
-                f"invalid direction="
-                f"{direction}"
+                f"invalid direction={direction}"
+            ),
+        }
+
+    bx = to_bx_symbol(symbol)
+
+    if not bx:
+        return {
+            "status": "error",
+            "error": "contract_not_found",
+        }
+
+    c = get_contract(symbol) or {}
+
+    if not contract_exists(symbol):
+        return {
+            "status": "error",
+            "error": "contract_unavailable",
+            "symbol": bx,
+        }
+
+    if has_open_position(
+        symbol,
+        direction,
+    ):
+        print(
+            f"[OPEN_SKIP_EXISTING_POSITION] "
+            f"symbol={bx} "
+            f"direction={direction}"
+        )
+
+        return {
+            "status": "existing_position",
+            "symbol": bx,
+            "direction": direction,
+        }
+
+    try:
+        prec = int(
+            c.get(
+                "quantityPrecision"
+            )
+            or 0
+        )
+
+        min_qty = float(
+            c.get(
+                "tradeMinQuantity"
+            )
+            or c.get("minQty")
+            or 0
+        )
+
+        mult = float(
+            c.get(
+                "multiplier"
+            )
+            or 1
+        )
+
+        max_lev = int(
+            c.get(
+                "maxLongLeverage"
+            )
+            or c.get(
+                "maxLeverage"
+            )
+            or MAX_LEVERAGE
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        return {
+            "status": "error",
+            "error": (
+                f"invalid contract parameters: "
+                f"{exc}"
+            ),
+            "symbol": bx,
+        }
+
+    leverage = min(
+        LEVERAGE,
+        max_lev,
+    )
+
+    qty = (
+        MARGIN_USDT * leverage
+    ) / max(
+        price * mult,
+        1e-12,
+    )
+
+    q = (
+        Decimal(str(qty))
+        .quantize(
+            Decimal(1).scaleb(
+                -prec
+            ),
+            rounding=ROUND_DOWN,
+        )
+        if prec >= 0
+        else Decimal(str(qty))
+    )
+
+    qty = float(q)
+
+    if qty < min_qty:
+        need = math.ceil(
+            (
+                min_qty
+                * price
+                * mult
+            )
+            / max(
+                MARGIN_USDT,
+                1e-9,
+            )
+        )
+
+        leverage = min(
+            max(
+                need,
+                leverage,
+            ),
+            max_lev,
+        )
+
+        qty = (
+            MARGIN_USDT
+            * leverage
+        ) / max(
+            price * mult,
+            1e-12,
+        )
+
+        q = Decimal(
+            str(qty)
+        ).quantize(
+            Decimal(1).scaleb(
+                -prec
+            ),
+            rounding=ROUND_DOWN,
+        )
+
+        qty = float(q)
+
+    if (
+        qty <= 0
+        or qty < min_qty
+    ):
+        return {
+            "status": "error",
+            "error": (
+                f"qty={qty} "
+                f"< min_qty={min_qty}"
+            ),
+            "symbol": bx,
+            "qty": qty,
+            "min_qty": min_qty,
+        }
+
+    leverage_ok = _set_leverage(
+        bx,
+        leverage,
+    )
+
+    print(
+        f"[OPEN_PREPARE] "
+        f"symbol={bx} "
+        f"direction={direction} "
+        f"price={price} "
+        f"margin={MARGIN_USDT} "
+        f"leverage={leverage} "
+        f"leverage_ok={leverage_ok} "
+        f"qty={qty} "
+        f"precision={prec} "
+        f"min_qty={min_qty}"
+    )
+
+    side = (
+        "BUY"
+        if direction == "LONG"
+        else "SELL"
+    )
+
+    client_order_id = (
+        _new_open_client_order_id(
+            bx
+        )
+    )
+
+    params = {
+        "symbol": bx,
+        "side": side,
+        "positionSide": direction,
+        "type": "MARKET",
+        "quantity": f"{qty:.{prec}f}",
+        "clientOrderId": client_order_id,
+    }
+
+    print(
+        f"[OPEN_ORDER_REQUEST] "
+        f"symbol={bx} "
+        f"direction={direction} "
+        f"side={side} "
+        f"qty={params['quantity']} "
+        f"leverage={leverage} "
+        f"trade_id={trade_id} "
+        f"clientOrderId={client_order_id}"
+    )
+
+    response = _request(
+        "POST",
+        ORDER_PATH,
+        params,
+    )
+
+    print(
+        f"[OPEN_ORDER_RESPONSE] "
+        f"symbol={bx} "
+        f"direction={direction} "
+        f"clientOrderId={client_order_id} "
+        f"response={response!r}"
+    )
+
+    if response.get("code") != 0:
+        error = str(
+            response.get(
+                "msg",
+                "",
+            )
+        )
+
+        print(
+            f"[OPEN_ORDER_FAILED] "
+            f"symbol={bx} "
+            f"direction={direction} "
+            f"clientOrderId={client_order_id} "
+            f"code={response.get('code')} "
+            f"msg={error}"
+        )
+
+        return {
+            "status": "error",
+            "error": error,
+            "symbol": bx,
+            "clientOrderId": client_order_id,
+            "response": response,
+        }
+
+    data = response.get(
+        "data"
+    ) or {}
+
+    order = data.get(
+        "order"
+    ) or {}
+
+    order_id = (
+        order.get(
+            "orderId"
+        )
+        or data.get(
+            "orderId"
+        )
+    )
+
+    print(
+        f"[OPEN_ORDER_ACCEPTED] "
+        f"symbol={bx} "
+        f"direction={direction} "
+        f"clientOrderId={client_order_id} "
+        f"orderId={order_id} "
+        f"qty={qty}"
+    )
+
+    return {
+        "status": "opened",
+        "symbol": bx,
+        "qty": qty,
+        "leverage": leverage,
+        "order_id": order_id,
+        "client_order_id": (
+            order.get(
+                "clientOrderId"
+            )
+            or client_order_id
+        ),
+        "response": response,
+    }
+
+
+def get_position_directional(
+    symbol: str,
+    direction: str,
+) -> dict:
+    bx_symbol = to_bx_symbol(symbol)
+    direction = str(
+        direction
+    ).upper()
+
+    if direction not in (
+        "LONG",
+        "SHORT",
+    ):
+        return {
+            "status": "error",
+            "error": (
+                f"invalid direction={direction}"
             ),
             "symbol": bx_symbol,
         }
 
-    response = _request(
+    resp = _request(
         "GET",
         POSITION_PATH,
         {
             "symbol": bx_symbol,
         },
-        signed=True,
     )
 
-    if response.get(
-        "code"
-    ) != 0:
+    if resp.get("code") != 0:
         return {
             "status": "error",
             "error": (
                 f"get_position failed: "
-                f"code="
-                f"{response.get('code')} "
-                f"msg="
-                f"{response.get('msg')}"
+                f"code={resp.get('code')} "
+                f"msg={resp.get('msg')}"
             ),
             "symbol": bx_symbol,
         }
 
-    for position in _normalize_orders_list(
-        response
-    ):
-
-        position_symbol = str(
-            position.get(
-                "symbol",
-                bx_symbol,
-            )
-        ).upper()
-
-        if position_symbol != bx_symbol:
-            continue
-
+    for p in _normalize_orders_list(resp):
         position_side = str(
-            position.get(
+            p.get(
                 "positionSide",
                 "",
             )
@@ -1156,7 +1180,7 @@ def get_position_directional(
         try:
             qty = abs(
                 float(
-                    position.get(
+                    p.get(
                         "positionAmt",
                         0,
                     )
@@ -1165,11 +1189,11 @@ def get_position_directional(
             )
 
             avg_price = float(
-                position.get(
+                p.get(
                     "avgPrice",
                     0,
                 )
-                or position.get(
+                or p.get(
                     "entryPrice",
                     0,
                 )
@@ -1190,12 +1214,15 @@ def get_position_directional(
 
         return {
             "status": "found",
-            "symbol": bx_symbol,
+            "symbol": p.get(
+                "symbol",
+                bx_symbol,
+            ),
             "positionSide": direction,
             "avgPrice": avg_price,
             "positionAmt": qty,
             "entryPrice": float(
-                position.get(
+                p.get(
                     "entryPrice",
                     0,
                 )
@@ -1210,362 +1237,84 @@ def get_position_directional(
     }
 
 
-def has_open_position(
-    symbol: str,
-    direction: str,
-) -> bool:
-
-    position = (
-        get_position_directional(
-            symbol,
-            direction,
-        )
-    )
-
-    return (
-        position.get(
-            "status"
-        )
-        == "found"
-    )
-
-
 def wait_for_position_fill_directional(
     symbol: str,
     direction: str,
     timeout_sec: int = 30,
     poll_interval: float = 1.0,
 ) -> dict:
-
     started = time.time()
 
+    print(
+        f"[POSITION_WAIT_START] "
+        f"symbol={symbol} "
+        f"direction={direction} "
+        f"timeout={timeout_sec}s"
+    )
+
     while (
-        time.time()
-        - started
+        time.time() - started
         < timeout_sec
     ):
-
-        position = (
-            get_position_directional(
-                symbol,
-                direction,
-            )
+        pos = get_position_directional(
+            symbol,
+            direction,
         )
 
-        if (
-            position.get(
-                "status"
-            )
-            == "found"
-        ):
-
-            log.info(
-                f"[{symbol}] "
-                f"directional position confirmed: "
-                f"side={direction} "
-                f"avgPrice="
-                f"{position.get('avgPrice')} "
-                f"qty="
-                f"{position.get('positionAmt')}"
+        if pos.get(
+            "status"
+        ) == "found":
+            print(
+                f"[POSITION_CONFIRMED] "
+                f"symbol={symbol} "
+                f"direction={direction} "
+                f"avgPrice={pos.get('avgPrice')} "
+                f"qty={pos.get('positionAmt')}"
             )
 
-            return position
+            return pos
 
         time.sleep(
             poll_interval
         )
 
+    print(
+        f"[POSITION_WAIT_TIMEOUT] "
+        f"symbol={symbol} "
+        f"direction={direction}"
+    )
+
     return {
         "status": "timeout",
-        "symbol": to_bx_symbol(
-            symbol
-        ),
+        "symbol": to_bx_symbol(symbol),
         "positionSide": direction,
     }
 
-
-# ============================================================================
-# MARKET ENTRY
-# ============================================================================
-
-def open_market(
-    symbol: str,
-    direction: str,
-    price: float,
-    trade_id: str,
-) -> dict:
-
-    bx_symbol = to_bx_symbol(
-        symbol
-    )
-
-    if not bx_symbol:
-        return {
-            "status": "error",
-            "error": "contract_not_found",
-        }
-
-    contract = (
-        get_contract(symbol)
-        or {}
-    )
-
-    if not contract_exists(
-        symbol
-    ):
-        return {
-            "status": "error",
-            "error": (
-                "contract_unavailable"
-            ),
-            "symbol": bx_symbol,
-        }
-
-    if has_open_position(
-        symbol,
-        direction,
-    ):
-        return {
-            "status": "existing_position",
-            "symbol": bx_symbol,
-        }
-
-    try:
-        quantity_precision = int(
-            contract.get(
-                "quantityPrecision"
-            )
-            or 0
-        )
-    except Exception:
-        quantity_precision = 0
-
-    min_qty = float(
-        contract.get(
-            "tradeMinQuantity"
-        )
-        or contract.get(
-            "minQty"
-        )
-        or 0
-    )
-
-    multiplier = float(
-        contract.get(
-            "multiplier"
-        )
-        or 1
-    )
-
-    max_lev = int(
-        contract.get(
-            "maxLongLeverage"
-        )
-        or contract.get(
-            "maxLeverage"
-        )
-        or MAX_LEVERAGE
-    )
-
-    leverage = min(
-        LEVERAGE,
-        max_lev,
-    )
-
-    quantity = (
-        MARGIN_USDT
-        * leverage
-    ) / max(
-        price
-        * multiplier,
-        1e-12,
-    )
-
-    quantity = _round_qty(
-        quantity,
-        quantity_precision,
-    )
-
-    if (
-        quantity < min_qty
-    ):
-
-        required_leverage = math.ceil(
-            (
-                min_qty
-                * price
-                * multiplier
-            )
-            / max(
-                MARGIN_USDT,
-                1e-9,
-            )
-        )
-
-        leverage = min(
-            max(
-                required_leverage,
-                leverage,
-            ),
-            max_lev,
-        )
-
-        quantity = (
-            MARGIN_USDT
-            * leverage
-        ) / max(
-            price
-            * multiplier,
-            1e-12,
-        )
-
-        quantity = _round_qty(
-            quantity,
-            quantity_precision,
-        )
-
-    if (
-        quantity <= 0
-        or quantity < min_qty
-    ):
-        return {
-            "status": "error",
-            "error": (
-                f"qty={quantity} "
-                f"< min_qty={min_qty}"
-            ),
-        }
-
-    _set_leverage(
-        bx_symbol,
-        leverage,
-    )
-
-    direction = str(
-        direction
-    ).upper()
-
-    if direction == "LONG":
-        side = "BUY"
-    elif direction == "SHORT":
-        side = "SELL"
-    else:
-        return {
-            "status": "error",
-            "error": (
-                f"invalid direction="
-                f"{direction}"
-            ),
-        }
-
-    client_order_id = (
-        f"EVT_OPEN_"
-        f"{trade_id[:24]}"
-    )[:32]
-
-    params = {
-        "symbol": bx_symbol,
-        "side": side,
-        "positionSide": direction,
-        "type": "MARKET",
-        "quantity": _format_qty(
-            quantity,
-            quantity_precision,
-        ),
-        "clientOrderId": client_order_id,
-    }
-
-    response = _request(
-        "POST",
-        ORDER_PATH,
-        params,
-    )
-
-    if response.get(
-        "code"
-    ) != 0:
-        return {
-            "status": "error",
-            "error": str(
-                response.get(
-                    "msg"
-                )
-            ),
-            "symbol": bx_symbol,
-            "response": response,
-        }
-
-    order = (
-        (
-            response.get(
-                "data"
-            )
-            or {}
-        ).get(
-            "order"
-        )
-        or {}
-    )
-
-    return {
-        "status": "opened",
-        "symbol": bx_symbol,
-        "qty": quantity,
-        "leverage": leverage,
-        "order_id": (
-            order.get(
-                "orderId"
-            )
-            or None
-        ),
-        "client_order_id": (
-            order.get(
-                "clientOrderId"
-            )
-            or client_order_id
-        ),
-        "response": response,
-    }
-
-
-# ============================================================================
-# EXISTING OPEN PROTECTION
-# ============================================================================
 
 def get_open_protection_directional(
     symbol: str,
     direction: str,
 ) -> dict:
-
-    bx_symbol = to_bx_symbol(
-        symbol
-    )
-
+    bx_symbol = to_bx_symbol(symbol)
     direction = str(
         direction
     ).upper()
 
-    response = _request(
+    resp = _request(
         "GET",
         OPEN_ORDERS_PATH,
         {
             "symbol": bx_symbol,
         },
-        signed=True,
     )
 
-    if response.get(
-        "code"
-    ) != 0:
-
+    if resp.get("code") != 0:
         return {
             "status": "error",
             "error": (
                 f"openOrders failed: "
-                f"code="
-                f"{response.get('code')} "
-                f"msg="
-                f"{response.get('msg')}"
+                f"code={resp.get('code')} "
+                f"msg={resp.get('msg')}"
             ),
             "tp_orders": [],
             "sl_orders": [],
@@ -1575,9 +1324,8 @@ def get_open_protection_directional(
     sl_orders = []
 
     for order in _normalize_orders_list(
-        response
+        resp
     ):
-
         position_side = str(
             order.get(
                 "positionSide",
@@ -1602,17 +1350,13 @@ def get_open_protection_directional(
             "TAKE_PROFIT",
             "TAKE_PROFIT_MARKET",
         ):
-            tp_orders.append(
-                order
-            )
+            tp_orders.append(order)
 
         elif order_type in (
             "STOP",
             "STOP_MARKET",
         ):
-            sl_orders.append(
-                order
-            )
+            sl_orders.append(order)
 
     return {
         "status": "ok",
@@ -1623,76 +1367,55 @@ def get_open_protection_directional(
     }
 
 
-# ============================================================================
-# PROTECTION
-# ============================================================================
-
-def _directional_qty(
+def _round_qty(
     qty: float,
     precision: int,
 ) -> float:
-    return _round_qty(
-        float(qty),
-        int(precision),
+    if precision < 0:
+        return float(qty)
+
+    return float(
+        Decimal(str(qty)).quantize(
+            Decimal(1).scaleb(
+                -precision
+            ),
+            rounding=ROUND_DOWN,
+        )
     )
 
 
-def _directional_protection_prices(
-    avg_price: float,
-    direction: str,
-    stop_loss_pct: float,
-    tp1_pct: float,
-    tp2_pct: float,
-    tp3_pct: float,
-) -> dict:
+def _format_qty(
+    qty: float,
+    precision: int,
+) -> str:
+    return f"{qty:.{precision}f}"
 
-    direction = str(
-        direction
-    ).upper()
 
-    if direction == "LONG":
-        return {
-            "sl": avg_price * (
-                1.0
-                - stop_loss_pct / 100.0
-            ),
-            "tp1": avg_price * (
-                1.0
-                + tp1_pct / 100.0
-            ),
-            "tp2": avg_price * (
-                1.0
-                + tp2_pct / 100.0
-            ),
-            "tp3": avg_price * (
-                1.0
-                + tp3_pct / 100.0
-            ),
-        }
+def _format_price(
+    price: float,
+    precision: int,
+) -> str:
+    return f"{price:.{precision}f}"
 
-    if direction == "SHORT":
-        return {
-            "sl": avg_price * (
-                1.0
-                + stop_loss_pct / 100.0
-            ),
-            "tp1": avg_price * (
-                1.0
-                - tp1_pct / 100.0
-            ),
-            "tp2": avg_price * (
-                1.0
-                - tp2_pct / 100.0
-            ),
-            "tp3": avg_price * (
-                1.0
-                - tp3_pct / 100.0
-            ),
-        }
 
-    raise ValueError(
-        f"invalid direction="
-        f"{direction}"
+def build_tp_client_order_id(
+    leg: str,
+    trade_id: str | None = None,
+) -> str:
+    token = uuid.uuid4().hex.upper()[:16]
+
+    return (
+        f"EVT_{str(leg).upper()}_{token}"
+    )
+
+
+def build_sl_client_order_id(
+    trade_id: str | None = None,
+) -> str:
+    token = uuid.uuid4().hex.upper()[:16]
+
+    return (
+        f"EVT_SL_{token}"
     )
 
 
@@ -1705,18 +1428,6 @@ def ensure_directional_protection(
     tp_levels: list,
     trade_id: str | None = None,
 ) -> dict:
-    """
-    Устанавливает Exchange TP/SL для уже открытой позиции.
-
-    LONG:
-      entry BUY
-      TP/SL close SELL positionSide=LONG
-
-    SHORT:
-      entry SELL
-      TP/SL close BUY positionSide=SHORT
-    """
-
     direction = str(
         direction
     ).upper()
@@ -1728,8 +1439,7 @@ def ensure_directional_protection(
         return {
             "status": "error",
             "error": (
-                f"invalid direction="
-                f"{direction}"
+                f"invalid direction={direction}"
             ),
         }
 
@@ -1750,12 +1460,9 @@ def ensure_directional_protection(
         TypeError,
         ValueError,
     ) as exc:
-
         return {
             "status": "error",
-            "error": str(
-                exc
-            ),
+            "error": str(exc),
         }
 
     if avg_price <= 0:
@@ -1771,31 +1478,19 @@ def ensure_directional_protection(
         }
 
     if not (
-        0
-        < stop_loss_pct
-        <= 25
+        0 < stop_loss_pct <= 25
     ):
         return {
             "status": "error",
             "error": (
-                "invalid stop_loss_pct="
+                f"invalid stop_loss_pct="
                 f"{stop_loss_pct}"
             ),
         }
 
-    bx_symbol = to_bx_symbol(
-        symbol
-    )
+    bx_symbol = to_bx_symbol(symbol)
 
-    if not bx_symbol:
-        return {
-            "status": "error",
-            "error": "contract_not_found",
-        }
-
-    contract = contracts().get(
-        bx_symbol
-    )
+    contract = get_contract(symbol)
 
     if not contract:
         return {
@@ -1817,20 +1512,18 @@ def ensure_directional_protection(
         contract.get(
             "pricePrecision"
         )
-        or 8
+        or 4
     )
 
     min_qty = float(
         contract.get(
             "tradeMinQuantity"
         )
-        or contract.get(
-            "minQty"
-        )
+        or contract.get("minQty")
         or 0
     )
 
-    position_qty = _directional_qty(
+    position_qty = _round_qty(
         qty,
         precision,
     )
@@ -1849,6 +1542,13 @@ def ensure_directional_protection(
                 f"< minQty={min_qty}"
             ),
         }
+
+    print(
+        f"[PROTECTION_CHECK] "
+        f"symbol={bx_symbol} "
+        f"direction={direction} "
+        f"qty={position_qty}"
+    )
 
     existing = (
         get_open_protection_directional(
@@ -1876,32 +1576,29 @@ def ensure_directional_protection(
         )
     )
 
-    close_side = (
+    print(
+        f"[PROTECTION_EXISTING] "
+        f"symbol={bx_symbol} "
+        f"direction={direction} "
+        f"tp={len(existing_tp)} "
+        f"sl={len(existing_sl)}"
+    )
+
+    tp_side = (
         "SELL"
         if direction == "LONG"
         else "BUY"
     )
 
-    # ================================================================
-    # NORMALIZE TP LEVELS
-    # ================================================================
+    sl_side = tp_side
 
     normalized_levels = []
 
-    for index, tp in enumerate(
-        tp_levels
-    ):
-
-        if not isinstance(
-            tp,
-            dict,
-        ):
-            continue
-
+    for tp in tp_levels:
         leg = str(
             tp.get(
                 "leg",
-                f"tp{index + 1}",
+                f"tp{len(normalized_levels) + 1}",
             )
         )
 
@@ -1910,7 +1607,6 @@ def ensure_directional_protection(
                 "pnl_pct",
                 0,
             )
-            or 0
         )
 
         fraction = float(
@@ -1918,13 +1614,12 @@ def ensure_directional_protection(
                 "close_fraction",
                 0,
             )
-            or 0
         )
 
-        if pnl_pct <= 0:
-            continue
-
-        if fraction <= 0:
+        if (
+            pnl_pct <= 0
+            or fraction <= 0
+        ):
             continue
 
         normalized_levels.append(
@@ -1942,9 +1637,7 @@ def ensure_directional_protection(
         }
 
     fraction_sum = sum(
-        x[
-            "close_fraction"
-        ]
+        x["close_fraction"]
         for x in normalized_levels
     )
 
@@ -1954,59 +1647,34 @@ def ensure_directional_protection(
             "error": "invalid TP fractions",
         }
 
-    for level in (
-        normalized_levels
-    ):
-        level[
-            "close_fraction"
-        ] /= fraction_sum
-
-    # ================================================================
-    # CREATE TP
-    # ================================================================
+    for x in normalized_levels:
+        x["close_fraction"] /= fraction_sum
 
     tp_results = []
 
-    for level in (
-        normalized_levels
-    ):
-
-        leg = level[
-            "leg"
-        ]
-
-        pnl_pct = level[
-            "pnl_pct"
-        ]
+    for level in normalized_levels:
+        leg = level["leg"]
+        pnl_pct = level["pnl_pct"]
 
         existing_leg = None
 
-        for order in (
-            existing_tp
-        ):
-
-            client_id = str(
+        for order in existing_tp:
+            cid = str(
                 order.get(
                     "clientOrderId",
                     "",
                 )
             )
 
-            if (
-                leg.lower()
-                in client_id.lower()
-            ):
+            if leg.upper() in cid.upper():
                 existing_leg = order
                 break
 
         if existing_leg:
-
             tp_results.append(
                 {
                     "leg": leg,
-                    "status": (
-                        "already_exists"
-                    ),
+                    "status": "already_exists",
                     "order_id": str(
                         existing_leg.get(
                             "orderId",
@@ -2030,24 +1698,19 @@ def ensure_directional_protection(
             continue
 
         if direction == "LONG":
-
             tp_price = avg_price * (
                 1.0
                 + pnl_pct / 100.0
             )
-
         else:
-
             tp_price = avg_price * (
                 1.0
                 - pnl_pct / 100.0
             )
 
-        tp_qty = _directional_qty(
+        tp_qty = _round_qty(
             position_qty
-            * level[
-                "close_fraction"
-            ],
+            * level["close_fraction"],
             precision,
         )
 
@@ -2058,19 +1721,13 @@ def ensure_directional_protection(
                 and tp_qty < min_qty
             )
         ):
-
             return {
                 "status": "error",
                 "error": (
-                    f"{leg}: qty="
-                    f"{tp_qty} "
-                    f"< minQty="
-                    f"{min_qty}"
+                    f"{leg}: qty={tp_qty} "
+                    f"< minQty={min_qty}"
                 ),
                 "tp_orders": tp_results,
-                "sl_result": {
-                    "status": "not_created",
-                },
             }
 
         client_order_id = (
@@ -2082,7 +1739,7 @@ def ensure_directional_protection(
 
         params = {
             "symbol": bx_symbol,
-            "side": close_side,
+            "side": tp_side,
             "positionSide": direction,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(
@@ -2096,83 +1753,80 @@ def ensure_directional_protection(
             "clientOrderId": client_order_id,
         }
 
-        response = _request(
+        print(
+            f"[TP_ORDER_REQUEST] "
+            f"symbol={bx_symbol} "
+            f"direction={direction} "
+            f"leg={leg} "
+            f"price={params['stopPrice']} "
+            f"qty={params['quantity']} "
+            f"clientOrderId={client_order_id}"
+        )
+
+        resp = _request(
             "POST",
             ORDER_PATH,
             params,
-            signed=True,
         )
 
-        if response.get(
-            "code"
-        ) != 0:
+        print(
+            f"[TP_ORDER_RESPONSE] "
+            f"symbol={bx_symbol} "
+            f"direction={direction} "
+            f"leg={leg} "
+            f"clientOrderId={client_order_id} "
+            f"response={resp!r}"
+        )
 
+        if resp.get("code") != 0:
             return {
                 "status": "error",
                 "error": (
                     f"{leg} TP failed: "
-                    f"code="
-                    f"{response.get('code')} "
-                    f"msg="
-                    f"{response.get('msg')}"
+                    f"code={resp.get('code')} "
+                    f"msg={resp.get('msg')}"
                 ),
                 "tp_orders": tp_results,
-                "sl_result": {
-                    "status": "not_created",
-                },
-                "response": response,
             }
 
         order = (
             (
-                response.get(
-                    "data"
-                )
+                resp.get("data")
                 or {}
-            ).get(
-                "order"
-            )
+            ).get("order")
             or {}
         )
 
-        result = {
-            "leg": leg,
-            "status": "created",
-            "order_id": str(
-                order.get(
-                    "orderId",
-                    "",
-                )
-            ),
-            "client_order_id": (
-                order.get(
-                    "clientOrderId"
-                )
-                or client_order_id
-            ),
-            "price": tp_price,
-            "qty": tp_qty,
-            "pnl_pct": pnl_pct,
-        }
-
         tp_results.append(
-            result
+            {
+                "leg": leg,
+                "status": "created",
+                "order_id": str(
+                    order.get(
+                        "orderId",
+                        "",
+                    )
+                ),
+                "client_order_id": (
+                    order.get(
+                        "clientOrderId"
+                    )
+                    or client_order_id
+                ),
+                "price": tp_price,
+                "qty": tp_qty,
+                "pnl_pct": pnl_pct,
+            }
         )
 
         log.info(
-            f"[{symbol}] "
-            f"{direction} "
+            f"[{symbol}] {direction} "
             f"{leg} TP created: "
             f"price={tp_price} "
             f"qty={tp_qty}"
         )
 
-    # ================================================================
-    # CREATE SL
-    # ================================================================
-
     if existing_sl:
-
         sl = existing_sl[0]
 
         sl_result = {
@@ -2197,16 +1851,21 @@ def ensure_directional_protection(
         }
 
     else:
-
         if direction == "LONG":
-            sl_price = avg_price * (
-                1.0
-                - stop_loss_pct / 100.0
+            sl_price = (
+                avg_price
+                * (
+                    1.0
+                    - stop_loss_pct / 100.0
+                )
             )
         else:
-            sl_price = avg_price * (
-                1.0
-                + stop_loss_pct / 100.0
+            sl_price = (
+                avg_price
+                * (
+                    1.0
+                    + stop_loss_pct / 100.0
+                )
             )
 
         client_order_id = (
@@ -2217,7 +1876,7 @@ def ensure_directional_protection(
 
         params = {
             "symbol": bx_symbol,
-            "side": close_side,
+            "side": sl_side,
             "positionSide": direction,
             "type": "STOP_MARKET",
             "stopPrice": _format_price(
@@ -2231,48 +1890,52 @@ def ensure_directional_protection(
             "clientOrderId": client_order_id,
         }
 
-        response = _request(
+        print(
+            f"[SL_ORDER_REQUEST] "
+            f"symbol={bx_symbol} "
+            f"direction={direction} "
+            f"price={params['stopPrice']} "
+            f"qty={params['quantity']} "
+            f"clientOrderId={client_order_id}"
+        )
+
+        resp = _request(
             "POST",
             ORDER_PATH,
             params,
-            signed=True,
         )
 
-        if response.get(
-            "code"
-        ) != 0:
+        print(
+            f"[SL_ORDER_RESPONSE] "
+            f"symbol={bx_symbol} "
+            f"direction={direction} "
+            f"clientOrderId={client_order_id} "
+            f"response={resp!r}"
+        )
 
+        if resp.get("code") != 0:
             return {
                 "status": "TP_PLACED_SL_FAILED",
                 "error": (
                     f"SL failed: "
-                    f"code="
-                    f"{response.get('code')} "
-                    f"msg="
-                    f"{response.get('msg')}"
+                    f"code={resp.get('code')} "
+                    f"msg={resp.get('msg')}"
                 ),
                 "tp_orders": tp_results,
                 "sl_result": {
                     "status": "error",
                     "error": (
-                        f"code="
-                        f"{response.get('code')} "
-                        f"msg="
-                        f"{response.get('msg')}"
+                        f"code={resp.get('code')} "
+                        f"msg={resp.get('msg')}"
                     ),
                 },
-                "response": response,
             }
 
         order = (
             (
-                response.get(
-                    "data"
-                )
+                resp.get("data")
                 or {}
-            ).get(
-                "order"
-            )
+            ).get("order")
             or {}
         )
 
@@ -2295,61 +1958,39 @@ def ensure_directional_protection(
         }
 
         log.info(
-            f"[{symbol}] "
-            f"{direction} SL created: "
+            f"[{symbol}] {direction} "
+            f"SL created: "
             f"stop={sl_price} "
             f"qty={position_qty}"
         )
 
-    # ================================================================
-    # FINAL RESULT
-    # ================================================================
-
     tp_ok = (
         len(tp_results)
-        == len(
-            normalized_levels
-        )
-        and all(
-            str(
-                x.get(
-                    "status",
-                    ""
-                )
-            ).lower()
-            in {
-                "created",
-                "already_exists",
-            }
-            for x in tp_results
-        )
+        == len(normalized_levels)
     )
 
-    sl_ok = (
-        str(
-            sl_result.get(
-                "status",
-                "",
-            )
-        ).lower()
-        in {
-            "created",
-            "already_exists",
-        }
+    sl_ok = sl_result.get(
+        "status"
+    ) in (
+        "created",
+        "already_exists",
     )
 
     if tp_ok and sl_ok:
         final_status = "PROTECTED"
-
     elif tp_ok:
-        final_status = (
-            "TP_PLACED_SL_FAILED"
-        )
-
+        final_status = "TP_PLACED_SL_FAILED"
     else:
-        final_status = (
-            "PROTECTION_FAILED"
-        )
+        final_status = "PROTECTION_FAILED"
+
+    print(
+        f"[PROTECTION_FINAL] "
+        f"symbol={bx_symbol} "
+        f"direction={direction} "
+        f"status={final_status} "
+        f"tp={len(tp_results)}/{len(normalized_levels)} "
+        f"sl={'OK' if sl_ok else 'FAILED'}"
+    )
 
     return {
         "status": final_status,
