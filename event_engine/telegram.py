@@ -88,12 +88,22 @@ def format_signal(
         ]
 
     if coinalyze_row is not None:
+        oi_chg = getattr(coinalyze_row, "oi_chg4h_pct", None)
+        # Защита от искажения денежных сумм в проценты (-1300000%)
+        if oi_chg is not None:
+            if abs(oi_chg) > 1000:
+                oi_chg_str = f"${oi_chg:,.0f}"
+            else:
+                oi_chg_str = f"{oi_chg:.2f}%"
+        else:
+            oi_chg_str = "—"
+
         lines += [
             "",
             "<b>Coinalyze</b>",
             f"Vol24H: <code>{esc(getattr(coinalyze_row, 'volume24', None))}</code>",
             f"OI: <code>{esc(getattr(coinalyze_row, 'oi', None))}</code>",
-            f"OI Chg 4H: <code>{esc(getattr(coinalyze_row, 'oi_chg4h_pct', None))}%</code>",
+            f"OI Chg 4H: <code>{esc(oi_chg_str)}</code>",
             f"Funding OI-W: <code>{esc(getattr(coinalyze_row, 'fr_oiw', None))}</code>",
         ]
 
@@ -111,9 +121,9 @@ def format_signal(
         lines += [
             "",
             "<b>EXECUTION</b>",
-            f"Mode: <code>{esc(execution.get('mode', 'vst'))}</code>",
-            f"Status: <code>{esc(execution.get('status'))}</code>",
-            f"Order: <code>{esc(execution.get('order_id'))}</code>",
+            f"Mode: <code>{esc(execution.get("mode", "vst"))}</code>",
+            f"Status: <code>{esc(execution.get("status"))}</code>",
+            f"Order: <code>{esc(execution.get("order_id"))}</code>",
         ]
 
     lines += ["", "⚡ Event-driven — 5×5m lifecycle is NOT used"]
