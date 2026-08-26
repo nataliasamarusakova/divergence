@@ -1,9 +1,3 @@
-
-"""
-bingx.py
-"""
-
-
 from __future__ import annotations
 
 import hashlib
@@ -427,9 +421,9 @@ def has_open_position(symbol: str, direction: str) -> bool:
     return False
 
 
-def _new_open_client_order_id(bx_symbol: str) -> str:
-    token = uuid.uuid4().hex.upper()[:20]
-    return f"EVT_OPEN_{token}"
+def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
+    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:24]
+    return f"EVT_OPEN_{digest}"
 
 
 def open_market(
@@ -476,10 +470,16 @@ def open_market(
     if qty <= 0 or qty < min_qty:
         return {"status": "error", "error": f"qty={qty} < min_qty={min_qty}", "symbol": bx, "qty": qty, "min_qty": min_qty}
 
-    _set_leverage(bx, leverage)
+    if not _set_leverage(bx, leverage):
+        return {
+            "status": "error",
+            "error": f"failed to set leverage={leverage}",
+            "symbol": bx,
+            "leverage": leverage,
+        }
 
     side = "BUY" if direction == "LONG" else "SELL"
-    client_order_id = _new_open_client_order_id(bx)
+    client_order_id = _new_open_client_order_id(bx, trade_id)
 
     params = {
         "symbol": bx,
@@ -964,4 +964,3 @@ def ensure_directional_protection(
         "tp_orders": tp_results,
         "sl_result": sl_result,
     }
-
