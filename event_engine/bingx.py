@@ -151,7 +151,12 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
         )
 
     rows = resp.get("data") or []
-
+    if rows and isinstance(rows[0], dict):
+        print(
+            "[BINGX_KLINE_FIELDS]",
+            bx,
+            sorted(rows[0].keys())
+        )
     if not isinstance(rows, list):
         raise RuntimeError(
             f"Unexpected BingX klines payload "
