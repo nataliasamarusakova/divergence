@@ -1,6 +1,5 @@
-"""
-shadow.py
-"""
+# shadow.py
+
 
 from __future__ import annotations
 
@@ -102,3 +101,4 @@ def append_shadow_health(events_path: Path, health_path: Path, trades_path: Path
         f"Trades={tr['opened']}/{tr['total']}"
     )
     return snapshot
+
