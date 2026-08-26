@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -15,7 +16,9 @@ from event_engine.bingx import (
     fetch_klines,
     open_market,
     wait_for_position_fill_directional,
+    get_positions,
     get_position_directional,
+    get_open_protection_directional,
     ensure_directional_protection,
 )
 from event_engine.signals import (
@@ -261,40 +264,102 @@ def install_protection(
         return {"status": "PROTECTION_EXCEPTION", "error": str(exc)}
 
 
-def reconcile_existing_position(symbol: str, direction: str, setup: dict, event_id: str) -> dict:
-    direction = str(direction).upper()
+def reconcile_all_open_positions() -> None:
+    """Проверяет ВСЕ реально открытые позиции на BingX и автоматически ставит недостающие SL/TP."""
     try:
-        position = get_position_directional(symbol=symbol, direction=direction)
+        positions = get_positions()
     except Exception as exc:
-        return {"status": "ALREADY_EXECUTED_POSITION_ERROR", "mode": EXECUTION_MODE, "order_id": None, "protection_status": "NOT_VERIFIED", "error": str(exc)}
+        print(f"[RECONCILIATION_ERROR] Failed to fetch positions: {exc}")
+        return
 
-    if not isinstance(position, dict) or str(position.get("status", "")).lower() != "found":
-        return {"status": "ALREADY_EXECUTED_POSITION_NOT_FOUND", "mode": EXECUTION_MODE, "order_id": None, "protection_status": "NOT_VERIFIED", "position": position}
+    for p in positions:
+        bx_symbol = str(p.get("symbol", "")).upper()
+        if not bx_symbol:
+            continue
 
-    try:
-        sl_pct, tp_levels = build_tp_levels(setup, direction)
-    except Exception as exc:
-        return {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None, "position": position, "protection_status": "SETUP_INVALID", "error": str(exc)}
+        position_side = str(p.get("positionSide", "")).upper()
+        try:
+            amt = float(p.get("positionAmt", 0) or 0)
+            avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
+        except (ValueError, TypeError):
+            continue
 
-    trade_id = event_id.replace("EVT_", "")
-    protection_result = install_protection(
-        symbol=symbol,
-        direction=direction,
-        position=position,
-        setup=setup,
-        sl_pct=sl_pct,
-        tp_levels=tp_levels,
-        trade_id=trade_id,
-    )
+        if amt == 0 or avg_price <= 0:
+            continue
 
-    return {
-        "status": "ALREADY_EXECUTED",
-        "mode": EXECUTION_MODE,
-        "order_id": None,
-        "position": position,
-        "protection": protection_result,
-        "protection_status": str(protection_result.get("status", "UNKNOWN")),
-    }
+        direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
+        qty = abs(amt)
+
+        # 1. Проверяем наличие стопа и тейков на бирже
+        prot = get_open_protection_directional(bx_symbol, direction)
+        sl_orders = prot.get("sl_orders", [])
+        tp_orders = prot.get("tp_orders", [])
+
+        if sl_orders and tp_orders:
+            continue  # Позиция уже полностью защищена
+
+        print(f"[RECONCILIATION] Найдена незащищенная позиция {bx_symbol} ({direction}, qty={qty}, avgPrice={avg_price}). Выставляем SL/TP...")
+
+        # 2. Вычисляем безопасные SL / TP по 1H ATR
+        sl_pct = 2.0
+        tp_pct = 4.0
+        try:
+            k1 = fetch_klines(bx_symbol, "1h", limit=30)
+            if len(k1) >= 20:
+                df1 = pd.DataFrame(k1)
+                for col in ("high", "low", "close"):
+                    df1[col] = pd.to_numeric(df1[col], errors="coerce")
+                prev_close = df1["close"].shift(1)
+                tr = pd.concat([df1["high"] - df1["low"], (df1["high"] - prev_close).abs(), (df1["low"] - prev_close).abs()], axis=1).max(axis=1)
+                atr = tr.rolling(14, min_periods=14).mean().iloc[-1]
+                if pd.notna(atr) and float(atr) > 0:
+                    risk_pct = max(0.50, min(float(atr) / avg_price * 100.0, 5.00))
+                    sl_pct = risk_pct
+                    tp_pct = risk_pct * 2.0
+        except Exception as exc:
+            print(f"[RECONCILIATION_ATR_ERROR] {bx_symbol}: {exc}")
+
+        tp_levels = [
+            {"leg": "tp1", "pnl_pct": round(tp_pct * 0.50, 6), "close_fraction": 0.30},
+            {"leg": "tp2", "pnl_pct": round(tp_pct * 0.75, 6), "close_fraction": 0.30},
+            {"leg": "tp3", "pnl_pct": round(tp_pct, 6), "close_fraction": 0.40},
+        ]
+
+        # 3. Устанавливаем защиту на BingX
+        res = ensure_directional_protection(
+            symbol=bx_symbol,
+            direction=direction,
+            avg_price=avg_price,
+            qty=qty,
+            stop_loss_pct=sl_pct,
+            tp_levels=tp_levels,
+            trade_id=f"REC_{int(time.time())}",
+        )
+
+        status = res.get("status")
+        print(f"[RECONCILIATION] Результат защиты {bx_symbol}: {status}")
+
+        if status in {"PROTECTED", "SL_ONLY"}:
+            register_active_trade(
+                event_id=f"RECON_{bx_symbol}_{int(time.time())}",
+                symbol=bx_symbol.replace("-USDT", ""),
+                name=bx_symbol.replace("-USDT", ""),
+                direction=direction,
+                entry_price=avg_price,
+                qty=qty,
+                tp_orders=res.get("tp_orders", []),
+                sl_result=res.get("sl_result", {}),
+                event_type="RECONCILED_POSITION",
+            )
+            send_tg(
+                f"🛡 <b>[ЗАЩИТА УСТАНОВЛЕНА] {bx_symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"Позиция на бирже успешно защищена:\n"
+                f"• Направление: <b>{direction}</b>\n"
+                f"• Цена входа: <code>{avg_price:.8g}</code>\n"
+                f"• SL: <code>{sl_pct:.2f}%</code>\n"
+                f"• TP: <code>+{tp_pct:.2f}%</code> (каскад)"
+            )
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
@@ -366,7 +431,14 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 
 def main() -> None:
+    # 1. АВТОМАТИЧЕСКАЯ РЕКОНСИЛЯЦИЯ ВСЕХ ОТКРЫТЫХ ПОЗИЦИЙ НА BINGX
     if EXECUTION_ENABLED:
+        try:
+            reconcile_all_open_positions()
+        except Exception as exc:
+            print(f"[RECONCILIATION_ERROR] {exc}")
+
+        # 2. Опрос жизненного цикла сделок (проверка тейков, безубыток, закрытие)
         try:
             update_active_trades()
         except Exception as exc:
@@ -506,7 +578,7 @@ def main() -> None:
         ev = opp["event"]
 
         if event_id in executed_event_ids:
-            execution_result = reconcile_existing_position(symbol=symbol, direction=direction, setup=setup, event_id=event_id) if EXECUTION_ENABLED else {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
+            execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
             execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
