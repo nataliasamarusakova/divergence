@@ -4,9 +4,8 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from event_engine.coinalyze import fetch_data
@@ -15,6 +14,9 @@ from event_engine.bingx import (
     get_contract,
     fetch_klines,
     open_market,
+    wait_for_position_fill_directional,
+    get_position_directional,
+    ensure_directional_protection,
 )
 from event_engine.signals import (
     add_cvd,
@@ -25,8 +27,10 @@ from event_engine.signals import (
 from event_engine.telegram import send as send_tg, format_signal
 
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
@@ -34,7 +38,6 @@ DATA.mkdir(exist_ok=True)
 EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
-
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "1000000"))
@@ -55,29 +58,17 @@ REQUIRE_TRIGGER = (
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "1"))
 
-KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "250"))
-KLINE_LIMIT_15M = int(os.environ.get("KLINE_LIMIT_15M", "250"))
+EXECUTION_MODE = os.environ.get(
+    "EXECUTION_MODE",
+    os.environ.get("BINGX_ENV", "vst"),
+)
 
-# ---------------------------------------------------------------------
-# EXECUTION RISK PARAMETERS
-# ---------------------------------------------------------------------
+POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE")
 
-# Структурный buffer для дивергенции.
-SWING_BUFFER_ATR = float(os.environ.get("SWING_BUFFER_ATR", "0.25"))
 
-# Для squeeze нет P2 structural swing, поэтому используется ATR.
-SQUEEZE_SL_ATR = float(os.environ.get("SQUEEZE_SL_ATR", "1.0"))
-
-# Минимальный R:R.
-MIN_RR = float(os.environ.get("MIN_RR", "2.0"))
-
-# TP = entry + RR * risk.
-TARGET_R_MULTIPLE = float(os.environ.get("TARGET_R_MULTIPLE", "2.0"))
-
-# Дополнительная защита от ненормальных стопов.
-MIN_SL_PCT = float(os.environ.get("MIN_SL_PCT", "0.20"))
-MAX_SL_PCT = float(os.environ.get("MAX_SL_PCT", "15.0"))
-
+# ============================================================================
+# FILE HELPERS
+# ============================================================================
 
 def load_ids(path: Path) -> set[str]:
     if not path.exists():
@@ -91,10 +82,11 @@ def load_ids(path: Path) -> set[str]:
 
         try:
             value = json.loads(line).get("event_id")
-            if value:
-                ids.add(value)
         except Exception:
             continue
+
+        if value:
+            ids.add(str(value))
 
     return ids
 
@@ -103,7 +95,13 @@ def append_jsonl(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(
+            json.dumps(
+                obj,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
 
 def emit_event(ev: dict) -> None:
@@ -118,270 +116,655 @@ def record_action(obj: dict) -> None:
     append_jsonl(ACTIONS, obj)
 
 
-# =====================================================================
-# INDICATORS
-# =====================================================================
+# ============================================================================
+# SETUP
+# ============================================================================
 
-def calculate_atr(
-    df: pd.DataFrame,
-    length: int = 14,
-) -> pd.Series:
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    close = pd.to_numeric(df["close"], errors="coerce")
+def build_event_setup(
+    ev: dict,
+    df_1h: pd.DataFrame,
+    entry_price: float,
+) -> dict:
+    """
+    Формирует торговый Setup независимо от EventObject.
 
-    prev_close = close.shift(1)
+    Приоритет:
+    1. готовые SL/TP внутри event;
+    2. ATR-based fallback.
+
+    Для LONG:
+        SL < Entry < TP
+
+    Для SHORT:
+        TP < Entry < SL
+    """
+
+    direction = str(
+        ev.get("direction", "LONG")
+    ).upper()
+
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(
+            f"Unsupported direction={direction}"
+        )
+
+    entry_price = float(entry_price)
+
+    if entry_price <= 0:
+        raise ValueError(
+            f"Invalid entry_price={entry_price}"
+        )
+
+    # ----------------------------------------------------------------------
+    # 1. Проверяем готовый setup внутри event
+    # ----------------------------------------------------------------------
+
+    candidates = [
+        ev.get("setup"),
+        ev.get("event_fact"),
+        ev,
+    ]
+
+    invalidation = None
+    target = None
+
+    for src in candidates:
+        if not isinstance(src, dict):
+            continue
+
+        if invalidation is None:
+            invalidation = src.get(
+                "invalidation_price"
+            )
+
+        if target is None:
+            target = src.get(
+                "target_price"
+            )
+
+    if invalidation is not None and target is not None:
+        invalidation = float(invalidation)
+        target = float(target)
+
+        if direction == "LONG":
+            valid_geometry = (
+                invalidation < entry_price
+                and target > entry_price
+            )
+        else:
+            valid_geometry = (
+                invalidation > entry_price
+                and target < entry_price
+            )
+
+        if valid_geometry:
+            risk_pct = (
+                abs(entry_price - invalidation)
+                / entry_price
+                * 100.0
+            )
+
+            reward_pct = (
+                abs(target - entry_price)
+                / entry_price
+                * 100.0
+            )
+
+            rr = (
+                reward_pct / risk_pct
+                if risk_pct > 0
+                else None
+            )
+
+            if rr is not None and rr > 0:
+                return {
+                    "entry_reference": entry_price,
+                    "invalidation_price": invalidation,
+                    "target_price": target,
+                    "rr": rr,
+                    "trigger_ok": True,
+                }
+
+    # ----------------------------------------------------------------------
+    # 2. ATR fallback
+    # ----------------------------------------------------------------------
+
+    df = df_1h.copy()
+
+    if len(df) < 20:
+        raise ValueError(
+            "insufficient 1H bars for setup"
+        )
+
+    for col in ("high", "low", "close"):
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+    prev_close = df["close"].shift(1)
 
     tr = pd.concat(
         [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    return tr.rolling(
-        window=length,
-        min_periods=length,
-    ).mean()
+    atr = (
+        tr
+        .rolling(
+            window=14,
+            min_periods=14,
+        )
+        .mean()
+        .iloc[-1]
+    )
 
+    if pd.isna(atr) or float(atr) <= 0:
+        raise ValueError(
+            "ATR unavailable"
+        )
 
-# =====================================================================
-# SETUP BUILDER
-# =====================================================================
+    atr = float(atr)
 
-def build_execution_setup(
-    event: dict,
-    df_1h: pd.DataFrame,
-) -> tuple[Optional[dict], Optional[str]]:
-    """
-    Строит executable risk geometry ДО open_market().
+    # Ограничиваем SL разумными границами.
+    risk_pct = (
+        atr / entry_price * 100.0
+    )
 
-    Дивергенция:
-        LONG  -> SL ниже P2 low
-        SHORT -> SL выше P2 high
-
-    Squeeze:
-        используется ATR-based invalidation.
-
-    TP рассчитывается от фиксированного R multiple.
-    """
-
-    if df_1h.empty or len(df_1h) < 20:
-        return None, "INSUFFICIENT_1H_DATA"
-
-    work = df_1h.copy().reset_index(drop=True)
-
-    for col in ("open", "high", "low", "close"):
-        work[col] = pd.to_numeric(work[col], errors="coerce")
-
-    work = work.dropna(
-        subset=["open", "high", "low", "close"]
-    ).reset_index(drop=True)
-
-    if len(work) < 20:
-        return None, "INVALID_1H_DATA"
-
-    work["atr14"] = calculate_atr(work, 14)
-
-    atr = float(work["atr14"].iloc[-1])
-    if not np.isfinite(atr) or atr <= 0:
-        return None, "INVALID_ATR"
-
-    direction = str(event.get("direction", "")).upper()
-
-    if direction not in {"LONG", "SHORT"}:
-        return None, "INVALID_DIRECTION"
-
-    event_type = str(event.get("event_type", ""))
-
-    event_fact = event.get("event_fact", {})
-
-    entry_price = event_fact.get("detection_close_price")
-
-    if entry_price is None:
-        entry_price = float(work["close"].iloc[-1])
-
-    entry_price = float(entry_price)
-
-    if not np.isfinite(entry_price) or entry_price <= 0:
-        return None, "INVALID_ENTRY_PRICE"
-
-    # ---------------------------------------------------------------
-    # 1. STRUCTURAL DIVERGENCE
-    # ---------------------------------------------------------------
-
-    p2_idx = None
-
-    timestamps = event.get("timestamps", {})
-    pivot_2_ts = timestamps.get("pivot_2_ts")
-
-    if "_RSI" in event_type or "BINGX_CVD" in event_type:
-        if pivot_2_ts is not None:
-            close_times = pd.to_numeric(
-                work["close_time"],
-                errors="coerce",
-            )
-
-            matches = np.where(
-                close_times.to_numpy(dtype=np.int64) == int(pivot_2_ts)
-            )[0]
-
-            if len(matches):
-                p2_idx = int(matches[-1])
-
-    if p2_idx is not None:
-        pivot_high = float(work["high"].iloc[p2_idx])
-        pivot_low = float(work["low"].iloc[p2_idx])
-
-        if direction == "LONG":
-            invalidation = pivot_low - SWING_BUFFER_ATR * atr
-
-            # Если detection close оказался ниже структуры,
-            # структурный SL уже бессмысленен.
-            if invalidation >= entry_price:
-                invalidation = entry_price - SWING_BUFFER_ATR * atr
-
-        else:
-            invalidation = pivot_high + SWING_BUFFER_ATR * atr
-
-            if invalidation <= entry_price:
-                invalidation = entry_price + SWING_BUFFER_ATR * atr
-
-        setup_type = "STRUCTURAL_DIVERGENCE"
-
-    # ---------------------------------------------------------------
-    # 2. SQUEEZE
-    # ---------------------------------------------------------------
-
-    elif event_type == "VOLATILITY_SQUEEZE_RELEASE":
-        if direction == "LONG":
-            invalidation = entry_price - SQUEEZE_SL_ATR * atr
-        else:
-            invalidation = entry_price + SQUEEZE_SL_ATR * atr
-
-        setup_type = "ATR_SQUEEZE"
-
-    else:
-        return None, "UNSUPPORTED_EVENT_TYPE"
-
-    # ---------------------------------------------------------------
-    # 3. RISK GEOMETRY
-    # ---------------------------------------------------------------
+    risk_pct = max(
+        0.50,
+        min(risk_pct, 5.00),
+    )
 
     if direction == "LONG":
-        risk = entry_price - invalidation
+        invalidation = (
+            entry_price
+            * (1.0 - risk_pct / 100.0)
+        )
+
+        target = (
+            entry_price
+            * (1.0 + 2.0 * risk_pct / 100.0)
+        )
+
     else:
-        risk = invalidation - entry_price
+        invalidation = (
+            entry_price
+            * (1.0 + risk_pct / 100.0)
+        )
 
-    if not np.isfinite(risk) or risk <= 0:
-        return None, "INVALID_RISK_DISTANCE"
+        target = (
+            entry_price
+            * (1.0 - 2.0 * risk_pct / 100.0)
+        )
 
-    risk_pct = risk / entry_price * 100.0
-
-    if risk_pct < MIN_SL_PCT:
-        return None, "SL_TOO_TIGHT"
-
-    if risk_pct > MAX_SL_PCT:
-        return None, "SL_TOO_WIDE"
-
-    target_distance = risk * TARGET_R_MULTIPLE
-
-    if direction == "LONG":
-        target_price = entry_price + target_distance
-    else:
-        target_price = entry_price - target_distance
-
-    rr = target_distance / risk
-
-    if not np.isfinite(rr) or rr < MIN_RR:
-        return None, "RR_BELOW_MINIMUM"
-
-    # Не допускаем неправильного расположения TP.
-    if direction == "LONG":
-        if target_price <= entry_price or invalidation >= entry_price:
-            return None, "INVALID_LONG_GEOMETRY"
-    else:
-        if target_price >= entry_price or invalidation <= entry_price:
-            return None, "INVALID_SHORT_GEOMETRY"
-
-    setup = {
-        "setup_type": setup_type,
+    return {
         "entry_reference": entry_price,
-        "invalidation_price": float(invalidation),
-        "target_price": float(target_price),
-        "risk_distance": float(risk),
-        "risk_pct": float(risk_pct),
-        "rr": float(rr),
-        "target_r_multiple": TARGET_R_MULTIPLE,
-        "atr14": float(atr),
+        "invalidation_price": invalidation,
+        "target_price": target,
+        "rr": 2.0,
         "trigger_ok": True,
     }
 
-    return setup, None
 
-
-# =====================================================================
-# CVD CONFIRMATION
-# =====================================================================
-
-def has_cvd_confirmation(
-    event: dict,
-    cvd_events: list[dict],
-) -> bool:
+def build_tp_levels(
+    setup: dict,
+    direction: str,
+) -> Tuple[float, List[dict]]:
     """
-    RSI divergence требует CVD на той же физической паре P1/P2
-    и том же направлении.
+    Формирует модельную защиту.
 
-    Squeeze здесь НЕ проверяется:
-    squeeze — отдельный event type.
+    SL:
+        весь остаток позиции защищается одним стопом.
+
+    TP:
+        TP1 = 30%
+        TP2 = 30%
+        TP3 = 40%
+
+    Важно:
+    total close_fraction = 1.0
     """
 
-    event_type = str(event.get("event_type", ""))
+    direction = str(direction).upper()
 
-    if "BINGX_CVD" in event_type:
-        return True
+    entry = float(
+        setup["entry_reference"]
+    )
 
-    if "_RSI" not in event_type:
-        return True
+    sl_price = float(
+        setup["invalidation_price"]
+    )
 
-    direction = event.get("direction")
-    timestamps = event.get("timestamps", {})
+    final_tp_price = float(
+        setup["target_price"]
+    )
 
-    p1 = timestamps.get("pivot_1_ts")
-    p2 = timestamps.get("pivot_2_ts")
+    if direction == "LONG":
+        sl_pct = (
+            entry - sl_price
+        ) / entry * 100.0
 
-    for other in cvd_events:
-        if other.get("direction") != direction:
-            continue
+        tp_pct = (
+            final_tp_price - entry
+        ) / entry * 100.0
 
-        other_ts = other.get("timestamps", {})
+    elif direction == "SHORT":
+        sl_pct = (
+            sl_price - entry
+        ) / entry * 100.0
 
-        if other_ts.get("pivot_1_ts") != p1:
-            continue
+        tp_pct = (
+            entry - final_tp_price
+        ) / entry * 100.0
 
-        if other_ts.get("pivot_2_ts") != p2:
-            continue
+    else:
+        raise ValueError(
+            f"Invalid direction={direction}"
+        )
 
-        return True
+    if sl_pct <= 0:
+        raise ValueError(
+            f"Invalid SL geometry: {sl_price}"
+        )
 
-    return False
+    if tp_pct <= 0:
+        raise ValueError(
+            f"Invalid TP geometry: {final_tp_price}"
+        )
+
+    tp_levels = [
+        {
+            "leg": "tp1",
+            "pnl_pct": round(
+                tp_pct * 0.50,
+                6,
+            ),
+            "close_fraction": 0.30,
+        },
+        {
+            "leg": "tp2",
+            "pnl_pct": round(
+                tp_pct * 0.75,
+                6,
+            ),
+            "close_fraction": 0.30,
+        },
+        {
+            "leg": "tp3",
+            "pnl_pct": round(
+                tp_pct,
+                6,
+            ),
+            "close_fraction": 0.40,
+        },
+    ]
+
+    return sl_pct, tp_levels
 
 
-# =====================================================================
+# ============================================================================
+# POSITION / PROTECTION
+# ============================================================================
+
+def reconcile_existing_position(
+    symbol: str,
+    direction: str,
+    setup: dict,
+    event_id: str,
+) -> dict:
+    """
+    Если событие уже было исполнено, НЕ открывает позицию повторно.
+
+    Вместо этого:
+        existing position
+            ↓
+        protection check/recovery
+    """
+
+    direction = str(direction).upper()
+
+    print(
+        f"[EXECUTION_RECONCILE] "
+        f"{symbol} direction={direction} "
+        f"event={event_id}"
+    )
+
+    try:
+        position = get_position_directional(
+            symbol=symbol,
+            direction=direction,
+        )
+    except TypeError:
+        # Поддерживаем также positional implementation.
+        position = get_position_directional(
+            symbol,
+            direction,
+        )
+
+    if not position:
+        return {
+            "status": "ALREADY_EXECUTED_POSITION_NOT_FOUND",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "protection_status": "NOT_VERIFIED",
+        }
+
+    print(
+        f"[POSITION_FOUND] "
+        f"{symbol} direction={direction} "
+        f"position={position}"
+    )
+
+    try:
+        sl_pct, tp_levels = build_tp_levels(
+            setup,
+            direction,
+        )
+
+        protection_result = ensure_directional_protection(
+            symbol=symbol,
+            direction=direction,
+            position=position,
+            setup=setup,
+            sl_pct=sl_pct,
+            tp_levels=tp_levels,
+        )
+
+    except TypeError:
+        # Совместимость с реализацией,
+        # где функция принимает позиционные аргументы.
+        protection_result = ensure_directional_protection(
+            symbol,
+            direction,
+            position,
+            setup,
+            sl_pct,
+            tp_levels,
+        )
+
+    return {
+        "status": "ALREADY_EXECUTED",
+        "mode": EXECUTION_MODE,
+        "order_id": position.get(
+            "order_id"
+        ) if isinstance(position, dict) else None,
+        "position": position,
+        "protection": protection_result,
+        "protection_status": (
+            protection_result.get("status")
+            if isinstance(
+                protection_result,
+                dict,
+            )
+            else "UNKNOWN"
+        ),
+    }
+
+
+def execute_new_position(
+    symbol: str,
+    direction: str,
+    price: float,
+    setup: dict,
+    event_id: str,
+) -> dict:
+    """
+    Event-driven execution.
+
+    OPEN
+      ↓
+    WAIT FOR POSITION
+      ↓
+    CONFIRMED POSITION
+      ↓
+    PROTECTION
+      ↓
+    OPENED_PROTECTED
+    """
+
+    direction = str(direction).upper()
+
+    # ----------------------------------------------------------------------
+    # 1. Open market order
+    # ----------------------------------------------------------------------
+
+    trade_id = event_id.replace(
+        "EVT_",
+        "",
+    )
+
+    print(
+        f"[EXECUTION_OPEN] "
+        f"{symbol} "
+        f"direction={direction} "
+        f"entry={price:.8g} "
+        f"event={event_id}"
+    )
+
+    try:
+        opened = open_market(
+            symbol,
+            direction,
+            price,
+            trade_id,
+        )
+    except Exception as exc:
+        return {
+            "status": "OPEN_EXCEPTION",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "error": str(exc),
+        }
+
+    if not isinstance(opened, dict):
+        return {
+            "status": "OPEN_INVALID_RESPONSE",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "raw": repr(opened),
+        }
+
+    open_status = str(
+        opened.get("status", "")
+    ).lower()
+
+    if open_status not in {
+        "opened",
+        "success",
+        "ok",
+    }:
+        return {
+            "status": "OPEN_FAILED",
+            "mode": EXECUTION_MODE,
+            "order_id": opened.get(
+                "order_id"
+            ),
+            "open_result": opened,
+        }
+
+    order_id = opened.get(
+        "order_id"
+    )
+
+    print(
+        f"[EXECUTION_ORDER_ACCEPTED] "
+        f"{symbol} "
+        f"direction={direction} "
+        f"order={order_id}"
+    )
+
+    # ----------------------------------------------------------------------
+    # 2. Wait for actual exchange position
+    # ----------------------------------------------------------------------
+
+    try:
+        position = wait_for_position_fill_directional(
+            symbol=symbol,
+            direction=direction,
+            timeout_sec=15,
+            poll_sec=0.5,
+        )
+    except TypeError:
+        try:
+            position = wait_for_position_fill_directional(
+                symbol,
+                direction,
+                15,
+                0.5,
+            )
+        except Exception as exc:
+            return {
+                "status": "POSITION_WAIT_FAILED",
+                "mode": EXECUTION_MODE,
+                "order_id": order_id,
+                "open_result": opened,
+                "error": str(exc),
+            }
+    except Exception as exc:
+        return {
+            "status": "POSITION_WAIT_FAILED",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+            "error": str(exc),
+        }
+
+    if not position:
+        return {
+            "status": "POSITION_NOT_CONFIRMED",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+        }
+
+    print(
+        f"[POSITION_CONFIRMED] "
+        f"{symbol} direction={direction} "
+        f"position={position}"
+    )
+
+    # ----------------------------------------------------------------------
+    # 3. Compute protection from actual setup
+    # ----------------------------------------------------------------------
+
+    try:
+        sl_pct, tp_levels = build_tp_levels(
+            setup,
+            direction,
+        )
+    except Exception as exc:
+        return {
+            "status": "PROTECTION_SETUP_INVALID",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "position": position,
+            "error": str(exc),
+        }
+
+    print(
+        f"[PROTECTION_PLAN] "
+        f"{symbol} "
+        f"direction={direction} "
+        f"sl_pct={sl_pct:.4f} "
+        f"tp_levels={tp_levels}"
+    )
+
+    # ----------------------------------------------------------------------
+    # 4. Install SL + TP
+    # ----------------------------------------------------------------------
+
+    try:
+        protection = ensure_directional_protection(
+            symbol=symbol,
+            direction=direction,
+            position=position,
+            setup=setup,
+            sl_pct=sl_pct,
+            tp_levels=tp_levels,
+        )
+    except TypeError:
+        try:
+            protection = ensure_directional_protection(
+                symbol,
+                direction,
+                position,
+                setup,
+                sl_pct,
+                tp_levels,
+            )
+        except Exception as exc:
+            protection = {
+                "status": "PROTECTION_EXCEPTION",
+                "error": str(exc),
+            }
+    except Exception as exc:
+        protection = {
+            "status": "PROTECTION_EXCEPTION",
+            "error": str(exc),
+        }
+
+    if not isinstance(protection, dict):
+        protection = {
+            "status": "UNKNOWN",
+            "raw": repr(protection),
+        }
+
+    protection_status = str(
+        protection.get("status", "")
+    ).lower()
+
+    print(
+        f"[PROTECTION_RESULT] "
+        f"{symbol} "
+        f"direction={direction} "
+        f"status={protection_status} "
+        f"result={protection}"
+    )
+
+    if protection_status in {
+        "ok",
+        "protected",
+        "created",
+        "reconciled",
+        "success",
+        "ready",
+    }:
+        final_status = "opened_protected"
+    else:
+        final_status = "opened_protection_check_required"
+
+    return {
+        "status": final_status,
+        "mode": EXECUTION_MODE,
+        "order_id": order_id,
+        "open_result": opened,
+        "position": position,
+        "protection": protection,
+        "sl_pct": sl_pct,
+        "tp_levels": tp_levels,
+    }
+
+
+# ============================================================================
 # TELEGRAM
-# =====================================================================
+# ============================================================================
 
-def build_fallback_message(
-    event: dict,
-    setup: Optional[dict],
-    row: Any,
-    execution: Optional[dict],
-    block_reason: Optional[str] = None,
+def build_fallback_signal_message(
+    ev: dict,
+    symbol: str,
+    name: str,
+    setup: dict,
+    execution_result: dict,
+    price: float,
 ) -> str:
-
-    direction = str(event.get("direction", "")).upper()
+    direction = str(
+        ev.get("direction", "")
+    ).upper()
 
     label = (
         "🚨 LONG SIGNAL"
@@ -389,97 +772,54 @@ def build_fallback_message(
         else "🔻 SHORT SIGNAL"
     )
 
-    symbol = event.get("symbol", "?")
-    event_type = event.get("event_type", "?")
-
-    price = (
-        setup["entry_reference"]
-        if setup
-        else event.get("event_fact", {}).get(
-            "detection_close_price",
-            0,
-        )
+    sl = setup.get(
+        "invalidation_price"
+    )
+    tp = setup.get(
+        "target_price"
+    )
+    rr = setup.get(
+        "rr"
     )
 
-    execution_status = (
-        execution.get("status")
-        if execution
-        else "NOT_ATTEMPTED"
+    return (
+        f"{label}\n\n"
+        f"<b>{name or symbol}</b> "
+        f"(<code>{symbol}</code>)\n\n"
+        f"Event: <code>{ev.get('event_type')}</code>\n"
+        f"TF: <b>{ev.get('timeframe', '1h')}</b> + trigger 15m\n"
+        f"Price: <code>{price:.8g}</code>\n"
+        f"Detected: <code>"
+        f"{ev.get('timestamps', {}).get('detected_at_ts')}"
+        f"</code>\n\n"
+        f"<b>SETUP</b>\n"
+        f"Entry: <code>{price:.8g}</code>\n"
+        f"SL: <code>"
+        f"{sl:.8g}"
+        f"</code>\n"
+        f"TP: <code>"
+        f"{tp:.8g}"
+        f"</code>\n"
+        f"R:R: <code>"
+        f"{rr:.2f}"
+        f"</code>\n\n"
+        f"<b>EXECUTION</b>\n"
+        f"Mode: <code>{EXECUTION_MODE}</code>\n"
+        f"Status: <code>"
+        f"{execution_result.get('status')}"
+        f"</code>\n"
+        f"Order: <code>"
+        f"{execution_result.get('order_id') or '—'}"
+        f"</code>\n\n"
+        f"⚡ Event-driven — 5×5m lifecycle is NOT used"
     )
 
-    lines = [
-        label,
-        "",
-        f"<b>{getattr(row, 'name', None) or symbol}</b> "
-        f"(<code>{symbol}</code>)",
-        "",
-        f"Event: <code>{event_type}</code>",
-        "TF: <b>1H + trigger 15m</b>",
-        f"Price: <code>{float(price):.8g}</code>",
-        "",
-        "<b>SETUP</b>",
-    ]
 
-    if setup:
-        lines.extend(
-            [
-                f"Entry: <code>{setup['entry_reference']:.8g}</code>",
-                f"SL: <code>{setup['invalidation_price']:.8g}</code>",
-                f"TP: <code>{setup['target_price']:.8g}</code>",
-                f"R:R: <code>{setup['rr']:.2f}</code>",
-                f"Risk: <code>{setup['risk_pct']:.2f}%</code>",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "Entry: <code>—</code>",
-                "SL: <code>—</code>",
-                "TP: <code>—</code>",
-                "R:R: <code>—</code>",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "<b>EXECUTION</b>",
-            f"Mode: <code>{os.environ.get('EXECUTION_MODE', 'vst')}</code>",
-            f"Status: <code>{execution_status}</code>",
-        ]
-    )
-
-    if execution and execution.get("order_id"):
-        lines.append(
-            f"Order: <code>{execution['order_id']}</code>"
-        )
-    else:
-        lines.append("Order: <code>—</code>")
-
-    if block_reason:
-        lines.extend(
-            [
-                "",
-                f"⛔ <b>BLOCKED:</b> <code>{block_reason}</code>",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "⚡ Event-driven — 5×5m lifecycle is NOT used",
-        ]
-    )
-
-    return "\n".join(lines)
-
-
-# =====================================================================
+# ============================================================================
 # MAIN
-# =====================================================================
+# ============================================================================
 
 def main() -> None:
-
     stats = {
         "coinalyze_rows": 0,
         "candidates_before_limit": 0,
@@ -506,12 +846,21 @@ def main() -> None:
         "scan_errors": 0,
     }
 
+    # ----------------------------------------------------------------------
+    # Coinalyze
+    # ----------------------------------------------------------------------
+
     rows = fetch_data()
+
     stats["coinalyze_rows"] = len(rows)
 
     print(
         f"[ENGINE] Coinalyze rows={len(rows)}"
     )
+
+    # ----------------------------------------------------------------------
+    # BingX contracts
+    # ----------------------------------------------------------------------
 
     try:
         refresh_contracts()
@@ -521,76 +870,116 @@ def main() -> None:
             f"[BINGX] contracts refresh error={exc}"
         )
 
-    candidates = []
+    candidates: List[Any] = []
 
     for r in rows:
+        try:
+            if (
+                r.price is None
+                or r.price <= 0
+            ):
+                continue
 
-        if r.price is None or r.price <= 0:
-            continue
+            if (
+                r.volume24 is None
+                or r.volume24 < MIN_VOL
+            ):
+                continue
 
-        if r.volume24 is None or r.volume24 < MIN_VOL:
-            continue
+            if (
+                r.oi is None
+                or r.oi < MIN_OI
+            ):
+                continue
 
-        if r.oi is None or r.oi < MIN_OI:
-            continue
-
-        contract = get_contract(r.symbol)
-
-        if not contract:
-            stats["bingx_unmapped"] += 1
-
-            print(
-                f"[MAP] NO_BINGX "
-                f"coinalyze={r.symbol} "
-                f"name={getattr(r, 'name', '')}"
+            contract = get_contract(
+                r.symbol
             )
 
-            continue
+            if not contract:
+                stats["bingx_unmapped"] += 1
 
-        stats["bingx_mapped"] += 1
+                print(
+                    f"[MAP] NO_BINGX "
+                    f"coinalyze={r.symbol} "
+                    f"name={getattr(r, 'name', '')}"
+                )
 
-        print(
-            f"[MAP] OK "
-            f"coinalyze={r.symbol} "
-            f"bingx={contract.get('symbol', r.symbol)} "
-            f"displayName={contract.get('displayName', '')}"
-        )
+                continue
 
-        candidates.append(r)
+            stats["bingx_mapped"] += 1
 
-    stats["candidates_before_limit"] = len(candidates)
+            print(
+                f"[MAP] OK "
+                f"coinalyze={r.symbol} "
+                f"bingx={contract.get('symbol', r.symbol)} "
+                f"displayName={contract.get('displayName', '')}"
+            )
+
+            candidates.append(r)
+
+        except Exception as exc:
+            stats["scan_errors"] += 1
+
+            print(
+                f"[CANDIDATE_ERROR] "
+                f"{getattr(r, 'symbol', '?')}: {exc}"
+            )
+
+    stats["candidates_before_limit"] = len(
+        candidates
+    )
 
     candidates = candidates[:MAX_CANDIDATES]
 
-    stats["candidates"] = len(candidates)
+    stats["candidates"] = len(
+        candidates
+    )
 
     print(
-        f"[ENGINE] Coinalyze candidates={len(candidates)} "
+        f"[ENGINE] Coinalyze candidates="
+        f"{len(candidates)} "
         f"execution={EXECUTION_ENABLED} "
-        f"env={os.environ.get('EXECUTION_MODE', os.environ.get('BINGX_ENV', 'vst'))}"
+        f"env={EXECUTION_MODE}"
     )
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_ids(TRADES)
 
-    trades = 0
+    trades_this_cycle = 0
+
+    # =========================================================================
+    # SYMBOL LOOP
+    # =========================================================================
 
     for r in candidates:
-
         symbol = r.symbol
 
         try:
+            # ------------------------------------------------------------------
+            # KLINES
+            # ------------------------------------------------------------------
 
             k1 = fetch_klines(
                 symbol,
                 "1h",
-                KLINE_LIMIT_1H,
+                int(
+                    os.environ.get(
+                        "KLINE_LIMIT_1H",
+                        "250",
+                    )
+                ),
             )
 
             k15 = fetch_klines(
                 symbol,
                 "15m",
-                KLINE_LIMIT_15M,
+                int(
+                    os.environ.get(
+                        "KLINE_LIMIT_15M",
+                        "250",
+                    )
+                ),
             )
 
             if len(k1) < 60:
@@ -610,11 +999,21 @@ def main() -> None:
             stats["klines_1h_ok"] += 1
             stats["klines_15m_ok"] += 1
 
+            # ------------------------------------------------------------------
+            # DATAFRAMES
+            # ------------------------------------------------------------------
+
             d1 = add_cvd(
                 pd.DataFrame(k1)
             )
 
-            rsi_events_all = detect_divergences(
+            d15 = pd.DataFrame(k15)
+
+            # ------------------------------------------------------------------
+            # EVENT DETECTION
+            # ------------------------------------------------------------------
+
+            divergence_events = detect_divergences(
                 d1,
                 symbol,
                 "1h",
@@ -627,40 +1026,60 @@ def main() -> None:
             )
 
             rsi_events = [
-                e for e in rsi_events_all
-                if "_RSI" in e.get("event_type", "")
+                e
+                for e in divergence_events
+                if "_RSI" in e.get(
+                    "event_type",
+                    "",
+                )
             ]
 
             cvd_events = [
-                e for e in rsi_events_all
-                if "BINGX_CVD" in e.get("event_type", "")
+                e
+                for e in divergence_events
+                if "BINGX_CVD" in e.get(
+                    "event_type",
+                    "",
+                )
             ]
 
-            stats["rsi_events"] += len(rsi_events)
-            stats["cvd_events"] += len(cvd_events)
-            stats["squeeze_events"] += len(squeeze_events)
+            stats["rsi_events"] += len(
+                rsi_events
+            )
+
+            stats["cvd_events"] += len(
+                cvd_events
+            )
+
+            stats["squeeze_events"] += len(
+                squeeze_events
+            )
 
             stats["events_total"] += (
-                len(rsi_events_all)
+                len(divergence_events)
                 + len(squeeze_events)
             )
 
             print(
-                f"[EVENT_SCAN] "
-                f"{symbol} "
+                f"[EVENT_SCAN] {symbol} "
                 f"RSI={len(rsi_events)} "
                 f"CVD={len(cvd_events)} "
                 f"SQUEEZE={len(squeeze_events)}"
             )
 
             all_events = (
-                rsi_events_all
+                divergence_events
                 + squeeze_events
             )
 
-            for ev in all_events:
+            # ------------------------------------------------------------------
+            # EVENTS
+            # ------------------------------------------------------------------
 
-                event_id = ev.get("event_id")
+            for ev in all_events:
+                event_id = ev.get(
+                    "event_id"
+                )
 
                 if not event_id:
                     print(
@@ -668,6 +1087,27 @@ def main() -> None:
                         f"{symbol} event without event_id"
                     )
                     continue
+
+                direction = str(
+                    ev.get(
+                        "direction",
+                        "",
+                    )
+                ).upper()
+
+                if direction not in {
+                    "LONG",
+                    "SHORT",
+                }:
+                    print(
+                        f"[EVENT_REJECT_DIRECTION] "
+                        f"{symbol} direction={direction}"
+                    )
+                    continue
+
+                # --------------------------------------------------------------
+                # EVENT AGE
+                # --------------------------------------------------------------
 
                 detected_at = int(
                     ev.get(
@@ -680,15 +1120,17 @@ def main() -> None:
                 )
 
                 latest_close = int(
-                    d1.close_time.iloc[-1]
+                    d1["close_time"].iloc[-1]
                 )
 
                 age = (
                     latest_close - detected_at
                 ) / 60000.0
 
-                if age < 0 or age > MAX_AGE:
-
+                if (
+                    age < 0
+                    or age > MAX_AGE
+                ):
                     print(
                         f"[EVENT_REJECT_AGE] "
                         f"{symbol} "
@@ -696,27 +1138,29 @@ def main() -> None:
                         f"age={age:.1f}m "
                         f"max={MAX_AGE}m"
                     )
-
                     continue
 
                 stats["events_recent"] += 1
 
-                # -----------------------------------------------------
-                # EVENT PERSISTENCE
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
+                # PERSIST EVENT
+                # --------------------------------------------------------------
 
-                if event_id in seen_events:
+                already_seen = (
+                    event_id in seen_events
+                )
 
+                if already_seen:
                     stats["events_duplicate"] += 1
-
                 else:
-
                     emit_event(ev)
-                    seen_events.add(event_id)
+                    seen_events.add(
+                        event_id
+                    )
 
-                # -----------------------------------------------------
-                # CVD GATE
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
+                # OPTIONAL CVD CONFIRMATION
+                # --------------------------------------------------------------
 
                 if (
                     REQUIRE_CVD
@@ -725,12 +1169,48 @@ def main() -> None:
                         "",
                     )
                 ):
+                    pivot_1 = ev.get(
+                        "timestamps",
+                        {},
+                    ).get(
+                        "pivot_1_ts"
+                    )
 
-                    if not has_cvd_confirmation(
-                        ev,
-                        cvd_events,
-                    ):
+                    pivot_2 = ev.get(
+                        "timestamps",
+                        {},
+                    ).get(
+                        "pivot_2_ts"
+                    )
 
+                    matched_cvd = any(
+                        (
+                            other.get(
+                                "direction"
+                            )
+                            == direction
+                            and
+                            other.get(
+                                "timestamps",
+                                {},
+                            ).get(
+                                "pivot_1_ts"
+                            )
+                            == pivot_1
+                            and
+                            other.get(
+                                "timestamps",
+                                {},
+                            ).get(
+                                "pivot_2_ts"
+                            )
+                            == pivot_2
+                        )
+                        for other
+                        in cvd_events
+                    )
+
+                    if not matched_cvd:
                         stats[
                             "events_cvd_gate_rejected"
                         ] += 1
@@ -738,31 +1218,32 @@ def main() -> None:
                         print(
                             f"[EVENT_REJECT_CVD] "
                             f"{symbol} "
-                            f"type={ev.get('event_type')} "
-                            f"reason=no_matching_cvd"
+                            f"type={ev.get('event_type')}"
                         )
 
-                        # Не строим setup,
-                        # не открываем trade.
                         continue
 
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
                 # 15M TRIGGER
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
 
                 trigger = build_15m_trigger(
-                    pd.DataFrame(k15),
-                    ev["direction"],
+                    d15,
+                    direction,
                 )
 
-                if REQUIRE_TRIGGER and not trigger:
-
-                    stats["trigger_rejected"] += 1
+                if (
+                    REQUIRE_TRIGGER
+                    and not trigger
+                ):
+                    stats[
+                        "trigger_rejected"
+                    ] += 1
 
                     print(
                         f"[TRIGGER_REJECT] "
                         f"symbol={symbol} "
-                        f"direction={ev.get('direction')} "
+                        f"direction={direction} "
                         f"event={ev.get('event_type')} "
                         f"reason=15m_trigger_failed"
                     )
@@ -771,101 +1252,69 @@ def main() -> None:
 
                 stats["trigger_pass"] += 1
 
-                # -----------------------------------------------------
-                # SETUP
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
+                # ENTRY PRICE
+                # --------------------------------------------------------------
 
-                setup, setup_reason = (
-                    build_execution_setup(
-                        ev,
-                        d1,
-                    )
+                fact = ev.get(
+                    "event_fact",
+                    {},
                 )
 
-                if setup is None:
+                price_raw = fact.get(
+                    "detection_close_price"
+                )
 
-                    stats["setup_rejected"] += 1
+                if price_raw is None:
+                    price_raw = (
+                        fact.get(
+                            "close"
+                        )
+                        or getattr(
+                            r,
+                            "price",
+                            None,
+                        )
+                    )
+
+                if price_raw is None:
+                    print(
+                        f"[SETUP_REJECT] "
+                        f"{symbol} "
+                        f"event={event_id} "
+                        f"reason=no_entry_price"
+                    )
+
+                    stats[
+                        "setup_rejected"
+                    ] += 1
+
+                    continue
+
+                price = float(
+                    price_raw
+                )
+
+                # --------------------------------------------------------------
+                # SETUP
+                # --------------------------------------------------------------
+
+                try:
+                    setup = build_event_setup(
+                        ev=ev,
+                        df_1h=d1,
+                        entry_price=price,
+                    )
+                except Exception as exc:
+                    stats[
+                        "setup_rejected"
+                    ] += 1
 
                     print(
                         f"[SETUP_REJECT] "
                         f"{symbol} "
                         f"event={event_id} "
-                        f"type={ev.get('event_type')} "
-                        f"reason={setup_reason}"
-                    )
-
-                    # Сигнал пользователю все равно отправляем,
-                    # но execution категорически не пытаемся.
-                    execution_result = {
-                        "status": "SETUP_REJECTED",
-                        "mode": os.environ.get(
-                            "EXECUTION_MODE",
-                            "vst",
-                        ),
-                        "order_id": None,
-                        "reason": setup_reason,
-                    }
-
-                    stats["telegram_attempts"] += 1
-
-                    try:
-                        msg = format_signal(
-                            ev,
-                            setup={
-                                "entry_reference":
-                                    ev.get(
-                                        "event_fact",
-                                        {},
-                                    ).get(
-                                        "detection_close_price"
-                                    ),
-                                "invalidation_price": None,
-                                "target_price": None,
-                                "rr": None,
-                            },
-                            coinalyze_row=r,
-                            execution=execution_result,
-                        )
-                    except Exception:
-                        msg = build_fallback_message(
-                            ev,
-                            None,
-                            r,
-                            execution_result,
-                            setup_reason,
-                        )
-
-                    try:
-                        sent = bool(send_tg(msg))
-                    except Exception as exc:
-                        sent = False
-                        print(
-                            f"[TELEGRAM_ERROR] "
-                            f"{symbol}: {exc}"
-                        )
-
-                    if sent:
-                        stats["telegram_sent"] += 1
-
-                    record_action(
-                        {
-                            "event_id": event_id,
-                            "symbol": symbol,
-                            "direction": ev["direction"],
-                            "event_type": ev.get(
-                                "event_type"
-                            ),
-                            "telegram_sent": bool(sent),
-                            "execution_status":
-                                "SETUP_REJECTED",
-                            "setup_reject_reason":
-                                setup_reason,
-                            "ts": int(
-                                pd.Timestamp.utcnow()
-                                .timestamp()
-                                * 1000
-                            ),
-                        }
+                        f"reason={exc}"
                     )
 
                     continue
@@ -875,211 +1324,174 @@ def main() -> None:
                 print(
                     f"[SETUP_OK] "
                     f"{symbol} "
-                    f"direction={ev['direction']} "
+                    f"direction={direction} "
                     f"entry={setup['entry_reference']:.8g} "
                     f"SL={setup['invalidation_price']:.8g} "
                     f"TP={setup['target_price']:.8g} "
-                    f"RR={setup['rr']:.2f} "
-                    f"risk={setup['risk_pct']:.2f}%"
+                    f"RR={setup['rr']:.2f}"
                 )
 
-                # -----------------------------------------------------
-                # EXECUTION
-                # -----------------------------------------------------
+                execution_result: Dict[str, Any]
 
-                execution_result = None
+                # ==============================================================
+                # EXISTING EVENT / POSITION
+                # ==============================================================
 
                 if event_id in executed_event_ids:
 
-                    execution_result = {
-                        "status": "ALREADY_EXECUTED",
-                        "mode": os.environ.get(
-                            "EXECUTION_MODE",
-                            "vst",
-                        ),
-                        "order_id": None,
-                    }
+                    if EXECUTION_ENABLED:
+
+                        execution_result = (
+                            reconcile_existing_position(
+                                symbol=symbol,
+                                direction=direction,
+                                setup=setup,
+                                event_id=event_id,
+                            )
+                        )
+
+                    else:
+                        execution_result = {
+                            "status": "ALREADY_EXECUTED",
+                            "mode": EXECUTION_MODE,
+                            "order_id": None,
+                            "protection_status": (
+                                "NOT_CHECKED_EXECUTION_DISABLED"
+                            ),
+                        }
 
                     print(
-                        f"[EXECUTION_SKIP_DUPLICATE] "
+                        f"[EXECUTION_RESULT] "
                         f"{symbol} "
-                        f"event={event_id}"
+                        f"event={event_id} "
+                        f"status={execution_result.get('status')}"
                     )
 
-                elif EXECUTION_ENABLED and trades < MAX_TRADES:
+                # ==============================================================
+                # NEW EXECUTION
+                # ==============================================================
 
-                    stats["execution_attempts"] += 1
+                elif (
+                    EXECUTION_ENABLED
+                    and trades_this_cycle
+                    < MAX_TRADES
+                ):
 
-                    trade_id = (
+                    stats[
+                        "execution_attempts"
+                    ] += 1
+
+                    execution_result = (
+                        execute_new_position(
+                            symbol=symbol,
+                            direction=direction,
+                            price=price,
+                            setup=setup,
+                            event_id=event_id,
+                        )
+                    )
+
+                    record_trade(
+                        {
+                            "event_id": event_id,
+                            "symbol": symbol,
+                            "direction": direction,
+                            "price": price,
+                            "event_type": ev.get(
+                                "event_type"
+                            ),
+                            "ts": int(
+                                pd.Timestamp.utcnow()
+                                .timestamp()
+                                * 1000
+                            ),
+                            "result":
+                                execution_result,
+                            "setup":
+                                setup,
+                        }
+                    )
+
+                    executed_event_ids.add(
                         event_id
-                        .replace(
-                            "EVT_",
+                    )
+
+                    status = str(
+                        execution_result.get(
+                            "status",
                             "",
                         )
                     )
 
-                    # -------------------------------------------------
-                    # FINAL HARD GATE
-                    # -------------------------------------------------
+                    if status == "opened_protected":
+                        trades_this_cycle += 1
+                        stats["trades"] += 1
 
-                    if not setup.get(
-                        "invalidation_price"
-                    ):
-                        execution_result = {
-                            "status":
-                                "BLOCKED_NO_SL",
-                            "mode":
-                                os.environ.get(
-                                    "EXECUTION_MODE",
-                                    "vst",
-                                ),
-                            "order_id":
-                                None,
-                        }
+                        print(
+                            f"[EXECUTION_OPENED_PROTECTED] "
+                            f"{symbol} "
+                            f"direction={direction} "
+                            f"order={execution_result.get('order_id')}"
+                        )
 
-                    elif not setup.get(
-                        "target_price"
+                    elif status.startswith(
+                        "opened_"
                     ):
-                        execution_result = {
-                            "status":
-                                "BLOCKED_NO_TP",
-                            "mode":
-                                os.environ.get(
-                                    "EXECUTION_MODE",
-                                    "vst",
-                                ),
-                            "order_id":
-                                None,
-                        }
+                        trades_this_cycle += 1
+                        stats["trades"] += 1
 
-                    elif (
-                        setup.get("rr") is None
-                        or setup["rr"] < MIN_RR
-                    ):
-                        execution_result = {
-                            "status":
-                                "BLOCKED_BAD_RR",
-                            "mode":
-                                os.environ.get(
-                                    "EXECUTION_MODE",
-                                    "vst",
-                                ),
-                            "order_id":
-                                None,
-                        }
+                        print(
+                            f"[EXECUTION_OPENED] "
+                            f"{symbol} "
+                            f"direction={direction} "
+                            f"status={status}"
+                        )
 
                     else:
-
-                        execution_result = open_market(
-                            symbol,
-                            ev["direction"],
-                            setup[
-                                "entry_reference"
-                            ],
-                            trade_id,
+                        print(
+                            f"[EXECUTION_RESULT] "
+                            f"{symbol} "
+                            f"status={status}"
                         )
 
-                        record_trade(
-                            {
-                                "event_id":
-                                    event_id,
-                                "symbol":
-                                    symbol,
-                                "direction":
-                                    ev["direction"],
-                                "price":
-                                    setup[
-                                        "entry_reference"
-                                    ],
-                                "sl":
-                                    setup[
-                                        "invalidation_price"
-                                    ],
-                                "tp":
-                                    setup[
-                                        "target_price"
-                                    ],
-                                "rr":
-                                    setup["rr"],
-                                "event_type":
-                                    ev.get(
-                                        "event_type"
-                                    ),
-                                "ts":
-                                    int(
-                                        pd.Timestamp.utcnow()
-                                        .timestamp()
-                                        * 1000
-                                    ),
-                                "result":
-                                    execution_result,
-                            }
-                        )
-
-                        if execution_result.get(
-                            "status"
-                        ) == "opened":
-
-                            trades += 1
-                            stats["trades"] += 1
-
-                            print(
-                                f"[EXECUTION_OPENED] "
-                                f"{symbol} "
-                                f"direction={ev['direction']} "
-                                f"entry={setup['entry_reference']:.8g} "
-                                f"SL={setup['invalidation_price']:.8g} "
-                                f"TP={setup['target_price']:.8g} "
-                                f"RR={setup['rr']:.2f} "
-                                f"order={execution_result.get('order_id')}"
-                            )
-
-                        else:
-
-                            print(
-                                f"[EXECUTION_RESULT] "
-                                f"{symbol} "
-                                f"status={execution_result.get('status')} "
-                                f"message={execution_result.get('msg')}"
-                            )
-
-                        executed_event_ids.add(
-                            event_id
-                        )
+                # ==============================================================
+                # EXECUTION DISABLED
+                # ==============================================================
 
                 elif not EXECUTION_ENABLED:
 
                     execution_result = {
                         "status": "DISABLED",
-                        "mode": os.environ.get(
-                            "EXECUTION_MODE",
-                            "vst",
-                        ),
+                        "mode": EXECUTION_MODE,
                         "order_id": None,
+                        "protection_status": (
+                            "NOT_ATTEMPTED"
+                        ),
                     }
+
+                # ==============================================================
+                # LIMIT REACHED
+                # ==============================================================
 
                 else:
 
                     execution_result = {
-                        "status":
-                            "TRADE_LIMIT_REACHED",
-                        "mode":
-                            os.environ.get(
-                                "EXECUTION_MODE",
-                                "vst",
-                            ),
-                        "order_id":
-                            None,
+                        "status": "TRADE_LIMIT_REACHED",
+                        "mode": EXECUTION_MODE,
+                        "order_id": None,
                     }
 
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
                 # TELEGRAM
-                # -----------------------------------------------------
+                # --------------------------------------------------------------
 
-                stats["telegram_attempts"] += 1
+                label = (
+                    "🚨 LONG SIGNAL"
+                    if direction == "LONG"
+                    else "🔻 SHORT SIGNAL"
+                )
 
                 try:
-
                     msg = format_signal(
                         ev,
                         setup=setup,
@@ -1087,28 +1499,54 @@ def main() -> None:
                         execution=execution_result,
                     )
 
+                    # Гарантируем требуемый заголовок.
+                    if not (
+                        msg.startswith(
+                            "🚨 LONG SIGNAL"
+                        )
+                        or msg.startswith(
+                            "🔻 SHORT SIGNAL"
+                        )
+                    ):
+                        msg = (
+                            f"{label}\n\n"
+                            + msg
+                        )
+
                 except Exception as exc:
+
+                    msg = (
+                        build_fallback_signal_message(
+                            ev=ev,
+                            symbol=symbol,
+                            name=(
+                                getattr(
+                                    r,
+                                    "name",
+                                    None,
+                                )
+                                or symbol
+                            ),
+                            setup=setup,
+                            execution_result=(
+                                execution_result
+                            ),
+                            price=price,
+                        )
+                    )
 
                     print(
                         f"[TELEGRAM_FORMAT_FALLBACK] "
                         f"{symbol}: {exc}"
                     )
 
-                    msg = build_fallback_message(
-                        ev,
-                        setup,
-                        r,
-                        execution_result,
-                    )
+                stats[
+                    "telegram_attempts"
+                ] += 1
 
                 try:
-
-                    sent = bool(
-                        send_tg(msg)
-                    )
-
+                    sent = send_tg(msg)
                 except Exception as exc:
-
                     sent = False
 
                     print(
@@ -1117,36 +1555,34 @@ def main() -> None:
                     )
 
                 if sent:
-                    stats["telegram_sent"] += 1
+                    stats[
+                        "telegram_sent"
+                    ] += 1
 
                 record_action(
                     {
-                        "event_id":
-                            event_id,
-                        "symbol":
-                            symbol,
-                        "direction":
-                            ev["direction"],
-                        "event_type":
-                            ev.get(
-                                "event_type"
-                            ),
-                        "telegram_sent":
-                            bool(sent),
+                        "event_id": event_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "event_type": ev.get(
+                            "event_type"
+                        ),
+                        "telegram_sent": bool(
+                            sent
+                        ),
                         "execution_status":
                             execution_result.get(
                                 "status"
-                            )
-                            if execution_result
-                            else None,
-                        "setup":
-                            setup,
-                        "ts":
-                            int(
-                                pd.Timestamp.utcnow()
-                                .timestamp()
-                                * 1000
                             ),
+                        "protection_status":
+                            execution_result.get(
+                                "protection_status"
+                            ),
+                        "ts": int(
+                            pd.Timestamp.utcnow()
+                            .timestamp()
+                            * 1000
+                        ),
                     }
                 )
 
@@ -1160,8 +1596,8 @@ def main() -> None:
             )
 
     print(
-        f"[ENGINE] "
-        f"trades_this_cycle={trades}"
+        f"[ENGINE] trades_this_cycle="
+        f"{trades_this_cycle}"
     )
 
     print(
