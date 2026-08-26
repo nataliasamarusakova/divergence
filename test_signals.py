@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import json
+from decimal import Decimal
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from event_engine.coinalyze import parse_number
 from event_engine.signals import (
+    _rsi,
     add_cvd,
     build_15m_trigger,
     detect_divergences,
     detect_squeeze_release,
 )
+from event_engine.bingx import (
+    _round_qty,
+    ensure_directional_protection,
+    get_contract,
+    CACHE,
+)
+from main import load_successful_trade_ids
 
 
 def _generate_synthetic_candles(n: int = 80, base_price: float = 100.0) -> pd.DataFrame:
@@ -36,6 +49,17 @@ def test_parse_number():
     assert parse_number("$5,000") == 5000
     assert parse_number("—") is None
     assert parse_number(None) is None
+
+
+def test_rsi_flat_and_extremes():
+    flat_series = pd.Series([100.0] * 30)
+    assert _rsi(flat_series).iloc[-1] == 50.0
+
+    up_series = pd.Series(list(range(10, 40)))
+    assert _rsi(up_series).iloc[-1] == 100.0
+
+    down_series = pd.Series(list(range(40, 10, -1)))
+    assert _rsi(down_series).iloc[-1] == 0.0
 
 
 def test_trigger_long_and_short():
@@ -81,3 +105,25 @@ def test_squeeze_release_duration_enforced():
     assert events[0]["direction"] == "LONG"
     assert events[0]["event_fact"]["squeeze_duration_bars"] >= 3
     assert events[0]["event_type"] == "VOLATILITY_SQUEEZE_RELEASE"
+
+
+def test_load_successful_trades_retry_safety(tmp_path: Path):
+    trades_file = tmp_path / "trades.jsonl"
+    trades_file.write_text(
+        json.dumps({"event_id": "EVT_FAIL", "result": {"status": "OPEN_FAILED"}}) + "\n" +
+        json.dumps({"event_id": "EVT_SUCCESS", "result": {"status": "opened_protected"}}) + "\n",
+        encoding="utf-8",
+    )
+    loaded_ids = load_successful_trade_ids(trades_file)
+    assert "EVT_FAIL" not in loaded_ids  # Разрешает повторную попытку при сбое API
+    assert "EVT_SUCCESS" in loaded_ids
+
+
+def test_get_contract_displayName_with_hyphen():
+    CACHE["data"] = {
+        "ETH-USDT": {"symbol": "ETH-USDT", "displayName": "ETH-USDT", "status": 1, "apiStateOpen": "true"}
+    }
+    CACHE["ts"] = 9999999999
+    c = get_contract("ETH")
+    assert c is not None
+    assert c["symbol"] == "ETH-USDT"
