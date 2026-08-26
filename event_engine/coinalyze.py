@@ -226,7 +226,27 @@ def parse_table(html_text: str) -> list[CoinalyzeRow]:
             "cvd24": parse_number(tds[21].get_text(" ", strip=True)),
             "lls24": parse_number(tds[22].get_text(" ", strip=True)),
         }
-        out.append(CoinalyzeRow(symbol=symbol, name=name, raw=raw, **raw))
+        out.append(CoinalyzeRow(
+            symbol=symbol,
+            name=name,
+            price=raw["price"],
+            price_chg24=raw["price_chg24"],
+            volume24=raw["volume24"],
+            oi=raw["oi"],
+            oi_chg24_pct=raw["oi_chg24_pct"],
+            oi_chg4h_pct=raw["oi_chg4h_pct"],
+            oi_vol_ratio=raw["oi_vol_ratio"],
+            oi_mktcap_ratio=raw["oi_mktcap_ratio"],
+            fr_oiw=raw["fr_oiw"],
+            pfr_oiw=raw["pfr_oiw"],
+            liq_short24=raw["liq_short24"],
+            liq_long24=raw["liq_long24"],
+            ls_accounts=raw["ls_accounts"],
+            btc_corr7d=raw["btc_corr7d"],
+            cvd24=raw["cvd24"],
+            lls24=raw["lls24"],
+            raw=raw,
+        ))
     return out
 
 
