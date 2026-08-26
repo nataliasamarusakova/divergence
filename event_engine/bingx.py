@@ -7,7 +7,7 @@ import math
 import os
 import time
 import uuid
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from typing import Any
 from urllib.parse import urlencode
 
@@ -625,6 +625,103 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
     return f"EVT_SL_{token}"
 
 
+def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """Round quantity upward to the exchange quantity step."""
+    if step <= 0:
+        raise ValueError("quantity step must be > 0")
+    units = (value / step).to_integral_value(rounding=ROUND_CEILING)
+    return units * step
+
+
+def _allocate_tp_quantities(
+    position_qty: float,
+    precision: int,
+    min_qty: float,
+    fractions: list[float],
+) -> list[float]:
+    """Allocate TP quantities so every leg is valid for exchange minQty/precision.
+
+    The function preserves the total quantity exactly in Decimal arithmetic after
+    step rounding. It raises ValueError when the requested number of legs cannot
+    be represented without violating minQty or exhausting the whole position.
+    """
+    if position_qty <= 0:
+        raise ValueError("position_qty must be > 0")
+    if not fractions or any(f <= 0 for f in fractions):
+        raise ValueError("fractions must be positive")
+
+    step = Decimal(1).scaleb(-precision) if precision >= 0 else Decimal("1")
+    pos = Decimal(str(position_qty))
+    min_q = Decimal(str(max(min_qty, 0.0)))
+    min_leg = max(step, min_q)
+    k = len(fractions)
+    if pos < min_leg * k:
+        raise ValueError(
+            f"position_qty={position_qty} cannot support {k} TP legs "
+            f"with min_leg={min_leg}"
+        )
+
+    total_fraction = sum(Decimal(str(f)) for f in fractions)
+    if total_fraction <= 0:
+        raise ValueError("fraction sum must be > 0")
+    normalized = [Decimal(str(f)) / total_fraction for f in fractions]
+
+    # Start every leg at the minimum valid quantity.
+    quantities = [min_leg] * k
+    remaining = pos - min_leg * k
+
+    # Allocate remaining quantity by largest-remainder style using the requested
+    # fractions, while keeping every result on the exchange step.
+    raw_extra = [remaining * f for f in normalized]
+    extra_steps = []
+    for raw in raw_extra:
+        n = (raw / step).to_integral_value(rounding=ROUND_FLOOR)
+        extra_steps.append(n)
+
+    allocated_extra = sum(extra_steps) * step
+    quantities = [q + n * step for q, n in zip(quantities, extra_steps)]
+    remainder = pos - sum(quantities)
+    while remainder >= step:
+        # Give the next step to the leg with the largest unmet fractional target.
+        best = max(
+            range(k),
+            key=lambda i: raw_extra[i] - (quantities[i] - min_leg),
+        )
+        quantities[best] += step
+        remainder -= step
+
+    # Decimal representation can differ by tiny residue; enforce exact total in
+    # the last leg while keeping it on-step.
+    quantities[-1] += remainder
+    quantities[-1] = quantities[-1].quantize(step)
+
+    if any(q < min_leg for q in quantities):
+        raise ValueError("TP allocation produced a leg below minimum quantity")
+    if sum(quantities) != pos:
+        raise ValueError(f"TP allocation mismatch: sum={sum(quantities)} position={pos}")
+
+    return [float(q) for q in quantities]
+
+
+def _normalize_tp_levels(tp_levels: list) -> list[dict]:
+    normalized = []
+    for tp in tp_levels or []:
+        leg = str(tp.get("leg", f"tp{len(normalized) + 1}"))
+        pnl_pct = float(tp.get("pnl_pct", 0))
+        fraction = float(tp.get("close_fraction", 0))
+        if not math.isfinite(pnl_pct) or not math.isfinite(fraction):
+            continue
+        if pnl_pct <= 0 or fraction <= 0:
+            continue
+        normalized.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
+    if not normalized:
+        normalized = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
+    total = sum(x["close_fraction"] for x in normalized)
+    for x in normalized:
+        x["close_fraction"] /= total
+    return normalized
+
+
 def ensure_directional_protection(
     symbol: str,
     direction: str,
@@ -634,7 +731,7 @@ def ensure_directional_protection(
     tp_levels: list,
     trade_id: str | None = None,
 ) -> dict:
-    """Гарантированная установка Stop Loss и каскадных Take Profit ордеров."""
+    """Install exchange-side SL first, verify it, then install valid TP legs."""
     direction = str(direction).upper()
     if direction not in ("LONG", "SHORT"):
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -646,95 +743,132 @@ def ensure_directional_protection(
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": str(exc)}
 
-    if avg_price <= 0 or qty <= 0 or not (0 < stop_loss_pct <= 25):
+    if (
+        not math.isfinite(avg_price)
+        or not math.isfinite(qty)
+        or not math.isfinite(stop_loss_pct)
+        or avg_price <= 0
+        or qty <= 0
+        or not (0 < stop_loss_pct <= 25)
+    ):
         return {"status": "error", "error": "invalid protection parameters"}
 
     bx_symbol = to_bx_symbol(symbol)
     contract = get_contract(symbol)
-    if not contract:
+    if not bx_symbol or not contract:
         return {"status": "error", "error": f"contract not found: {bx_symbol}"}
 
-    precision = int(contract.get("quantityPrecision") or 0)
-    price_precision = int(contract.get("pricePrecision") or 4)
-    min_qty = float(contract.get("tradeMinQuantity") or contract.get("minQty") or 0)
+    try:
+        precision = int(contract.get("quantityPrecision") or 0)
+        price_precision = int(contract.get("pricePrecision") or 4)
+        min_qty = float(contract.get("tradeMinQuantity") or contract.get("minQty") or 0)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": f"invalid contract parameters: {exc}"}
 
     position_qty = _round_qty(qty, precision)
     if position_qty <= 0 or (min_qty > 0 and position_qty < min_qty):
         return {"status": "error", "error": f"qty={position_qty} < minQty={min_qty}"}
 
     existing = get_open_protection_directional(symbol, direction)
-    existing_tp = list(existing.get("tp_orders", [])) if existing.get("status") == "ok" else []
-    existing_sl = list(existing.get("sl_orders", [])) if existing.get("status") == "ok" else []
+    if existing.get("status") != "ok":
+        return {"status": "PROTECTION_FAILED", "error": existing.get("error", "openOrders unavailable")}
 
-    tp_side = "SELL" if direction == "LONG" else "BUY"
-    sl_side = tp_side
+    existing_tp = list(existing.get("tp_orders", []))
+    existing_sl = list(existing.get("sl_orders", []))
 
-    # =========================================================================
-    # ШАГ 1: ГАРАНТИРОВАННАЯ УСТАНОВКА STOP LOSS (ПРИОРИТЕТ №1)
-    # =========================================================================
-    sl_result = {}
+    tp_levels_norm = _normalize_tp_levels(tp_levels)
+
+    # SAFETY INVARIANT: an exchange-side SL must exist before any TP is created.
     if existing_sl:
         sl = existing_sl[0]
         sl_result = {
             "status": "already_exists",
             "order_id": str(sl.get("orderId", "")),
             "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
+            "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
         }
     else:
-        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
+        sl_price = (
+            avg_price * (1.0 - stop_loss_pct / 100.0)
+            if direction == "LONG"
+            else avg_price * (1.0 + stop_loss_pct / 100.0)
+        )
         client_order_id = build_sl_client_order_id(trade_id)
         params = {
             "symbol": bx_symbol,
-            "side": sl_side,
+            "side": "SELL" if direction == "LONG" else "BUY",
             "positionSide": direction,
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
             "clientOrderId": client_order_id,
         }
-
         resp = _request("POST", ORDER_PATH, params)
         if resp.get("code") != 0:
-            log.error("[BINGX_SL_FAILED] code=%s msg=%s params=%s", resp.get("code"), resp.get("msg"), params)
-            sl_result = {"status": "error", "error": f"SL failed: code={resp.get('code')} msg={resp.get('msg')}"}
-        else:
-            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-            sl_result = {
-                "status": "created",
-                "order_id": str(order.get("orderId", "")),
-                "client_order_id": order.get("clientOrderId") or client_order_id,
-                "stop_price": sl_price,
-                "qty": position_qty,
+            log.error("[BINGX_SL_FAILED] code=%s msg=%s", resp.get("code"), resp.get("msg"))
+            return {
+                "status": "PROTECTION_FAILED",
+                "error": f"SL failed: code={resp.get('code')} msg={resp.get('msg')}",
+                "sl_result": {"status": "error", "error": f"SL failed: code={resp.get('code')} msg={resp.get('msg')}"},
+                "tp_orders": [],
             }
+        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+        sl_result = {
+            "status": "created",
+            "order_id": str(order.get("orderId", "")),
+            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "stop_price": sl_price,
+            "qty": position_qty,
+        }
 
-    # =========================================================================
-    # ШАГ 2: АДАПТИВНАЯ УСТАНОВКА СЕТКИ TAKE PROFIT
-    # =========================================================================
-    normalized_levels = []
-    for tp in tp_levels:
-        leg = str(tp.get("leg", f"tp{len(normalized_levels) + 1}"))
-        pnl_pct = float(tp.get("pnl_pct", 0))
-        fraction = float(tp.get("close_fraction", 0))
-        if pnl_pct <= 0 or fraction <= 0:
-            continue
-        normalized_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
+    # Re-read exchange open orders after SL creation. Never continue to TP if the
+    # exchange does not show an SL.
+    verified = get_open_protection_directional(symbol, direction)
+    verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
+    if not verified_sl:
+        return {
+            "status": "SL_UNVERIFIED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "sl_result": sl_result,
+            "tp_orders": [],
+            "error": "SL was created/requested but is not visible on exchange",
+        }
 
-    if not normalized_levels:
-        normalized_levels = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
+    # If current position is too small for the configured number of legs, use one
+    # valid full-size TP rather than sending invalid minQty orders.
+    if min_qty > 0 and position_qty < min_qty * len(tp_levels_norm):
+        tp_levels_norm = [{
+            "leg": tp_levels_norm[-1]["leg"],
+            "pnl_pct": tp_levels_norm[-1]["pnl_pct"],
+            "close_fraction": 1.0,
+        }]
 
-    fraction_sum = sum(x["close_fraction"] for x in normalized_levels)
-    for x in normalized_levels:
-        x["close_fraction"] /= fraction_sum
+    try:
+        desired_qtys = _allocate_tp_quantities(
+            position_qty=position_qty,
+            precision=precision,
+            min_qty=min_qty,
+            fractions=[x["close_fraction"] for x in tp_levels_norm],
+        )
+    except ValueError as exc:
+        return {
+            "status": "PROTECTION_FAILED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "sl_result": sl_result,
+            "tp_orders": [],
+            "error": str(exc),
+        }
 
     tp_results = []
-    placed_qty_sum = Decimal("0.0")
-    pos_qty_dec = Decimal(str(position_qty))
-
-    # Если позиция мала для деления на 3 части (30% < min_qty), ставим 1 надежный общий TP
-    if min_qty > 0 and (position_qty * 0.3) < min_qty:
-        normalized_levels = [{"leg": "tp1", "pnl_pct": normalized_levels[-1]["pnl_pct"], "close_fraction": 1.0}]
-
-    for idx, level in enumerate(normalized_levels):
+    for level, tp_qty in zip(tp_levels_norm, desired_qtys):
         leg = level["leg"]
         pnl_pct = level["pnl_pct"]
 
@@ -747,11 +881,13 @@ def ensure_directional_protection(
 
         if existing_leg:
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
-            if existing_qty <= 0:
-                raw_qty = pos_qty_dec * Decimal(str(level["close_fraction"]))
-                existing_qty = _round_qty(float(raw_qty), precision)
-            placed_qty_sum += Decimal(str(existing_qty))
-
+            if existing_qty > 0 and min_qty > 0 and existing_qty < min_qty:
+                return {
+                    "status": "PROTECTION_FAILED",
+                    "error": f"existing {leg} qty={existing_qty} < minQty={min_qty}",
+                    "sl_result": sl_result,
+                    "tp_orders": tp_results,
+                }
             tp_results.append({
                 "leg": leg,
                 "status": "already_exists",
@@ -761,23 +897,15 @@ def ensure_directional_protection(
             })
             continue
 
-        tp_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
-
-        if idx == len(normalized_levels) - 1:
-            tp_qty_dec = max(Decimal("0.0"), pos_qty_dec - placed_qty_sum)
-            tp_qty = float(tp_qty_dec)
-        else:
-            raw_qty = pos_qty_dec * Decimal(str(level["close_fraction"]))
-            tp_qty = _round_qty(float(raw_qty), precision)
-            placed_qty_sum += Decimal(str(tp_qty))
-
-        if tp_qty <= 0:
-            continue
-
+        tp_price = (
+            avg_price * (1.0 + pnl_pct / 100.0)
+            if direction == "LONG"
+            else avg_price * (1.0 - pnl_pct / 100.0)
+        )
         client_order_id = build_tp_client_order_id(leg, trade_id)
         params = {
             "symbol": bx_symbol,
-            "side": tp_side,
+            "side": "SELL" if direction == "LONG" else "BUY",
             "positionSide": direction,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
@@ -787,28 +915,38 @@ def ensure_directional_protection(
 
         resp = _request("POST", ORDER_PATH, params)
         if resp.get("code") != 0:
-            log.error("[BINGX_TP_FAILED] %s code=%s msg=%s params=%s", leg, resp.get("code"), resp.get("msg"), params)
+            log.error("[BINGX_TP_FAILED] %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
+            # Do not remove the verified SL. Return a partial protection status so
+            # the reconciliation loop can safely retry missing TP legs later.
             tp_results.append({
                 "leg": leg,
                 "status": "error",
                 "error": f"code={resp.get('code')} msg={resp.get('msg')}",
-            })
-        else:
-            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-            tp_results.append({
-                "leg": leg,
-                "status": "created",
-                "order_id": str(order.get("orderId", "")),
-                "client_order_id": order.get("clientOrderId") or client_order_id,
-                "price": tp_price,
                 "qty": tp_qty,
-                "pnl_pct": pnl_pct,
             })
+            continue
 
-    sl_ok = sl_result.get("status") in ("created", "already_exists")
-    tp_ok = any(t.get("status") in ("created", "already_exists") for t in tp_results)
+        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+        tp_results.append({
+            "leg": leg,
+            "status": "created",
+            "order_id": str(order.get("orderId", "")),
+            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "price": tp_price,
+            "qty": tp_qty,
+            "pnl_pct": pnl_pct,
+        })
 
-    final_status = "PROTECTED" if (sl_ok and tp_ok) else ("SL_ONLY" if sl_ok else "PROTECTION_FAILED")
+    sl_ok = bool(verified_sl) or sl_result.get("status") in {"created", "already_exists"}
+    successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists"}]
+    if not sl_ok:
+        final_status = "PROTECTION_FAILED"
+    elif len(successful_tps) == len(tp_levels_norm):
+        final_status = "PROTECTED"
+    elif successful_tps:
+        final_status = "SL_ONLY"
+    else:
+        final_status = "SL_ONLY"
 
     return {
         "status": final_status,
@@ -820,3 +958,4 @@ def ensure_directional_protection(
         "tp_orders": tp_results,
         "sl_result": sl_result,
     }
+
