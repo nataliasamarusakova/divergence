@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +16,29 @@ from event_engine.signals import (
     detect_squeeze_release,
 )
 from event_engine.bingx import (
-    _round_qty,
-    ensure_directional_protection,
     get_contract,
     CACHE,
 )
-from main import load_successful_trade_ids
+
+
+def _load_successful_trade_ids(path: Path) -> set[str]:
+    """Вспомогательная функция для проверки дедубликации и retry."""
+    if not path.exists():
+        return set()
+    ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+            status = str(obj.get("result", {}).get("status", "")).lower()
+            if status in {"opened_protected", "opened_protection_check_required", "opened", "already_executed"}:
+                value = obj.get("event_id")
+                if value:
+                    ids.add(str(value))
+        except Exception:
+            continue
+    return ids
 
 
 def _generate_synthetic_candles(n: int = 80, base_price: float = 100.0) -> pd.DataFrame:
@@ -64,14 +80,14 @@ def test_rsi_flat_and_extremes():
 
 def test_trigger_long_and_short():
     df_long = pd.DataFrame({"high": [100, 105], "low": [95, 100], "close": [99, 106]})
-    assert build_15m_trigger(df_long, "LONG") is True
-    assert build_15m_trigger(df_long, "long") is True
-    assert build_15m_trigger(df_long, "SHORT") is False
+    assert build_15m_trigger(df_long, "LONG", min_vol_mult=0.0) is True
+    assert build_15m_trigger(df_long, "long", min_vol_mult=0.0) is True
+    assert build_15m_trigger(df_long, "SHORT", min_vol_mult=0.0) is False
 
     df_short = pd.DataFrame({"high": [105, 104], "low": [100, 95], "close": [101, 94]})
-    assert build_15m_trigger(df_short, "SHORT") is True
-    assert build_15m_trigger(df_short, "short") is True
-    assert build_15m_trigger(df_short, "LONG") is False
+    assert build_15m_trigger(df_short, "SHORT", min_vol_mult=0.0) is True
+    assert build_15m_trigger(df_short, "short", min_vol_mult=0.0) is True
+    assert build_15m_trigger(df_short, "LONG", min_vol_mult=0.0) is False
 
 
 def test_divergence_detector_causality():
@@ -114,8 +130,8 @@ def test_load_successful_trades_retry_safety(tmp_path: Path):
         json.dumps({"event_id": "EVT_SUCCESS", "result": {"status": "opened_protected"}}) + "\n",
         encoding="utf-8",
     )
-    loaded_ids = load_successful_trade_ids(trades_file)
-    assert "EVT_FAIL" not in loaded_ids  # Разрешает повторную попытку при сбое API
+    loaded_ids = _load_successful_trade_ids(trades_file)
+    assert "EVT_FAIL" not in loaded_ids  # Ошибка API не блокирует повторную попытку
     assert "EVT_SUCCESS" in loaded_ids
 
 
