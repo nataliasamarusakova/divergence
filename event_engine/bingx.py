@@ -80,7 +80,7 @@ def _request(
 
     try:
         response = requests.request(
-            "GET" if method == "GET" else method,
+            method,
             BASE_URL + path,
             params=params,
             headers=headers,
@@ -275,7 +275,6 @@ def fetch_klines(
         else:
             continue
 
-        # Защита от незакрытых свечей
         if close_time > now_ms:
             continue
 
@@ -358,6 +357,47 @@ def get_positions() -> list[dict]:
     if resp.get("code") != 0:
         return []
     return _normalize_orders_list(resp)
+
+
+def get_order(symbol: str, order_id: str | int) -> dict:
+    """Получает статус ордера по orderId."""
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found"}
+
+    resp = _request(
+        "GET",
+        ORDER_PATH,
+        {"symbol": bx, "orderId": str(order_id)},
+        signed=True,
+    )
+    if resp.get("code") != 0:
+        return {"status": "error", "error": resp.get("msg"), "code": resp.get("code")}
+
+    data = resp.get("data") or {}
+    order = data.get("order") or data
+    return {
+        "status": "ok",
+        "order_id": str(order.get("orderId", order_id)),
+        "order_status": str(order.get("status", "")).upper(),
+        "avg_price": float(order.get("avgPrice", 0) or order.get("price", 0) or order.get("stopPrice", 0) or 0),
+        "executed_qty": float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0),
+        "orig_qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
+    }
+
+
+def cancel_order(symbol: str, order_id: str | int) -> dict:
+    """Отменяет ордер по orderId."""
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found"}
+
+    return _request(
+        "DELETE",
+        ORDER_PATH,
+        {"symbol": bx, "orderId": str(order_id)},
+        signed=True,
+    )
 
 
 def has_open_position(symbol: str, direction: str) -> bool:
