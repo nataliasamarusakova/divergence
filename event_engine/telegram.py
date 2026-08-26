@@ -89,7 +89,6 @@ def format_signal(
 
     if coinalyze_row is not None:
         oi_chg = getattr(coinalyze_row, "oi_chg4h_pct", None)
-        # Защита от искажения денежных сумм в проценты (-1300000%)
         if oi_chg is not None:
             if abs(oi_chg) > 1000:
                 oi_chg_str = f"${oi_chg:,.0f}"
@@ -108,13 +107,14 @@ def format_signal(
         ]
 
     if setup:
+        rr = setup.get("realized_rr", setup.get("target_rr", 2.0))
         lines += [
             "",
             "<b>SETUP</b>",
             f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
             f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
-            f"TP: <code>{esc(setup.get('target_price'))}</code>",
-            f"R:R: <code>{esc(setup.get('rr'))}</code>",
+            f"TP (Final): <code>{esc(setup.get('target_price'))}</code>",
+            f"R:R (Realized): <code>{esc(rr)}</code>",
         ]
 
     if execution:
