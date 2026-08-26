@@ -26,6 +26,7 @@ from event_engine.signals import (
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health
+from event_engine.tracker import update_active_trades, register_active_trade
 
 
 logging.basicConfig(
@@ -150,7 +151,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         "invalidation_price": invalidation,
         "target_price": target,
         "target_rr": 2.0,
-        "realized_rr": 1.55,  # Взвешенное матожидание каскадного закрытия 30%/30%/40%
+        "realized_rr": 1.55,
         "trigger_ok": True,
     }
 
@@ -347,6 +348,13 @@ def build_fallback_signal_message(
 
 
 def main() -> None:
+    # 1. Сначала опрашиваем открытые позиции (проверяем тейки и стопы)
+    if EXECUTION_ENABLED:
+        try:
+            update_active_trades()
+        except Exception as exc:
+            print(f"[TRACKER_ERROR] {exc}")
+
     stats = {
         "coinalyze_rows": 0,
         "candidates_before_limit": 0,
@@ -486,7 +494,7 @@ def main() -> None:
                         stats["events_cvd_gate_rejected"] += 1
                         continue
 
-                # Окно синхронизации 15M триггера согласовано с MAX_AGE
+                # Окно синхронизации 15M триггера
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
@@ -558,6 +566,24 @@ def main() -> None:
                         executed_event_ids.add(event_id)
                         trades_this_cycle += 1
                         stats["trades"] += 1
+
+                        # Регистрируем открытую сделку в трекере для отслеживания тейков и стопов
+                        try:
+                            register_active_trade(
+                                event_id=event_id,
+                                symbol=symbol,
+                                name=getattr(r, "name", None) or symbol,
+                                direction=direction,
+                                entry_price=float(execution_result.get("position", {}).get("avgPrice", price)),
+                                qty=float(execution_result.get("position", {}).get("positionAmt", 0)),
+                                tp_orders=execution_result.get("protection", {}).get("tp_orders", []),
+                                sl_result=execution_result.get("protection", {}).get("sl_result", {}),
+                                event_type=ev.get("event_type", ""),
+                                coinalyze_row=r,
+                            )
+                        except Exception as exc:
+                            print(f"[REGISTER_ACTIVE_TRADE_ERROR] {symbol}: {exc}")
+
                 elif not EXECUTION_ENABLED:
                     execution_result = {
                         "status": "DISABLED",
