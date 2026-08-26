@@ -4,7 +4,9 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from event_engine.coinalyze import fetch_data
@@ -25,6 +27,7 @@ from event_engine.telegram import send as send_tg, format_signal
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
 
@@ -32,42 +35,48 @@ EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
 
-MAX_CANDIDATES = int(
-    os.environ.get("MAX_CANDIDATES", "40")
-)
 
-MIN_VOL = float(
-    os.environ.get("MIN_VOLUME_24H", "1000000")
-)
-
-MIN_OI = float(
-    os.environ.get("MIN_OPEN_INTEREST", "500000")
-)
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
+MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "1000000"))
+MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "500000"))
 
 EXECUTION_ENABLED = (
-    os.environ.get("EXECUTION_ENABLED", "false").lower()
-    == "true"
+    os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 )
 
 REQUIRE_CVD = (
-    os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower()
-    == "true"
+    os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
 )
 
 REQUIRE_TRIGGER = (
-    os.environ.get("REQUIRE_15M_TRIGGER", "true").lower()
-    == "true"
+    os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 )
 
-# 1H event -> 15m execution trigger.
-# 90m is intentionally used instead of the old 45m.
-MAX_AGE = int(
-    os.environ.get("MAX_EVENT_AGE_MIN", "90")
-)
+MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
+MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "1"))
 
-MAX_TRADES = int(
-    os.environ.get("MAX_TRADES_PER_CYCLE", "1")
-)
+KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "250"))
+KLINE_LIMIT_15M = int(os.environ.get("KLINE_LIMIT_15M", "250"))
+
+# ---------------------------------------------------------------------
+# EXECUTION RISK PARAMETERS
+# ---------------------------------------------------------------------
+
+# Структурный buffer для дивергенции.
+SWING_BUFFER_ATR = float(os.environ.get("SWING_BUFFER_ATR", "0.25"))
+
+# Для squeeze нет P2 structural swing, поэтому используется ATR.
+SQUEEZE_SL_ATR = float(os.environ.get("SQUEEZE_SL_ATR", "1.0"))
+
+# Минимальный R:R.
+MIN_RR = float(os.environ.get("MIN_RR", "2.0"))
+
+# TP = entry + RR * risk.
+TARGET_R_MULTIPLE = float(os.environ.get("TARGET_R_MULTIPLE", "2.0"))
+
+# Дополнительная защита от ненормальных стопов.
+MIN_SL_PCT = float(os.environ.get("MIN_SL_PCT", "0.20"))
+MAX_SL_PCT = float(os.environ.get("MAX_SL_PCT", "15.0"))
 
 
 def load_ids(path: Path) -> set[str]:
@@ -76,49 +85,25 @@ def load_ids(path: Path) -> set[str]:
 
     ids: set[str] = set()
 
-    for line in path.read_text(
-        encoding="utf-8"
-    ).splitlines():
-
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
 
         try:
-            value = json.loads(line).get(
-                "event_id"
-            )
-
+            value = json.loads(line).get("event_id")
             if value:
                 ids.add(value)
-
         except Exception:
             continue
 
     return ids
 
 
-def append_jsonl(
-    path: Path,
-    obj: dict,
-) -> None:
+def append_jsonl(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with path.open(
-        "a",
-        encoding="utf-8",
-    ) as f:
-
-        f.write(
-            json.dumps(
-                obj,
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 def emit_event(ev: dict) -> None:
@@ -133,69 +118,365 @@ def record_action(obj: dict) -> None:
     append_jsonl(ACTIONS, obj)
 
 
-def _event_label(direction: str) -> str:
-    if str(direction).upper() == "LONG":
-        return "🚨 LONG SIGNAL"
+# =====================================================================
+# INDICATORS
+# =====================================================================
 
-    return "🔻 SHORT SIGNAL"
+def calculate_atr(
+    df: pd.DataFrame,
+    length: int = 14,
+) -> pd.Series:
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.rolling(
+        window=length,
+        min_periods=length,
+    ).mean()
 
 
-def _safe_price(value) -> str:
-    try:
-        return f"{float(value):.8g}"
-    except Exception:
-        return "n/a"
+# =====================================================================
+# SETUP BUILDER
+# =====================================================================
 
+def build_execution_setup(
+    event: dict,
+    df_1h: pd.DataFrame,
+) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Строит executable risk geometry ДО open_market().
 
-def _print_trigger_debug(
-    symbol: str,
-    direction: str,
-    df15: pd.DataFrame,
-) -> None:
+    Дивергенция:
+        LONG  -> SL ниже P2 low
+        SHORT -> SL выше P2 high
 
-    try:
-        if len(df15) < 2:
-            print(
-                f"[TRIGGER_DEBUG] "
-                f"symbol={symbol} "
-                f"direction={direction} "
-                f"15m_bars={len(df15)} < 2"
+    Squeeze:
+        используется ATR-based invalidation.
+
+    TP рассчитывается от фиксированного R multiple.
+    """
+
+    if df_1h.empty or len(df_1h) < 20:
+        return None, "INSUFFICIENT_1H_DATA"
+
+    work = df_1h.copy().reset_index(drop=True)
+
+    for col in ("open", "high", "low", "close"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work = work.dropna(
+        subset=["open", "high", "low", "close"]
+    ).reset_index(drop=True)
+
+    if len(work) < 20:
+        return None, "INVALID_1H_DATA"
+
+    work["atr14"] = calculate_atr(work, 14)
+
+    atr = float(work["atr14"].iloc[-1])
+    if not np.isfinite(atr) or atr <= 0:
+        return None, "INVALID_ATR"
+
+    direction = str(event.get("direction", "")).upper()
+
+    if direction not in {"LONG", "SHORT"}:
+        return None, "INVALID_DIRECTION"
+
+    event_type = str(event.get("event_type", ""))
+
+    event_fact = event.get("event_fact", {})
+
+    entry_price = event_fact.get("detection_close_price")
+
+    if entry_price is None:
+        entry_price = float(work["close"].iloc[-1])
+
+    entry_price = float(entry_price)
+
+    if not np.isfinite(entry_price) or entry_price <= 0:
+        return None, "INVALID_ENTRY_PRICE"
+
+    # ---------------------------------------------------------------
+    # 1. STRUCTURAL DIVERGENCE
+    # ---------------------------------------------------------------
+
+    p2_idx = None
+
+    timestamps = event.get("timestamps", {})
+    pivot_2_ts = timestamps.get("pivot_2_ts")
+
+    if "_RSI" in event_type or "BINGX_CVD" in event_type:
+        if pivot_2_ts is not None:
+            close_times = pd.to_numeric(
+                work["close_time"],
+                errors="coerce",
             )
-            return
 
-        prev_bar = df15.iloc[-2]
-        last_bar = df15.iloc[-1]
+            matches = np.where(
+                close_times.to_numpy(dtype=np.int64) == int(pivot_2_ts)
+            )[0]
 
-        print(
-            f"[TRIGGER_DEBUG] "
-            f"symbol={symbol} "
-            f"direction={direction} "
-            f"prev_high={_safe_price(prev_bar.get('high'))} "
-            f"prev_low={_safe_price(prev_bar.get('low'))} "
-            f"last_open={_safe_price(last_bar.get('open'))} "
-            f"last_high={_safe_price(last_bar.get('high'))} "
-            f"last_low={_safe_price(last_bar.get('low'))} "
-            f"last_close={_safe_price(last_bar.get('close'))}"
+            if len(matches):
+                p2_idx = int(matches[-1])
+
+    if p2_idx is not None:
+        pivot_high = float(work["high"].iloc[p2_idx])
+        pivot_low = float(work["low"].iloc[p2_idx])
+
+        if direction == "LONG":
+            invalidation = pivot_low - SWING_BUFFER_ATR * atr
+
+            # Если detection close оказался ниже структуры,
+            # структурный SL уже бессмысленен.
+            if invalidation >= entry_price:
+                invalidation = entry_price - SWING_BUFFER_ATR * atr
+
+        else:
+            invalidation = pivot_high + SWING_BUFFER_ATR * atr
+
+            if invalidation <= entry_price:
+                invalidation = entry_price + SWING_BUFFER_ATR * atr
+
+        setup_type = "STRUCTURAL_DIVERGENCE"
+
+    # ---------------------------------------------------------------
+    # 2. SQUEEZE
+    # ---------------------------------------------------------------
+
+    elif event_type == "VOLATILITY_SQUEEZE_RELEASE":
+        if direction == "LONG":
+            invalidation = entry_price - SQUEEZE_SL_ATR * atr
+        else:
+            invalidation = entry_price + SQUEEZE_SL_ATR * atr
+
+        setup_type = "ATR_SQUEEZE"
+
+    else:
+        return None, "UNSUPPORTED_EVENT_TYPE"
+
+    # ---------------------------------------------------------------
+    # 3. RISK GEOMETRY
+    # ---------------------------------------------------------------
+
+    if direction == "LONG":
+        risk = entry_price - invalidation
+    else:
+        risk = invalidation - entry_price
+
+    if not np.isfinite(risk) or risk <= 0:
+        return None, "INVALID_RISK_DISTANCE"
+
+    risk_pct = risk / entry_price * 100.0
+
+    if risk_pct < MIN_SL_PCT:
+        return None, "SL_TOO_TIGHT"
+
+    if risk_pct > MAX_SL_PCT:
+        return None, "SL_TOO_WIDE"
+
+    target_distance = risk * TARGET_R_MULTIPLE
+
+    if direction == "LONG":
+        target_price = entry_price + target_distance
+    else:
+        target_price = entry_price - target_distance
+
+    rr = target_distance / risk
+
+    if not np.isfinite(rr) or rr < MIN_RR:
+        return None, "RR_BELOW_MINIMUM"
+
+    # Не допускаем неправильного расположения TP.
+    if direction == "LONG":
+        if target_price <= entry_price or invalidation >= entry_price:
+            return None, "INVALID_LONG_GEOMETRY"
+    else:
+        if target_price >= entry_price or invalidation <= entry_price:
+            return None, "INVALID_SHORT_GEOMETRY"
+
+    setup = {
+        "setup_type": setup_type,
+        "entry_reference": entry_price,
+        "invalidation_price": float(invalidation),
+        "target_price": float(target_price),
+        "risk_distance": float(risk),
+        "risk_pct": float(risk_pct),
+        "rr": float(rr),
+        "target_r_multiple": TARGET_R_MULTIPLE,
+        "atr14": float(atr),
+        "trigger_ok": True,
+    }
+
+    return setup, None
+
+
+# =====================================================================
+# CVD CONFIRMATION
+# =====================================================================
+
+def has_cvd_confirmation(
+    event: dict,
+    cvd_events: list[dict],
+) -> bool:
+    """
+    RSI divergence требует CVD на той же физической паре P1/P2
+    и том же направлении.
+
+    Squeeze здесь НЕ проверяется:
+    squeeze — отдельный event type.
+    """
+
+    event_type = str(event.get("event_type", ""))
+
+    if "BINGX_CVD" in event_type:
+        return True
+
+    if "_RSI" not in event_type:
+        return True
+
+    direction = event.get("direction")
+    timestamps = event.get("timestamps", {})
+
+    p1 = timestamps.get("pivot_1_ts")
+    p2 = timestamps.get("pivot_2_ts")
+
+    for other in cvd_events:
+        if other.get("direction") != direction:
+            continue
+
+        other_ts = other.get("timestamps", {})
+
+        if other_ts.get("pivot_1_ts") != p1:
+            continue
+
+        if other_ts.get("pivot_2_ts") != p2:
+            continue
+
+        return True
+
+    return False
+
+
+# =====================================================================
+# TELEGRAM
+# =====================================================================
+
+def build_fallback_message(
+    event: dict,
+    setup: Optional[dict],
+    row: Any,
+    execution: Optional[dict],
+    block_reason: Optional[str] = None,
+) -> str:
+
+    direction = str(event.get("direction", "")).upper()
+
+    label = (
+        "🚨 LONG SIGNAL"
+        if direction == "LONG"
+        else "🔻 SHORT SIGNAL"
+    )
+
+    symbol = event.get("symbol", "?")
+    event_type = event.get("event_type", "?")
+
+    price = (
+        setup["entry_reference"]
+        if setup
+        else event.get("event_fact", {}).get(
+            "detection_close_price",
+            0,
+        )
+    )
+
+    execution_status = (
+        execution.get("status")
+        if execution
+        else "NOT_ATTEMPTED"
+    )
+
+    lines = [
+        label,
+        "",
+        f"<b>{getattr(row, 'name', None) or symbol}</b> "
+        f"(<code>{symbol}</code>)",
+        "",
+        f"Event: <code>{event_type}</code>",
+        "TF: <b>1H + trigger 15m</b>",
+        f"Price: <code>{float(price):.8g}</code>",
+        "",
+        "<b>SETUP</b>",
+    ]
+
+    if setup:
+        lines.extend(
+            [
+                f"Entry: <code>{setup['entry_reference']:.8g}</code>",
+                f"SL: <code>{setup['invalidation_price']:.8g}</code>",
+                f"TP: <code>{setup['target_price']:.8g}</code>",
+                f"R:R: <code>{setup['rr']:.2f}</code>",
+                f"Risk: <code>{setup['risk_pct']:.2f}%</code>",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Entry: <code>—</code>",
+                "SL: <code>—</code>",
+                "TP: <code>—</code>",
+                "R:R: <code>—</code>",
+            ]
         )
 
-        if "close_time" in df15.columns:
-            try:
-                print(
-                    f"[TRIGGER_TIME] "
-                    f"symbol={symbol} "
-                    f"prev_close_time={int(prev_bar['close_time'])} "
-                    f"last_close_time={int(last_bar['close_time'])}"
-                )
-            except Exception:
-                pass
+    lines.extend(
+        [
+            "",
+            "<b>EXECUTION</b>",
+            f"Mode: <code>{os.environ.get('EXECUTION_MODE', 'vst')}</code>",
+            f"Status: <code>{execution_status}</code>",
+        ]
+    )
 
-    except Exception as exc:
-        print(
-            f"[TRIGGER_DEBUG_ERROR] "
-            f"symbol={symbol} "
-            f"error={exc}"
+    if execution and execution.get("order_id"):
+        lines.append(
+            f"Order: <code>{execution['order_id']}</code>"
+        )
+    else:
+        lines.append("Order: <code>—</code>")
+
+    if block_reason:
+        lines.extend(
+            [
+                "",
+                f"⛔ <b>BLOCKED:</b> <code>{block_reason}</code>",
+            ]
         )
 
+    lines.extend(
+        [
+            "",
+            "⚡ Event-driven — 5×5m lifecycle is NOT used",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 def main() -> None:
 
@@ -216,6 +497,7 @@ def main() -> None:
         "events_cvd_gate_rejected": 0,
         "trigger_pass": 0,
         "trigger_rejected": 0,
+        "setup_rejected": 0,
         "setups": 0,
         "execution_attempts": 0,
         "trades": 0,
@@ -224,37 +506,20 @@ def main() -> None:
         "scan_errors": 0,
     }
 
-    # ==============================================================
-    # 1. COINALYZE DISCOVERY
-    # ==============================================================
-
     rows = fetch_data()
-
     stats["coinalyze_rows"] = len(rows)
 
     print(
         f"[ENGINE] Coinalyze rows={len(rows)}"
     )
 
-    # ==============================================================
-    # 2. BINGX CONTRACTS
-    # ==============================================================
-
     try:
-
         refresh_contracts()
-
     except Exception as exc:
-
         stats["scan_errors"] += 1
-
         print(
             f"[BINGX] contracts refresh error={exc}"
         )
-
-    # ==============================================================
-    # 3. CANDIDATE BUILDING + BINGX MAPPING
-    # ==============================================================
 
     candidates = []
 
@@ -263,24 +528,15 @@ def main() -> None:
         if r.price is None or r.price <= 0:
             continue
 
-        if (
-            r.volume24 is None
-            or r.volume24 < MIN_VOL
-        ):
+        if r.volume24 is None or r.volume24 < MIN_VOL:
             continue
 
-        if (
-            r.oi is None
-            or r.oi < MIN_OI
-        ):
+        if r.oi is None or r.oi < MIN_OI:
             continue
 
-        contract = get_contract(
-            r.symbol
-        )
+        contract = get_contract(r.symbol)
 
         if not contract:
-
             stats["bingx_unmapped"] += 1
 
             print(
@@ -302,17 +558,11 @@ def main() -> None:
 
         candidates.append(r)
 
-    stats["candidates_before_limit"] = len(
-        candidates
-    )
+    stats["candidates_before_limit"] = len(candidates)
 
-    candidates = candidates[
-        :MAX_CANDIDATES
-    ]
+    candidates = candidates[:MAX_CANDIDATES]
 
-    stats["candidates"] = len(
-        candidates
-    )
+    stats["candidates"] = len(candidates)
 
     print(
         f"[ENGINE] Coinalyze candidates={len(candidates)} "
@@ -320,23 +570,10 @@ def main() -> None:
         f"env={os.environ.get('EXECUTION_MODE', os.environ.get('BINGX_ENV', 'vst'))}"
     )
 
-    # ==============================================================
-    # 4. EVENT / EXECUTION STATE
-    # ==============================================================
-
-    seen_events = load_ids(
-        EVENTS
-    )
-
-    executed_event_ids = load_ids(
-        TRADES
-    )
+    seen_events = load_ids(EVENTS)
+    executed_event_ids = load_ids(TRADES)
 
     trades = 0
-
-    # ==============================================================
-    # 5. PROCESS CANDIDATES
-    # ==============================================================
 
     for r in candidates:
 
@@ -344,66 +581,38 @@ def main() -> None:
 
         try:
 
-            # ------------------------------------------------------
-            # 5.1 OHLCV
-            # ------------------------------------------------------
-
             k1 = fetch_klines(
                 symbol,
                 "1h",
-                int(
-                    os.environ.get(
-                        "KLINE_LIMIT_1H",
-                        "250",
-                    )
-                ),
+                KLINE_LIMIT_1H,
             )
 
             k15 = fetch_klines(
                 symbol,
                 "15m",
-                int(
-                    os.environ.get(
-                        "KLINE_LIMIT_15M",
-                        "250",
-                    )
-                ),
+                KLINE_LIMIT_15M,
             )
 
             if len(k1) < 60:
-
                 print(
                     f"[DATA_REJECT] "
-                    f"{symbol} "
-                    f"1H bars={len(k1)} < 60"
+                    f"{symbol} 1H bars={len(k1)} < 60"
                 )
-
                 continue
 
             if len(k15) < 10:
-
                 print(
                     f"[DATA_REJECT] "
-                    f"{symbol} "
-                    f"15m bars={len(k15)} < 10"
+                    f"{symbol} 15m bars={len(k15)} < 10"
                 )
-
                 continue
 
             stats["klines_1h_ok"] += 1
             stats["klines_15m_ok"] += 1
 
-            # ------------------------------------------------------
-            # 5.2 CVD
-            # ------------------------------------------------------
-
             d1 = add_cvd(
                 pd.DataFrame(k1)
             )
-
-            # ------------------------------------------------------
-            # 5.3 1H DIVERGENCES
-            # ------------------------------------------------------
 
             rsi_events_all = detect_divergences(
                 d1,
@@ -411,47 +620,25 @@ def main() -> None:
                 "1h",
             )
 
-            # ------------------------------------------------------
-            # 5.4 1H SQUEEZE
-            # ------------------------------------------------------
-
-            squeeze_events = (
-                detect_squeeze_release(
-                    d1,
-                    symbol,
-                    "1h",
-                )
+            squeeze_events = detect_squeeze_release(
+                d1,
+                symbol,
+                "1h",
             )
 
             rsi_events = [
-                e
-                for e in rsi_events_all
-                if "_RSI" in e.get(
-                    "event_type",
-                    "",
-                )
+                e for e in rsi_events_all
+                if "_RSI" in e.get("event_type", "")
             ]
 
             cvd_events = [
-                e
-                for e in rsi_events_all
-                if "BINGX_CVD" in e.get(
-                    "event_type",
-                    "",
-                )
+                e for e in rsi_events_all
+                if "BINGX_CVD" in e.get("event_type", "")
             ]
 
-            stats["rsi_events"] += len(
-                rsi_events
-            )
-
-            stats["cvd_events"] += len(
-                cvd_events
-            )
-
-            stats["squeeze_events"] += len(
-                squeeze_events
-            )
+            stats["rsi_events"] += len(rsi_events)
+            stats["cvd_events"] += len(cvd_events)
+            stats["squeeze_events"] += len(squeeze_events)
 
             stats["events_total"] += (
                 len(rsi_events_all)
@@ -471,24 +658,15 @@ def main() -> None:
                 + squeeze_events
             )
 
-            # ------------------------------------------------------
-            # 5.5 EVENT PROCESSING
-            # ------------------------------------------------------
-
             for ev in all_events:
 
-                event_id = ev.get(
-                    "event_id"
-                )
+                event_id = ev.get("event_id")
 
                 if not event_id:
-
                     print(
                         f"[EVENT_REJECT] "
-                        f"{symbol} "
-                        f"event without event_id"
+                        f"{symbol} event without event_id"
                     )
-
                     continue
 
                 detected_at = int(
@@ -506,18 +684,10 @@ def main() -> None:
                 )
 
                 age = (
-                    latest_close
-                    - detected_at
+                    latest_close - detected_at
                 ) / 60000.0
 
-                # --------------------------------------------------
-                # EVENT AGE
-                # --------------------------------------------------
-
-                if (
-                    age < 0
-                    or age > MAX_AGE
-                ):
+                if age < 0 or age > MAX_AGE:
 
                     print(
                         f"[EVENT_REJECT_AGE] "
@@ -531,9 +701,9 @@ def main() -> None:
 
                 stats["events_recent"] += 1
 
-                # --------------------------------------------------
-                # PERSIST EVENT
-                # --------------------------------------------------
+                # -----------------------------------------------------
+                # EVENT PERSISTENCE
+                # -----------------------------------------------------
 
                 if event_id in seen_events:
 
@@ -541,63 +711,25 @@ def main() -> None:
 
                 else:
 
-                    emit_event(
-                        ev
-                    )
+                    emit_event(ev)
+                    seen_events.add(event_id)
 
-                    seen_events.add(
-                        event_id
-                    )
-
-                # --------------------------------------------------
-                # OPTIONAL CVD CONFIRMATION
-                # --------------------------------------------------
+                # -----------------------------------------------------
+                # CVD GATE
+                # -----------------------------------------------------
 
                 if (
                     REQUIRE_CVD
-                    and "_RSI"
-                    in ev.get(
+                    and "_RSI" in ev.get(
                         "event_type",
                         "",
                     )
                 ):
 
-                    matched_cvd = any(
-                        other.get(
-                            "direction"
-                        )
-                        == ev.get(
-                            "direction"
-                        )
-                        and other.get(
-                            "timestamps",
-                            {},
-                        ).get(
-                            "pivot_1_ts"
-                        )
-                        == ev.get(
-                            "timestamps",
-                            {},
-                        ).get(
-                            "pivot_1_ts"
-                        )
-                        and other.get(
-                            "timestamps",
-                            {},
-                        ).get(
-                            "pivot_2_ts"
-                        )
-                        == ev.get(
-                            "timestamps",
-                            {},
-                        ).get(
-                            "pivot_2_ts"
-                        )
-                        for other
-                        in cvd_events
-                    )
-
-                    if not matched_cvd:
+                    if not has_cvd_confirmation(
+                        ev,
+                        cvd_events,
+                    ):
 
                         stats[
                             "events_cvd_gate_rejected"
@@ -606,32 +738,26 @@ def main() -> None:
                         print(
                             f"[EVENT_REJECT_CVD] "
                             f"{symbol} "
-                            f"type={ev.get('event_type')}"
+                            f"type={ev.get('event_type')} "
+                            f"reason=no_matching_cvd"
                         )
 
+                        # Не строим setup,
+                        # не открываем trade.
                         continue
 
-                # --------------------------------------------------
+                # -----------------------------------------------------
                 # 15M TRIGGER
-                # --------------------------------------------------
-
-                df15 = pd.DataFrame(
-                    k15
-                )
+                # -----------------------------------------------------
 
                 trigger = build_15m_trigger(
-                    df15,
+                    pd.DataFrame(k15),
                     ev["direction"],
                 )
 
-                if (
-                    REQUIRE_TRIGGER
-                    and not trigger
-                ):
+                if REQUIRE_TRIGGER and not trigger:
 
-                    stats[
-                        "trigger_rejected"
-                    ] += 1
+                    stats["trigger_rejected"] += 1
 
                     print(
                         f"[TRIGGER_REJECT] "
@@ -641,71 +767,125 @@ def main() -> None:
                         f"reason=15m_trigger_failed"
                     )
 
-                    _print_trigger_debug(
-                        symbol=symbol,
-                        direction=ev.get(
-                            "direction",
-                            "",
-                        ),
-                        df15=df15,
-                    )
-
                     continue
 
-                stats[
-                    "trigger_pass"
-                ] += 1
+                stats["trigger_pass"] += 1
 
-                print(
-                    f"[TRIGGER_PASS] "
-                    f"symbol={symbol} "
-                    f"direction={ev.get('direction')} "
-                    f"event={ev.get('event_type')}"
+                # -----------------------------------------------------
+                # SETUP
+                # -----------------------------------------------------
+
+                setup, setup_reason = (
+                    build_execution_setup(
+                        ev,
+                        d1,
+                    )
                 )
 
-                # --------------------------------------------------
-                # REFERENCE ENTRY PRICE
-                # --------------------------------------------------
+                if setup is None:
 
-                try:
-
-                    price = float(
-                        ev[
-                            "event_fact"
-                        ][
-                            "detection_close_price"
-                        ]
-                    )
-
-                except Exception:
+                    stats["setup_rejected"] += 1
 
                     print(
-                        f"[EVENT_REJECT] "
+                        f"[SETUP_REJECT] "
                         f"{symbol} "
-                        f"missing detection_close_price"
+                        f"event={event_id} "
+                        f"type={ev.get('event_type')} "
+                        f"reason={setup_reason}"
+                    )
+
+                    # Сигнал пользователю все равно отправляем,
+                    # но execution категорически не пытаемся.
+                    execution_result = {
+                        "status": "SETUP_REJECTED",
+                        "mode": os.environ.get(
+                            "EXECUTION_MODE",
+                            "vst",
+                        ),
+                        "order_id": None,
+                        "reason": setup_reason,
+                    }
+
+                    stats["telegram_attempts"] += 1
+
+                    try:
+                        msg = format_signal(
+                            ev,
+                            setup={
+                                "entry_reference":
+                                    ev.get(
+                                        "event_fact",
+                                        {},
+                                    ).get(
+                                        "detection_close_price"
+                                    ),
+                                "invalidation_price": None,
+                                "target_price": None,
+                                "rr": None,
+                            },
+                            coinalyze_row=r,
+                            execution=execution_result,
+                        )
+                    except Exception:
+                        msg = build_fallback_message(
+                            ev,
+                            None,
+                            r,
+                            execution_result,
+                            setup_reason,
+                        )
+
+                    try:
+                        sent = bool(send_tg(msg))
+                    except Exception as exc:
+                        sent = False
+                        print(
+                            f"[TELEGRAM_ERROR] "
+                            f"{symbol}: {exc}"
+                        )
+
+                    if sent:
+                        stats["telegram_sent"] += 1
+
+                    record_action(
+                        {
+                            "event_id": event_id,
+                            "symbol": symbol,
+                            "direction": ev["direction"],
+                            "event_type": ev.get(
+                                "event_type"
+                            ),
+                            "telegram_sent": bool(sent),
+                            "execution_status":
+                                "SETUP_REJECTED",
+                            "setup_reject_reason":
+                                setup_reason,
+                            "ts": int(
+                                pd.Timestamp.utcnow()
+                                .timestamp()
+                                * 1000
+                            ),
+                        }
                     )
 
                     continue
 
-                # --------------------------------------------------
-                # SETUP
-                # --------------------------------------------------
+                stats["setups"] += 1
 
-                setup = {
-                    "entry_reference": price,
-                    "invalidation_price": None,
-                    "target_price": None,
-                    "rr": None,
-                    "trigger_ok": True,
-                }
+                print(
+                    f"[SETUP_OK] "
+                    f"{symbol} "
+                    f"direction={ev['direction']} "
+                    f"entry={setup['entry_reference']:.8g} "
+                    f"SL={setup['invalidation_price']:.8g} "
+                    f"TP={setup['target_price']:.8g} "
+                    f"RR={setup['rr']:.2f} "
+                    f"risk={setup['risk_pct']:.2f}%"
+                )
 
-                stats[
-                    "setups"
-                ] += 1
-
-                # --------------------------------------------------
+                # -----------------------------------------------------
                 # EXECUTION
-                # --------------------------------------------------
+                # -----------------------------------------------------
 
                 execution_result = None
 
@@ -726,82 +906,145 @@ def main() -> None:
                         f"event={event_id}"
                     )
 
-                elif (
-                    EXECUTION_ENABLED
-                    and trades < MAX_TRADES
-                ):
+                elif EXECUTION_ENABLED and trades < MAX_TRADES:
 
-                    stats[
-                        "execution_attempts"
-                    ] += 1
+                    stats["execution_attempts"] += 1
 
                     trade_id = (
-                        event_id.replace(
+                        event_id
+                        .replace(
                             "EVT_",
                             "",
                         )
                     )
 
-                    execution_result = open_market(
-                        symbol,
-                        ev["direction"],
-                        price,
-                        trade_id,
-                    )
+                    # -------------------------------------------------
+                    # FINAL HARD GATE
+                    # -------------------------------------------------
 
-                    record_trade(
-                        {
-                            "event_id": event_id,
-                            "symbol": symbol,
-                            "direction": ev[
-                                "direction"
-                            ],
-                            "price": price,
-                            "event_type": ev.get(
-                                "event_type"
-                            ),
-                            "ts": int(
-                                pd.Timestamp.utcnow().timestamp()
-                                * 1000
-                            ),
-                            "result": execution_result,
-                        }
-                    )
-
-                    # IMPORTANT:
-                    # Mark event as processed after order attempt
-                    # so the same event isn't repeatedly submitted.
-                    executed_event_ids.add(
-                        event_id
-                    )
-
-                    if (
-                        execution_result.get(
-                            "status"
-                        )
-                        == "opened"
+                    if not setup.get(
+                        "invalidation_price"
                     ):
+                        execution_result = {
+                            "status":
+                                "BLOCKED_NO_SL",
+                            "mode":
+                                os.environ.get(
+                                    "EXECUTION_MODE",
+                                    "vst",
+                                ),
+                            "order_id":
+                                None,
+                        }
 
-                        trades += 1
+                    elif not setup.get(
+                        "target_price"
+                    ):
+                        execution_result = {
+                            "status":
+                                "BLOCKED_NO_TP",
+                            "mode":
+                                os.environ.get(
+                                    "EXECUTION_MODE",
+                                    "vst",
+                                ),
+                            "order_id":
+                                None,
+                        }
 
-                        stats[
-                            "trades"
-                        ] += 1
-
-                        print(
-                            f"[EXECUTION_OPENED] "
-                            f"{symbol} "
-                            f"direction={ev['direction']} "
-                            f"order={execution_result.get('order_id')}"
-                        )
+                    elif (
+                        setup.get("rr") is None
+                        or setup["rr"] < MIN_RR
+                    ):
+                        execution_result = {
+                            "status":
+                                "BLOCKED_BAD_RR",
+                            "mode":
+                                os.environ.get(
+                                    "EXECUTION_MODE",
+                                    "vst",
+                                ),
+                            "order_id":
+                                None,
+                        }
 
                     else:
 
-                        print(
-                            f"[EXECUTION_RESULT] "
-                            f"{symbol} "
-                            f"status={execution_result.get('status')} "
-                            f"message={execution_result.get('msg')}"
+                        execution_result = open_market(
+                            symbol,
+                            ev["direction"],
+                            setup[
+                                "entry_reference"
+                            ],
+                            trade_id,
+                        )
+
+                        record_trade(
+                            {
+                                "event_id":
+                                    event_id,
+                                "symbol":
+                                    symbol,
+                                "direction":
+                                    ev["direction"],
+                                "price":
+                                    setup[
+                                        "entry_reference"
+                                    ],
+                                "sl":
+                                    setup[
+                                        "invalidation_price"
+                                    ],
+                                "tp":
+                                    setup[
+                                        "target_price"
+                                    ],
+                                "rr":
+                                    setup["rr"],
+                                "event_type":
+                                    ev.get(
+                                        "event_type"
+                                    ),
+                                "ts":
+                                    int(
+                                        pd.Timestamp.utcnow()
+                                        .timestamp()
+                                        * 1000
+                                    ),
+                                "result":
+                                    execution_result,
+                            }
+                        )
+
+                        if execution_result.get(
+                            "status"
+                        ) == "opened":
+
+                            trades += 1
+                            stats["trades"] += 1
+
+                            print(
+                                f"[EXECUTION_OPENED] "
+                                f"{symbol} "
+                                f"direction={ev['direction']} "
+                                f"entry={setup['entry_reference']:.8g} "
+                                f"SL={setup['invalidation_price']:.8g} "
+                                f"TP={setup['target_price']:.8g} "
+                                f"RR={setup['rr']:.2f} "
+                                f"order={execution_result.get('order_id')}"
+                            )
+
+                        else:
+
+                            print(
+                                f"[EXECUTION_RESULT] "
+                                f"{symbol} "
+                                f"status={execution_result.get('status')} "
+                                f"message={execution_result.get('msg')}"
+                            )
+
+                        executed_event_ids.add(
+                            event_id
                         )
 
                 elif not EXECUTION_ENABLED:
@@ -818,21 +1061,22 @@ def main() -> None:
                 else:
 
                     execution_result = {
-                        "status": "TRADE_LIMIT_REACHED",
-                        "mode": os.environ.get(
-                            "EXECUTION_MODE",
-                            "vst",
-                        ),
-                        "order_id": None,
+                        "status":
+                            "TRADE_LIMIT_REACHED",
+                        "mode":
+                            os.environ.get(
+                                "EXECUTION_MODE",
+                                "vst",
+                            ),
+                        "order_id":
+                            None,
                     }
 
-                # --------------------------------------------------
+                # -----------------------------------------------------
                 # TELEGRAM
-                # --------------------------------------------------
+                # -----------------------------------------------------
 
-                label = _event_label(
-                    ev["direction"]
-                )
+                stats["telegram_attempts"] += 1
 
                 try:
 
@@ -845,43 +1089,22 @@ def main() -> None:
 
                 except Exception as exc:
 
-                    status = (
-                        execution_result.get(
-                            "status"
-                        )
-                        if execution_result
-                        else "NOT_ATTEMPTED"
-                    )
-
-                    msg = (
-                        f"{label}\n"
-                        f"<b>"
-                        f"{getattr(r, 'name', None) or symbol}"
-                        f"</b> "
-                        f"(<code>{symbol}</code>)\n"
-                        f"Event: "
-                        f"<code>{ev.get('event_type')}</code>\n"
-                        f"TF: "
-                        f"1H + trigger 15m\n"
-                        f"Price: "
-                        f"<code>{price:.8g}</code>\n"
-                        f"Execution: "
-                        f"<code>{status}</code>"
-                    )
-
                     print(
                         f"[TELEGRAM_FORMAT_FALLBACK] "
                         f"{symbol}: {exc}"
                     )
 
-                stats[
-                    "telegram_attempts"
-                ] += 1
+                    msg = build_fallback_message(
+                        ev,
+                        setup,
+                        r,
+                        execution_result,
+                    )
 
                 try:
 
-                    sent = send_tg(
-                        msg
+                    sent = bool(
+                        send_tg(msg)
                     )
 
                 except Exception as exc:
@@ -894,58 +1117,47 @@ def main() -> None:
                     )
 
                 if sent:
-
-                    stats[
-                        "telegram_sent"
-                    ] += 1
-
-                    print(
-                        f"[TELEGRAM_SENT] "
-                        f"{symbol} "
-                        f"direction={ev['direction']}"
-                    )
+                    stats["telegram_sent"] += 1
 
                 record_action(
                     {
-                        "event_id": event_id,
-                        "symbol": symbol,
-                        "direction": ev[
-                            "direction"
-                        ],
-                        "event_type": ev.get(
-                            "event_type"
-                        ),
-                        "telegram_sent": bool(
-                            sent
-                        ),
-                        "execution_status": (
+                        "event_id":
+                            event_id,
+                        "symbol":
+                            symbol,
+                        "direction":
+                            ev["direction"],
+                        "event_type":
+                            ev.get(
+                                "event_type"
+                            ),
+                        "telegram_sent":
+                            bool(sent),
+                        "execution_status":
                             execution_result.get(
                                 "status"
                             )
                             if execution_result
-                            else None
-                        ),
-                        "ts": int(
-                            pd.Timestamp.utcnow().timestamp()
-                            * 1000
-                        ),
+                            else None,
+                        "setup":
+                            setup,
+                        "ts":
+                            int(
+                                pd.Timestamp.utcnow()
+                                .timestamp()
+                                * 1000
+                            ),
                     }
                 )
 
         except Exception as exc:
 
-            stats[
-                "scan_errors"
-            ] += 1
+            stats["scan_errors"] += 1
 
             print(
                 f"[SCAN_ERROR] "
                 f"{symbol}: {exc}"
             )
-
-    # ==============================================================
-    # 6. SUMMARY
-    # ==============================================================
 
     print(
         f"[ENGINE] "
@@ -956,8 +1168,7 @@ def main() -> None:
         "[ENGINE_SUMMARY] "
         + " ".join(
             f"{key}={value}"
-            for key, value
-            in stats.items()
+            for key, value in stats.items()
         )
     )
 
