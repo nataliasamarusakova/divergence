@@ -1,6 +1,4 @@
-"""
-test_signals.py
-"""
+#  test_signals.py
 
 from __future__ import annotations
 
