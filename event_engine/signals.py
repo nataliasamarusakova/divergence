@@ -13,10 +13,17 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+    # Корректная обработка граничных случаев
+    zero_loss = (avg_loss == 0) & (avg_gain > 0)
+    zero_both = (avg_loss == 0) & (avg_gain == 0)
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    # Защита от NaN при безоткатном вертикальном пампе (avg_loss == 0)
-    return rsi.fillna(100.0)
+
+    rsi = rsi.where(~zero_loss, 100.0)
+    rsi = rsi.where(~zero_both, 50.0)  # Плоский рынок = нейтральные 50.0
+    return rsi.fillna(50.0)
 
 
 def _bbands(series: pd.Series, n: int = 20, std: float = 2.0):
@@ -142,7 +149,7 @@ def detect_divergences(
             if p2_price < p1_price and p2v > p1v:
                 typ = f"REGULAR_BULLISH_{indicator.upper()}"
                 direction = "LONG"
-            # 2. Hidden Bullish: Price Higher Low + Indicator Lower Low (Trend Continuation)
+            # 2. Hidden Bullish: Price Higher Low + Indicator Lower Low
             elif p2_price > p1_price and p2v < p1v:
                 typ = f"HIDDEN_BULLISH_{indicator.upper()}"
                 direction = "LONG"
@@ -151,7 +158,7 @@ def detect_divergences(
             if p2_price > p1_price and p2v < p1v:
                 typ = f"REGULAR_BEARISH_{indicator.upper()}"
                 direction = "SHORT"
-            # 4. Hidden Bearish: Price Lower High + Indicator Higher High (Trend Continuation)
+            # 4. Hidden Bearish: Price Lower High + Indicator Higher High
             elif p2_price < p1_price and p2v > p1v:
                 typ = f"HIDDEN_BEARISH_{indicator.upper()}"
                 direction = "SHORT"
