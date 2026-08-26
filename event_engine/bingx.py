@@ -159,61 +159,204 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
             f"data_type={type(rows).__name__}"
         )
 
+    first_shape = "empty"
+
+    if rows:
+        if isinstance(rows[0], (list, tuple)):
+            first_shape = f"array_len={len(rows[0])}"
+        elif isinstance(rows[0], dict):
+            first_shape = "dict"
+        else:
+            first_shape = type(rows[0]).__name__
+
     print(
         f"[BINGX_KLINES_RAW] "
         f"symbol={bx} "
         f"interval={interval} "
         f"rows={len(rows)} "
-        f"first_len={len(rows[0]) if rows and isinstance(rows[0], (list, tuple)) else 0}"
+        f"first_shape={first_shape}"
     )
 
     out: list[dict] = []
 
-    now = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
 
     duration_ms = {
-        "15m": 15 * 60 * 1000,
-        "1h": 60 * 60 * 1000,
+        "1m": 60_000,
+        "3m": 180_000,
+        "5m": 300_000,
+        "15m": 900_000,
+        "30m": 1_800_000,
+        "1h": 3_600_000,
+        "2h": 7_200_000,
+        "4h": 14_400_000,
+        "6h": 21_600_000,
+        "12h": 43_200_000,
+        "1d": 86_400_000,
     }.get(interval)
 
     for row in rows:
 
-        if not isinstance(row, (list, tuple)):
-            continue
+        # ------------------------------------------------------------
+        # FORMAT 1: ARRAY
+        #
+        # [open_time, open, high, low, close, volume, close_time, ...]
+        # ------------------------------------------------------------
+        if isinstance(row, (list, tuple)):
 
-        # OHLCV + close_time are mandatory.
-        # Taker fields are optional.
-        if len(row) < 7:
-            continue
-
-        try:
-            ot = int(row[0])
-
-            ct = (
-                int(row[6])
-                if row[6] is not None
-                else (
-                    ot + duration_ms
-                    if duration_ms
-                    else ot
-                )
-            )
-
-            if ct > now:
+            if len(row) < 6:
                 continue
 
-            open_ = float(row[1])
-            high = float(row[2])
-            low = float(row[3])
-            close = float(row[4])
-            volume = float(row[5])
+            try:
+                open_time = int(row[0])
+                open_price = float(row[1])
+                high = float(row[2])
+                low = float(row[3])
+                close = float(row[4])
+                volume = float(row[5])
 
-        except (TypeError, ValueError, IndexError):
+                if len(row) >= 7 and row[6] is not None:
+                    close_time = int(row[6])
+                else:
+                    close_time = (
+                        open_time + duration_ms
+                        if duration_ms
+                        else open_time
+                    )
+
+                quote_volume = None
+                taker_buy_base = None
+                taker_buy_quote = None
+
+                if len(row) >= 8 and row[7] is not None:
+                    try:
+                        quote_volume = float(row[7])
+                    except (TypeError, ValueError):
+                        quote_volume = None
+
+                if len(row) >= 10 and row[9] is not None:
+                    try:
+                        taker_buy_base = float(row[9])
+                    except (TypeError, ValueError):
+                        taker_buy_base = None
+
+                if len(row) >= 11 and row[10] is not None:
+                    try:
+                        taker_buy_quote = float(row[10])
+                    except (TypeError, ValueError):
+                        taker_buy_quote = None
+
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        # ------------------------------------------------------------
+        # FORMAT 2: DICT / OBJECT
+        # ------------------------------------------------------------
+        elif isinstance(row, dict):
+
+            def pick(*names):
+                for name in names:
+                    if name in row and row[name] is not None:
+                        return row[name]
+                return None
+
+            try:
+                open_time = int(
+                    pick(
+                        "openTime",
+                        "open_time",
+                        "time",
+                    )
+                )
+
+                open_price = float(
+                    pick("open")
+                )
+
+                high = float(
+                    pick("high")
+                )
+
+                low = float(
+                    pick("low")
+                )
+
+                close = float(
+                    pick("close")
+                )
+
+                volume = float(
+                    pick("volume")
+                )
+
+                raw_close_time = pick(
+                    "closeTime",
+                    "close_time",
+                )
+
+                close_time = (
+                    int(raw_close_time)
+                    if raw_close_time is not None
+                    else (
+                        open_time + duration_ms
+                        if duration_ms
+                        else open_time
+                    )
+                )
+
+                quote_volume_raw = pick(
+                    "quoteAssetVolume",
+                    "quoteVolume",
+                    "quote_volume",
+                )
+
+                taker_base_raw = pick(
+                    "takerBuyBaseVolume",
+                    "taker_buy_base",
+                    "takerBuyBase",
+                )
+
+                taker_quote_raw = pick(
+                    "takerBuyQuoteVolume",
+                    "taker_buy_quote",
+                    "takerBuyQuote",
+                )
+
+                quote_volume = (
+                    float(quote_volume_raw)
+                    if quote_volume_raw is not None
+                    else None
+                )
+
+                taker_buy_base = (
+                    float(taker_base_raw)
+                    if taker_base_raw is not None
+                    else None
+                )
+
+                taker_buy_quote = (
+                    float(taker_quote_raw)
+                    if taker_quote_raw is not None
+                    else None
+                )
+
+            except (TypeError, ValueError, KeyError):
+                continue
+
+        else:
             continue
 
-        # Basic OHLCV validation.
+        # ------------------------------------------------------------
+        # CLOSED CANDLE GUARD
+        # ------------------------------------------------------------
+        if close_time > now_ms:
+            continue
+
+        # ------------------------------------------------------------
+        # OHLCV VALIDATION
+        # ------------------------------------------------------------
         if (
-            open_ <= 0
+            open_price <= 0
             or high <= 0
             or low <= 0
             or close <= 0
@@ -223,76 +366,75 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
 
         if (
             high < low
-            or high < open_
+            or high < open_price
             or high < close
-            or low > open_
+            or low > open_price
             or low > close
         ):
             continue
 
-        quote = None
-        taker_b = None
-        taker_q = None
+        # ------------------------------------------------------------
+        # TAKER FLOW VALIDATION
+        #
+        # Missing taker data != zero.
+        # ------------------------------------------------------------
+        taker_flow_valid = (
+            quote_volume is not None
+            and taker_buy_base is not None
+            and taker_buy_quote is not None
+            and quote_volume >= 0
+            and taker_buy_base >= 0
+            and taker_buy_quote >= 0
+            and taker_buy_base <= volume * 1.001 + 1e-8
+            and taker_buy_quote <= quote_volume * 1.001 + 1e-8
+        )
 
-        # Extended fields are optional.
-        if len(row) >= 8:
-            try:
-                quote = float(row[7])
-            except (TypeError, ValueError):
-                quote = None
-
-        if len(row) >= 10:
-            try:
-                taker_b = float(row[9])
-            except (TypeError, ValueError):
-                taker_b = None
-
-        if len(row) >= 11:
-            try:
-                taker_q = float(row[10])
-            except (TypeError, ValueError):
-                taker_q = None
-
-        taker_flow_valid = False
-        delta_usdt = None
-
-        # CVD is valid only when the complete taker flow is present.
-        if (
-            quote is not None
-            and taker_b is not None
-            and taker_q is not None
-            and quote >= 0
-            and taker_b >= 0
-            and taker_q >= 0
-            and taker_b <= volume * 1.001 + 1e-9
-            and taker_q <= quote * 1.001 + 1e-9
-        ):
-            taker_flow_valid = True
-            delta_usdt = (
-                2.0 * taker_q
-                - quote
+        if taker_flow_valid:
+            bar_delta_usdt = (
+                2.0 * taker_buy_quote
+                - quote_volume
             )
+        else:
+            bar_delta_usdt = None
 
         out.append(
             {
-                "open_time": ot,
-                "close_time": ct,
-                "open": open_,
+                "open_time": open_time,
+                "close_time": close_time,
+                "open": open_price,
                 "high": high,
                 "low": low,
                 "close": close,
                 "volume": volume,
-                "quote_volume": quote,
-                "taker_buy_base": taker_b,
-                "taker_buy_quote": taker_q,
+                "quote_volume": quote_volume,
+                "taker_buy_base": taker_buy_base,
+                "taker_buy_quote": taker_buy_quote,
                 "taker_flow_valid": taker_flow_valid,
-                "bar_delta_usdt": delta_usdt,
+                "bar_delta_usdt": bar_delta_usdt,
             }
         )
 
+    # ------------------------------------------------------------
+    # SORT + DEDUP
+    # ------------------------------------------------------------
     out.sort(
         key=lambda x: x["close_time"]
     )
+
+    deduped = []
+
+    seen_close_times = set()
+
+    for bar in out:
+        ct = bar["close_time"]
+
+        if ct in seen_close_times:
+            continue
+
+        seen_close_times.add(ct)
+        deduped.append(bar)
+
+    out = deduped
 
     print(
         f"[BINGX_KLINES_PARSED] "
