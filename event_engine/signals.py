@@ -44,14 +44,58 @@ def _event_id(symbol, tf, typ, p1_ts, p2_ts):
 
 
 def add_cvd(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    segment = (~out["bar_delta_usdt"].notna()).cumsum()
-    out["cvd_segment_id"] = segment
-    out["bingx_cvd"] = np.nan
-    for seg, g in out.groupby("cvd_segment_id"):
-        valid = g["bar_delta_usdt"].notna()
-        out.loc[g.index[valid], "bingx_cvd"] = g.loc[valid, "bar_delta_usdt"].cumsum()
-    return out
+    work = df.copy()
+
+    if "bar_delta_usdt" not in work.columns:
+        work["bingx_cvd"] = float("nan")
+        work["cvd_segment_id"] = 0
+        return work
+
+    if "taker_flow_valid" not in work.columns:
+        work["taker_flow_valid"] = False
+
+    work["taker_flow_valid"] = (
+        work["taker_flow_valid"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # New segment after every invalid taker-flow bar.
+    work["cvd_segment_id"] = (
+        (~work["taker_flow_valid"])
+        .cumsum()
+    )
+
+    work["bingx_cvd"] = float("nan")
+
+    for segment_id, idx in work.groupby(
+        "cvd_segment_id",
+        sort=False,
+    ).groups.items():
+
+        valid_idx = [
+            i
+            for i in idx
+            if bool(
+                work.at[i, "taker_flow_valid"]
+            )
+            and pd.notna(
+                work.at[i, "bar_delta_usdt"]
+            )
+        ]
+
+        if not valid_idx:
+            continue
+
+        work.loc[
+            valid_idx,
+            "bingx_cvd"
+        ] = work.loc[
+            valid_idx,
+            "bar_delta_usdt"
+        ].cumsum()
+
+    return work
 
 
 def detect_divergences(df: pd.DataFrame, symbol: str, timeframe: str = "1h", left=3, right=2, min_bars=5, max_bars=35, min_delta_atr=0.25) -> list[dict[str, Any]]:
