@@ -41,16 +41,17 @@ def test_parse_number():
 def test_trigger_long_and_short():
     df_long = pd.DataFrame({"high": [100, 105], "low": [95, 100], "close": [99, 106]})
     assert build_15m_trigger(df_long, "LONG") is True
+    assert build_15m_trigger(df_long, "long") is True
     assert build_15m_trigger(df_long, "SHORT") is False
 
     df_short = pd.DataFrame({"high": [105, 104], "low": [100, 95], "close": [101, 94]})
     assert build_15m_trigger(df_short, "SHORT") is True
+    assert build_15m_trigger(df_short, "short") is True
     assert build_15m_trigger(df_short, "LONG") is False
 
 
 def test_divergence_detector_causality():
     df = _generate_synthetic_candles(75)
-    # Price Lower Low
     df.loc[30, "low"] = 85.0
     df.loc[30, "close"] = 86.0
     df.loc[45, "low"] = 80.0
@@ -62,19 +63,16 @@ def test_divergence_detector_causality():
 
     for ev in events:
         ts = ev["timestamps"]
-        # Invariant: detected_at_ts must be >= pivot_2_ts
         assert ts["detected_at_ts"] >= ts["pivot_2_ts"]
         assert ts["pivot_2_ts"] > ts["pivot_1_ts"]
 
 
 def test_squeeze_release_duration_enforced():
     df = _generate_synthetic_candles(80)
-    # Force squeeze across previous bars
     df["close"] = 100.0
     df["high"] = 100.1
     df["low"] = 99.9
 
-    # Massive expansion on the final bar
     df.loc[79, "close"] = 115.0
     df.loc[79, "high"] = 116.0
 
