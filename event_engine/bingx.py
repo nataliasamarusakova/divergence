@@ -512,3 +512,829 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     resp = _request("POST", ORDER_PATH, params)
     if resp.get("code") != 0: return {"status": "error", "error": str(resp.get("msg")), "symbol": bx}
     return {"status": "opened", "symbol": bx, "qty": qty, "leverage": leverage, "response": resp}
+
+
+# ============================================================
+# EVENT-DRIVEN DIRECTIONAL PROTECTION
+# ============================================================
+
+def get_position_directional(symbol: str, direction: str) -> dict:
+    """
+    Получает реальную позицию BingX именно нужного направления.
+
+    LONG  -> positionSide LONG
+    SHORT -> positionSide SHORT
+
+    НИЧЕГО не открывает и не изменяет.
+    """
+    bx_symbol = to_bx_symbol(symbol)
+    direction = str(direction).upper()
+
+    if direction not in ("LONG", "SHORT"):
+        return {
+            "status": "error",
+            "error": f"invalid direction={direction}",
+            "symbol": bx_symbol,
+        }
+
+    resp = _request(
+        "GET",
+        POSITION_PATH,
+        {"symbol": bx_symbol},
+    )
+
+    if resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": (
+                f"get_position failed: "
+                f"code={resp.get('code')} "
+                f"msg={resp.get('msg')}"
+            ),
+            "symbol": bx_symbol,
+        }
+
+    for p in _normalize_orders_list(resp):
+        position_side = str(
+            p.get("positionSide", "")
+        ).upper()
+
+        if position_side != direction:
+            continue
+
+        try:
+            qty = abs(
+                float(
+                    p.get("positionAmt", 0) or 0
+                )
+            )
+
+            avg_price = float(
+                p.get("avgPrice", 0)
+                or p.get("entryPrice", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if qty <= 0 or avg_price <= 0:
+            continue
+
+        return {
+            "status": "found",
+            "symbol": p.get(
+                "symbol",
+                bx_symbol,
+            ),
+            "positionSide": direction,
+            "avgPrice": avg_price,
+            "positionAmt": qty,
+            "entryPrice": float(
+                p.get("entryPrice", 0)
+                or avg_price
+            ),
+        }
+
+    return {
+        "status": "not_found",
+        "symbol": bx_symbol,
+        "positionSide": direction,
+    }
+
+
+def wait_for_position_fill_directional(
+    symbol: str,
+    direction: str,
+    timeout_sec: int = 30,
+    poll_interval: float = 1.0,
+) -> dict:
+    """
+    После market entry ждём именно реальную позицию
+    нужного направления.
+    """
+    import time
+
+    started = time.time()
+
+    while (
+        time.time() - started
+        < timeout_sec
+    ):
+        pos = get_position_directional(
+            symbol,
+            direction,
+        )
+
+        if pos.get("status") == "found":
+            log.info(
+                f"[{symbol}] directional position confirmed: "
+                f"side={direction} "
+                f"avgPrice={pos.get('avgPrice')} "
+                f"qty={pos.get('positionAmt')}"
+            )
+            return pos
+
+        time.sleep(
+            poll_interval
+        )
+
+    return {
+        "status": "timeout",
+        "symbol": to_bx_symbol(symbol),
+        "positionSide": direction,
+    }
+
+
+def get_open_protection_directional(
+    symbol: str,
+    direction: str,
+) -> dict:
+    """
+    Читает существующие TP/SL для нужного positionSide.
+    """
+    bx_symbol = to_bx_symbol(symbol)
+    direction = str(direction).upper()
+
+    resp = _request(
+        "GET",
+        "/openApi/swap/v2/trade/openOrders",
+        {"symbol": bx_symbol},
+    )
+
+    if resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": (
+                f"openOrders failed: "
+                f"code={resp.get('code')} "
+                f"msg={resp.get('msg')}"
+            ),
+            "tp_orders": [],
+            "sl_orders": [],
+        }
+
+    tp_orders = []
+    sl_orders = []
+
+    for order in _normalize_orders_list(resp):
+
+        position_side = str(
+            order.get("positionSide", "")
+        ).upper()
+
+        if position_side not in (
+            direction,
+            "BOTH",
+        ):
+            continue
+
+        order_type = str(
+            order.get("type", "")
+        ).upper()
+
+        if order_type in (
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_MARKET",
+        ):
+            tp_orders.append(order)
+
+        elif order_type in (
+            "STOP",
+            "STOP_MARKET",
+        ):
+            sl_orders.append(order)
+
+    return {
+        "status": "ok",
+        "symbol": bx_symbol,
+        "positionSide": direction,
+        "tp_orders": tp_orders,
+        "sl_orders": sl_orders,
+    }
+
+
+def _directional_qty(
+    qty: float,
+    precision: int,
+) -> float:
+    return _round_qty(
+        float(qty),
+        int(precision),
+    )
+
+
+def _directional_protection_prices(
+    avg_price: float,
+    direction: str,
+    stop_loss_pct: float,
+    tp1_pct: float,
+    tp2_pct: float,
+    tp3_pct: float,
+) -> dict:
+
+    direction = str(direction).upper()
+
+    if direction == "LONG":
+        return {
+            "sl": avg_price * (
+                1.0 - stop_loss_pct / 100.0
+            ),
+            "tp1": avg_price * (
+                1.0 + tp1_pct / 100.0
+            ),
+            "tp2": avg_price * (
+                1.0 + tp2_pct / 100.0
+            ),
+            "tp3": avg_price * (
+                1.0 + tp3_pct / 100.0
+            ),
+        }
+
+    if direction == "SHORT":
+        return {
+            "sl": avg_price * (
+                1.0 + stop_loss_pct / 100.0
+            ),
+            "tp1": avg_price * (
+                1.0 - tp1_pct / 100.0
+            ),
+            "tp2": avg_price * (
+                1.0 - tp2_pct / 100.0
+            ),
+            "tp3": avg_price * (
+                1.0 - tp3_pct / 100.0
+            ),
+        }
+
+    raise ValueError(
+        f"invalid direction={direction}"
+    )
+
+
+def ensure_directional_protection(
+    symbol: str,
+    direction: str,
+    avg_price: float,
+    qty: float,
+    stop_loss_pct: float,
+    tp_levels: list,
+    trade_id: str | None = None,
+) -> dict:
+    """
+    Гарантирует наличие Exchange TP/SL для event-driven позиции.
+
+    ВАЖНО:
+      - не открывает позицию;
+      - не закрывает позицию;
+      - LONG и SHORT обрабатываются симметрично;
+      - существующие protection orders НЕ дублируются.
+
+    tp_levels:
+      [
+        {"leg":"tp1","pnl_pct":5.0,"close_fraction":0.30},
+        {"leg":"tp2","pnl_pct":8.0,"close_fraction":0.30},
+        {"leg":"tp3","pnl_pct":11.0,"close_fraction":0.40},
+      ]
+    """
+
+    direction = str(direction).upper()
+
+    if direction not in (
+        "LONG",
+        "SHORT",
+    ):
+        return {
+            "status": "error",
+            "error": f"invalid direction={direction}",
+        }
+
+    try:
+        avg_price = float(avg_price)
+        qty = abs(float(qty))
+        stop_loss_pct = float(
+            stop_loss_pct
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+    if avg_price <= 0:
+        return {
+            "status": "error",
+            "error": "avg_price <= 0",
+        }
+
+    if qty <= 0:
+        return {
+            "status": "error",
+            "error": "qty <= 0",
+        }
+
+    if not (
+        0 < stop_loss_pct <= 25
+    ):
+        return {
+            "status": "error",
+            "error": (
+                f"invalid stop_loss_pct="
+                f"{stop_loss_pct}"
+            ),
+        }
+
+    bx_symbol = to_bx_symbol(symbol)
+
+    contract = _contracts().get(
+        bx_symbol
+    )
+
+    if not contract:
+        return {
+            "status": "error",
+            "error": (
+                f"contract not found: "
+                f"{bx_symbol}"
+            ),
+        }
+
+    precision = int(
+        contract.get(
+            "quantityPrecision"
+        ) or 0
+    )
+
+    price_precision = int(
+        contract.get(
+            "pricePrecision"
+        ) or 4
+    )
+
+    min_qty = float(
+        contract.get(
+            "tradeMinQuantity"
+        )
+        or contract.get(
+            "minQty"
+        )
+        or 0
+    )
+
+    position_qty = _directional_qty(
+        qty,
+        precision,
+    )
+
+    if (
+        position_qty <= 0
+        or (
+            min_qty > 0
+            and position_qty < min_qty
+        )
+    ):
+        return {
+            "status": "error",
+            "error": (
+                f"qty={position_qty} "
+                f"< minQty={min_qty}"
+            ),
+        }
+
+    existing = (
+        get_open_protection_directional(
+            symbol,
+            direction,
+        )
+    )
+
+    if existing.get("status") != "ok":
+        return existing
+
+    existing_tp = list(
+        existing.get(
+            "tp_orders",
+            [],
+        )
+    )
+
+    existing_sl = list(
+        existing.get(
+            "sl_orders",
+            [],
+        )
+    )
+
+    tp_side = (
+        "SELL"
+        if direction == "LONG"
+        else "BUY"
+    )
+
+    sl_side = (
+        "SELL"
+        if direction == "LONG"
+        else "BUY"
+    )
+
+    # ========================================================
+    # TP QUANTIZATION
+    # ========================================================
+
+    normalized_levels = []
+
+    for tp in tp_levels:
+        leg = str(
+            tp.get(
+                "leg",
+                f"tp{len(normalized_levels)+1}",
+            )
+        )
+
+        pnl_pct = float(
+            tp.get(
+                "pnl_pct",
+                0,
+            )
+        )
+
+        fraction = float(
+            tp.get(
+                "close_fraction",
+                0,
+            )
+        )
+
+        if pnl_pct <= 0:
+            continue
+
+        if fraction <= 0:
+            continue
+
+        normalized_levels.append(
+            {
+                "leg": leg,
+                "pnl_pct": pnl_pct,
+                "close_fraction": fraction,
+            }
+        )
+
+    if not normalized_levels:
+        return {
+            "status": "error",
+            "error": "no valid tp_levels",
+        }
+
+    # Если доли не дают ровно единицу —
+    # нормализуем их.
+    fraction_sum = sum(
+        x["close_fraction"]
+        for x in normalized_levels
+    )
+
+    if fraction_sum <= 0:
+        return {
+            "status": "error",
+            "error": "invalid TP fractions",
+        }
+
+    for x in normalized_levels:
+        x["close_fraction"] /= fraction_sum
+
+    # ========================================================
+    # TP CREATION
+    # ========================================================
+
+    tp_results = []
+
+    for level in normalized_levels:
+
+        leg = level["leg"]
+        pnl_pct = level["pnl_pct"]
+
+        # Не создаём TP дважды.
+        existing_leg = None
+
+        for order in existing_tp:
+
+            cid = str(
+                order.get(
+                    "clientOrderId",
+                    "",
+                )
+            )
+
+            if leg in cid:
+                existing_leg = order
+                break
+
+        if existing_leg:
+
+            tp_results.append({
+                "leg": leg,
+                "status": "already_exists",
+                "order_id": str(
+                    existing_leg.get(
+                        "orderId",
+                        "",
+                    )
+                ),
+                "price": float(
+                    existing_leg.get(
+                        "stopPrice",
+                        0,
+                    )
+                    or existing_leg.get(
+                        "price",
+                        0,
+                    )
+                    or 0
+                ),
+            })
+            continue
+
+        if direction == "LONG":
+            tp_price = avg_price * (
+                1.0 + pnl_pct / 100.0
+            )
+        else:
+            tp_price = avg_price * (
+                1.0 - pnl_pct / 100.0
+            )
+
+        tp_qty = _directional_qty(
+            position_qty
+            * level[
+                "close_fraction"
+            ],
+            precision,
+        )
+
+        if (
+            tp_qty <= 0
+            or (
+                min_qty > 0
+                and tp_qty < min_qty
+            )
+        ):
+            return {
+                "status": "error",
+                "error": (
+                    f"{leg}: qty={tp_qty} "
+                    f"< minQty={min_qty}"
+                ),
+                "tp_orders": tp_results,
+            }
+
+        client_order_id = (
+            build_tp_client_order_id(
+                leg,
+                trade_id,
+            )
+        )
+
+        params = {
+            "symbol": bx_symbol,
+            "side": tp_side,
+            "positionSide": direction,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": _format_price(
+                tp_price,
+                price_precision,
+            ),
+            "quantity": _format_qty(
+                tp_qty,
+                precision,
+            ),
+            "clientOrderId": client_order_id,
+        }
+
+        resp = _request(
+            "POST",
+            ORDER_PATH,
+            params,
+        )
+
+        if resp.get("code") != 0:
+
+            return {
+                "status": "error",
+                "error": (
+                    f"{leg} TP failed: "
+                    f"code={resp.get('code')} "
+                    f"msg={resp.get('msg')}"
+                ),
+                "tp_orders": tp_results,
+            }
+
+        order = (
+            (resp.get("data") or {})
+            .get("order")
+            or {}
+        )
+
+        result = {
+            "leg": leg,
+            "status": "created",
+            "order_id": str(
+                order.get(
+                    "orderId",
+                    "",
+                )
+            ),
+            "client_order_id": (
+                order.get(
+                    "clientOrderId"
+                )
+                or client_order_id
+            ),
+            "price": tp_price,
+            "qty": tp_qty,
+            "pnl_pct": pnl_pct,
+        }
+
+        tp_results.append(
+            result
+        )
+
+        log.info(
+            f"[{symbol}] {direction} "
+            f"{leg} TP created: "
+            f"price={tp_price} "
+            f"qty={tp_qty}"
+        )
+
+    # ========================================================
+    # SL
+    # ========================================================
+
+    if existing_sl:
+
+        sl = existing_sl[0]
+
+        sl_result = {
+            "status": "already_exists",
+            "order_id": str(
+                sl.get(
+                    "orderId",
+                    "",
+                )
+            ),
+            "stop_price": float(
+                sl.get(
+                    "stopPrice",
+                    0,
+                )
+                or sl.get(
+                    "price",
+                    0,
+                )
+                or 0
+            ),
+        }
+
+    else:
+
+        if direction == "LONG":
+
+            sl_price = (
+                avg_price
+                * (
+                    1.0
+                    - stop_loss_pct
+                    / 100.0
+                )
+            )
+
+        else:
+
+            sl_price = (
+                avg_price
+                * (
+                    1.0
+                    + stop_loss_pct
+                    / 100.0
+                )
+            )
+
+        client_order_id = (
+            build_sl_client_order_id(
+                trade_id
+            )
+        )
+
+        params = {
+            "symbol": bx_symbol,
+            "side": sl_side,
+            "positionSide": direction,
+            "type": "STOP_MARKET",
+            "stopPrice": _format_price(
+                sl_price,
+                price_precision,
+            ),
+            "quantity": _format_qty(
+                position_qty,
+                precision,
+            ),
+            "clientOrderId": client_order_id,
+        }
+
+        resp = _request(
+            "POST",
+            ORDER_PATH,
+            params,
+        )
+
+        if resp.get("code") != 0:
+
+            return {
+                "status": "TP_PLACED_SL_FAILED",
+                "error": (
+                    f"SL failed: "
+                    f"code={resp.get('code')} "
+                    f"msg={resp.get('msg')}"
+                ),
+                "tp_orders": tp_results,
+                "sl_result": {
+                    "status": "error",
+                    "error": (
+                        f"code={resp.get('code')} "
+                        f"msg={resp.get('msg')}"
+                    ),
+                },
+            }
+
+        order = (
+            (resp.get("data") or {})
+            .get("order")
+            or {}
+        )
+
+        sl_result = {
+            "status": "created",
+            "order_id": str(
+                order.get(
+                    "orderId",
+                    "",
+                )
+            ),
+            "client_order_id": (
+                order.get(
+                    "clientOrderId"
+                )
+                or client_order_id
+            ),
+            "stop_price": sl_price,
+            "qty": position_qty,
+        }
+
+        log.info(
+            f"[{symbol}] {direction} "
+            f"SL created: "
+            f"stop={sl_price} "
+            f"qty={position_qty}"
+        )
+
+    tp_ok = (
+        len(tp_results)
+        == len(normalized_levels)
+    )
+
+    sl_ok = (
+        sl_result.get("status")
+        in (
+            "created",
+            "already_exists",
+        )
+    )
+
+    if tp_ok and sl_ok:
+
+        final_status = (
+            "PROTECTED"
+        )
+
+    elif tp_ok:
+
+        final_status = (
+            "TP_PLACED_SL_FAILED"
+        )
+
+    else:
+
+        final_status = (
+            "PROTECTION_FAILED"
+        )
+
+    return {
+        "status": final_status,
+        "symbol": symbol,
+        "bx_symbol": bx_symbol,
+        "direction": direction,
+        "avg_price": avg_price,
+        "qty": position_qty,
+        "tp_orders": tp_results,
+        "sl_result": sl_result,
+    }
