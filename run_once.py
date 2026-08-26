@@ -1,6 +1,4 @@
-"""
-run_once.py
-"""
+# run_once.py
 
 from __future__ import annotations
 
@@ -34,7 +32,7 @@ from event_engine.signals import (
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health
-from event_engine.tracker import update_active_trades, register_active_trade
+from event_engine.tracker import update_active_trades, register_active_trade, update_active_trade_protection
 
 
 logging.basicConfig(
@@ -56,6 +54,7 @@ MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "500000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
+CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
@@ -294,15 +293,15 @@ def reconcile_all_open_positions() -> None:
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
 
-        # 1. Проверяем наличие стопа и тейков на бирже
+        # 1. Проверяем состояние защиты; ensure_directional_protection() сама
+        #    дозаведёт только отсутствующие legs и не будет создавать дубликаты наших TP.
         prot = get_open_protection_directional(bx_symbol, direction)
+        if prot.get("status") == "error":
+            print(f"[RECONCILIATION] Cannot inspect protection for {bx_symbol}: {prot.get('error')}")
+            continue
         sl_orders = prot.get("sl_orders", [])
         tp_orders = prot.get("tp_orders", [])
-
-        if sl_orders and tp_orders:
-            continue  # Позиция уже полностью защищена
-
-        print(f"[RECONCILIATION] Найдена незащищенная позиция {bx_symbol} ({direction}, qty={qty}, avgPrice={avg_price}). Выставляем SL/TP...")
+        print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection: SL={len(sl_orders)} TP={len(tp_orders)}; reconciling...")
 
         # 2. Вычисляем безопасные SL / TP по 1H ATR
         sl_pct = 2.0
@@ -344,17 +343,24 @@ def reconcile_all_open_positions() -> None:
         print(f"[RECONCILIATION] Результат защиты {bx_symbol}: {status}")
 
         if status in {"PROTECTED", "SL_ONLY"}:
-            register_active_trade(
-                event_id=f"RECON_{bx_symbol}_{int(time.time())}",
-                symbol=bx_symbol.replace("-USDT", ""),
-                name=bx_symbol.replace("-USDT", ""),
+            updated_existing = update_active_trade_protection(
+                symbol=bx_symbol,
                 direction=direction,
-                entry_price=avg_price,
-                qty=qty,
                 tp_orders=res.get("tp_orders", []),
                 sl_result=res.get("sl_result", {}),
-                event_type="RECONCILED_POSITION",
             )
+            if not updated_existing:
+                register_active_trade(
+                    event_id=f"RECON_{bx_symbol}_{direction}",
+                    symbol=bx_symbol.replace("-USDT", ""),
+                    name=bx_symbol.replace("-USDT", ""),
+                    direction=direction,
+                    entry_price=avg_price,
+                    qty=qty,
+                    tp_orders=res.get("tp_orders", []),
+                    sl_result=res.get("sl_result", {}),
+                    event_type="RECONCILED_POSITION",
+                )
             send_tg(
                 f"🛡 <b>[ЗАЩИТА УСТАНОВЛЕНА] {bx_symbol}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -594,6 +600,15 @@ def main() -> None:
                 if REQUIRE_TRIGGER and not build_15m_trigger(d15, direction, min_vol_mult=1.05):
                     continue
 
+                if REQUIRE_CVD:
+                    cvd24 = getattr(r, "cvd24", None)
+                    try:
+                        cvd24_value = float(cvd24)
+                    except (TypeError, ValueError):
+                        continue
+                    if cvd24_value <= CVD_MIN_CONFIRMATION:
+                        continue
+
                 fact = ev.get("event_fact", {})
                 price = float(fact.get("detection_close_price") or fact.get("close") or r.price)
                 setup = build_event_setup(ev=ev, df_1h=d1, entry_price=price)
@@ -648,7 +663,7 @@ def main() -> None:
             })
 
             status = str(execution_result.get("status", ""))
-            if status == "opened_protected":
+            if status in {"opened_protected", "opened_protection_check_required"}:
                 executed_event_ids.add(event_id)
                 trades_this_cycle += 1
                 stats["trades"] += 1
@@ -714,6 +729,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
