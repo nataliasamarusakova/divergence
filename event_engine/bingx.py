@@ -147,16 +147,17 @@ def get_contract(symbol: str) -> dict | None:
 
     base = s.replace("-USDT", "").replace("-", "")
 
-    # Приоритет 1: строгое совпадение символа
+    # Приоритет 1: прямое совпадение символа
     for c in CACHE["data"].values():
         cs = str(c.get("symbol", "")).upper()
         if cs == f"{base}-USDT" or cs == base:
             return c
 
-    # Приоритет 2: строгое совпадение displayName
+    # Приоритет 2: совпадение displayName с нормализацией разделителей
+    norm_base = base.replace("-", "").replace("/", "").replace(" ", "")
     for c in CACHE["data"].values():
-        name = str(c.get("displayName", "")).upper().replace("-", "")
-        if name == f"{base}-USDT" or name == base:
+        name = str(c.get("displayName", "")).upper().replace("-", "").replace("/", "").replace(" ", "")
+        if name == f"{norm_base}USDT" or name == norm_base:
             return c
 
     return CACHE["by_display_name"].get(f"{base}-USDT")
@@ -481,7 +482,6 @@ def get_position_directional(symbol: str, direction: str) -> dict:
 
     for p in _normalize_orders_list(resp):
         position_side = str(p.get("positionSide", "")).upper()
-        # Поддержка One-Way (BOTH) и Hedge (LONG/SHORT)
         if position_side not in (direction, "BOTH"):
             continue
 
@@ -665,19 +665,26 @@ def ensure_directional_protection(
                 break
 
         if existing_leg:
+            existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
+            if existing_qty <= 0:
+                raw_qty = pos_qty_dec * Decimal(str(level["close_fraction"]))
+                existing_qty = _round_qty(float(raw_qty), precision)
+            placed_qty_sum += Decimal(str(existing_qty))
+
             tp_results.append({
                 "leg": leg,
                 "status": "already_exists",
                 "order_id": str(existing_leg.get("orderId", "")),
                 "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
+                "qty": existing_qty,
             })
             continue
 
         tp_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
 
-        # Последний TP-лег гарантированно забирает весь остаток объема позиции
+        # Гарантированный расчет остатка без переполнения объема
         if idx == len(normalized_levels) - 1:
-            tp_qty_dec = pos_qty_dec - placed_qty_sum
+            tp_qty_dec = max(Decimal("0.0"), pos_qty_dec - placed_qty_sum)
             tp_qty = float(tp_qty_dec)
         else:
             raw_qty = pos_qty_dec * Decimal(str(level["close_fraction"]))
@@ -696,6 +703,7 @@ def ensure_directional_protection(
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
             "clientOrderId": client_order_id,
+            "reduceOnly": "true",
         }
 
         resp = _request("POST", ORDER_PATH, params)
@@ -735,6 +743,7 @@ def ensure_directional_protection(
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
             "clientOrderId": client_order_id,
+            "reduceOnly": "true",
         }
 
         resp = _request("POST", ORDER_PATH, params)
