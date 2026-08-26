@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple
 
 import pandas as pd
 
@@ -70,6 +69,26 @@ def load_ids(path: Path) -> set[str]:
     return ids
 
 
+def load_successful_trade_ids(path: Path) -> set[str]:
+    """Считывает только успешно открытые сделки, позволяя retry при временных сбоях API."""
+    if not path.exists():
+        return set()
+    ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+            status = str(obj.get("result", {}).get("status", "")).lower()
+            if status in {"opened_protected", "opened_protection_check_required", "opened", "already_executed"}:
+                value = obj.get("event_id")
+                if value:
+                    ids.add(str(value))
+        except Exception:
+            continue
+    return ids
+
+
 def append_jsonl(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -130,7 +149,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         "entry_reference": entry_price,
         "invalidation_price": invalidation,
         "target_price": target,
-        "rr": 2.0,
+        "target_rr": 2.0,
+        "realized_rr": 1.55,  # Взвешенное матожидание каскадного закрытия 30%/30%/40%
         "trigger_ok": True,
     }
 
@@ -304,7 +324,7 @@ def build_fallback_signal_message(
     label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
     sl = setup.get("invalidation_price")
     tp = setup.get("target_price")
-    rr = setup.get("rr")
+    rr = setup.get("realized_rr", setup.get("target_rr", 2.0))
 
     return (
         f"{label}\n\n"
@@ -317,7 +337,7 @@ def build_fallback_signal_message(
         f"Entry: <code>{price:.8g}</code>\n"
         f"SL: <code>{sl:.8g}</code>\n"
         f"TP: <code>{tp:.8g}</code>\n"
-        f"R:R: <code>{rr:.2f}</code>\n\n"
+        f"Realized R:R: <code>{rr:.2f}</code>\n\n"
         f"<b>EXECUTION</b>\n"
         f"Mode: <code>{EXECUTION_MODE}</code>\n"
         f"Status: <code>{execution_result.get('status')}</code>\n"
@@ -394,7 +414,7 @@ def main() -> None:
     )
 
     seen_events = load_ids(EVENTS)
-    executed_event_ids = load_ids(TRADES)
+    executed_event_ids = load_successful_trade_ids(TRADES)
     telegram_sent_event_ids = load_ids(ACTIONS)
 
     trades_this_cycle = 0
@@ -466,11 +486,11 @@ def main() -> None:
                         stats["events_cvd_gate_rejected"] += 1
                         continue
 
-                # Окно синхронизации 15M триггера относительно 1H подтверждения
+                # Окно синхронизации 15M триггера согласовано с MAX_AGE
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
-                if trigger_delay_min < -15 or trigger_delay_min > 45:
+                if trigger_delay_min < -15 or trigger_delay_min > MAX_AGE:
                     stats["trigger_rejected"] += 1
                     continue
 
@@ -572,7 +592,6 @@ def main() -> None:
                         price=price,
                     )
 
-                # Исправление: Разрешать отправку Telegram, если статус изменился с алерта на РЕАЛЬНОЕ открытие
                 is_real_execution = execution_result.get("status") in {"opened_protected", "opened", "opened_protection_check_required"}
                 telegram_already_sent = (event_id in telegram_sent_event_ids) and not is_real_execution
 
