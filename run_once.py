@@ -54,7 +54,7 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "tru
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
-MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "1"))
+MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
 
