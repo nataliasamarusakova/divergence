@@ -121,9 +121,9 @@ def format_signal(
         lines += [
             "",
             "<b>EXECUTION</b>",
-            f"Mode: <code>{esc(execution.get("mode", "vst"))}</code>",
-            f"Status: <code>{esc(execution.get("status"))}</code>",
-            f"Order: <code>{esc(execution.get("order_id"))}</code>",
+            f"Mode: <code>{esc(execution.get('mode', 'vst'))}</code>",
+            f"Status: <code>{esc(execution.get('status'))}</code>",
+            f"Order: <code>{esc(execution.get('order_id'))}</code>",
         ]
 
     lines += ["", "⚡ Event-driven — 5×5m lifecycle is NOT used"]
