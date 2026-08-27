@@ -14,10 +14,10 @@ from event_engine.bingx import (
     get_contract,
     fetch_klines,
     open_market,
+    wait_for_position_fill_directional,
     get_positions,
     get_open_protection_directional,
     ensure_directional_protection,
-    wait_for_position_fill_directional,
 )
 from event_engine.signals import (
     add_cvd,
@@ -34,7 +34,6 @@ from event_engine.tracker import (
     update_active_trade_protection,
 )
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -48,7 +47,7 @@ TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
 HEALTH = DATA / "health.jsonl"
 
-# 0 or negative = scan ALL eligible candidates.
+# 0 or negative = scan ALL eligible universe candidates.
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 
 MIN_VOL = float(
@@ -60,56 +59,35 @@ MIN_OI = float(
 )
 
 EXECUTION_ENABLED = (
-    os.environ.get(
-        "EXECUTION_ENABLED",
-        "false",
-    ).lower()
+    os.environ.get("EXECUTION_ENABLED", "false").lower()
     == "true"
 )
 
 REQUIRE_CVD = (
-    os.environ.get(
-        "REQUIRE_CVD_CONFIRMATION",
-        "false",
-    ).lower()
+    os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower()
     == "true"
 )
 
 CVD_MIN_CONFIRMATION = float(
-    os.environ.get(
-        "MIN_CVD24_CONFIRMATION",
-        "55",
-    )
+    os.environ.get("MIN_CVD24_CONFIRMATION", "55")
 )
 
 REQUIRE_TRIGGER = (
-    os.environ.get(
-        "REQUIRE_15M_TRIGGER",
-        "true",
-    ).lower()
+    os.environ.get("REQUIRE_15M_TRIGGER", "true").lower()
     == "true"
 )
 
 MAX_AGE = int(
-    os.environ.get(
-        "MAX_EVENT_AGE_MIN",
-        "90",
-    )
+    os.environ.get("MAX_EVENT_AGE_MIN", "90")
 )
 
 MAX_TRADES = int(
-    os.environ.get(
-        "MAX_TRADES_PER_CYCLE",
-        "3",
-    )
+    os.environ.get("MAX_TRADES_PER_CYCLE", "3")
 )
 
 EXECUTION_MODE = os.environ.get(
     "EXECUTION_MODE",
-    os.environ.get(
-        "BINGX_ENV",
-        "vst",
-    ),
+    os.environ.get("BINGX_ENV", "vst"),
 )
 
 
@@ -141,23 +119,18 @@ def load_ids(path: Path) -> set[str]:
     return ids
 
 
-def load_successful_trade_ids(path: Path) -> set[str]:
+def load_successful_trade_ids(
+    path: Path,
+) -> set[str]:
     """
-    Loads only execution results that indicate a position was successfully opened.
+    Считывает только события, которые действительно
+    считаются успешно открытыми.
+    """
 
-    FAILED / uncertain execution results remain retryable.
-    """
     if not path.exists():
         return set()
 
     ids: set[str] = set()
-
-    successful_statuses = {
-        "opened_protected",
-        "opened_protection_check_required",
-        "opened",
-        "already_executed",
-    }
 
     for line in path.read_text(
         encoding="utf-8"
@@ -173,8 +146,7 @@ def load_successful_trade_ids(path: Path) -> set[str]:
         if not isinstance(obj, dict):
             continue
 
-        result = obj.get("result") or {}
-
+        result = obj.get("result", {})
         if not isinstance(result, dict):
             continue
 
@@ -182,13 +154,15 @@ def load_successful_trade_ids(path: Path) -> set[str]:
             result.get("status", "")
         ).lower()
 
-        if status not in successful_statuses:
-            continue
-
-        event_id = obj.get("event_id")
-
-        if event_id:
-            ids.add(str(event_id))
+        if status in {
+            "opened_protected",
+            "opened_protection_check_required",
+            "opened",
+            "already_executed",
+        }:
+            event_id = obj.get("event_id")
+            if event_id:
+                ids.add(str(event_id))
 
     return ids
 
@@ -236,17 +210,83 @@ def record_action(obj: dict) -> None:
     )
 
 
+def calculate_execution_slippage(
+    signal_price: float,
+    actual_entry_price: float,
+    direction: str,
+) -> dict:
+    """
+    Считает фактическое отклонение fill от signal price.
+
+    slippage_pct:
+        signed raw difference:
+        (fill - signal) / signal * 100
+
+    adverse_slippage_pct:
+        только неблагоприятная для сделки часть.
+    """
+
+    try:
+        signal_price = float(signal_price)
+        actual_entry_price = float(actual_entry_price)
+    except (TypeError, ValueError):
+        return {
+            "slippage_pct": None,
+            "adverse_slippage_pct": None,
+        }
+
+    direction = str(
+        direction
+    ).upper()
+
+    if (
+        signal_price <= 0
+        or actual_entry_price <= 0
+    ):
+        return {
+            "slippage_pct": None,
+            "adverse_slippage_pct": None,
+        }
+
+    raw_pct = (
+        (
+            actual_entry_price
+            - signal_price
+        )
+        / signal_price
+        * 100.0
+    )
+
+    if direction == "LONG":
+        adverse = max(
+            0.0,
+            raw_pct,
+        )
+    elif direction == "SHORT":
+        adverse = max(
+            0.0,
+            -raw_pct,
+        )
+    else:
+        adverse = None
+
+    return {
+        "slippage_pct": raw_pct,
+        "adverse_slippage_pct": adverse,
+    }
+
+
 def calculate_setup_score(
     ev: dict,
     coinalyze_row: Any,
     df_15m: pd.DataFrame,
 ) -> float:
     """
-    Composite signal score.
+    Композитный score качества setup.
 
-    This score is used only for ranking opportunities.
-    It does not modify the actual execution risk parameters.
+    Это ranking score, а не математическое ожидание.
     """
+
     score = 50.0
 
     fact = ev.get(
@@ -268,29 +308,28 @@ def calculate_setup_score(
                 0,
             )
         )
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         delta_atr = 0.0
 
     if delta_atr >= 1.0:
         score += 15.0
-
     elif delta_atr >= 0.5:
         score += 10.0
 
-    event_type = str(
+    if "CVD" in str(
         ev.get(
             "event_type",
-            "",
+            ""
         )
-    )
-
-    if "CVD" in event_type:
+    ):
         score += 15.0
 
-    if "VOLATILITY_SQUEEZE_RELEASE" in event_type:
+    if "VOLATILITY_SQUEEZE_RELEASE" in str(
+        ev.get(
+            "event_type",
+            ""
+        )
+    ):
         try:
             comp_ratio = float(
                 fact.get(
@@ -298,10 +337,7 @@ def calculate_setup_score(
                     1.0,
                 )
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             comp_ratio = 1.0
 
         if comp_ratio < 0.65:
@@ -314,59 +350,66 @@ def calculate_setup_score(
                     0,
                 )
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             duration = 0
 
         if duration >= 5:
             score += 10.0
 
     if coinalyze_row is not None:
-        fr = getattr(
-            coinalyze_row,
-            "fr_oiw",
-            None,
-        )
+        try:
+            fr = getattr(
+                coinalyze_row,
+                "fr_oiw",
+                None,
+            )
 
-        if fr is not None:
-            try:
+            if fr is not None:
                 fr = float(fr)
 
                 if direction == "LONG" and fr < 0:
                     score += 15.0
 
-                elif direction == "SHORT" and fr > 0.02:
+                elif (
+                    direction == "SHORT"
+                    and fr > 0.02
+                ):
                     score += 15.0
 
-                elif direction == "LONG" and fr > 0.05:
+                elif (
+                    direction == "LONG"
+                    and fr > 0.05
+                ):
                     score -= 15.0
 
-                elif direction == "SHORT" and fr < -0.05:
+                elif (
+                    direction == "SHORT"
+                    and fr < -0.05
+                ):
                     score -= 15.0
 
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
+        except (TypeError, ValueError):
+            pass
 
     if (
         "volume" in df_15m.columns
         and len(df_15m) >= 20
     ):
-        recent_avg = df_15m[
-            "volume"
-        ].iloc[-21:-1].mean()
+        try:
+            recent_avg = (
+                df_15m["volume"]
+                .iloc[-21:-1]
+                .mean()
+            )
 
-        if (
-            pd.notna(recent_avg)
-            and recent_avg > 0
-        ):
-            try:
+            if (
+                pd.notna(recent_avg)
+                and recent_avg > 0
+            ):
                 vol_ratio = (
-                    float(df_15m["volume"].iloc[-1])
+                    float(
+                        df_15m["volume"].iloc[-1]
+                    )
                     / float(recent_avg)
                 )
 
@@ -376,12 +419,8 @@ def calculate_setup_score(
                 elif vol_ratio >= 1.2:
                     score += 5.0
 
-            except (
-                TypeError,
-                ValueError,
-                ZeroDivisionError,
-            ):
-                pass
+        except (TypeError, ValueError):
+            pass
 
     return max(
         0.0,
@@ -398,19 +437,14 @@ def build_event_setup(
     entry_price: float,
 ) -> dict:
     """
-    Build setup from a specific reference price.
+    Плановый setup.
 
-    IMPORTANT:
-    This function is now called twice in the full lifecycle:
-
-    1. Before execution:
-       entry_price = signal/reference price.
-
-    2. After exchange fill:
-       entry_price = actual exchange avgPrice.
-
-    Only the second setup is used for final SL/TP placement.
+    ВАЖНО:
+    entry_price здесь является reference price.
+    После фактического exchange fill торговая статистика
+    должна использовать actual avgPrice.
     """
+
     direction = str(
         ev.get(
             "direction",
@@ -420,7 +454,10 @@ def build_event_setup(
 
     entry_price = float(entry_price)
 
-    if not pd.notna(entry_price) or entry_price <= 0:
+    if (
+        not pd.notna(entry_price)
+        or entry_price <= 0
+    ):
         raise ValueError(
             f"Invalid entry_price={entry_price}"
         )
@@ -439,7 +476,7 @@ def build_event_setup(
     ):
         if col not in df.columns:
             raise ValueError(
-                f"Missing 1H column: {col}"
+                f"missing 1H column: {col}"
             )
 
         df[col] = pd.to_numeric(
@@ -447,21 +484,15 @@ def build_event_setup(
             errors="coerce",
         )
 
-    if (
-        df[
-            [
-                "high",
-                "low",
-                "close",
-            ]
+    if df[
+        [
+            "high",
+            "low",
+            "close",
         ]
-        .iloc[-20:]
-        .isna()
-        .any()
-        .any()
-    ):
+    ].tail(14).isna().any().any():
         raise ValueError(
-            "Invalid NaN values in recent 1H OHLC data"
+            "invalid NaN in recent 1H OHLC"
         )
 
     prev_close = df["close"].shift(1)
@@ -481,17 +512,19 @@ def build_event_setup(
         axis=1,
     ).max(axis=1)
 
-    atr_series = tr.rolling(
-        window=14,
-        min_periods=14,
-    ).mean()
-
-    atr = atr_series.iloc[-1]
+    atr = (
+        tr
+        .rolling(
+            window=14,
+            min_periods=14,
+        )
+        .mean()
+        .iloc[-1]
+    )
 
     if (
         pd.isna(atr)
         or float(atr) <= 0
-        or not pd.notna(atr)
     ):
         raise ValueError(
             "ATR unavailable"
@@ -526,9 +559,7 @@ def build_event_setup(
             entry_price
             * (
                 1.0
-                + 2.0
-                * risk_pct
-                / 100.0
+                + 2.0 * risk_pct / 100.0
             )
         )
 
@@ -545,9 +576,7 @@ def build_event_setup(
             entry_price
             * (
                 1.0
-                - 2.0
-                * risk_pct
-                / 100.0
+                - 2.0 * risk_pct / 100.0
             )
         )
 
@@ -556,47 +585,26 @@ def build_event_setup(
             f"Invalid direction={direction}"
         )
 
-    if direction == "LONG":
-        if not (
-            invalidation < entry_price
-            < target
-        ):
-            raise ValueError(
-                "Invalid LONG setup geometry"
-            )
-
-    else:
-        if not (
-            target < entry_price
-            < invalidation
-        ):
-            raise ValueError(
-                "Invalid SHORT setup geometry"
-            )
-
     return {
-        "entry_reference": float(
-            entry_price
-        ),
-        "invalidation_price": float(
-            invalidation
-        ),
-        "target_price": float(
-            target
-        ),
+        "entry_reference": entry_price,
+        "invalidation_price": invalidation,
+        "target_price": target,
         "target_rr": 2.0,
 
-        # Weighted RR of the TP distribution
-        # 0.30*0.50 + 0.30*0.75 + 0.40*1.00 = 0.775
+        # 30% @ 1R
+        # 30% @ 1.5R
+        # 40% @ 2R
         #
-        # With the protective BE/lifecycle semantics
-        # the historical displayed planned metric remains 1.55.
+        # weighted RR:
+        # 0.30*1 + 0.30*1.5 + 0.40*2 = 1.55
         "planned_weighted_rr": 1.55,
 
-        # Kept for backward compatibility.
-        "realized_rr": 1.55,
+        # This is NOT known at setup time.
+        "realized_rr": None,
 
         "trigger_ok": True,
+        "atr": atr,
+        "risk_pct": risk_pct,
     }
 
 
@@ -625,39 +633,55 @@ def build_tp_levels(
 
     if direction == "LONG":
         sl_pct = (
-            entry
-            - sl_price
-        ) / entry * 100.0
+            (
+                entry
+                - sl_price
+            )
+            / entry
+            * 100.0
+        )
 
         tp_pct = (
-            final_tp_price
-            - entry
-        ) / entry * 100.0
+            (
+                final_tp_price
+                - entry
+            )
+            / entry
+            * 100.0
+        )
 
     elif direction == "SHORT":
         sl_pct = (
-            sl_price
-            - entry
-        ) / entry * 100.0
+            (
+                sl_price
+                - entry
+            )
+            / entry
+            * 100.0
+        )
 
         tp_pct = (
-            entry
-            - final_tp_price
-        ) / entry * 100.0
+            (
+                entry
+                - final_tp_price
+            )
+            / entry
+            * 100.0
+        )
 
     else:
         raise ValueError(
             f"Invalid direction={direction}"
         )
 
-    if sl_pct <= 0:
+    if (
+        not pd.notna(sl_pct)
+        or not pd.notna(tp_pct)
+        or sl_pct <= 0
+        or tp_pct <= 0
+    ):
         raise ValueError(
-            f"Invalid SL percentage={sl_pct}"
-        )
-
-    if tp_pct <= 0:
-        raise ValueError(
-            f"Invalid TP percentage={tp_pct}"
+            "invalid TP/SL percentages"
         )
 
     tp_levels = [
@@ -702,24 +726,28 @@ def install_protection(
     tp_levels: list,
     trade_id: str,
 ) -> dict:
-    avg_price = float(
-        position.get("avgPrice", 0)
-        or position.get(
-            "entryPrice",
-            0,
-        )
-        or 0
-    )
-
-    qty = abs(
-        float(
-            position.get(
-                "positionAmt",
-                0,
-            )
+    try:
+        avg_price = float(
+            position.get("avgPrice", 0)
+            or position.get("entryPrice", 0)
             or 0
         )
-    )
+
+        qty = abs(
+            float(
+                position.get(
+                    "positionAmt",
+                    0,
+                )
+                or 0
+            )
+        )
+
+    except (TypeError, ValueError):
+        return {
+            "status": "PROTECTION_INVALID_POSITION",
+            "error": "invalid position values",
+        }
 
     if (
         avg_price <= 0
@@ -780,42 +808,6 @@ def _tp_orders_to_tracker(
         if not leg:
             continue
 
-        try:
-            price = float(
-                order.get(
-                    "stopPrice",
-                    0,
-                )
-                or order.get(
-                    "price",
-                    0,
-                )
-                or 0
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            price = 0.0
-
-        try:
-            qty = float(
-                order.get(
-                    "origQty",
-                    0,
-                )
-                or order.get(
-                    "quantity",
-                    0,
-                )
-                or 0
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            qty = 0.0
-
         out.append(
             {
                 "leg": leg,
@@ -826,8 +818,28 @@ def _tp_orders_to_tracker(
                         "",
                     )
                 ),
-                "price": price,
-                "qty": qty,
+                "price": float(
+                    order.get(
+                        "stopPrice",
+                        0,
+                    )
+                    or order.get(
+                        "price",
+                        0,
+                    )
+                    or 0
+                ),
+                "qty": float(
+                    order.get(
+                        "origQty",
+                        0,
+                    )
+                    or order.get(
+                        "quantity",
+                        0,
+                    )
+                    or 0
+                ),
             }
         )
 
@@ -842,8 +854,15 @@ def _sl_order_to_tracker(
 
     sl = sl_orders[0]
 
-    try:
-        stop_price = float(
+    return {
+        "status": "already_exists",
+        "order_id": str(
+            sl.get(
+                "orderId",
+                "",
+            )
+        ),
+        "stop_price": float(
             sl.get(
                 "stopPrice",
                 0,
@@ -853,15 +872,8 @@ def _sl_order_to_tracker(
                 0,
             )
             or 0
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        stop_price = 0.0
-
-    try:
-        qty = float(
+        ),
+        "qty": float(
             sl.get(
                 "origQty",
                 0,
@@ -871,23 +883,7 @@ def _sl_order_to_tracker(
                 0,
             )
             or 0
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        qty = 0.0
-
-    return {
-        "status": "already_exists",
-        "order_id": str(
-            sl.get(
-                "orderId",
-                "",
-            )
         ),
-        "stop_price": stop_price,
-        "qty": qty,
     }
 
 
@@ -895,9 +891,7 @@ def _expected_tp_leg_count(
     position_qty: float,
     symbol: str,
 ) -> int:
-    contract = get_contract(
-        symbol
-    ) or {}
+    contract = get_contract(symbol) or {}
 
     try:
         min_qty = float(
@@ -909,24 +903,24 @@ def _expected_tp_leg_count(
             )
             or 0
         )
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         min_qty = 0.0
 
-    if (
-        min_qty > 0
-        and position_qty < min_qty * 3
-    ):
-        return 1
-
-    return 3
+    return (
+        1
+        if (
+            min_qty > 0
+            and position_qty
+            < min_qty * 3
+        )
+        else 3
+    )
 
 
 def reconcile_all_open_positions() -> None:
     try:
         positions = get_positions()
+
     except Exception as exc:
         print(
             "[RECONCILIATION_ERROR] "
@@ -973,10 +967,7 @@ def reconcile_all_open_positions() -> None:
                 or 0
             )
 
-        except (
-            ValueError,
-            TypeError,
-        ):
+        except (ValueError, TypeError):
             continue
 
         if (
@@ -985,19 +976,17 @@ def reconcile_all_open_positions() -> None:
         ):
             continue
 
-        direction = (
-            position_side
-            if position_side
-            in {
-                "LONG",
-                "SHORT",
-            }
-            else (
+        if position_side in {
+            "LONG",
+            "SHORT",
+        }:
+            direction = position_side
+        else:
+            direction = (
                 "LONG"
                 if amt > 0
                 else "SHORT"
             )
-        )
 
         qty = abs(amt)
 
@@ -1008,7 +997,7 @@ def reconcile_all_open_positions() -> None:
 
         if prot.get("status") != "ok":
             print(
-                f"[RECONCILIATION] "
+                "[RECONCILIATION] "
                 f"Cannot inspect protection "
                 f"for {bx_symbol}: "
                 f"{prot.get('error', 'unknown error')}"
@@ -1083,7 +1072,9 @@ def reconcile_all_open_positions() -> None:
 
                 if (
                     direction == "LONG"
-                    and 0 < sl_price < avg_price
+                    and 0
+                    < sl_price
+                    < avg_price
                     and sl_amt > 0
                 ):
                     sl_valid = True
@@ -1129,10 +1120,7 @@ def reconcile_all_open_positions() -> None:
                 )
             )
 
-            if (
-                tracker_tp
-                and tracker_sl
-            ):
+            if tracker_tp and tracker_sl:
                 tracked = (
                     update_active_trade_protection(
                         symbol=bx_symbol,
@@ -1170,13 +1158,13 @@ def reconcile_all_open_positions() -> None:
             continue
 
         print(
-            f"[RECONCILIATION] "
+            "[RECONCILIATION] "
             f"{bx_symbol} ({direction}) "
-            f"protection incomplete: "
+            "protection incomplete: "
             f"SL={len(sl_orders)} "
             f"TP={len(known_tp_legs)}/"
             f"{expected_tp_count}; "
-            f"repairing only missing protection..."
+            "repairing only missing protection..."
         )
 
         sl_pct = 2.0
@@ -1203,8 +1191,7 @@ def reconcile_all_open_positions() -> None:
                     )
 
                 prev_close = (
-                    df1["close"]
-                    .shift(1)
+                    df1["close"].shift(1)
                 )
 
                 tr = pd.concat(
@@ -1224,7 +1211,8 @@ def reconcile_all_open_positions() -> None:
                 ).max(axis=1)
 
                 atr = (
-                    tr.rolling(
+                    tr
+                    .rolling(
                         14,
                         min_periods=14,
                     )
@@ -1253,7 +1241,7 @@ def reconcile_all_open_positions() -> None:
 
         except Exception as exc:
             print(
-                f"[RECONCILIATION_ATR_ERROR] "
+                "[RECONCILIATION_ATR_ERROR] "
                 f"{bx_symbol}: {exc}"
             )
 
@@ -1338,9 +1326,8 @@ def reconcile_all_open_positions() -> None:
         )
 
         print(
-            f"[RECONCILIATION] "
-            f"{bx_symbol} "
-            f"result={status} "
+            "[RECONCILIATION] "
+            f"{bx_symbol} result={status} "
             f"changed={changed}"
         )
 
@@ -1409,7 +1396,8 @@ def reconcile_all_open_positions() -> None:
                     f"{bx_symbol}"
                     f"</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Недостающая защита восстановлена:\n"
+                    f"Недостающая защита "
+                    f"восстановлена:\n"
                     f"• Направление: "
                     f"<b>{direction}</b>\n"
                     f"• Цена входа: "
@@ -1425,33 +1413,10 @@ def reconcile_all_open_positions() -> None:
 def execute_new_position(
     symbol: str,
     direction: str,
-    signal_price: float,
-    signal_setup: dict,
-    df_1h: pd.DataFrame,
+    price: float,
+    setup: dict,
     event_id: str,
 ) -> dict:
-    """
-    Full execution lifecycle:
-
-        signal
-          ↓
-        MARKET order
-          ↓
-        exchange-confirmed position
-          ↓
-        actual avgPrice
-          ↓
-        FINAL setup recalculation
-          ↓
-        SL
-          ↓
-        verify SL
-          ↓
-        TP legs
-
-    CRITICAL:
-    signal_setup is never reused as the final risk geometry.
-    """
     direction = str(
         direction
     ).upper()
@@ -1461,14 +1426,11 @@ def execute_new_position(
         "",
     )
 
-    # ---------------------------------------------------------
-    # 1. OPEN MARKET
-    # ---------------------------------------------------------
     try:
         opened = open_market(
             symbol,
             direction,
-            signal_price,
+            price,
             trade_id,
         )
 
@@ -1478,8 +1440,6 @@ def execute_new_position(
             "mode": EXECUTION_MODE,
             "order_id": None,
             "error": str(exc),
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
     if not isinstance(
@@ -1491,8 +1451,6 @@ def execute_new_position(
             "mode": EXECUTION_MODE,
             "order_id": None,
             "raw": repr(opened),
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
     open_status = str(
@@ -1515,28 +1473,19 @@ def execute_new_position(
             ),
             "open_result": opened,
             "error": (
-                opened.get(
-                    "error"
-                )
-                or opened.get(
-                    "msg"
-                )
+                opened.get("error")
+                or opened.get("msg")
                 or "unknown_open_error"
             ),
             "bingx_code": opened.get(
                 "code"
             ),
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
     order_id = opened.get(
         "order_id"
     )
 
-    # ---------------------------------------------------------
-    # 2. WAIT FOR ACTUAL FILL
-    # ---------------------------------------------------------
     try:
         position = (
             wait_for_position_fill_directional(
@@ -1554,8 +1503,6 @@ def execute_new_position(
             "order_id": order_id,
             "open_result": opened,
             "error": str(exc),
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
     if (
@@ -1577,13 +1524,8 @@ def execute_new_position(
             "order_id": order_id,
             "open_result": opened,
             "position": position,
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
-    # ---------------------------------------------------------
-    # 3. EXCHANGE-CONFIRMED QTY + AVG PRICE
-    # ---------------------------------------------------------
     try:
         actual_qty = abs(
             float(
@@ -1624,93 +1566,137 @@ def execute_new_position(
             "order_id": order_id,
             "open_result": opened,
             "position": position,
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
         }
 
-    # ---------------------------------------------------------
-    # 4. FINAL SETUP FROM ACTUAL FILL
-    # ---------------------------------------------------------
+    execution_quality = (
+        calculate_execution_slippage(
+            signal_price=price,
+            actual_entry_price=actual_avg_price,
+            direction=direction,
+        )
+    )
+
+    # IMPORTANT:
+    # protection percentages are recalculated from the actual fill.
+    actual_setup = build_event_setup(
+        ev={
+            **setup,
+            "direction": direction,
+        },
+        df_1h=pd.DataFrame(
+            []
+        ),
+        entry_price=actual_avg_price,
+    ) if False else None
+
     try:
-        execution_setup = build_event_setup(
-            ev={
-                "direction": direction,
-            },
-            df_1h=df_1h,
-            entry_price=actual_avg_price,
+        setup_for_fill = dict(setup)
+
+        setup_for_fill[
+            "entry_reference"
+        ] = actual_avg_price
+
+        planned_risk_pct = float(
+            setup.get(
+                "risk_pct",
+                0,
+            )
+            or 0
         )
 
-    except Exception as exc:
-        return {
-            "status": "PROTECTION_SETUP_INVALID",
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "open_result": opened,
-            "position": position,
-            "signal_setup": signal_setup,
-            "signal_price": signal_price,
-            "actual_fill_price": actual_avg_price,
-            "error": (
-                "Failed to build final "
-                "execution setup from "
-                f"actual avgPrice="
-                f"{actual_avg_price}: {exc}"
-            ),
-        }
+        if (
+            not pd.notna(
+                planned_risk_pct
+            )
+            or planned_risk_pct <= 0
+        ):
+            raise ValueError(
+                "invalid planned risk_pct"
+            )
 
-    execution_setup[
-        "signal_reference_price"
-    ] = float(
-        signal_price
-    )
-
-    execution_setup[
-        "actual_fill_price"
-    ] = float(
-        actual_avg_price
-    )
-
-    # Explicit slippage / fill delta.
-    if signal_price > 0:
-        execution_setup[
-            "fill_vs_signal_pct"
-        ] = (
-            (
+        if direction == "LONG":
+            invalidation = (
                 actual_avg_price
-                - signal_price
+                * (
+                    1.0
+                    - planned_risk_pct
+                    / 100.0
+                )
             )
-            / signal_price
-            * 100.0
-        )
 
-    # ---------------------------------------------------------
-    # 5. FINAL SL / TP LEVELS
-    # ---------------------------------------------------------
-    try:
-        sl_pct, tp_levels = (
-            build_tp_levels(
-                execution_setup,
-                direction,
+            target = (
+                actual_avg_price
+                * (
+                    1.0
+                    + 2.0
+                    * planned_risk_pct
+                    / 100.0
+                )
             )
-        )
 
-    except Exception as exc:
+        else:
+            invalidation = (
+                actual_avg_price
+                * (
+                    1.0
+                    + planned_risk_pct
+                    / 100.0
+                )
+            )
+
+            target = (
+                actual_avg_price
+                * (
+                    1.0
+                    - 2.0
+                    * planned_risk_pct
+                    / 100.0
+                )
+            )
+
+        setup_for_fill[
+            "invalidation_price"
+        ] = invalidation
+
+        setup_for_fill[
+            "target_price"
+        ] = target
+
+        setup_for_fill[
+            "realized_rr"
+        ] = None
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
-            "open_result": opened,
             "position": position,
-            "signal_setup": signal_setup,
-            "execution_setup": execution_setup,
-            "signal_price": signal_price,
-            "actual_fill_price": actual_avg_price,
+            "open_result": opened,
+            "execution_quality": execution_quality,
             "error": str(exc),
         }
 
-    # ---------------------------------------------------------
-    # 6. INSTALL PROTECTION FROM ACTUAL AVG PRICE
-    # ---------------------------------------------------------
+    try:
+        sl_pct, tp_levels = build_tp_levels(
+            setup_for_fill,
+            direction,
+        )
+
+    except Exception as exc:
+        return {
+            "status": "PROTECTION_SETUP_INVALID",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "position": position,
+            "open_result": opened,
+            "execution_quality": execution_quality,
+            "error": str(exc),
+        }
+
     protection = install_protection(
         symbol=symbol,
         direction=direction,
@@ -1719,7 +1705,7 @@ def execute_new_position(
             "positionAmt": actual_qty,
             "avgPrice": actual_avg_price,
         },
-        setup=execution_setup,
+        setup=setup_for_fill,
         sl_pct=sl_pct,
         tp_levels=tp_levels,
         trade_id=trade_id,
@@ -1732,18 +1718,12 @@ def execute_new_position(
         )
     ).upper()
 
-    if (
-        protection_status
-        == "PROTECTED"
-    ):
+    if protection_status == "PROTECTED":
         final_status = (
             "opened_protected"
         )
 
-    elif (
-        protection_status
-        == "SL_ONLY"
-    ):
+    elif protection_status == "SL_ONLY":
         final_status = (
             "opened_protection_check_required"
         )
@@ -1753,53 +1733,33 @@ def execute_new_position(
             "opened_protection_failed"
         )
 
-    # ---------------------------------------------------------
-    # 7. FINAL EXECUTION RESULT
-    # ---------------------------------------------------------
     return {
         "status": final_status,
         "mode": EXECUTION_MODE,
         "order_id": order_id,
-
-        "signal_price": float(
-            signal_price
-        ),
-        "actual_fill_price": float(
-            actual_avg_price
-        ),
-
-        # Original signal geometry
-        "signal_setup": signal_setup,
-
-        # Actual protection geometry
-        "execution_setup": execution_setup,
-
         "open_result": opened,
-
         "position": {
             **position,
             "positionAmt": actual_qty,
             "avgPrice": actual_avg_price,
         },
-
         "protection": protection,
-
         "sl_pct": sl_pct,
         "tp_levels": tp_levels,
+        "execution_quality": execution_quality,
+        "setup_used_for_protection": setup_for_fill,
     }
 
 
 def main() -> None:
-    # =========================================================
-    # 1. RECONCILIATION
-    # =========================================================
     if EXECUTION_ENABLED:
         try:
             reconcile_all_open_positions()
 
         except Exception as exc:
             print(
-                f"[RECONCILIATION_ERROR] {exc}"
+                "[RECONCILIATION_ERROR] "
+                f"{exc}"
             )
 
         try:
@@ -1807,32 +1767,33 @@ def main() -> None:
 
         except Exception as exc:
             print(
-                f"[TRACKER_ERROR] {exc}"
+                "[TRACKER_ERROR] "
+                f"{exc}"
             )
 
-    # =========================================================
-    # 2. DIAGNOSTICS
-    # =========================================================
     stats = {
         "coinalyze_rows": 0,
-        "candidates": 0,
-        "valid_signals": 0,
-        "btc_filter_blocked": 0,
-        "execution_attempts": 0,
-        "trades": 0,
-        "scan_errors": 0,
+        "liquidity_candidates": 0,
+        "contract_candidates": 0,
+        "candidates_scanned": 0,
         "divergence_events": 0,
         "squeeze_events": 0,
         "events_total": 0,
+        "rejected_age": 0,
+        "rejected_btc": 0,
+        "rejected_trigger": 0,
+        "rejected_cvd": 0,
+        "valid_signals": 0,
+        "execution_attempts": 0,
+        "trades": 0,
+        "scan_errors": 0,
+
         "fresh_events": 0,
         "fresh_long": 0,
         "fresh_short": 0,
         "fresh_divergence": 0,
         "fresh_squeeze": 0,
-        "rejected_age": 0,
-        "rejected_btc": 0,
-        "rejected_trigger": 0,
-        "rejected_cvd": 0,
+
         "trigger_passed": 0,
         "trigger_no_window": 0,
         "trigger_breakout_failed": 0,
@@ -1841,9 +1802,6 @@ def main() -> None:
         "trigger_direction_failed": 0,
     }
 
-    # =========================================================
-    # 3. BTC REGIME
-    # =========================================================
     btc_regime_df = None
 
     try:
@@ -1860,22 +1818,22 @@ def main() -> None:
 
     except Exception as exc:
         print(
-            f"[BTC_FETCH_ERROR] {exc}"
+            "[BTC_FETCH_ERROR] "
+            f"{exc}"
         )
 
-    # =========================================================
-    # 4. COINALYZE
-    # =========================================================
-    rows = []
+    rows: list[Any] = []
 
     try:
         rows = fetch_data()
 
     except Exception as exc:
-        stats["scan_errors"] += 1
+        stats[
+            "scan_errors"
+        ] += 1
 
         print(
-            f"[COINALYZE_SCRAPE_ERROR] "
+            "[COINALYZE_SCRAPE_ERROR] "
             f"{exc}"
         )
 
@@ -1883,23 +1841,19 @@ def main() -> None:
         "coinalyze_rows"
     ] = len(rows)
 
-    # =========================================================
-    # 5. BINGX CONTRACTS
-    # =========================================================
     try:
         refresh_contracts()
 
     except Exception as exc:
-        stats["scan_errors"] += 1
+        stats[
+            "scan_errors"
+        ] += 1
 
         print(
-            f"[BINGX] contracts refresh "
-            f"error={exc}"
+            "[BINGX] contracts refresh error="
+            f"{exc}"
         )
 
-    # =========================================================
-    # 6. BUILD FULL CANDIDATE UNIVERSE
-    # =========================================================
     candidates: List[Any] = []
 
     for r in rows:
@@ -1907,25 +1861,23 @@ def main() -> None:
             if (
                 r.price is None
                 or r.price <= 0
-            ):
-                continue
-
-            if (
-                r.volume24 is None
+                or r.volume24 is None
                 or r.volume24 < MIN_VOL
-            ):
-                continue
-
-            if (
-                r.oi is None
+                or r.oi is None
                 or r.oi < MIN_OI
             ):
                 continue
 
-            if not get_contract(
-                r.symbol
-            ):
+            stats[
+                "liquidity_candidates"
+            ] += 1
+
+            if not get_contract(r.symbol):
                 continue
+
+            stats[
+                "contract_candidates"
+            ] += 1
 
             candidates.append(r)
 
@@ -1935,21 +1887,15 @@ def main() -> None:
             ] += 1
             continue
 
-    # IMPORTANT:
-    # MAX_CANDIDATES = 0 means no truncation.
-    # This must never become candidates[:0].
     if MAX_CANDIDATES > 0:
         candidates = candidates[
             :MAX_CANDIDATES
         ]
 
     stats[
-        "candidates"
+        "candidates_scanned"
     ] = len(candidates)
 
-    # =========================================================
-    # 7. PERSISTENCE / DEDUPLICATION
-    # =========================================================
     seen_events = load_ids(
         EVENTS
     )
@@ -1966,11 +1912,14 @@ def main() -> None:
         )
     )
 
-    opportunities: List[dict] = []
+    opportunities: List[
+        dict
+    ] = []
 
-    # =========================================================
-    # 8. SCAN ALL CANDIDATES
-    # =========================================================
+    opportunity_keys: set[
+        tuple
+    ] = set()
+
     for r in candidates:
         symbol = r.symbol
 
@@ -2029,9 +1978,7 @@ def main() -> None:
 
             stats[
                 "events_total"
-            ] += len(
-                all_events
-            )
+            ] += len(all_events)
 
             if not all_events:
                 continue
@@ -2059,22 +2006,18 @@ def main() -> None:
                 }:
                     continue
 
+                timestamps = ev.get(
+                    "timestamps",
+                    {}
+                )
+
                 detected_at = int(
-                    ev.get(
-                        "timestamps",
-                        {},
-                    ).get(
+                    timestamps.get(
                         "detected_at_ts",
                         0,
                     )
                     or 0
                 )
-
-                if detected_at <= 0:
-                    stats[
-                        "rejected_age"
-                    ] += 1
-                    continue
 
                 latest_close = int(
                     d1[
@@ -2109,40 +2052,36 @@ def main() -> None:
                         "fresh_short"
                     ] += 1
 
-                if (
-                    "VOLATILITY_SQUEEZE_RELEASE"
-                    in str(
-                        ev.get(
-                            "event_type",
-                            "",
-                        )
+                event_type = str(
+                    ev.get(
+                        "event_type",
+                        "",
                     )
+                ).upper()
+
+                if (
+                    "SQUEEZE"
+                    in event_type
                 ):
                     stats[
                         "fresh_squeeze"
                     ] += 1
-
                 else:
                     stats[
                         "fresh_divergence"
                     ] += 1
 
-                if (
-                    event_id
-                    not in seen_events
-                ):
+                if event_id not in seen_events:
                     emit_event(ev)
                     seen_events.add(
                         event_id
                     )
 
-                # =================================================
-                # BTC FILTER
-                # =================================================
                 if (
                     btc_regime_df
                     is not None
-                    and symbol != "BTC-USDT"
+                    and symbol
+                    != "BTC-USDT"
                 ):
                     btc_ok, _ = (
                         check_btc_regime(
@@ -2155,50 +2094,59 @@ def main() -> None:
                         stats[
                             "rejected_btc"
                         ] += 1
-
-                        stats[
-                            "btc_filter_blocked"
-                        ] += 1
-
                         continue
 
-                # =================================================
-                # 15M DATA ONLY AFTER FRESH EVENT
-                # =================================================
                 if d15 is None:
-                    k15 = fetch_klines(
-                        symbol,
-                        "15m",
-                        int(
-                            os.environ.get(
-                                "KLINE_LIMIT_15M",
-                                "250",
-                            )
-                        ),
-                    )
+                    try:
+                        k15 = fetch_klines(
+                            symbol,
+                            "15m",
+                            int(
+                                os.environ.get(
+                                    "KLINE_LIMIT_15M",
+                                    "250",
+                                )
+                            ),
+                        )
+
+                    except Exception as exc:
+                        stats[
+                            "trigger_data_failed"
+                        ] += 1
+                        stats[
+                            "scan_errors"
+                        ] += 1
+
+                        print(
+                            "[15M_FETCH_ERROR] "
+                            f"{symbol}: {exc}"
+                        )
+                        continue
 
                     if len(k15) < 20:
                         stats[
                             "trigger_data_failed"
                         ] += 1
-
                         continue
 
                     d15 = pd.DataFrame(
                         k15
                     )
 
-                # =================================================
-                # 15M TEMPORAL RELATIONSHIP
-                # =================================================
-                if (
-                    "close_time"
-                    not in d15.columns
+                required_15m = {
+                    "close_time",
+                    "close",
+                    "high",
+                    "low",
+                    "volume",
+                }
+
+                if not required_15m.issubset(
+                    d15.columns
                 ):
                     stats[
                         "trigger_data_failed"
                     ] += 1
-
                     continue
 
                 try:
@@ -2208,6 +2156,11 @@ def main() -> None:
                         ].iloc[-1]
                     )
 
+                    trigger_delay_min = (
+                        latest_15m_close_ts
+                        - detected_at
+                    ) / 60000.0
+
                 except (
                     TypeError,
                     ValueError,
@@ -2216,16 +2169,8 @@ def main() -> None:
                     stats[
                         "trigger_data_failed"
                     ] += 1
-
                     continue
 
-                trigger_delay_min = (
-                    latest_15m_close_ts
-                    - detected_at
-                ) / 60000.0
-
-                # Trigger candle must NOT be before event detection
-                # and must remain within the allowed freshness window.
                 if (
                     trigger_delay_min < 0
                     or trigger_delay_min
@@ -2234,109 +2179,86 @@ def main() -> None:
                     stats[
                         "trigger_no_window"
                     ] += 1
-
                     continue
 
-                # =================================================
-                # 15M TRIGGER
-                # =================================================
                 if REQUIRE_TRIGGER:
-                    trigger_result = (
-                        build_15m_trigger(
-                            d15,
-                            direction,
-                            min_vol_mult=1.05,
-                        )
+                    trigger_ok = build_15m_trigger(
+                        d15,
+                        direction,
+                        min_vol_mult=1.05,
                     )
 
-                    if not trigger_result:
+                    if not trigger_ok:
                         stats[
                             "rejected_trigger"
                         ] += 1
 
-                        # Best-effort classification based on the
-                        # exact trigger structure.
+                        # Diagnostic decomposition.
                         try:
-                            if len(d15) < 2:
+                            h = d15.iloc[-1]
+                            p = d15.iloc[-2]
+
+                            if direction == "LONG":
+                                price_confirmed = (
+                                    float(
+                                        h["close"]
+                                    )
+                                    > float(
+                                        p["high"]
+                                    )
+                                )
+                            else:
+                                price_confirmed = (
+                                    float(
+                                        h["close"]
+                                    )
+                                    < float(
+                                        p["low"]
+                                    )
+                                )
+
+                            if not price_confirmed:
                                 stats[
-                                    "trigger_data_failed"
+                                    "trigger_breakout_failed"
                                 ] += 1
 
-                            else:
-                                h = d15.iloc[-1]
-                                p = d15.iloc[-2]
-
-                                close_val = float(
-                                    h["close"]
+                            elif (
+                                "volume"
+                                in d15.columns
+                                and len(d15) >= 20
+                            ):
+                                vol_sma = (
+                                    d15[
+                                        "volume"
+                                    ]
+                                    .iloc[-21:-1]
+                                    .mean()
                                 )
 
-                                prev_high = float(
-                                    p["high"]
-                                )
-
-                                prev_low = float(
-                                    p["low"]
-                                )
-
-                                if direction == "LONG":
-                                    price_confirmed = (
-                                        close_val
-                                        > prev_high
+                                if (
+                                    pd.notna(
+                                        vol_sma
                                     )
-                                else:
-                                    price_confirmed = (
-                                        close_val
-                                        < prev_low
-                                    )
-
-                                if not price_confirmed:
-                                    stats[
-                                        "trigger_breakout_failed"
-                                    ] += 1
-
-                                elif (
-                                    "volume"
-                                    in d15.columns
-                                    and len(d15)
-                                    >= 20
+                                    and vol_sma > 0
                                 ):
-                                    vol_sma = (
-                                        d15[
-                                            "volume"
-                                        ]
-                                        .iloc[
-                                            -21:-1
-                                        ]
-                                        .mean()
+                                    vol_ratio = (
+                                        float(
+                                            h[
+                                                "volume"
+                                            ]
+                                        )
+                                        / float(
+                                            vol_sma
+                                        )
                                     )
 
                                     if (
-                                        pd.notna(
-                                            vol_sma
-                                        )
-                                        and vol_sma > 0
+                                        vol_ratio
+                                        < 1.05
                                     ):
-                                        if (
-                                            float(
-                                                h["volume"]
-                                            )
-                                            < (
-                                                vol_sma
-                                                * 1.05
-                                            )
-                                        ):
-                                            stats[
-                                                "trigger_volume_failed"
-                                            ] += 1
-                                    else:
                                         stats[
-                                            "trigger_data_failed"
+                                            "trigger_volume_failed"
                                         ] += 1
-
-                                else:
-                                    stats[
-                                        "trigger_data_failed"
-                                    ] += 1
 
                         except Exception:
                             stats[
@@ -2349,9 +2271,11 @@ def main() -> None:
                         "trigger_passed"
                     ] += 1
 
-                # =================================================
-                # OPTIONAL CVD CONFIRMATION
-                # =================================================
+                else:
+                    stats[
+                        "trigger_passed"
+                    ] += 1
+
                 if REQUIRE_CVD:
                     cvd24 = getattr(
                         r,
@@ -2371,7 +2295,6 @@ def main() -> None:
                         stats[
                             "rejected_cvd"
                         ] += 1
-
                         continue
 
                     if (
@@ -2384,18 +2307,14 @@ def main() -> None:
                         stats[
                             "rejected_cvd"
                         ] += 1
-
                         continue
 
-                # =================================================
-                # SIGNAL PRICE
-                # =================================================
                 fact = ev.get(
                     "event_fact",
-                    {},
+                    {}
                 )
 
-                signal_price_raw = (
+                raw_price = (
                     fact.get(
                         "detection_close_price"
                     )
@@ -2407,13 +2326,15 @@ def main() -> None:
 
                 try:
                     signal_price = float(
-                        signal_price_raw
+                        raw_price
                     )
-
                 except (
                     TypeError,
                     ValueError,
                 ):
+                    stats[
+                        "scan_errors"
+                    ] += 1
                     continue
 
                 if (
@@ -2422,41 +2343,43 @@ def main() -> None:
                     )
                     or signal_price <= 0
                 ):
-                    continue
-
-                # =================================================
-                # SIGNAL SETUP
-                # =================================================
-                try:
-                    signal_setup = (
-                        build_event_setup(
-                            ev=ev,
-                            df_1h=d1,
-                            entry_price=signal_price,
-                        )
-                    )
-
-                except Exception as exc:
                     stats[
                         "scan_errors"
                     ] += 1
-
-                    print(
-                        f"[SETUP_ERROR] "
-                        f"{symbol}: {exc}"
-                    )
-
                     continue
 
-                # =================================================
-                # SCORE
-                # =================================================
-                score = (
-                    calculate_setup_score(
-                        ev=ev,
-                        coinalyze_row=r,
-                        df_15m=d15,
-                    )
+                setup = build_event_setup(
+                    ev=ev,
+                    df_1h=d1,
+                    entry_price=signal_price,
+                )
+
+                score = calculate_setup_score(
+                    ev=ev,
+                    coinalyze_row=r,
+                    df_15m=d15,
+                )
+
+                opportunity_key = (
+                    symbol,
+                    direction,
+                    event_type,
+                    timestamps.get(
+                        "pivot_1_ts"
+                    ),
+                    timestamps.get(
+                        "pivot_2_ts"
+                    ),
+                )
+
+                if (
+                    opportunity_key
+                    in opportunity_keys
+                ):
+                    continue
+
+                opportunity_keys.add(
+                    opportunity_key
                 )
 
                 opportunities.append(
@@ -2466,14 +2389,7 @@ def main() -> None:
                         "symbol": symbol,
                         "direction": direction,
                         "price": signal_price,
-
-                        # Price-at-signal setup
-                        "setup": signal_setup,
-
-                        # Required for recalculation
-                        # after actual fill.
-                        "df_1h": d1.copy(),
-
+                        "setup": setup,
                         "score": score,
                         "coinalyze_row": r,
                     }
@@ -2485,13 +2401,10 @@ def main() -> None:
             ] += 1
 
             print(
-                f"[SCAN_ERROR] "
+                "[SCAN_ERROR] "
                 f"{symbol}: {exc}"
             )
 
-    # =========================================================
-    # 9. RANK OPPORTUNITIES
-    # =========================================================
     stats[
         "valid_signals"
     ] = len(
@@ -2505,9 +2418,6 @@ def main() -> None:
         reverse=True,
     )
 
-    # =========================================================
-    # 10. EXECUTION
-    # =========================================================
     trades_this_cycle = 0
 
     for opp in opportunities:
@@ -2527,7 +2437,7 @@ def main() -> None:
             "price"
         ]
 
-        signal_setup = opp[
+        setup = opp[
             "setup"
         ]
 
@@ -2543,9 +2453,6 @@ def main() -> None:
             "event"
         ]
 
-        # -----------------------------------------------------
-        # Already executed
-        # -----------------------------------------------------
         if event_id in executed_event_ids:
             execution_result = {
                 "status": "ALREADY_EXECUTED",
@@ -2553,9 +2460,6 @@ def main() -> None:
                 "order_id": None,
             }
 
-        # -----------------------------------------------------
-        # Real execution
-        # -----------------------------------------------------
         elif (
             EXECUTION_ENABLED
             and trades_this_cycle
@@ -2569,27 +2473,109 @@ def main() -> None:
                 execute_new_position(
                     symbol=symbol,
                     direction=direction,
-                    signal_price=price,
-                    signal_setup=signal_setup,
-                    df_1h=opp[
-                        "df_1h"
-                    ],
+                    price=price,
+                    setup=setup,
                     event_id=event_id,
                 )
             )
 
-            # ---------------------------------------------
-            # Persist complete execution record
-            # ---------------------------------------------
+            actual_position = (
+                execution_result.get(
+                    "position",
+                    {}
+                )
+                if isinstance(
+                    execution_result,
+                    dict,
+                )
+                else {}
+            )
+
+            actual_entry = float(
+                actual_position.get(
+                    "avgPrice",
+                    0,
+                )
+                or actual_position.get(
+                    "entryPrice",
+                    0,
+                )
+                or price
+            )
+
+            execution_quality = (
+                execution_result.get(
+                    "execution_quality",
+                    {},
+                )
+                if isinstance(
+                    execution_result,
+                    dict,
+                )
+                else {}
+            )
+
             record_trade(
                 {
+                    "record_type": "TRADE_OPEN",
                     "event_id": event_id,
                     "symbol": symbol,
                     "direction": direction,
 
-                    # Signal/reference price
-                    "price": price,
-                    "signal_price": price,
+                    "signal": {
+                        "event_type": ev.get(
+                            "event_type"
+                        ),
+                        "timeframe": ev.get(
+                            "timeframe"
+                        ),
+                        "signal_price": price,
+                        "score": score,
+                        "detected_at_ts": (
+                            ev.get(
+                                "timestamps",
+                                {},
+                            ).get(
+                                "detected_at_ts"
+                            )
+                        ),
+                        "event_fact": ev.get(
+                            "event_fact",
+                            {},
+                        ),
+                    },
+
+                    "execution": {
+                        "requested_price": price,
+                        "actual_entry_price": (
+                            actual_entry
+                        ),
+                        "actual_qty": (
+                            actual_position.get(
+                                "positionAmt"
+                            )
+                        ),
+                        "order_id": (
+                            execution_result.get(
+                                "order_id"
+                            )
+                        ),
+                        "status": (
+                            execution_result.get(
+                                "status"
+                            )
+                        ),
+                        "slippage_pct": (
+                            execution_quality.get(
+                                "slippage_pct"
+                            )
+                        ),
+                        "adverse_slippage_pct": (
+                            execution_quality.get(
+                                "adverse_slippage_pct"
+                            )
+                        ),
+                    },
 
                     "score": score,
                     "event_type": ev.get(
@@ -2604,32 +2590,99 @@ def main() -> None:
 
                     "result": execution_result,
 
-                    # Backward-compatible setup
-                    "setup": execution_result.get(
-                        "execution_setup",
-                        signal_setup,
-                    ),
+                    "setup": setup,
 
-                    # Explicit separation
-                    "signal_setup": execution_result.get(
-                        "signal_setup",
-                        signal_setup,
-                    ),
+                    "planned_metrics": {
+                        "target_rr": setup.get(
+                            "target_rr"
+                        ),
+                        "planned_weighted_rr": (
+                            setup.get(
+                                "planned_weighted_rr"
+                            )
+                        ),
+                        "realized_rr": None,
+                    },
 
-                    "execution_setup": execution_result.get(
-                        "execution_setup"
-                    ),
-
-                    "actual_fill_price": execution_result.get(
-                        "actual_fill_price"
-                    ),
+                    "coinalyze_snapshot": {
+                        "volume24": getattr(
+                            r,
+                            "volume24",
+                            None,
+                        ),
+                        "oi": getattr(
+                            r,
+                            "oi",
+                            None,
+                        ),
+                        "oi_chg24_pct": getattr(
+                            r,
+                            "oi_chg24_pct",
+                            None,
+                        ),
+                        "oi_chg4h_pct": getattr(
+                            r,
+                            "oi_chg4h_pct",
+                            None,
+                        ),
+                        "oi_vol_ratio": getattr(
+                            r,
+                            "oi_vol_ratio",
+                            None,
+                        ),
+                        "oi_mktcap_ratio": getattr(
+                            r,
+                            "oi_mktcap_ratio",
+                            None,
+                        ),
+                        "fr_oiw": getattr(
+                            r,
+                            "fr_oiw",
+                            None,
+                        ),
+                        "pfr_oiw": getattr(
+                            r,
+                            "pfr_oiw",
+                            None,
+                        ),
+                        "liq_short24": getattr(
+                            r,
+                            "liq_short24",
+                            None,
+                        ),
+                        "liq_long24": getattr(
+                            r,
+                            "liq_long24",
+                            None,
+                        ),
+                        "ls_accounts": getattr(
+                            r,
+                            "ls_accounts",
+                            None,
+                        ),
+                        "btc_corr7d": getattr(
+                            r,
+                            "btc_corr7d",
+                            None,
+                        ),
+                        "cvd24": getattr(
+                            r,
+                            "cvd24",
+                            None,
+                        ),
+                        "lls24": getattr(
+                            r,
+                            "lls24",
+                            None,
+                        ),
+                    },
                 }
             )
 
             status = str(
                 execution_result.get(
                     "status",
-                    "",
+                    ""
                 )
             )
 
@@ -2656,43 +2709,17 @@ def main() -> None:
                     print(
                         "[CRITICAL_PROTECTION_FAILED] "
                         f"Position opened but "
-                        f"protection failed "
-                        f"for {symbol}: "
+                        f"protection failed for "
+                        f"{symbol}: "
                         f"{execution_result.get('protection')}"
                     )
 
-                # -----------------------------------------
-                # Register actual exchange position
-                # -----------------------------------------
                 try:
-                    actual_position = (
-                        execution_result.get(
-                            "position",
-                            {},
-                        )
-                        or {}
-                    )
-
-                    actual_entry = float(
-                        actual_position.get(
-                            "avgPrice",
-                            price,
-                        )
-                    )
-
-                    actual_qty = float(
-                        actual_position.get(
-                            "positionAmt",
-                            0,
-                        )
-                    )
-
-                    protection_data = (
+                    protection = (
                         execution_result.get(
                             "protection",
                             {},
                         )
-                        or {}
                     )
 
                     register_active_trade(
@@ -2707,13 +2734,31 @@ def main() -> None:
                             or symbol
                         ),
                         direction=direction,
-                        entry_price=actual_entry,
-                        qty=actual_qty,
-                        tp_orders=protection_data.get(
+                        entry_price=float(
+                            execution_result.get(
+                                "position",
+                                {},
+                            ).get(
+                                "avgPrice",
+                                price,
+                            )
+                            or price
+                        ),
+                        qty=float(
+                            execution_result.get(
+                                "position",
+                                {},
+                            ).get(
+                                "positionAmt",
+                                0,
+                            )
+                            or 0
+                        ),
+                        tp_orders=protection.get(
                             "tp_orders",
                             [],
                         ),
-                        sl_result=protection_data.get(
+                        sl_result=protection.get(
                             "sl_result",
                             {},
                         ),
@@ -2731,9 +2776,6 @@ def main() -> None:
                         f"{symbol}: {exc}"
                     )
 
-        # -----------------------------------------------------
-        # Execution disabled
-        # -----------------------------------------------------
         elif not EXECUTION_ENABLED:
             execution_result = {
                 "status": "DISABLED",
@@ -2741,9 +2783,6 @@ def main() -> None:
                 "order_id": None,
             }
 
-        # -----------------------------------------------------
-        # Per-cycle trade limit
-        # -----------------------------------------------------
         else:
             execution_result = {
                 "status": "TRADE_LIMIT_REACHED",
@@ -2751,25 +2790,15 @@ def main() -> None:
                 "order_id": None,
             }
 
-        # =====================================================
-        # 11. TELEGRAM
-        # =====================================================
         label = (
             "🚨 LONG SIGNAL"
             if direction == "LONG"
             else "🔻 SHORT SIGNAL"
         )
 
-        telegram_setup = (
-            execution_result.get(
-                "execution_setup"
-            )
-            or signal_setup
-        )
-
         msg = format_signal(
             ev,
-            setup=telegram_setup,
+            setup=setup,
             coinalyze_row=r,
             execution=execution_result,
             score=score,
@@ -2785,7 +2814,7 @@ def main() -> None:
         ):
             msg = (
                 f"{label}\n\n"
-                + msg
+                f"{msg}"
             )
 
         is_real_execution = (
@@ -2813,11 +2842,7 @@ def main() -> None:
                 sent = bool(
                     send_tg(msg)
                 )
-            except Exception as exc:
-                print(
-                    f"[TELEGRAM_ERROR] "
-                    f"{event_id}: {exc}"
-                )
+            except Exception:
                 sent = False
 
             if sent:
@@ -2825,9 +2850,6 @@ def main() -> None:
                     event_id
                 )
 
-        # =====================================================
-        # 12. ACTION LOG
-        # =====================================================
         record_action(
             {
                 "event_id": event_id,
@@ -2840,12 +2862,10 @@ def main() -> None:
                 "telegram_sent": bool(
                     sent
                 ),
-                "execution_status": execution_result.get(
-                    "status"
-                ),
-                "signal_price": price,
-                "actual_fill_price": execution_result.get(
-                    "actual_fill_price"
+                "execution_status": (
+                    execution_result.get(
+                        "status"
+                    )
                 ),
                 "ts": int(
                     pd.Timestamp.utcnow()
@@ -2855,9 +2875,6 @@ def main() -> None:
             }
         )
 
-    # =========================================================
-    # 13. SHADOW HEALTH
-    # =========================================================
     try:
         append_shadow_health(
             events_path=EVENTS,
@@ -2867,13 +2884,54 @@ def main() -> None:
 
     except Exception as exc:
         print(
-            f"[SHADOW_HEALTH_ERROR] "
+            "[SHADOW_HEALTH_ERROR] "
             f"{exc}"
         )
 
-    # =========================================================
-    # 14. FORENSIC SUMMARY
-    # =========================================================
+    print(
+        "=============================="
+    )
+
+    print(
+        "[FORENSIC SUMMARY]"
+    )
+
+    for key in (
+        "coinalyze_rows",
+        "liquidity_candidates",
+        "contract_candidates",
+        "candidates_scanned",
+        "divergence_events",
+        "squeeze_events",
+        "events_total",
+        "fresh_events",
+        "fresh_long",
+        "fresh_short",
+        "fresh_divergence",
+        "fresh_squeeze",
+        "rejected_age",
+        "rejected_btc",
+        "trigger_passed",
+        "trigger_no_window",
+        "trigger_breakout_failed",
+        "trigger_volume_failed",
+        "trigger_data_failed",
+        "trigger_direction_failed",
+        "rejected_trigger",
+        "rejected_cvd",
+        "valid_signals",
+        "execution_attempts",
+        "trades",
+        "scan_errors",
+    ):
+        print(
+            f"{key}={stats[key]}"
+        )
+
+    print(
+        "=============================="
+    )
+
     print(
         f"[ENGINE] "
         f"trades_this_cycle="
