@@ -678,9 +678,29 @@ def _format_price(price: float, precision: int) -> str:
     return f"{price:.{precision}f}"
 
 
-def build_tp_client_order_id(leg: str, trade_id: str | None = None) -> str:
+def build_tp_client_order_id(
+    leg: str,
+    trade_id: str | None = None,
+) -> str:
+    leg_u = str(leg).upper()
+
+    if trade_id:
+        raw_trade_id = str(trade_id).upper()
+
+        # Keep the ID deterministic and within exchange-safe size limits.
+        trade_digest = hashlib.sha256(
+            raw_trade_id.encode()
+        ).hexdigest().upper()[:16]
+
+        token = uuid.uuid4().hex.upper()[:8]
+
+        return (
+            f"EVT_{trade_digest}_{leg_u}_{token}"
+        )
+
     token = uuid.uuid4().hex.upper()[:16]
-    return f"EVT_{str(leg).upper()}_{token}"
+
+    return f"EVT_{leg_u}_{token}"
 
 
 def build_sl_client_order_id(trade_id: str | None = None) -> str:
