@@ -729,34 +729,38 @@ def _allocate_tp_quantities(
         raise ValueError("fraction sum must be > 0")
     normalized = [Decimal(str(f)) / total_fraction for f in fractions]
 
-    # Start every leg at the minimum valid quantity.
-    quantities = [min_leg] * k
-    remaining = pos - min_leg * k
+    # Target raw quantities for each leg based on total position
+    raw_targets = [pos * f for f in normalized]
 
-    # Allocate remaining quantity by largest-remainder style using the requested
-    # fractions, while keeping every result on the exchange step.
-    raw_extra = [remaining * f for f in normalized]
-    extra_steps = []
-    for raw in raw_extra:
-        n = (raw / step).to_integral_value(rounding=ROUND_FLOOR)
-        extra_steps.append(n)
+    # Initial floor step allocation, enforcing min_leg
+    quantities = []
+    for raw in raw_targets:
+        q_step = (raw / step).to_integral_value(rounding=ROUND_FLOOR) * step
+        quantities.append(max(q_step, min_leg))
 
-    allocated_extra = sum(extra_steps) * step
-    quantities = [q + n * step for q, n in zip(quantities, extra_steps)]
-    remainder = pos - sum(quantities)
-    while remainder >= step:
-        # Give the next step to the leg with the largest unmet fractional target.
-        best = max(
+    # If min_leg pushed sum above pos, reduce from legs with available headroom above min_leg
+    while sum(quantities) > pos:
+        best_reduce = max(
             range(k),
-            key=lambda i: raw_extra[i] - (quantities[i] - min_leg),
+            key=lambda i: (quantities[i] - min_leg, quantities[i] - raw_targets[i]),
         )
-        quantities[best] += step
-        remainder -= step
+        if quantities[best_reduce] <= min_leg:
+            raise ValueError("Cannot reduce leg below min_leg")
+        quantities[best_reduce] -= step
 
-    # Decimal representation can differ by tiny residue; enforce exact total in
-    # the last leg while keeping it on-step.
-    quantities[-1] += remainder
-    quantities[-1] = quantities[-1].quantize(step)
+    # If floor rounding left remainder, distribute step by step to legs with largest unmet target
+    while sum(quantities) < pos:
+        best_add = max(
+            range(k),
+            key=lambda i: raw_targets[i] - quantities[i],
+        )
+        quantities[best_add] += step
+
+    # Final exact total enforcement
+    remainder = pos - sum(quantities)
+    if remainder != 0:
+        quantities[-1] += remainder
+        quantities[-1] = quantities[-1].quantize(step)
 
     if any(q < min_leg for q in quantities):
         raise ValueError("TP allocation produced a leg below minimum quantity")
