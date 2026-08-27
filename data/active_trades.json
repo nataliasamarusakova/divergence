@@ -134,60 +134,6 @@
     "realized_pnl_weighted_sum": 0.0,
     "last_tp_exec_price": null
   },
-  "RECON_SPX-USDT_LONG": {
-    "event_id": "RECON_SPX-USDT_LONG",
-    "symbol": "SPX",
-    "name": "SPX",
-    "direction": "LONG",
-    "entry_price": 0.5617,
-    "initial_qty": 17.76,
-    "remaining_qty": 17.76,
-    "entry_ts": 1787776872602,
-    "tp_orders": [
-      {
-        "leg": "tp1",
-        "status": "deferred",
-        "reason": "trigger_already_crossed",
-        "price": 0.580992855942,
-        "current_price": 0.636,
-        "qty": 3.25,
-        "pnl_pct": 3.434726
-      },
-      {
-        "leg": "tp2",
-        "status": "deferred",
-        "reason": "trigger_already_crossed",
-        "price": 0.5906392839129999,
-        "current_price": 0.636,
-        "qty": 3.24,
-        "pnl_pct": 5.152089
-      },
-      {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092712817022558208",
-        "price": 0.6572,
-        "qty": 6.22
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2092774502999613440",
-      "stop_price": 0.5966,
-      "qty": 9.77
-    },
-    "hit_legs": [],
-    "be_activated": false,
-    "peak_pnl_pct": 15.097026882677584,
-    "max_drawdown_pct": -5.572369592309062,
-    "score": 50.0,
-    "event_type": "RECONCILED_POSITION",
-    "research": {},
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null
-  },
   "RECON_GIGGLE-USDT_LONG": {
     "event_id": "RECON_GIGGLE-USDT_LONG",
     "symbol": "GIGGLE",
@@ -379,7 +325,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.9981285090455422,
-    "max_drawdown_pct": -2.651278852152204,
+    "max_drawdown_pct": -2.6824703680598865,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
@@ -996,11 +942,10 @@
     "entry_ts": 1787796169492,
     "tp_orders": [
       {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092794934800769024",
-        "price": 0.0009943,
-        "qty": 3477.0
+        "leg": "tp1",
+        "status": "error",
+        "error": "code=110414 msg=Take Profit price should be lower than the current price",
+        "qty": 2168.0
       },
       {
         "leg": "tp2",
@@ -1010,22 +955,22 @@
         "qty": 3091.0
       },
       {
-        "leg": "tp1",
+        "leg": "tp3",
         "status": "already_exists",
-        "order_id": "2092794930577104896",
-        "price": 0.0010139,
-        "qty": 3092.0
+        "order_id": "2092794934800769024",
+        "price": 0.0009943,
+        "qty": 3477.0
       }
     ],
     "sl_order": {
       "status": "already_exists",
       "order_id": "2092794926709956608",
       "stop_price": 0.0010529,
-      "qty": 9660.0
+      "qty": 6568.0
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 1.7321463131411035,
+    "peak_pnl_pct": 2.070834139732918,
     "max_drawdown_pct": -1.7514999032320342,
     "score": 80.0,
     "event_type": "HIDDEN_BEARISH_RSI",
@@ -1035,62 +980,6 @@
       "liq_long24": 0.0086,
       "ls_accounts": 0.0,
       "oi": 22100000.0
-    },
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null
-  },
-  "EVT_6514E55885E2C79E": {
-    "event_id": "EVT_6514E55885E2C79E",
-    "symbol": "CRV",
-    "name": "Curve DAO Token",
-    "direction": "SHORT",
-    "entry_price": 0.3116,
-    "initial_qty": 31.6,
-    "remaining_qty": 31.6,
-    "entry_ts": 1787797054591,
-    "tp_orders": [
-      {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092798647208599552",
-        "price": 0.3016,
-        "qty": 11.4
-      },
-      {
-        "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2092798646046777344",
-        "price": 0.3041,
-        "qty": 10.1
-      },
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2092798644838817792",
-        "price": 0.3066,
-        "qty": 10.1
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2092798639876956160",
-      "stop_price": 0.3166,
-      "qty": 31.6
-    },
-    "hit_legs": [],
-    "be_activated": false,
-    "peak_pnl_pct": 0.06418485237483247,
-    "max_drawdown_pct": -2.2785622593068022,
-    "score": 75.0,
-    "event_type": "HIDDEN_BEARISH_RSI",
-    "research": {
-      "fr_oiw": 0.079,
-      "liq_short24": 0.0128,
-      "liq_long24": 0.0116,
-      "ls_accounts": 0.0101,
-      "oi": 38700000.0
     },
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
@@ -1138,7 +1027,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.6976561887591243,
-    "max_drawdown_pct": -0.956337696950704,
+    "max_drawdown_pct": -1.0895978678372775,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
@@ -1287,7 +1176,7 @@
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 0.2572434335228828,
+    "peak_pnl_pct": 0.3249390739236486,
     "max_drawdown_pct": -1.4893040888166815,
     "score": 85.0,
     "event_type": "HIDDEN_BEARISH_RSI",
@@ -1399,7 +1288,7 @@
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 0.975609756097572,
+    "peak_pnl_pct": 1.1585365853658613,
     "max_drawdown_pct": -1.646341463414639,
     "score": 70.0,
     "event_type": "HIDDEN_BEARISH_RSI",
@@ -1456,7 +1345,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.2174205638439979,
-    "max_drawdown_pct": -0.779608021783467,
+    "max_drawdown_pct": -0.850010871028196,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
@@ -1505,7 +1394,7 @@
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 1.0303536619326041,
+    "peak_pnl_pct": 1.2531328320801862,
     "max_drawdown_pct": -1.1974380395432946,
     "score": 80.0,
     "event_type": "HIDDEN_BEARISH_RSI",
@@ -1562,7 +1451,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.6530782530557965,
-    "max_drawdown_pct": -1.1721711642684463,
+    "max_drawdown_pct": -1.2548088301956506,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
