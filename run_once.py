@@ -48,9 +48,10 @@ TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
 HEALTH = DATA / "health.jsonl"
 
-MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
-MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "1000000"))
-MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "500000"))
+# 0 or negative means scan ALL eligible liquidity/contract candidates (no selection bias)
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
+MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "10000000"))
+MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "5000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
@@ -269,7 +270,6 @@ def install_protection(
 
 
 def _tp_orders_to_tracker(tp_orders: list[dict]) -> list[dict]:
-    """Normalize existing exchange TP orders into tracker-compatible dictionaries."""
     out: list[dict] = []
     for order in tp_orders:
         cid = str(order.get("clientOrderId", "")).upper()
@@ -299,18 +299,15 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
 
 
 def _expected_tp_leg_count(position_qty: float, symbol: str) -> int:
-    """Return the number of TP legs this position can validly support."""
     contract = get_contract(symbol) or {}
     try:
         min_qty = float(contract.get("tradeMinQuantity") or contract.get("minQty") or 0)
     except (TypeError, ValueError):
         min_qty = 0.0
-    # Mirrors ensure_directional_protection(): small positions collapse to one full-size TP.
     return 1 if min_qty > 0 and position_qty < min_qty * 3 else 3
 
 
 def reconcile_all_open_positions() -> None:
-    """Repair missing protection only; never recreate already-complete protection."""
     try:
         positions = get_positions()
     except Exception as exc:
@@ -335,7 +332,6 @@ def reconcile_all_open_positions() -> None:
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
 
-        # First read only. A read error is not evidence that protection is absent.
         prot = get_open_protection_directional(bx_symbol, direction)
         if prot.get("status") != "ok":
             print(f"[RECONCILIATION] Cannot inspect protection for {bx_symbol}: {prot.get('error', 'unknown error')}")
@@ -360,8 +356,6 @@ def reconcile_all_open_positions() -> None:
             elif direction == "SHORT" and sl_price > avg_price > 0 and sl_amt > 0:
                 sl_valid = True
 
-        # Nothing is missing: DO NOT call ensure_directional_protection(),
-        # DO NOT recalculate ATR, DO NOT touch exchange orders, DO NOT send Telegram.
         protection_complete = sl_valid and len(known_tp_legs) >= expected_tp_count
         if protection_complete:
             print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection OK: SL=1 TP={len(known_tp_legs)}; no changes")
@@ -393,7 +387,6 @@ def reconcile_all_open_positions() -> None:
             f"SL={len(sl_orders)} TP={len(known_tp_legs)}/{expected_tp_count}; repairing only missing protection..."
         )
 
-        # Compute fallback protection only when something is actually missing.
         sl_pct = 2.0
         tp_pct = 4.0
         try:
@@ -467,7 +460,6 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
-            # Telegram is emitted ONLY when this reconciliation actually changed protection.
             if changed:
                 send_tg(
                     f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n"
@@ -521,8 +513,6 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "error": str(exc),
         }
 
-    # Exchange position is the sole source of truth for actual average price and
-    # quantity. Never install protection against the requested order quantity.
     if not isinstance(position, dict) or str(position.get("status", "")).lower() != "found":
         return {
             "status": "POSITION_NOT_CONFIRMED",
@@ -549,8 +539,6 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         }
 
     try:
-        # Setup may have been calculated from signal price; protection percentages
-        # are retained, but actual exchange avgPrice is authoritative for all prices.
         sl_pct, tp_levels = build_tp_levels(setup, direction)
     except Exception as exc:
         return {
@@ -597,14 +585,13 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 
 def main() -> None:
-    # 1. АВТОМАТИЧЕСКАЯ РЕКОНСИЛЯЦИЯ ВСЕХ ОТКРЫТЫХ ПОЗИЦИЙ НА BINGX
+    # 1. Автоматическая реконсиляция открытых позиций
     if EXECUTION_ENABLED:
         try:
             reconcile_all_open_positions()
         except Exception as exc:
             print(f"[RECONCILIATION_ERROR] {exc}")
 
-        # 2. Опрос жизненного цикла сделок (проверка тейков, безубыток, закрытие)
         try:
             update_active_trades()
         except Exception as exc:
@@ -612,9 +599,17 @@ def main() -> None:
 
     stats = {
         "coinalyze_rows": 0,
-        "candidates": 0,
+        "liquidity_candidates": 0,
+        "contract_candidates": 0,
+        "candidates_scanned": 0,
+        "divergence_events": 0,
+        "squeeze_events": 0,
+        "events_total": 0,
+        "rejected_age": 0,
+        "rejected_btc": 0,
+        "rejected_trigger": 0,
+        "rejected_cvd": 0,
         "valid_signals": 0,
-        "btc_filter_blocked": 0,
         "execution_attempts": 0,
         "trades": 0,
         "scan_errors": 0,
@@ -647,14 +642,17 @@ def main() -> None:
         try:
             if r.price is None or r.price <= 0 or r.volume24 is None or r.volume24 < MIN_VOL or r.oi is None or r.oi < MIN_OI:
                 continue
+            stats["liquidity_candidates"] += 1
             if not get_contract(r.symbol):
                 continue
+            stats["contract_candidates"] += 1
             candidates.append(r)
         except Exception:
             continue
 
-    candidates = candidates[:MAX_CANDIDATES]
-    stats["candidates"] = len(candidates)
+    if MAX_CANDIDATES > 0:
+        candidates = candidates[:MAX_CANDIDATES]
+    stats["candidates_scanned"] = len(candidates)
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
@@ -666,17 +664,23 @@ def main() -> None:
         symbol = r.symbol
         try:
             k1 = fetch_klines(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
-            k15 = fetch_klines(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
-
-            if len(k1) < 60 or len(k15) < 20:
+            if len(k1) < 60:
                 continue
 
             d1 = add_cvd(pd.DataFrame(k1))
-            d15 = pd.DataFrame(k15)
-
             divergence_events = detect_divergences(d1, symbol, "1h")
             squeeze_events = detect_squeeze_release(d1, symbol, "1h", min_squeeze_bars=3)
+
+            stats["divergence_events"] += len(divergence_events)
+            stats["squeeze_events"] += len(squeeze_events)
             all_events = divergence_events + squeeze_events
+            stats["events_total"] += len(all_events)
+
+            if not all_events:
+                continue
+
+            # Fetch 15M klines only when 1H events actually exist
+            d15 = None
 
             for ev in all_events:
                 event_id = ev.get("event_id")
@@ -692,6 +696,7 @@ def main() -> None:
                 age = (latest_close - detected_at) / 60000.0
 
                 if age < 0 or age > MAX_AGE:
+                    stats["rejected_age"] += 1
                     continue
 
                 if event_id not in seen_events:
@@ -701,16 +706,24 @@ def main() -> None:
                 if btc_regime_df is not None and symbol != "BTC-USDT":
                     btc_ok, _ = check_btc_regime(btc_regime_df, direction)
                     if not btc_ok:
-                        stats["btc_filter_blocked"] += 1
+                        stats["rejected_btc"] += 1
                         continue
+
+                if d15 is None:
+                    k15 = fetch_klines(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
+                    if len(k15) < 20:
+                        continue
+                    d15 = pd.DataFrame(k15)
 
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
                 if trigger_delay_min < 0 or trigger_delay_min > MAX_AGE:
+                    stats["rejected_age"] += 1
                     continue
 
                 if REQUIRE_TRIGGER and not build_15m_trigger(d15, direction, min_vol_mult=1.05):
+                    stats["rejected_trigger"] += 1
                     continue
 
                 if REQUIRE_CVD:
@@ -718,8 +731,10 @@ def main() -> None:
                     try:
                         cvd24_value = float(cvd24)
                     except (TypeError, ValueError):
+                        stats["rejected_cvd"] += 1
                         continue
                     if cvd24_value <= CVD_MIN_CONFIRMATION:
+                        stats["rejected_cvd"] += 1
                         continue
 
                 fact = ev.get("event_fact", {})
@@ -845,4 +860,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
