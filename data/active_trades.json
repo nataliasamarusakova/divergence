@@ -943,9 +943,12 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "error",
-        "error": "code=110414 msg=Take Profit price should be lower than the current price",
-        "qty": 2168.0
+        "status": "deferred",
+        "reason": "trigger_already_crossed",
+        "price": 0.0010152642846960002,
+        "current_price": 0.0010138,
+        "qty": 2167.0,
+        "pnl_pct": 1.754956
       },
       {
         "leg": "tp2",
@@ -1027,7 +1030,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.6976561887591243,
-    "max_drawdown_pct": -1.0895978678372775,
+    "max_drawdown_pct": -1.1013561182096114,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
@@ -1345,7 +1348,7 @@
     "hit_legs": [],
     "be_activated": false,
     "peak_pnl_pct": 0.2174205638439979,
-    "max_drawdown_pct": -0.850010871028196,
+    "max_drawdown_pct": -0.8582935591746381,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
