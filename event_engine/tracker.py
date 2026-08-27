@@ -1,7 +1,5 @@
 # tracker.py
 
-
-
 from __future__ import annotations
 
 import json
@@ -40,7 +38,14 @@ def _load_active_trades() -> dict[str, dict]:
     try:
         data = json.loads(ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        log.error("[TRACKER_CORRUPT_STATE] Failed to read %s: %s", ACTIVE_TRADES_PATH, exc)
+        try:
+            corrupt_path = ACTIVE_TRADES_PATH.with_suffix(f".corrupt.{int(time.time())}.json")
+            ACTIVE_TRADES_PATH.rename(corrupt_path)
+            log.warning("[TRACKER_CORRUPT_BACKUP] Saved to %s", corrupt_path)
+        except Exception:
+            pass
         return {}
 
 
@@ -200,8 +205,15 @@ def format_trade_closed_message(
     return "\n".join(lines)
 
 
-def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None) -> dict:
-    """Create and verify the BE stop before cancelling the existing SL."""
+def _move_sl_to_break_even(
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    old_sl_id: str | None,
+    trade_id: str | None = None,
+) -> dict:
+    """Create and verify the BE stop before cancelling the existing SL with deterministic idempotency."""
     bx = to_bx_symbol(symbol)
     contract = get_contract(symbol) or {}
     precision = int(contract.get("quantityPrecision") or 0)
@@ -210,8 +222,26 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
     if qty <= 0 or entry_price <= 0 or not bx:
         return {"status": "error", "error": "invalid BE parameters", "order_id": "", "stop_price": entry_price}
 
+    be_client_id = f"EVT_BE_{trade_id}" if trade_id else f"EVT_BE_{uuid.uuid4().hex.upper()[:16]}"
+
+    # 1. Idempotency check: check if BE stop already exists on exchange
+    verified = get_open_protection_directional(symbol, direction)
+    if verified.get("status") == "ok":
+        for o in verified.get("sl_orders", []):
+            cid = str(o.get("clientOrderId", "")).upper()
+            o_price = float(o.get("stopPrice", 0) or o.get("price", 0) or 0)
+            if (be_client_id.upper() in cid) or (abs(o_price - entry_price) / max(entry_price, 1e-8) < 0.002):
+                existing_be_id = str(o.get("orderId", ""))
+                if old_sl_id and str(old_sl_id) != existing_be_id:
+                    cancel_order(symbol, old_sl_id)
+                return {
+                    "status": "created",
+                    "order_id": existing_be_id,
+                    "client_order_id": cid or be_client_id,
+                    "stop_price": entry_price,
+                }
+
     sl_side = "SELL" if direction.upper() == "LONG" else "BUY"
-    client_order_id = f"EVT_BE_{uuid.uuid4().hex.upper()[:16]}"
     params = {
         "symbol": bx,
         "side": sl_side,
@@ -219,7 +249,7 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
         "type": "STOP_MARKET",
         "stopPrice": _format_price(entry_price, price_precision),
         "quantity": _format_qty(qty, precision),
-        "clientOrderId": client_order_id,
+        "clientOrderId": be_client_id,
     }
 
     try:
@@ -240,16 +270,16 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
     if not new_order_id:
         return {"status": "error", "error": "BE stop response has no orderId", "order_id": "", "stop_price": entry_price}
 
-    verified = get_open_protection_directional(symbol, direction)
-    if verified.get("status") != "ok":
+    verified_after = get_open_protection_directional(symbol, direction)
+    if verified_after.get("status") != "ok":
         return {
             "status": "error",
-            "error": verified.get("error", "BE stop verification failed"),
+            "error": verified_after.get("error", "BE stop verification failed"),
             "order_id": new_order_id,
             "stop_price": entry_price,
         }
 
-    found = any(str(o.get("orderId", "")) == new_order_id for o in verified.get("sl_orders", []))
+    found = any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", []))
     if not found:
         return {
             "status": "error",
@@ -265,7 +295,7 @@ def _move_sl_to_break_even(symbol: str, direction: str, entry_price: float, qty:
     result = {
         "status": "created" if not isinstance(old_cancel, dict) or old_cancel.get("code") in (None, 0) else "created_old_sl_cancel_failed",
         "order_id": new_order_id,
-        "client_order_id": order.get("clientOrderId") or client_order_id,
+        "client_order_id": order.get("clientOrderId") or be_client_id,
         "stop_price": entry_price,
     }
     if old_cancel is not None and isinstance(old_cancel, dict) and old_cancel.get("code") != 0:
@@ -309,23 +339,31 @@ def update_active_trades() -> None:
         try:
             k1m = fetch_klines(symbol, "1m", limit=60)
             if k1m:
-                cur_high = max(float(b["high"]) for b in k1m)
-                cur_low = min(float(b["low"]) for b in k1m)
                 cur_price = float(k1m[-1]["close"])
+                peak_so_far = float(t.get("peak_pnl_pct", 0.0) or 0.0)
+                max_dd_so_far = float(t.get("max_drawdown_pct", 0.0) or 0.0)
+
+                # Chronological peak and drawdown calculation
+                for b in k1m:
+                    if direction == "LONG":
+                        b_high = ((float(b["high"]) - entry_price) / entry_price) * 100.0
+                        b_low = ((float(b["low"]) - entry_price) / entry_price) * 100.0
+                    else:
+                        b_high = ((entry_price - float(b["low"])) / entry_price) * 100.0
+                        b_low = ((entry_price - float(b["high"])) / entry_price) * 100.0
+
+                    peak_so_far = max(peak_so_far, b_high)
+                    dd_here = b_low - peak_so_far
+                    max_dd_so_far = min(max_dd_so_far, dd_here)
+
                 if direction == "LONG":
-                    max_p = ((cur_high - entry_price) / entry_price) * 100.0
-                    min_p = ((cur_low - entry_price) / entry_price) * 100.0
                     current_pnl = ((cur_price - entry_price) / entry_price) * 100.0
                 else:
-                    max_p = ((entry_price - cur_low) / entry_price) * 100.0
-                    min_p = ((entry_price - cur_high) / entry_price) * 100.0
                     current_pnl = ((entry_price - cur_price) / entry_price) * 100.0
 
-                peak_before = float(t.get("peak_pnl_pct", 0.0) or 0.0)
-                peak_now = max(peak_before, max_p, current_pnl)
-                t["peak_pnl_pct"] = peak_now
-                drawdown_now = min_p - peak_now
-                t["max_drawdown_pct"] = min(float(t.get("max_drawdown_pct", 0.0) or 0.0), drawdown_now)
+                peak_so_far = max(peak_so_far, current_pnl)
+                t["peak_pnl_pct"] = peak_so_far
+                t["max_drawdown_pct"] = max_dd_so_far
         except Exception as exc:
             log.warning("[TRACKER_KLINE_ERROR] %s: %s", symbol, exc)
 
@@ -390,6 +428,7 @@ def update_active_trades() -> None:
                         entry_price=entry_price,
                         qty=rem_qty,
                         old_sl_id=t.get("sl_order", {}).get("order_id"),
+                        trade_id=event_id.replace("EVT_", ""),
                     )
                     if new_sl.get("status") in {"created", "created_old_sl_cancel_failed"}:
                         t["sl_order"] = new_sl
