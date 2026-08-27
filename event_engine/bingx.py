@@ -249,7 +249,7 @@ def fetch_klines(
 
     rows = resp.get("data") or []
     out: list[dict] = []
-    now_ms = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
 
     duration_ms = {
         "1m": 60_000,
@@ -374,8 +374,10 @@ def fetch_klines(
     return deduped
 
 
-def _set_leverage(bx_symbol: str, leverage: int) -> bool:
-    for side in ("LONG", "BOTH"):
+def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> bool:
+    d = direction.upper() if direction else "LONG"
+    sides = (d, "BOTH") if d in ("LONG", "SHORT") else ("BOTH",)
+    for side in sides:
         resp = _request(
             "POST",
             LEVERAGE_PATH,
@@ -403,7 +405,7 @@ def _normalize_orders_list(resp: dict) -> list[dict]:
 def get_positions() -> list[dict]:
     resp = _request("GET", POSITION_PATH, {}, signed=True)
     if resp.get("code") != 0:
-        return []
+        raise RuntimeError(f"BingX get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
     return _normalize_orders_list(resp)
 
 
@@ -452,8 +454,9 @@ def has_open_position(symbol: str, direction: str) -> bool:
         return False
 
     want = "LONG" if direction.upper() == "LONG" else "SHORT"
+    positions = get_positions()
 
-    for p in get_positions():
+    for p in positions:
         if str(p.get("symbol", "")).upper() != bx:
             continue
 
@@ -492,14 +495,20 @@ def open_market(
     if not contract_exists(symbol):
         return {"status": "error", "error": "contract_unavailable", "symbol": bx}
 
-    if has_open_position(symbol, direction):
-        return {"status": "existing_position", "symbol": bx, "direction": direction}
+    try:
+        if has_open_position(symbol, direction):
+            return {"status": "existing_position", "symbol": bx, "direction": direction}
+    except Exception as exc:
+        return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
 
     try:
         prec = int(c.get("quantityPrecision") or 0)
         min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
         mult = float(c.get("multiplier") or 1)
-        max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
+        if direction == "SHORT":
+            max_lev = int(c.get("maxShortLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
+        else:
+            max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
@@ -518,10 +527,10 @@ def open_market(
     if qty <= 0 or qty < min_qty:
         return {"status": "error", "error": f"qty={qty} < min_qty={min_qty}", "symbol": bx, "qty": qty, "min_qty": min_qty}
 
-    if not _set_leverage(bx, leverage):
+    if not _set_leverage(bx, leverage, direction):
         return {
             "status": "error",
-            "error": f"failed to set leverage={leverage}",
+            "error": f"failed to set leverage={leverage} for {direction}",
             "symbol": bx,
             "leverage": leverage,
         }
@@ -777,11 +786,6 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
 
 
 def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, price_precision: int) -> bool:
-    expected_leg = str(expected_leg).upper()
-    client_id = str(order.get("clientOrderId", "")).upper()
-    if expected_leg and expected_leg in client_id:
-        return True
-
     order_type = str(order.get("type", "")).upper()
     if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
         return False
@@ -789,6 +793,12 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     actual_price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
     if actual_price <= 0:
         return False
+
+    expected_leg = str(expected_leg).upper()
+    client_id = str(order.get("clientOrderId", "")).upper()
+    if expected_leg and expected_leg in client_id:
+        return True
+
     return _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
 
 
