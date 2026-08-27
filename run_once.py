@@ -442,6 +442,7 @@ def build_event_setup(
         "invalidation_price": invalidation,
         "target_price": target,
         "target_rr": 2.0,
+        "planned_weighted_rr": 1.55,
         "realized_rr": 1.55,
         "trigger_ok": True,
     }
