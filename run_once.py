@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import math
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -167,20 +168,36 @@ def calculate_setup_score(
     return max(0.0, min(100.0, score))
 
 
-def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict:
+def build_event_setup(
+    ev: dict,
+    df_1h: pd.DataFrame,
+    entry_price: float,
+) -> dict:
     direction = str(ev.get("direction", "LONG")).upper()
     entry_price = float(entry_price)
-    if entry_price <= 0:
+
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(f"Invalid direction={direction}")
+
+    if not math.isfinite(entry_price) or entry_price <= 0:
         raise ValueError(f"Invalid entry_price={entry_price}")
 
     df = df_1h.copy()
+
     if len(df) < 20:
         raise ValueError("insufficient 1H bars for setup")
 
     for col in ("high", "low", "close"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col not in df.columns:
+            raise ValueError(f"missing required 1H column: {col}")
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
 
     prev_close = df["close"].shift(1)
+
     tr = pd.concat(
         [
             df["high"] - df["low"],
@@ -190,28 +207,74 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         axis=1,
     ).max(axis=1)
 
-    atr = tr.rolling(window=14, min_periods=14).mean().iloc[-1]
+    atr = (
+        tr.rolling(
+            window=14,
+            min_periods=14,
+        )
+        .mean()
+        .iloc[-1]
+    )
+
     if pd.isna(atr) or float(atr) <= 0:
         raise ValueError("ATR unavailable")
 
     atr = float(atr)
-    risk_pct = atr / entry_price * 100.0
-    risk_pct = max(0.50, min(risk_pct, 5.00))
+
+    risk_pct = (
+        atr
+        / entry_price
+        * 100.0
+    )
+
+    risk_pct = max(
+        0.50,
+        min(
+            risk_pct,
+            5.00,
+        ),
+    )
 
     if direction == "LONG":
-        invalidation = entry_price * (1.0 - risk_pct / 100.0)
-        target = entry_price * (1.0 + 2.0 * risk_pct / 100.0)
+        invalidation = (
+            entry_price
+            * (1.0 - risk_pct / 100.0)
+        )
+
+        target = (
+            entry_price
+            * (1.0 + 2.0 * risk_pct / 100.0)
+        )
+
     else:
-        invalidation = entry_price * (1.0 + risk_pct / 100.0)
-        target = entry_price * (1.0 - 2.0 * risk_pct / 100.0)
+        invalidation = (
+            entry_price
+            * (1.0 + risk_pct / 100.0)
+        )
+
+        target = (
+            entry_price
+            * (1.0 - 2.0 * risk_pct / 100.0)
+        )
 
     return {
         "entry_reference": entry_price,
         "invalidation_price": invalidation,
         "target_price": target,
+
+        # Planned target is 2R.
         "target_rr": 2.0,
+
+        # 30% @ 0.5R + 30% @ 0.75R + 40% @ 1R,
+        # multiplied against final 2R target:
+        # 2 * (0.30*0.50 + 0.30*0.75 + 0.40*1.00) = 1.55R
         "planned_weighted_rr": 1.55,
-        "realized_rr": 1.55,
+
+        # IMPORTANT:
+        # Nothing has been realized at setup/open time.
+        "realized_rr": None,
+
+        "risk_pct": risk_pct,
         "trigger_ok": True,
     }
 
