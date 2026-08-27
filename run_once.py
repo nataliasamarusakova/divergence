@@ -1,3 +1,5 @@
+# run_once.py
+
 from __future__ import annotations
 
 import json
@@ -207,6 +209,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         "invalidation_price": invalidation,
         "target_price": target,
         "target_rr": 2.0,
+        "planned_weighted_rr": 1.55,
         "realized_rr": 1.55,
         "trigger_ok": True,
     }
@@ -348,9 +351,18 @@ def reconcile_all_open_positions() -> None:
             if leg.upper() in str(order.get("clientOrderId", "")).upper()
         }
 
+        sl_valid = False
+        if sl_orders:
+            sl_price = float(sl_orders[0].get("stopPrice", 0) or sl_orders[0].get("price", 0) or 0)
+            sl_amt = float(sl_orders[0].get("origQty", 0) or sl_orders[0].get("quantity", 0) or 0)
+            if direction == "LONG" and 0 < sl_price < avg_price and sl_amt > 0:
+                sl_valid = True
+            elif direction == "SHORT" and sl_price > avg_price > 0 and sl_amt > 0:
+                sl_valid = True
+
         # Nothing is missing: DO NOT call ensure_directional_protection(),
         # DO NOT recalculate ATR, DO NOT touch exchange orders, DO NOT send Telegram.
-        protection_complete = bool(sl_orders) and len(known_tp_legs) >= expected_tp_count
+        protection_complete = sl_valid and len(known_tp_legs) >= expected_tp_count
         if protection_complete:
             print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection OK: SL=1 TP={len(known_tp_legs)}; no changes")
             tracker_tp = _tp_orders_to_tracker(tp_orders)
@@ -566,7 +578,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     elif protection_status == "SL_ONLY":
         final_status = "opened_protection_check_required"
     else:
-        final_status = "opened_protection_check_required"
+        final_status = "opened_protection_failed"
 
     return {
         "status": final_status,
@@ -616,7 +628,12 @@ def main() -> None:
     except Exception as exc:
         print(f"[BTC_FETCH_ERROR] {exc}")
 
-    rows = fetch_data()
+    rows = []
+    try:
+        rows = fetch_data()
+    except Exception as exc:
+        stats["scan_errors"] += 1
+        print(f"[COINALYZE_SCRAPE_ERROR] {exc}")
     stats["coinalyze_rows"] = len(rows)
 
     try:
@@ -690,7 +707,7 @@ def main() -> None:
                 latest_15m_close_ts = int(d15["close_time"].iloc[-1])
                 trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
 
-                if trigger_delay_min < -15 or trigger_delay_min > MAX_AGE:
+                if trigger_delay_min < 0 or trigger_delay_min > MAX_AGE:
                     continue
 
                 if REQUIRE_TRIGGER and not build_15m_trigger(d15, direction, min_vol_mult=1.05):
@@ -759,10 +776,13 @@ def main() -> None:
             })
 
             status = str(execution_result.get("status", ""))
-            if status in {"opened_protected", "opened_protection_check_required"}:
-                executed_event_ids.add(event_id)
+            if status in {"opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
                 trades_this_cycle += 1
-                stats["trades"] += 1
+                if status in {"opened_protected", "opened_protection_check_required"}:
+                    executed_event_ids.add(event_id)
+                    stats["trades"] += 1
+                else:
+                    print(f"[CRITICAL_PROTECTION_FAILED] Position opened but protection failed for {symbol}: {execution_result.get('protection')}")
 
                 try:
                     register_active_trade(
@@ -791,7 +811,7 @@ def main() -> None:
         if not (msg.startswith("🚨 LONG SIGNAL") or msg.startswith("🔻 SHORT SIGNAL")):
             msg = f"{label}\n\n" + msg
 
-        is_real_execution = execution_result.get("status") in {"opened_protected", "opened", "opened_protection_check_required"}
+        is_real_execution = execution_result.get("status") in {"opened_protected", "opened", "opened_protection_check_required", "opened_protection_failed"}
         telegram_already_sent = (event_id in telegram_sent_event_ids) and not is_real_execution
 
         sent = False
