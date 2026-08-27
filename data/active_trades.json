@@ -95,56 +95,6 @@
     "realized_pnl_weighted_sum": 0.0,
     "last_tp_exec_price": null
   },
-  "RECON_SOL-USDT_LONG": {
-    "event_id": "RECON_SOL-USDT_LONG",
-    "symbol": "SOL",
-    "name": "SOL",
-    "direction": "LONG",
-    "entry_price": 100.1,
-    "initial_qty": 0.09,
-    "remaining_qty": 0.09,
-    "entry_ts": 1787783153172,
-    "tp_orders": [
-      {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092739345441710080",
-        "price": 119.62,
-        "qty": 0.03
-      },
-      {
-        "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2092739344149864448",
-        "price": 112.112,
-        "qty": 0.02
-      },
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2092739342790909952",
-        "price": 106.606,
-        "qty": 0.02
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2092739346821636096",
-      "stop_price": 95.095,
-      "qty": 0.09
-    },
-    "hit_legs": [],
-    "be_activated": false,
-    "peak_pnl_pct": 2.2767232767232874,
-    "max_drawdown_pct": -2.6463536463536474,
-    "score": 50.0,
-    "event_type": "RECONCILED_POSITION",
-    "research": {},
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null
-  },
   "EVT_04132FA3D164D4CF": {
     "event_id": "EVT_04132FA3D164D4CF",
     "symbol": "BNB",
@@ -408,8 +358,8 @@
         "status": "deferred",
         "reason": "trigger_already_crossed",
         "price": 0.2083957150674,
-        "current_price": 0.20448,
-        "qty": 10.4984,
+        "current_price": 0.20305,
+        "qty": 10.5046,
         "pnl_pct": 2.614274
       },
       {
@@ -435,7 +385,7 @@
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 5.154446469461195,
+    "peak_pnl_pct": 5.20117762512267,
     "max_drawdown_pct": -3.803916070844436,
     "score": 90.0,
     "event_type": "REGULAR_BEARISH_RSI",
@@ -1278,11 +1228,13 @@
     "entry_ts": 1787810760226,
     "tp_orders": [
       {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2092855164494503936",
-        "price": 5.242,
-        "qty": 0.783
+        "leg": "tp1",
+        "status": "deferred",
+        "reason": "trigger_already_crossed",
+        "price": 4.6764285568,
+        "current_price": 4.74,
+        "qty": 0.579,
+        "pnl_pct": 4.384566
       },
       {
         "leg": "tp2",
@@ -1292,23 +1244,23 @@
         "qty": 0.559
       },
       {
-        "leg": "tp1",
+        "leg": "tp3",
         "status": "already_exists",
-        "order_id": "2092855161789177856",
-        "price": 4.749,
-        "qty": 0.448
+        "order_id": "2092855164494503936",
+        "price": 5.242,
+        "qty": 0.783
       }
     ],
     "sl_order": {
       "status": "already_exists",
       "order_id": "2092855165782155264",
       "stop_price": 4.256,
-      "qty": 2.237
+      "qty": 1.789
     },
     "hit_legs": [],
     "be_activated": false,
-    "peak_pnl_pct": 3.4151785714285623,
-    "max_drawdown_pct": -6.138392857142865,
+    "peak_pnl_pct": 7.299107142857141,
+    "max_drawdown_pct": -9.977678571428571,
     "score": 50.0,
     "event_type": "RECONCILED_POSITION",
     "research": {},
