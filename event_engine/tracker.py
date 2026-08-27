@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +23,27 @@ from event_engine.bingx import (
 )
 from event_engine.telegram import send as send_tg
 
-log = logging.getLogger(
-    "event_engine.tracker"
-)
+
+log = logging.getLogger("event_engine.tracker")
+
 
 DATA = Path("data")
+ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 
-ACTIVE_TRADES_PATH = (
-    DATA / "active_trades.json"
-)
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    try:
+        result = float(value)
+        if result != result:
+            return default
+        if result in (float("inf"), float("-inf")):
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
 
 
 def _load_active_trades() -> dict[str, dict]:
@@ -44,28 +57,21 @@ def _load_active_trades() -> dict[str, dict]:
             )
         )
 
-        return (
-            data
-            if isinstance(
-                data,
-                dict,
-            )
-            else {}
-        )
+        if not isinstance(data, dict):
+            return {}
+
+        return data
 
     except Exception as exc:
         log.error(
-            "[TRACKER_CORRUPT_STATE] "
-            "Failed to read %s: %s",
+            "[TRACKER_CORRUPT_STATE] Failed to read %s: %s",
             ACTIVE_TRADES_PATH,
             exc,
         )
 
         try:
-            corrupt_path = (
-                ACTIVE_TRADES_PATH.with_suffix(
-                    f".corrupt.{int(time.time())}.json"
-                )
+            corrupt_path = ACTIVE_TRADES_PATH.with_suffix(
+                f".corrupt.{int(time.time())}.json"
             )
 
             ACTIVE_TRADES_PATH.rename(
@@ -73,8 +79,7 @@ def _load_active_trades() -> dict[str, dict]:
             )
 
             log.warning(
-                "[TRACKER_CORRUPT_BACKUP] "
-                "Saved to %s",
+                "[TRACKER_CORRUPT_BACKUP] Saved to %s",
                 corrupt_path,
             )
 
@@ -85,18 +90,15 @@ def _load_active_trades() -> dict[str, dict]:
 
 
 def _save_active_trades(
-    trades: dict[str, dict],
+    trades: dict[str, dict]
 ) -> None:
     ACTIVE_TRADES_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    tmp_path = (
-        ACTIVE_TRADES_PATH.with_name(
-            ACTIVE_TRADES_PATH.name
-            + ".tmp"
-        )
+    tmp_path = ACTIVE_TRADES_PATH.with_name(
+        ACTIVE_TRADES_PATH.name + ".tmp"
     )
 
     payload = json.dumps(
@@ -123,24 +125,22 @@ def update_active_trade_protection(
     sl_result: dict,
 ) -> bool:
     """
-    Update protection of an already tracked position
-    without resetting lifecycle statistics.
+    Обновляет только exchange-side protection.
+
+    Lifecycle-статистика сделки не сбрасывается.
     """
+
     trades = _load_active_trades()
 
     want_symbol = (
         str(symbol)
         .upper()
-        .replace(
-            "-USDT",
-            "",
-        )
+        .replace("-USDT", "")
     )
 
-    want_direction = (
-        str(direction)
-        .upper()
-    )
+    want_direction = str(
+        direction
+    ).upper()
 
     for trade in trades.values():
         trade_symbol = (
@@ -166,16 +166,15 @@ def update_active_trade_protection(
 
         if (
             trade_symbol == want_symbol
-            and trade_direction
-            == want_direction
+            and trade_direction == want_direction
         ):
-            trade[
-                "tp_orders"
-            ] = tp_orders
+            trade["tp_orders"] = (
+                tp_orders
+            )
 
-            trade[
-                "sl_order"
-            ] = sl_result
+            trade["sl_order"] = (
+                sl_result
+            )
 
             _save_active_trades(
                 trades
@@ -198,28 +197,35 @@ def register_active_trade(
     event_type: str,
     coinalyze_row: Any = None,
     score: float = 50.0,
-    risk_pct: float | None = None,
-    signal_price: float | None = None,
-    entry_price_deviation_pct: float | None = None,
 ) -> None:
     """
-    Register the active trade using exchange-confirmed entry/quantity.
+    Регистрирует открытую позицию.
 
-    signal_price is retained separately for execution-quality analysis.
+    Важно:
+    - entry_price = фактическая exchange avgPrice;
+    - qty = фактический exchange positionAmt;
+    - planned_weighted_rr хранится отдельно;
+    - realized_rr до закрытия сделки неизвестен.
     """
+
     trades = _load_active_trades()
 
     now_ms = int(
         time.time() * 1000
     )
 
-    research = {}
+    research: dict[str, Any] = {}
 
-    if coinalyze_row:
+    if coinalyze_row is not None:
         research = {
             "fr_oiw": getattr(
                 coinalyze_row,
                 "fr_oiw",
+                None,
+            ),
+            "pfr_oiw": getattr(
+                coinalyze_row,
+                "pfr_oiw",
                 None,
             ),
             "liq_short24": getattr(
@@ -242,6 +248,36 @@ def register_active_trade(
                 "oi",
                 None,
             ),
+            "oi_chg24_pct": getattr(
+                coinalyze_row,
+                "oi_chg24_pct",
+                None,
+            ),
+            "oi_chg4h_pct": getattr(
+                coinalyze_row,
+                "oi_chg4h_pct",
+                None,
+            ),
+            "oi_vol_ratio": getattr(
+                coinalyze_row,
+                "oi_vol_ratio",
+                None,
+            ),
+            "oi_mktcap_ratio": getattr(
+                coinalyze_row,
+                "oi_mktcap_ratio",
+                None,
+            ),
+            "volume24": getattr(
+                coinalyze_row,
+                "volume24",
+                None,
+            ),
+            "btc_corr7d": getattr(
+                coinalyze_row,
+                "btc_corr7d",
+                None,
+            ),
             "cvd24": getattr(
                 coinalyze_row,
                 "cvd24",
@@ -252,180 +288,95 @@ def register_active_trade(
                 "lls24",
                 None,
             ),
-            "oi_chg4h_pct": getattr(
-                coinalyze_row,
-                "oi_chg4h_pct",
-                None,
-            ),
         }
 
-    try:
-        actual_entry = float(
-            entry_price
-        )
-
-        actual_qty = float(
-            qty
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise ValueError(
-            "invalid active trade "
-            f"entry/qty: {exc}"
-        ) from exc
-
-    if (
-        actual_entry <= 0
-        or actual_qty <= 0
-    ):
-        raise ValueError(
-            f"invalid active trade "
-            f"entry_price={actual_entry} "
-            f"qty={actual_qty}"
-        )
-
-    normalized_risk = None
-
-    if risk_pct is not None:
-        try:
-            candidate = float(
-                risk_pct
-            )
-
-            if (
-                candidate > 0
-                and candidate
-                < float("inf")
-            ):
-                normalized_risk = candidate
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-            normalized_risk = None
-
-    normalized_signal_price = None
-
-    if signal_price is not None:
-        try:
-            candidate = float(
-                signal_price
-            )
-
-            if (
-                candidate > 0
-                and candidate
-                < float("inf")
-            ):
-                normalized_signal_price = candidate
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-            normalized_signal_price = None
-
-    normalized_deviation = None
-
-    if (
-        entry_price_deviation_pct
-        is not None
-    ):
-        try:
-            candidate = float(
-                entry_price_deviation_pct
-            )
-
-            if (
-                candidate
-                == candidate
-                and abs(candidate)
-                < float("inf")
-            ):
-                normalized_deviation = candidate
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-            normalized_deviation = None
+    planned_weighted_rr = 1.55
 
     trades[event_id] = {
         "event_id": event_id,
-
         "symbol": symbol,
+        "name": name or symbol,
+        "direction": str(
+            direction
+        ).upper(),
 
-        "name": (
-            name
-            or symbol
+        "entry_price": _safe_float(
+            entry_price
         ),
 
-        "direction": (
-            direction.upper()
+        "initial_qty": abs(
+            _safe_float(qty)
         ),
 
-        # EXCHANGE-CONFIRMED entry.
-        "entry_price": (
-            actual_entry
-        ),
-
-        # Original signal/reference price.
-        "signal_price": (
-            normalized_signal_price
-        ),
-
-        # Signal -> actual fill deviation.
-        "entry_price_deviation_pct": (
-            normalized_deviation
-        ),
-
-        "initial_qty": (
-            actual_qty
-        ),
-
-        "remaining_qty": (
-            actual_qty
+        "remaining_qty": abs(
+            _safe_float(qty)
         ),
 
         "entry_ts": now_ms,
 
-        "tp_orders": tp_orders,
+        "tp_orders": (
+            tp_orders
+            if isinstance(
+                tp_orders,
+                list,
+            )
+            else []
+        ),
 
-        "sl_order": sl_result,
+        "sl_order": (
+            sl_result
+            if isinstance(
+                sl_result,
+                dict,
+            )
+            else {}
+        ),
 
         "hit_legs": [],
-
         "be_activated": False,
 
         "peak_pnl_pct": 0.0,
-
         "max_drawdown_pct": 0.0,
 
-        "score": score,
+        "score": _safe_float(
+            score,
+            50.0,
+        ),
 
         "event_type": event_type,
 
         "research": research,
 
+        # Incremental TP execution accounting.
         "tp_filled_qty": {},
 
+        # Qty-weighted realized PnL in percentage points.
         "realized_pnl_qty": 0.0,
-
         "realized_pnl_weighted_sum": 0.0,
 
         "last_tp_exec_price": None,
 
-        # Risk used for R-multiple calculation.
-        "risk_pct": normalized_risk,
+        # Planned setup metrics.
+        "planned_target_rr": 2.0,
+        "planned_weighted_rr": planned_weighted_rr,
 
-        "planned_weighted_rr": 1.55,
-
-        # Nothing realized at entry.
+        # Unknown until close.
         "realized_rr": None,
+        "realized_pnl_pct": None,
+
+        # Final close information.
+        "exit_price": None,
+        "exit_reason": None,
+        "closed_ts": None,
+        "duration_min": None,
+
+        # Actual execution information.
+        "actual_entry_price": _safe_float(
+            entry_price
+        ),
+        "requested_entry_price": None,
+        "entry_slippage_pct": None,
+        "adverse_entry_slippage_pct": None,
     }
 
     _save_active_trades(
@@ -464,8 +415,7 @@ def format_be_message(
     entry_price: float,
 ) -> str:
     return (
-        f"🛡 <b>{name} ({symbol}) — "
-        f"БЕЗУБЫТОК</b>\n"
+        f"🛡 <b>{name} ({symbol}) — БЕЗУБЫТОК</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"TP1 взят! Стоп-лосс перенесен "
         f"на точку входа: "
@@ -482,17 +432,16 @@ def format_trade_closed_message(
     entry_price: float,
     exit_price: float,
     pnl_pct: float,
+    realized_rr: float | None,
+    planned_rr: float | None,
     duration_min: float,
     peak_pnl: float,
     max_drawdown: float,
     exit_reason: str,
     event_type: str,
     research: dict,
-    realized_rr: float | None = None,
 ) -> str:
-    is_win = (
-        pnl_pct >= 0
-    )
+    is_win = pnl_pct >= 0
 
     emoji = (
         "💚"
@@ -507,42 +456,44 @@ def format_trade_closed_message(
     )
 
     rr_text = (
-        f"{realized_rr:.2f}R"
+        f"{realized_rr:.3f}"
         if realized_rr is not None
         else "—"
     )
 
+    planned_rr_text = (
+        f"{planned_rr:.3f}"
+        if planned_rr is not None
+        else "—"
+    )
+
     lines = [
-        (
-            f"{emoji} <b>{name} ({symbol}) "
-            f"— сделка закрыта</b>"
-        ),
+        f"{emoji} <b>{name} ({symbol}) — "
+        f"сделка закрыта</b>",
         "━━━━━━━━━━━━━━━━━━",
         (
-            f"Вход "
-            f"<code>{entry_price:.8g}</code> "
+            f"Вход <code>{entry_price:.8g}</code> "
             f"→ Выход "
-            f"<code>{exit_price:.8g}</code> "
+            f"<code>{exit_price:.8g}</code>   "
             f"<b>{pnl_sign}{pnl_pct:.2f}%</b>"
         ),
         (
-            f"Держали <b>{duration_min:.1f} мин</b> "
-            f"· пик <b>+{peak_pnl:.1f}%</b> "
-            f"· просадка "
-            f"<b>-{abs(max_drawdown):.1f}%</b>"
-        ),
-        (
             f"Realized R:R: "
-            f"<b>{rr_text}</b>"
+            f"<b>{rr_text}</b> · "
+            f"Planned Weighted R:R: "
+            f"<b>{planned_rr_text}</b>"
         ),
         (
-            f"Выход по: "
-            f"<b>{exit_reason}</b>"
+            f"Держали <b>{duration_min:.1f} мин</b> · "
+            f"пик <b>+{peak_pnl:.1f}%</b> · "
+            f"просадка "
+            f"<b>{max_drawdown:.1f}%</b>"
         ),
+        f"Выход по: <b>{exit_reason}</b>",
         (
             f"Вход был: "
-            f"<code>{event_type}</code> "
-            f"· TF <b>1h</b>"
+            f"<code>{event_type}</code> · "
+            f"TF <b>1h</b>"
         ),
     ]
 
@@ -589,6 +540,22 @@ def format_trade_closed_message(
                 f"<code>{research['liq_long24']}</code>"
             )
 
+        if research.get(
+            "cvd24"
+        ) is not None:
+            res_parts.append(
+                "CVD24: "
+                f"<code>{research['cvd24']}</code>"
+            )
+
+        if research.get(
+            "lls24"
+        ) is not None:
+            res_parts.append(
+                "LLS24: "
+                f"<code>{research['lls24']}</code>"
+            )
+
         lines.append(
             " · ".join(
                 res_parts
@@ -611,11 +578,10 @@ def _move_sl_to_break_even(
     trade_id: str | None = None,
 ) -> dict:
     """
-    Create and verify BE stop before cancelling old SL.
-
-    Deterministic clientOrderId prevents duplicate BE orders
-    after a lost response.
+    Создаёт BE stop, проверяет его наличие на бирже,
+    и только после проверки удаляет старый SL.
     """
+
     bx = to_bx_symbol(
         symbol
     )
@@ -625,21 +591,31 @@ def _move_sl_to_break_even(
         or {}
     )
 
-    precision = int(
-        contract.get(
-            "quantityPrecision",
-            0,
+    try:
+        precision = int(
+            contract.get(
+                "quantityPrecision"
+            )
+            or 0
         )
-        or 0
-    )
 
-    price_precision = int(
-        contract.get(
-            "pricePrecision",
-            4,
+        price_precision = int(
+            contract.get(
+                "pricePrecision"
+            )
+            or 4
         )
-        or 4
-    )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return {
+            "status": "error",
+            "error": "invalid contract precision",
+            "order_id": "",
+            "stop_price": entry_price,
+        }
 
     if (
         qty <= 0
@@ -648,34 +624,24 @@ def _move_sl_to_break_even(
     ):
         return {
             "status": "error",
-            "error": (
-                "invalid BE parameters"
-            ),
+            "error": "invalid BE parameters",
             "order_id": "",
             "stop_price": entry_price,
         }
 
-    if trade_id:
-        import hashlib
+    trade_token = (
+        str(trade_id)
+        if trade_id
+        else uuid.uuid4().hex.upper()[
+            :16
+        ]
+    )
 
-        digest = hashlib.sha256(
-            str(
-                trade_id
-            ).upper().encode()
-        ).hexdigest().upper()[:16]
+    be_client_id = (
+        f"EVT_BE_{trade_token}"
+    )
 
-        be_client_id = (
-            f"EVT_{digest}_BE"
-        )
-
-    else:
-        be_client_id = (
-            "EVT_BE"
-        )
-
-    # ---------------------------------------------------------
-    # 1. Existing BE check.
-    # ---------------------------------------------------------
+    # First check whether an identical BE already exists.
     verified = (
         get_open_protection_directional(
             symbol,
@@ -683,64 +649,50 @@ def _move_sl_to_break_even(
         )
     )
 
-    if (
-        verified.get("status")
-        == "ok"
-    ):
-        for o in verified.get(
+    if verified.get(
+        "status"
+    ) == "ok":
+
+        for order in verified.get(
             "sl_orders",
             [],
         ):
             cid = str(
-                o.get(
+                order.get(
                     "clientOrderId",
                     "",
                 )
             ).upper()
 
-            try:
-                o_price = float(
-                    o.get(
-                        "stopPrice",
-                        0,
-                    )
-                    or o.get(
-                        "price",
-                        0,
-                    )
-                    or 0
+            order_price = _safe_float(
+                order.get(
+                    "stopPrice"
                 )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            same_client_id = (
-                cid
-                == be_client_id.upper()
+                or order.get(
+                    "price"
+                )
             )
 
-            same_price = (
-                o_price > 0
+            price_matches = (
+                order_price > 0
                 and abs(
-                    o_price
+                    order_price
                     - entry_price
                 )
                 / max(
                     entry_price,
-                    1e-8,
+                    1e-12,
                 )
                 < 0.002
             )
 
             if (
-                same_client_id
-                or same_price
+                be_client_id.upper()
+                in cid
+                or price_matches
             ):
-                existing_be_id = str(
-                    o.get(
+                existing_id = str(
+                    order.get(
                         "orderId",
                         "",
                     )
@@ -749,7 +701,7 @@ def _move_sl_to_break_even(
                 if (
                     old_sl_id
                     and str(old_sl_id)
-                    != existing_be_id
+                    != existing_id
                 ):
                     cancel_order(
                         symbol,
@@ -758,16 +710,12 @@ def _move_sl_to_break_even(
 
                 return {
                     "status": "created",
-                    "order_id": (
-                        existing_be_id
-                    ),
+                    "order_id": existing_id,
                     "client_order_id": (
                         cid
                         or be_client_id
                     ),
-                    "stop_price": (
-                        entry_price
-                    ),
+                    "stop_price": entry_price,
                 }
 
     sl_side = (
@@ -792,9 +740,7 @@ def _move_sl_to_break_even(
             qty,
             precision,
         ),
-        "clientOrderId": (
-            be_client_id
-        ),
+        "clientOrderId": be_client_id,
     }
 
     try:
@@ -817,29 +763,28 @@ def _move_sl_to_break_even(
             resp,
             dict,
         )
-        or resp.get("code") != 0
+        or resp.get(
+            "code"
+        )
+        != 0
     ):
         return {
             "status": "error",
             "error": (
-                f"BE stop failed: "
-                f"code={resp.get('code') if isinstance(resp, dict) else None} "
-                f"msg={resp.get('msg') if isinstance(resp, dict) else resp}"
+                "BE stop failed: "
+                f"code="
+                f"{resp.get('code') if isinstance(resp, dict) else None} "
+                f"msg="
+                f"{resp.get('msg') if isinstance(resp, dict) else resp}"
             ),
             "order_id": "",
             "stop_price": entry_price,
         }
 
     order = (
-        (
-            resp.get("data")
-            or {}
-        ).get(
-            "order"
-        )
-        or resp.get(
-            "data"
-        )
+        (resp.get("data") or {})
+        .get("order")
+        or resp.get("data")
         or {}
     )
 
@@ -904,9 +849,9 @@ def _move_sl_to_break_even(
         return {
             "status": "error",
             "error": (
-                "BE stop was created "
-                "but is not visible on "
-                "exchange; old SL was kept"
+                "BE stop was created but "
+                "is not visible on exchange; "
+                "old SL was kept"
             ),
             "order_id": new_order_id,
             "stop_price": entry_price,
@@ -935,10 +880,7 @@ def _move_sl_to_break_even(
                 or old_cancel.get(
                     "code"
                 )
-                in (
-                    None,
-                    0,
-                )
+                in (None, 0)
             )
             else "created_old_sl_cancel_failed"
         ),
@@ -953,14 +895,14 @@ def _move_sl_to_break_even(
     }
 
     if (
-        old_cancel is not None
-        and isinstance(
+        isinstance(
             old_cancel,
             dict,
         )
         and old_cancel.get(
             "code"
-        ) != 0
+        )
+        != 0
     ):
         result[
             "old_sl_cancel_error"
@@ -974,11 +916,191 @@ def _move_sl_to_break_even(
     return result
 
 
+def _calc_trade_pnl_pct(
+    entry_price: float,
+    exit_price: float,
+    direction: str,
+) -> float:
+    if (
+        entry_price <= 0
+        or exit_price <= 0
+    ):
+        return 0.0
+
+    if (
+        str(direction).upper()
+        == "LONG"
+    ):
+        return (
+            (
+                exit_price
+                - entry_price
+            )
+            / entry_price
+            * 100.0
+        )
+
+    return (
+        (
+            entry_price
+            - exit_price
+        )
+        / entry_price
+        * 100.0
+    )
+
+
+def _calc_realized_rr(
+    realized_pnl_pct: float,
+    planned_risk_pct: float | None,
+) -> float | None:
+    """
+    Realized R:R = actual realized return / planned initial risk.
+
+    planned_risk_pct должен быть процентом SL
+    относительно actual entry.
+    """
+
+    if (
+        planned_risk_pct is None
+        or planned_risk_pct <= 0
+    ):
+        return None
+
+    return (
+        realized_pnl_pct
+        / planned_risk_pct
+    )
+
+
+def _update_mfe_mae(
+    trade: dict,
+    candles: list[dict],
+) -> None:
+    if not candles:
+        return
+
+    entry_price = _safe_float(
+        trade.get(
+            "entry_price"
+        )
+    )
+
+    direction = str(
+        trade.get(
+            "direction",
+            "LONG",
+        )
+    ).upper()
+
+    if entry_price <= 0:
+        return
+
+    peak = _safe_float(
+        trade.get(
+            "peak_pnl_pct",
+            0.0,
+        )
+    )
+
+    max_dd = _safe_float(
+        trade.get(
+            "max_drawdown_pct",
+            0.0,
+        )
+    )
+
+    for candle in candles:
+        high = _safe_float(
+            candle.get("high")
+        )
+
+        low = _safe_float(
+            candle.get("low")
+        )
+
+        if (
+            high <= 0
+            or low <= 0
+        ):
+            continue
+
+        if direction == "LONG":
+            favorable = (
+                (
+                    high
+                    - entry_price
+                )
+                / entry_price
+                * 100.0
+            )
+
+            adverse = (
+                (
+                    low
+                    - entry_price
+                )
+                / entry_price
+                * 100.0
+            )
+
+        else:
+            favorable = (
+                (
+                    entry_price
+                    - low
+                )
+                / entry_price
+                * 100.0
+            )
+
+            adverse = (
+                (
+                    entry_price
+                    - high
+                )
+                / entry_price
+                * 100.0
+            )
+
+        peak = max(
+            peak,
+            favorable,
+        )
+
+        drawdown = (
+            adverse
+            - peak
+        )
+
+        max_dd = min(
+            max_dd,
+            drawdown,
+        )
+
+    trade[
+        "peak_pnl_pct"
+    ] = peak
+
+    trade[
+        "max_drawdown_pct"
+    ] = max_dd
+
+
 def update_active_trades() -> None:
     """
-    Poll exchange positions/orders,
-    track partial fills, BE and final closure.
+    Полностью сопровождает активные сделки.
+
+    Гарантии:
+
+    1. Ошибка API при чтении позиции не считается закрытием.
+    2. TP учитывается инкрементально.
+    3. PARTIALLY_FILLED не приводит к двойному учёту.
+    4. BE создаётся и проверяется до удаления старого SL.
+    5. Итоговый PnL считается по фактическим execution prices.
+    6. Реальный R:R появляется только после закрытия.
     """
+
     trades = _load_active_trades()
 
     if not trades:
@@ -988,323 +1110,440 @@ def update_active_trades() -> None:
         time.time() * 1000
     )
 
-    updated_trades = {}
+    updated_trades: dict[
+        str,
+        dict,
+    ] = {}
 
-    for event_id, t in trades.items():
-        symbol = t[
-            "symbol"
-        ]
-
-        direction = str(
-            t[
-                "direction"
-            ]
-        ).upper()
-
-        entry_price = float(
-            t[
-                "entry_price"
-            ]
-        )
-
-        init_qty = float(
-            t[
-                "initial_qty"
-            ]
-        )
-
-        rem_qty = float(
-            t[
-                "remaining_qty"
-            ]
-        )
-
-        hit_legs = set(
-            t.get(
-                "hit_legs",
-                [],
-            )
-        )
-
-        filled_by_leg = {
-            str(k): float(v)
-            for k, v in (
-                t.get(
-                    "tp_filled_qty"
-                )
-                or {}
-            ).items()
-        }
-
-        realized_qty = float(
-            t.get(
-                "realized_pnl_qty",
-                0.0,
-            )
-            or 0.0
-        )
-
-        realized_weighted = float(
-            t.get(
-                "realized_pnl_weighted_sum",
-                0.0,
-            )
-            or 0.0
-        )
-
-        pos = (
-            get_position_directional(
-                symbol,
-                direction,
-            )
-        )
-
-        pos_status = str(
-            pos.get(
-                "status",
-                "",
-            )
-        ).lower()
-
-        if pos_status not in {
-            "found",
-            "not_found",
-        }:
-            log.warning(
-                "[TRACKER_POSITION_UNCERTAIN] "
-                "%s %s: %s",
-                symbol,
-                direction,
-                pos.get(
-                    "error"
-                )
-                or pos_status,
-            )
-
-            updated_trades[
-                event_id
-            ] = t
-
-            continue
-
-        pos_amt = (
-            float(
-                pos.get(
-                    "positionAmt",
-                    0,
-                )
-                or 0
-            )
-            if pos_status == "found"
-            else 0.0
-        )
-
-        cur_price = entry_price
-        current_pnl = 0.0
-
+    for event_id, trade in trades.items():
         try:
-            k1m = fetch_klines(
-                symbol,
-                "1m",
-                limit=60,
-            )
-
-            if k1m:
-                cur_price = float(
-                    k1m[-1][
-                        "close"
-                    ]
-                )
-
-                peak_so_far = float(
-                    t.get(
-                        "peak_pnl_pct",
-                        0.0,
-                    )
-                    or 0.0
-                )
-
-                max_dd_so_far = float(
-                    t.get(
-                        "max_drawdown_pct",
-                        0.0,
-                    )
-                    or 0.0
-                )
-
-                for b in k1m:
-                    if direction == "LONG":
-                        b_high = (
-                            (
-                                float(
-                                    b["high"]
-                                )
-                                - entry_price
-                            )
-                            / entry_price
-                        ) * 100.0
-
-                        b_low = (
-                            (
-                                float(
-                                    b["low"]
-                                )
-                                - entry_price
-                            )
-                            / entry_price
-                        ) * 100.0
-
-                    else:
-                        b_high = (
-                            (
-                                entry_price
-                                - float(
-                                    b["low"]
-                                )
-                            )
-                            / entry_price
-                        ) * 100.0
-
-                        b_low = (
-                            (
-                                entry_price
-                                - float(
-                                    b["high"]
-                                )
-                            )
-                            / entry_price
-                        ) * 100.0
-
-                    peak_so_far = max(
-                        peak_so_far,
-                        b_high,
-                    )
-
-                    dd_here = (
-                        b_low
-                        - peak_so_far
-                    )
-
-                    max_dd_so_far = min(
-                        max_dd_so_far,
-                        dd_here,
-                    )
-
-                if direction == "LONG":
-                    current_pnl = (
-                        (
-                            cur_price
-                            - entry_price
-                        )
-                        / entry_price
-                    ) * 100.0
-
-                else:
-                    current_pnl = (
-                        (
-                            entry_price
-                            - cur_price
-                        )
-                        / entry_price
-                    ) * 100.0
-
-                peak_so_far = max(
-                    peak_so_far,
-                    current_pnl,
-                )
-
-                t[
-                    "peak_pnl_pct"
-                ] = peak_so_far
-
-                t[
-                    "max_drawdown_pct"
-                ] = max_dd_so_far
-
-        except Exception as exc:
-            log.warning(
-                "[TRACKER_KLINE_ERROR] "
-                "%s: %s",
-                symbol,
-                exc,
-            )
-
-        # -----------------------------------------------------
-        # 1. Track TP fills.
-        # -----------------------------------------------------
-        for tp in t.get(
-            "tp_orders",
-            [],
-        ):
-            leg = str(
-                tp.get(
-                    "leg",
+            symbol = str(
+                trade.get(
+                    "symbol",
                     "",
                 )
             )
 
-            order_id = tp.get(
-                "order_id"
-            )
-
-            if not order_id:
-                continue
-
-            order_info = get_order(
-                symbol,
-                order_id,
-            )
-
-            if (
-                order_info.get(
-                    "status"
-                )
-                == "error"
-            ):
-                continue
-
-            order_status = str(
-                order_info.get(
-                    "order_status",
-                    "",
+            direction = str(
+                trade.get(
+                    "direction",
+                    "LONG",
                 )
             ).upper()
 
-            if order_status not in {
-                "PARTIALLY_FILLED",
-                "FILLED",
-            }:
+            entry_price = _safe_float(
+                trade.get(
+                    "entry_price"
+                )
+            )
+
+            init_qty = abs(
+                _safe_float(
+                    trade.get(
+                        "initial_qty"
+                    )
+                )
+            )
+
+            rem_qty = max(
+                0.0,
+                _safe_float(
+                    trade.get(
+                        "remaining_qty"
+                    )
+                )
+            )
+
+            entry_ts = int(
+                _safe_float(
+                    trade.get(
+                        "entry_ts"
+                    )
+                )
+            )
+
+            if (
+                not symbol
+                or direction
+                not in {
+                    "LONG",
+                    "SHORT",
+                }
+                or entry_price <= 0
+                or init_qty <= 0
+            ):
+                log.error(
+                    "[TRACKER_INVALID_TRADE] "
+                    "event_id=%s symbol=%s",
+                    event_id,
+                    symbol,
+                )
+
+                updated_trades[
+                    event_id
+                ] = trade
+
                 continue
 
-            executed_qty = max(
+            hit_legs = set(
+                trade.get(
+                    "hit_legs",
+                    [],
+                )
+            )
+
+            filled_by_leg = {
+                str(k): max(
+                    0.0,
+                    _safe_float(v),
+                )
+                for k, v in (
+                    trade.get(
+                        "tp_filled_qty",
+                        {}
+                    )
+                    or {}
+                ).items()
+            }
+
+            realized_qty = max(
                 0.0,
-                float(
+                _safe_float(
+                    trade.get(
+                        "realized_pnl_qty",
+                        0.0,
+                    )
+                )
+            )
+
+            realized_weighted = (
+                _safe_float(
+                    trade.get(
+                        "realized_pnl_weighted_sum",
+                        0.0,
+                    )
+                )
+            )
+
+            # ---------------------------------------------------------
+            # POSITION SOURCE OF TRUTH
+            # ---------------------------------------------------------
+
+            pos = get_position_directional(
+                symbol,
+                direction,
+            )
+
+            pos_status = str(
+                pos.get(
+                    "status",
+                    "",
+                )
+            ).lower()
+
+            if pos_status not in {
+                "found",
+                "not_found",
+            }:
+                log.warning(
+                    "[TRACKER_POSITION_UNCERTAIN] "
+                    "%s %s: %s",
+                    symbol,
+                    direction,
+                    pos.get(
+                        "error"
+                    )
+                    or pos_status,
+                )
+
+                updated_trades[
+                    event_id
+                ] = trade
+
+                continue
+
+            pos_amt = (
+                abs(
+                    _safe_float(
+                        pos.get(
+                            "positionAmt"
+                        )
+                    )
+                )
+                if pos_status
+                == "found"
+                else 0.0
+            )
+
+            # ---------------------------------------------------------
+            # CURRENT PRICE / MFE / MAE
+            # ---------------------------------------------------------
+
+            cur_price = entry_price
+
+            try:
+                k1m = fetch_klines(
+                    symbol,
+                    "1m",
+                    limit=60,
+                )
+
+                if k1m:
+                    cur_price = _safe_float(
+                        k1m[-1].get(
+                            "close"
+                        ),
+                        entry_price,
+                    )
+
+                    _update_mfe_mae(
+                        trade,
+                        k1m,
+                    )
+
+            except Exception as exc:
+                log.warning(
+                    "[TRACKER_KLINE_ERROR] "
+                    "%s: %s",
+                    symbol,
+                    exc,
+                )
+
+            current_pnl = (
+                _calc_trade_pnl_pct(
+                    entry_price,
+                    cur_price,
+                    direction,
+                )
+            )
+
+            trade[
+                "current_pnl_pct"
+            ] = current_pnl
+
+            trade[
+                "current_position_qty"
+            ] = pos_amt
+
+            trade[
+                "last_observation_ts"
+            ] = now_ms
+
+            # ---------------------------------------------------------
+            # TP FILL PROCESSING
+            # ---------------------------------------------------------
+
+            for tp in trade.get(
+                "tp_orders",
+                [],
+            ):
+                leg = str(
+                    tp.get(
+                        "leg",
+                        "",
+                    )
+                )
+
+                order_id = tp.get(
+                    "order_id"
+                )
+
+                if (
+                    not leg
+                    or not order_id
+                ):
+                    continue
+
+                order_info = get_order(
+                    symbol,
+                    order_id,
+                )
+
+                if (
                     order_info.get(
-                        "executed_qty",
-                        0.0,
+                        "status"
                     )
-                    or 0.0
-                ),
-            )
+                    == "error"
+                ):
+                    continue
 
-            previous_qty = max(
-                0.0,
-                float(
-                    filled_by_leg.get(
+                order_status = str(
+                    order_info.get(
+                        "order_status",
+                        "",
+                    )
+                ).upper()
+
+                if order_status not in {
+                    "PARTIALLY_FILLED",
+                    "FILLED",
+                }:
+                    continue
+
+                executed_qty = max(
+                    0.0,
+                    _safe_float(
+                        order_info.get(
+                            "executed_qty",
+                            0.0,
+                        )
+                    )
+                )
+
+                previous_qty = max(
+                    0.0,
+                    _safe_float(
+                        filled_by_leg.get(
+                            leg,
+                            0.0,
+                        )
+                    )
+                )
+
+                delta_qty = max(
+                    0.0,
+                    executed_qty
+                    - previous_qty,
+                )
+
+                if (
+                    delta_qty <= 0
+                ):
+                    if (
+                        order_status
+                        == "FILLED"
+                    ):
+                        hit_legs.add(
+                            leg
+                        )
+
+                    continue
+
+                exec_price = _safe_float(
+                    order_info.get(
+                        "avg_price"
+                    )
+                    or tp.get(
+                        "price"
+                    )
+                    or cur_price,
+                    cur_price,
+                )
+
+                if exec_price <= 0:
+                    log.warning(
+                        "[TRACKER_INVALID_EXEC_PRICE] "
+                        "%s %s order=%s",
+                        symbol,
                         leg,
-                        0.0,
+                        order_id,
                     )
-                    or 0.0
-                ),
-            )
+                    continue
 
-            delta_qty = max(
-                0.0,
-                executed_qty
-                - previous_qty,
-            )
+                pnl_tp = _safe_float(
+                    tp.get(
+                        "pnl_pct"
+                    )
+                )
 
-            if delta_qty <= 0:
+                if pnl_tp <= 0:
+                    pnl_tp = (
+                        _calc_trade_pnl_pct(
+                            entry_price,
+                            exec_price,
+                            direction,
+                        )
+                    )
+
+                # IMPORTANT:
+                # only delta_qty is booked, so repeated polling cannot
+                # double-count already executed quantity.
+                rem_qty = max(
+                    0.0,
+                    rem_qty
+                    - delta_qty,
+                )
+
+                realized_qty += (
+                    delta_qty
+                )
+
+                realized_weighted += (
+                    delta_qty
+                    * pnl_tp
+                )
+
+                filled_by_leg[
+                    leg
+                ] = executed_qty
+
+                trade[
+                    "remaining_qty"
+                ] = rem_qty
+
+                trade[
+                    "realized_pnl_qty"
+                ] = realized_qty
+
+                trade[
+                    "realized_pnl_weighted_sum"
+                ] = realized_weighted
+
+                trade[
+                    "last_tp_exec_price"
+                ] = exec_price
+
+                # Record every execution event.
+                tp_exec_history = trade.setdefault(
+                    "tp_execution_history",
+                    [],
+                )
+
+                already_recorded = any(
+                    (
+                        str(
+                            item.get(
+                                "order_id",
+                                "",
+                            )
+                        )
+                        == str(
+                            order_id
+                        )
+                        and abs(
+                            _safe_float(
+                                item.get(
+                                    "executed_qty_total",
+                                    0,
+                                )
+                            )
+                            - executed_qty
+                        )
+                        < 1e-12
+                    )
+                    for item in tp_exec_history
+                )
+
+                if not already_recorded:
+                    tp_exec_history.append(
+                        {
+                            "ts": now_ms,
+                            "leg": leg,
+                            "order_id": str(
+                                order_id
+                            ),
+                            "executed_qty_total": executed_qty,
+                            "delta_qty": delta_qty,
+                            "exec_price": exec_price,
+                            "pnl_pct": pnl_tp,
+                            "order_status": order_status,
+                        }
+                    )
+
+                # -----------------------------------------------------
+                # FULL TP LEG
+                # -----------------------------------------------------
+
                 if (
                     order_status
                     == "FILLED"
@@ -1315,254 +1554,196 @@ def update_active_trades() -> None:
                         leg
                     )
 
-                continue
-
-            exec_price = float(
-                order_info.get(
-                    "avg_price"
-                )
-                or tp.get(
-                    "price"
-                )
-                or cur_price
-            )
-
-            pnl_tp = float(
-                tp.get(
-                    "pnl_pct"
-                )
-                or (
-                    (
-                        exec_price
-                        - entry_price
+                    rem_pct = (
+                        rem_qty
+                        / init_qty
+                        * 100.0
+                        if init_qty > 0
+                        else 0.0
                     )
-                    / entry_price
-                    * 100.0
-                    if direction
-                    == "LONG"
-                    else (
-                        entry_price
-                        - exec_price
-                    )
-                    / entry_price
-                    * 100.0
-                )
-            )
 
-            rem_qty = max(
-                0.0,
-                rem_qty
-                - delta_qty,
-            )
-
-            realized_qty += (
-                delta_qty
-            )
-
-            realized_weighted += (
-                delta_qty
-                * pnl_tp
-            )
-
-            filled_by_leg[
-                leg
-            ] = executed_qty
-
-            t[
-                "remaining_qty"
-            ] = rem_qty
-
-            t[
-                "realized_pnl_qty"
-            ] = realized_qty
-
-            t[
-                "realized_pnl_weighted_sum"
-            ] = realized_weighted
-
-            t[
-                "last_tp_exec_price"
-            ] = exec_price
-
-            if (
-                order_status
-                == "FILLED"
-                and leg
-                not in hit_legs
-            ):
-                hit_legs.add(
-                    leg
-                )
-
-                rem_pct = (
-                    rem_qty
-                    / init_qty
-                    * 100.0
-                    if init_qty > 0
-                    else 0.0
-                )
-
-                send_tg(
-                    format_tp_hit_message(
-                        name=t["name"],
-                        symbol=symbol,
-                        leg=leg,
-                        pnl_pct=pnl_tp,
-                        exec_price=exec_price,
-                        closed_qty=delta_qty,
-                        remaining_qty=rem_qty,
-                        remaining_pct=rem_pct,
-                    )
-                )
-
-                # Move SL to BE only if position remains.
-                if (
-                    leg == "tp1"
-                    and not t.get(
-                        "be_activated"
-                    )
-                    and rem_qty > 0
-                ):
-                    new_sl = (
-                        _move_sl_to_break_even(
+                    send_tg(
+                        format_tp_hit_message(
+                            name=trade.get(
+                                "name",
+                                symbol,
+                            ),
                             symbol=symbol,
-                            direction=direction,
-                            entry_price=entry_price,
-                            qty=rem_qty,
-                            old_sl_id=(
-                                t.get(
-                                    "sl_order",
-                                    {},
-                                ).get(
-                                    "order_id"
-                                )
-                            ),
-                            trade_id=(
-                                event_id.replace(
-                                    "EVT_",
-                                    "",
-                                )
-                            ),
+                            leg=leg,
+                            pnl_pct=pnl_tp,
+                            exec_price=exec_price,
+                            closed_qty=delta_qty,
+                            remaining_qty=rem_qty,
+                            remaining_pct=rem_pct,
                         )
                     )
 
-                    if new_sl.get(
-                        "status"
-                    ) in {
-                        "created",
-                        "created_old_sl_cancel_failed",
-                    }:
-                        t[
-                            "sl_order"
-                        ] = new_sl
-
-                        t[
+                    # Move SL to BE only after TP1 FULL fill.
+                    if (
+                        leg == "tp1"
+                        and not trade.get(
                             "be_activated"
-                        ] = True
-
-                        send_tg(
-                            format_be_message(
-                                t["name"],
-                                symbol,
-                                entry_price,
+                        )
+                        and rem_qty > 0
+                    ):
+                        old_sl_id = (
+                            trade.get(
+                                "sl_order",
+                                {}
+                            )
+                            .get(
+                                "order_id"
                             )
                         )
 
-                    else:
-                        log.error(
-                            "[TRACKER_BE_FAILED] "
-                            "%s %s: %s",
-                            symbol,
-                            direction,
-                            new_sl.get(
-                                "error"
-                            ),
+                        new_sl = (
+                            _move_sl_to_break_even(
+                                symbol=symbol,
+                                direction=direction,
+                                entry_price=entry_price,
+                                qty=rem_qty,
+                                old_sl_id=old_sl_id,
+                                trade_id=(
+                                    str(
+                                        event_id
+                                    ).replace(
+                                        "EVT_",
+                                        "",
+                                    )
+                                ),
+                            )
                         )
 
-        t[
-            "hit_legs"
-        ] = list(
-            hit_legs
-        )
+                        if new_sl.get(
+                            "status"
+                        ) in {
+                            "created",
+                            "created_old_sl_cancel_failed",
+                        }:
+                            trade[
+                                "sl_order"
+                            ] = new_sl
 
-        t[
-            "tp_filled_qty"
-        ] = filled_by_leg
+                            trade[
+                                "be_activated"
+                            ] = True
 
-        # -----------------------------------------------------
-        # 2. Determine whether position is closed.
-        # -----------------------------------------------------
-        closed_by_tp = (
-            rem_qty <= 0
-            and realized_qty > 0
-        )
+                            trade[
+                                "be_activation_ts"
+                            ] = now_ms
 
-        position_gone = (
-            pos_status
-            == "not_found"
-        )
+                            send_tg(
+                                format_be_message(
+                                    trade.get(
+                                        "name",
+                                        symbol,
+                                    ),
+                                    symbol,
+                                    entry_price,
+                                )
+                            )
 
-        if (
-            not position_gone
-            and not closed_by_tp
-        ):
-            updated_trades[
-                event_id
-            ] = t
+                        else:
+                            log.error(
+                                "[TRACKER_BE_FAILED] "
+                                "%s %s: %s",
+                                symbol,
+                                direction,
+                                new_sl.get(
+                                    "error"
+                                ),
+                            )
 
-            continue
-
-        duration_min = (
-            now_ms
-            - t["entry_ts"]
-        ) / 60000.0
-
-        exit_price = float(
-            t.get(
-                "last_tp_exec_price"
+            trade[
+                "hit_legs"
+            ] = sorted(
+                hit_legs
             )
-            or cur_price
-        )
 
-        sl_order_id = (
-            t.get(
-                "sl_order",
-                {},
-            ).get(
-                "order_id"
-            )
-        )
+            trade[
+                "tp_filled_qty"
+            ] = filled_by_leg
 
-        sl_info = (
-            get_order(
-                symbol,
-                sl_order_id,
-            )
-            if sl_order_id
-            else {}
-        )
+            # ---------------------------------------------------------
+            # DETERMINE WHETHER POSITION IS CLOSED
+            # ---------------------------------------------------------
 
-        if (
-            sl_info.get(
-                "status"
+            closed_by_tp = (
+                rem_qty <= 1e-12
+                and realized_qty > 0
             )
-            == "ok"
-            and sl_info.get(
-                "order_status"
+
+            position_gone = (
+                pos_status
+                == "not_found"
             )
-            == "FILLED"
-        ):
-            exit_price = float(
-                sl_info.get(
-                    "avg_price"
+
+            if (
+                not position_gone
+                and not closed_by_tp
+            ):
+                updated_trades[
+                    event_id
+                ] = trade
+
+                continue
+
+            # ---------------------------------------------------------
+            # DETERMINE EXIT
+            # ---------------------------------------------------------
+
+            duration_min = (
+                now_ms
+                - entry_ts
+            ) / 60000.0
+
+            exit_price = _safe_float(
+                trade.get(
+                    "last_tp_exec_price"
+                ),
+                cur_price,
+            )
+
+            sl_order_id = (
+                trade.get(
+                    "sl_order",
+                    {}
+                ).get(
+                    "order_id"
                 )
-                or exit_price
             )
 
-            exit_reason = (
-                "BREAK_EVEN"
+            sl_info = (
+                get_order(
+                    symbol,
+                    sl_order_id,
+                )
+                if sl_order_id
+                else {}
+            )
+
+            if (
+                sl_info.get(
+                    "status"
+                )
+                == "ok"
+                and str(
+                    sl_info.get(
+                        "order_status",
+                        "",
+                    )
+                ).upper()
+                == "FILLED"
+            ):
+                exit_price = _safe_float(
+                    sl_info.get(
+                        "avg_price"
+                    ),
+                    exit_price,
+                )
+
                 if (
-                    t.get(
+                    trade.get(
                         "be_activated"
                     )
                     and entry_price > 0
@@ -1572,190 +1753,360 @@ def update_active_trades() -> None:
                     )
                     / entry_price
                     < 0.003
+                ):
+                    exit_reason = (
+                        "BREAK_EVEN"
+                    )
+                else:
+                    exit_reason = (
+                        "STOP_LOSS"
+                    )
+
+            elif (
+                closed_by_tp
+                and hit_legs
+            ):
+                exit_reason = (
+                    "TAKE_PROFIT_FULL"
                 )
-                else "STOP_LOSS"
-            )
 
-        elif (
-            closed_by_tp
-            and hit_legs
-        ):
-            exit_reason = (
-                "TAKE_PROFIT_FULL"
-            )
-
-        else:
-            exit_reason = (
-                "POSITION_CLOSED"
-            )
-
-        # -----------------------------------------------------
-        # 3. Add remaining quantity to realized PnL if the
-        #    position disappeared after partial TP.
-        # -----------------------------------------------------
-        if (
-            position_gone
-            and rem_qty > 0
-            and init_qty > 0
-        ):
-            exit_pnl = (
-                (
-                    exit_price
-                    - entry_price
+            elif position_gone:
+                exit_reason = (
+                    "POSITION_CLOSED"
                 )
-                / entry_price
-                * 100.0
-                if direction == "LONG"
-                else (
-                    entry_price
-                    - exit_price
+
+            else:
+                exit_reason = (
+                    "POSITION_CLOSED"
                 )
-                / entry_price
-                * 100.0
-            )
 
-            realized_weighted += (
-                rem_qty
-                * exit_pnl
-            )
+            if exit_price <= 0:
+                exit_price = cur_price
 
-            realized_qty += (
-                rem_qty
-            )
+            # ---------------------------------------------------------
+            # ACCOUNT FOR REMAINING POSITION
+            # ---------------------------------------------------------
 
-            rem_qty = 0.0
-
-        # -----------------------------------------------------
-        # 4. Final weighted PnL in percentage of initial qty.
-        # -----------------------------------------------------
-        if (
-            init_qty > 0
-            and realized_qty > 0
-        ):
-            final_pnl = (
-                realized_weighted
-                / init_qty
-            )
-
-        else:
-            final_pnl = current_pnl
-
-        # -----------------------------------------------------
-        # 5. TRUE realized R.
-        #
-        # realized_pnl_pct / actual initial risk_pct
-        # -----------------------------------------------------
-        risk_pct = float(
-            t.get(
-                "risk_pct",
-                0.0,
-            )
-            or 0.0
-        )
-
-        realized_rr = None
-
-        if (
-            risk_pct > 0
-            and init_qty > 0
-            and realized_qty > 0
-            and math_is_finite(
-                risk_pct
-            )
-        ):
-            realized_rr = (
-                final_pnl
-                / risk_pct
-            )
-
-        t[
-            "realized_rr"
-        ] = realized_rr
-
-        t[
-            "realized_pnl_qty"
-        ] = realized_qty
-
-        t[
-            "realized_pnl_weighted_sum"
-        ] = realized_weighted
-
-        t[
-            "remaining_qty"
-        ] = 0.0
-
-        send_tg(
-            format_trade_closed_message(
-                name=t["name"],
-                symbol=symbol,
-                direction=direction,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                pnl_pct=final_pnl,
-                duration_min=duration_min,
-                peak_pnl=t.get(
-                    "peak_pnl_pct",
-                    0.0,
-                ),
-                max_drawdown=t.get(
-                    "max_drawdown_pct",
-                    0.0,
-                ),
-                exit_reason=exit_reason,
-                event_type=t.get(
-                    "event_type",
-                    "DIVERGENCE",
-                ),
-                research=t.get(
-                    "research",
-                    {},
-                ),
-                realized_rr=realized_rr,
-            )
-        )
-
-        # -----------------------------------------------------
-        # 6. Cancel only tracked orders still considered open.
-        # -----------------------------------------------------
-        for tp in t.get(
-            "tp_orders",
-            [],
-        ):
             if (
-                tp.get(
+                position_gone
+                and rem_qty > 0
+                and init_qty > 0
+            ):
+                exit_pnl = (
+                    _calc_trade_pnl_pct(
+                        entry_price,
+                        exit_price,
+                        direction,
+                    )
+                )
+
+                realized_weighted += (
+                    rem_qty
+                    * exit_pnl
+                )
+
+                realized_qty += (
+                    rem_qty
+                )
+
+                rem_qty = 0.0
+
+                trade[
+                    "remaining_qty"
+                ] = 0.0
+
+                trade[
+                    "realized_pnl_qty"
+                ] = realized_qty
+
+                trade[
+                    "realized_pnl_weighted_sum"
+                ] = realized_weighted
+
+                trade[
+                    "last_close_exec_price"
+                ] = exit_price
+
+            # ---------------------------------------------------------
+            # FINAL REALIZED PNL
+            # ---------------------------------------------------------
+
+            if (
+                init_qty > 0
+                and realized_qty > 0
+            ):
+                final_pnl = (
+                    realized_weighted
+                    / init_qty
+                )
+            else:
+                final_pnl = current_pnl
+
+            # Determine planned initial risk.
+            planned_risk_pct = None
+
+            stored_setup = (
+                trade.get(
+                    "setup",
+                    {}
+                )
+            )
+
+            if isinstance(
+                stored_setup,
+                dict,
+            ):
+                planned_risk_pct = (
+                    _safe_float(
+                        stored_setup.get(
+                            "risk_pct"
+                        ),
+                        0.0,
+                    )
+                )
+
+            if (
+                not planned_risk_pct
+                or planned_risk_pct <= 0
+            ):
+                sl_order = trade.get(
+                    "sl_order",
+                    {}
+                )
+
+                sl_price = _safe_float(
+                    sl_order.get(
+                        "stop_price"
+                    )
+                    if isinstance(
+                        sl_order,
+                        dict,
+                    )
+                    else 0,
+                    0.0,
+                )
+
+                if sl_price > 0:
+                    if direction == "LONG":
+                        planned_risk_pct = (
+                            (
+                                entry_price
+                                - sl_price
+                            )
+                            / entry_price
+                            * 100.0
+                        )
+                    else:
+                        planned_risk_pct = (
+                            (
+                                sl_price
+                                - entry_price
+                            )
+                            / entry_price
+                            * 100.0
+                        )
+
+            realized_rr = (
+                _calc_realized_rr(
+                    final_pnl,
+                    planned_risk_pct,
+                )
+            )
+
+            planned_rr = _safe_float(
+                trade.get(
+                    "planned_weighted_rr",
+                    1.55,
+                ),
+                1.55,
+            )
+
+            # ---------------------------------------------------------
+            # FINAL STATE
+            # ---------------------------------------------------------
+
+            trade[
+                "remaining_qty"
+            ] = 0.0
+
+            trade[
+                "realized_pnl_pct"
+            ] = final_pnl
+
+            trade[
+                "realized_rr"
+            ] = realized_rr
+
+            trade[
+                "exit_price"
+            ] = exit_price
+
+            trade[
+                "exit_reason"
+            ] = exit_reason
+
+            trade[
+                "closed_ts"
+            ] = now_ms
+
+            trade[
+                "duration_min"
+            ] = duration_min
+
+            trade[
+                "planned_risk_pct"
+            ] = planned_risk_pct
+
+            trade[
+                "closed"
+            ] = True
+
+            trade[
+                "close_metrics"
+            ] = {
+                "realized_pnl_pct": final_pnl,
+                "realized_rr": realized_rr,
+                "planned_weighted_rr": planned_rr,
+                "realized_qty": realized_qty,
+                "initial_qty": init_qty,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "duration_min": duration_min,
+                "peak_pnl_pct": _safe_float(
+                    trade.get(
+                        "peak_pnl_pct"
+                    )
+                ),
+                "max_drawdown_pct": _safe_float(
+                    trade.get(
+                        "max_drawdown_pct"
+                    )
+                ),
+            }
+
+            # ---------------------------------------------------------
+            # TELEGRAM
+            # ---------------------------------------------------------
+
+            send_tg(
+                format_trade_closed_message(
+                    name=trade.get(
+                        "name",
+                        symbol,
+                    ),
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    pnl_pct=final_pnl,
+                    realized_rr=realized_rr,
+                    planned_rr=planned_rr,
+                    duration_min=duration_min,
+                    peak_pnl=_safe_float(
+                        trade.get(
+                            "peak_pnl_pct"
+                        )
+                    ),
+                    max_drawdown=_safe_float(
+                        trade.get(
+                            "max_drawdown_pct"
+                        )
+                    ),
+                    exit_reason=exit_reason,
+                    event_type=trade.get(
+                        "event_type",
+                        "DIVERGENCE",
+                    ),
+                    research=trade.get(
+                        "research",
+                        {},
+                    ),
+                )
+            )
+
+            # ---------------------------------------------------------
+            # CANCEL REMAINING ORDERS
+            # ---------------------------------------------------------
+
+            for tp in trade.get(
+                "tp_orders",
+                [],
+            ):
+                leg = tp.get(
                     "leg"
                 )
-                not in hit_legs
-                and tp.get(
-                    "order_id"
-                )
-            ):
-                cancel_order(
-                    symbol,
-                    tp[
-                        "order_id"
-                    ],
-                )
 
-        if sl_order_id:
-            cancel_order(
+                if (
+                    leg not in hit_legs
+                    and tp.get(
+                        "order_id"
+                    )
+                ):
+                    try:
+                        cancel_order(
+                            symbol,
+                            tp[
+                                "order_id"
+                            ],
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[TRACKER_CANCEL_TP_ERROR] "
+                            "%s %s: %s",
+                            symbol,
+                            leg,
+                            exc,
+                        )
+
+            if sl_order_id:
+                try:
+                    cancel_order(
+                        symbol,
+                        sl_order_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[TRACKER_CANCEL_SL_ERROR] "
+                        "%s: %s",
+                        symbol,
+                        exc,
+                    )
+
+            # Closed trades are intentionally removed
+            # from active_trades.json after their final
+            # statistics have been calculated.
+            log.info(
+                "[TRACKER_CLOSED] "
+                "%s %s pnl=%.4f%% "
+                "realized_rr=%s "
+                "reason=%s",
                 symbol,
-                sl_order_id,
+                direction,
+                final_pnl,
+                (
+                    f"{realized_rr:.4f}"
+                    if realized_rr is not None
+                    else "n/a"
+                ),
+                exit_reason,
             )
+
+        except Exception as exc:
+            log.exception(
+                "[TRACKER_FATAL_TRADE_ERROR] "
+                "event_id=%s symbol=%s: %s",
+                event_id,
+                trade.get(
+                    "symbol",
+                    "",
+                ),
+                exc,
+            )
+
+            updated_trades[
+                event_id
+            ] = trade
 
     _save_active_trades(
         updated_trades
     )
-
-
-def math_is_finite(
-    value: float,
-) -> bool:
-    try:
-        return (
-            value == value
-            and abs(value)
-            < float("inf")
-        )
-    except Exception:
-        return False
