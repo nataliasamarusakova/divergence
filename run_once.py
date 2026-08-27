@@ -1585,13 +1585,10 @@ def main() -> None:
         except Exception:
             continue
 
-    candidates = candidates[
-        :MAX_CANDIDATES
-    ]
+    if MAX_CANDIDATES > 0:
+        candidates = candidates[:MAX_CANDIDATES]
 
-    stats["candidates"] = len(
-        candidates
-    )
+    stats["candidates"] = len(candidates)
 
     # ===============================================================
     # STATE
