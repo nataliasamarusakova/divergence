@@ -1,3 +1,5 @@
+# test_signals.py
+
 from __future__ import annotations
 
 import json
@@ -7,17 +9,24 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from event_engine.coinalyze import parse_number
+from event_engine.coinalyze import parse_number, CoinalyzeRow
 from event_engine.signals import (
     _rsi,
     add_cvd,
     build_15m_trigger,
     detect_divergences,
     detect_squeeze_release,
+    check_btc_regime,
 )
 from event_engine.bingx import (
     get_contract,
     CACHE,
+    _allocate_tp_quantities,
+)
+from run_once import (
+    build_event_setup,
+    build_tp_levels,
+    calculate_setup_score,
 )
 
 
@@ -143,3 +152,118 @@ def test_get_contract_displayName_with_hyphen():
     c = get_contract("ETH")
     assert c is not None
     assert c["symbol"] == "ETH-USDT"
+
+
+def test_allocate_tp_quantities_exact_sum():
+    # 1. Standard precision and min_qty
+    qtys = _allocate_tp_quantities(
+        position_qty=100.0,
+        precision=0,
+        min_qty=10.0,
+        fractions=[0.30, 0.30, 0.40],
+    )
+    assert qtys == [30.0, 30.0, 40.0]
+    assert sum(qtys) == 100.0
+
+    # 2. Fractional precision
+    qtys_frac = _allocate_tp_quantities(
+        position_qty=1.0,
+        precision=2,
+        min_qty=0.1,
+        fractions=[0.30, 0.30, 0.40],
+    )
+    assert qtys_frac == [0.30, 0.30, 0.40]
+    assert round(sum(qtys_frac), 2) == 1.0
+
+    # 3. Step rounding remainder distribution
+    qtys_rem = _allocate_tp_quantities(
+        position_qty=10.0,
+        precision=0,
+        min_qty=1.0,
+        fractions=[0.33, 0.33, 0.34],
+    )
+    assert sum(qtys_rem) == 10.0
+    assert all(q >= 1.0 for q in qtys_rem)
+
+    # 4. Position cannot support 3 legs
+    with pytest.raises(ValueError):
+        _allocate_tp_quantities(
+            position_qty=2.0,
+            precision=0,
+            min_qty=1.0,
+            fractions=[0.30, 0.30, 0.40],
+        )
+
+
+def test_squeeze_release_short():
+    df = _generate_synthetic_candles(80)
+    df["close"] = 100.0
+    df["high"] = 100.1
+    df["low"] = 99.9
+
+    df.loc[79, "close"] = 85.0
+    df.loc[79, "low"] = 84.0
+
+    events = detect_squeeze_release(df, "BTC-USDT", "1h", min_squeeze_bars=3)
+    assert len(events) == 1
+    assert events[0]["direction"] == "SHORT"
+    assert events[0]["event_fact"]["squeeze_duration_bars"] >= 3
+    assert events[0]["event_type"] == "VOLATILITY_SQUEEZE_RELEASE"
+
+
+def test_btc_regime_filtering():
+    # 1. Normal BTC
+    normal_df = pd.DataFrame({"close": [100, 100.1, 100.2, 100.1, 100.3]})
+    ok, _ = check_btc_regime(normal_df, "LONG")
+    assert ok is True
+    ok, _ = check_btc_regime(normal_df, "SHORT")
+    assert ok is True
+
+    # 2. BTC dumping 1H -> Blocks LONG
+    dump_df = pd.DataFrame({"close": [100, 100, 100, 100, 98.0]})
+    ok_long, reason = check_btc_regime(dump_df, "LONG")
+    assert ok_long is False
+    assert "DUMPING_1H" in reason
+
+    # 3. BTC pumping 1H -> Blocks SHORT
+    pump_df = pd.DataFrame({"close": [100, 100, 100, 100, 102.5]})
+    ok_short, reason = check_btc_regime(pump_df, "SHORT")
+    assert ok_short is False
+    assert "PUMPING_1H" in reason
+
+
+def test_setup_and_tp_levels_symmetry():
+    df = _generate_synthetic_candles(60)
+
+    # Long setup
+    setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
+    assert setup_long["invalidation_price"] < 100.0
+    assert setup_long["target_price"] > 100.0
+    assert setup_long["planned_weighted_rr"] == 1.55
+    sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
+    assert sl_pct_l > 0
+    assert len(tp_levels_l) == 3
+    assert tp_levels_l[0]["pnl_pct"] < tp_levels_l[1]["pnl_pct"] < tp_levels_l[2]["pnl_pct"]
+
+    # Short setup
+    setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
+    assert setup_short["invalidation_price"] > 100.0
+    assert setup_short["target_price"] < 100.0
+    assert setup_short["planned_weighted_rr"] == 1.55
+    sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
+    assert sl_pct_s > 0
+    assert len(tp_levels_s) == 3
+    assert tp_levels_s[0]["pnl_pct"] < tp_levels_s[1]["pnl_pct"] < tp_levels_s[2]["pnl_pct"]
+
+
+def test_rsi_warmup_preserves_nan():
+    series = pd.Series([10.0 + i for i in range(30)])
+    rsi = _rsi(series, n=14)
+    # Warmup bars (0..12) must be NaN
+    assert pd.isna(rsi.iloc[0])
+    assert pd.isna(rsi.iloc[12])
+    # Post-warmup bars must be valid numbers
+    assert pd.notna(rsi.iloc[14])
+    assert pd.notna(rsi.iloc[-1])
+
+
