@@ -202,32 +202,80 @@ def parse_table(html_text: str) -> list[CoinalyzeRow]:
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
     out: list[CoinalyzeRow] = []
+
+    # Map column headers dynamically if thead exists, otherwise fallback to positional indices
+    header_map = {}
+    headers = [th.get_text(" ", strip=True).lower() for th in soup.select("thead th")]
+    for idx, h in enumerate(headers):
+        if "price" in h and "chg" not in h:
+            header_map["price"] = idx
+        elif "24h chg" in h or "price chg" in h or "24h %" in h:
+            header_map["price_chg24"] = idx
+        elif "market cap" in h or "mkt cap" in h:
+            header_map["mktcap"] = idx
+        elif "24h vol" in h or "volume" in h:
+            header_map["volume24"] = idx
+        elif "open int" in h or h == "oi":
+            header_map["oi"] = idx
+        elif "24h oi" in h or "oi chg 24h" in h:
+            header_map["oi_chg24_pct"] = idx
+        elif "4h oi" in h or "oi chg 4h" in h:
+            header_map["oi_chg4h_pct"] = idx
+        elif "oi / vol" in h:
+            header_map["oi_vol_ratio"] = idx
+        elif "oi / mkt" in h:
+            header_map["oi_mktcap_ratio"] = idx
+        elif "fr" in h and "pred" not in h:
+            header_map["fr_oiw"] = idx
+        elif "pred fr" in h or "pfr" in h:
+            header_map["pfr_oiw"] = idx
+        elif "liq short" in h:
+            header_map["liq_short24"] = idx
+        elif "liq long" in h:
+            header_map["liq_long24"] = idx
+        elif "l/s" in h or "accounts" in h:
+            header_map["ls_accounts"] = idx
+        elif "btc corr" in h:
+            header_map["btc_corr7d"] = idx
+        elif "cvd" in h:
+            header_map["cvd24"] = idx
+        elif "lls" in h:
+            header_map["lls24"] = idx
+
+    def _get_val(tds: list, field_name: str, fallback_idx: int) -> float | None:
+        idx = header_map.get(field_name, fallback_idx)
+        if idx < len(tds):
+            return parse_number(tds[idx].get_text(" ", strip=True))
+        return None
+
     for tr in rows:
         symbol = (tr.get("data-coin") or "").strip().upper()
         tds = tr.find_all("td")
-        if not symbol or len(tds) < 23:
+        if not symbol or len(tds) < 18:
             continue
-        spans = tds[1].find_all("span")
+        spans = tds[1].find_all("span") if len(tds) > 1 else []
         name = spans[0].get_text(strip=True) if spans else symbol
+
         raw = {
-            "price": parse_number(tds[2].get_text(" ", strip=True)),
-            "price_chg24": parse_number(tds[3].get_text(" ", strip=True)),
-            "mktcap": parse_number(tds[4].get_text(" ", strip=True)),
-            "volume24": parse_number(tds[5].get_text(" ", strip=True)),
-            "oi": parse_number(tds[6].get_text(" ", strip=True)),
-            "oi_chg24_pct": parse_number(tds[7].get_text(" ", strip=True)),
-            "oi_chg4h_pct": parse_number(tds[9].get_text(" ", strip=True)),
-            "oi_vol_ratio": parse_number(tds[11].get_text(" ", strip=True)),
-            "oi_mktcap_ratio": parse_number(tds[12].get_text(" ", strip=True)),
-            "fr_oiw": parse_number(tds[15].get_text(" ", strip=True)),
-            "pfr_oiw": parse_number(tds[16].get_text(" ", strip=True)),
-            "liq_short24": parse_number(tds[17].get_text(" ", strip=True)),
-            "liq_long24": parse_number(tds[18].get_text(" ", strip=True)),
-            "ls_accounts": parse_number(tds[19].get_text(" ", strip=True)),
-            "btc_corr7d": parse_number(tds[20].get_text(" ", strip=True)),
-            "cvd24": parse_number(tds[21].get_text(" ", strip=True)),
-            "lls24": parse_number(tds[22].get_text(" ", strip=True)),
+            "price": _get_val(tds, "price", 2),
+            "price_chg24": _get_val(tds, "price_chg24", 3),
+            "mktcap": _get_val(tds, "mktcap", 4),
+            "volume24": _get_val(tds, "volume24", 5),
+            "oi": _get_val(tds, "oi", 6),
+            "oi_chg24_pct": _get_val(tds, "oi_chg24_pct", 7),
+            "oi_chg4h_pct": _get_val(tds, "oi_chg4h_pct", 9),
+            "oi_vol_ratio": _get_val(tds, "oi_vol_ratio", 11),
+            "oi_mktcap_ratio": _get_val(tds, "oi_mktcap_ratio", 12),
+            "fr_oiw": _get_val(tds, "fr_oiw", 15),
+            "pfr_oiw": _get_val(tds, "pfr_oiw", 16),
+            "liq_short24": _get_val(tds, "liq_short24", 17),
+            "liq_long24": _get_val(tds, "liq_long24", 18),
+            "ls_accounts": _get_val(tds, "ls_accounts", 19),
+            "btc_corr7d": _get_val(tds, "btc_corr7d", 20),
+            "cvd24": _get_val(tds, "cvd24", 21),
+            "lls24": _get_val(tds, "lls24", 22),
         }
+
         out.append(CoinalyzeRow(
             symbol=symbol,
             name=name,
