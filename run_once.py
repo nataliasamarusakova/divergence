@@ -436,15 +436,6 @@ def build_event_setup(
     df_1h: pd.DataFrame,
     entry_price: float,
 ) -> dict:
-    """
-    Плановый setup.
-
-    ВАЖНО:
-    entry_price здесь является reference price.
-    После фактического exchange fill торговая статистика
-    должна использовать actual avgPrice.
-    """
-
     direction = str(
         ev.get(
             "direction",
@@ -452,12 +443,19 @@ def build_event_setup(
         )
     ).upper()
 
-    entry_price = float(entry_price)
+    if direction not in {
+        "LONG",
+        "SHORT",
+    }:
+        raise ValueError(
+            f"Invalid direction={direction}"
+        )
 
-    if (
-        not pd.notna(entry_price)
-        or entry_price <= 0
-    ):
+    entry_price = float(
+        entry_price
+    )
+
+    if entry_price <= 0:
         raise ValueError(
             f"Invalid entry_price={entry_price}"
         )
@@ -474,43 +472,51 @@ def build_event_setup(
         "low",
         "close",
     ):
-        if col not in df.columns:
-            raise ValueError(
-                f"missing 1H column: {col}"
-            )
-
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce",
         )
 
-    if df[
-        [
-            "high",
-            "low",
-            "close",
+    if (
+        df[
+            [
+                "high",
+                "low",
+                "close",
+            ]
         ]
-    ].tail(14).isna().any().any():
+        .isna()
+        .any()
+        .any()
+    ):
         raise ValueError(
-            "invalid NaN in recent 1H OHLC"
+            "invalid OHLC data"
         )
 
-    prev_close = df["close"].shift(1)
+    prev_close = (
+        df["close"]
+        .shift(1)
+    )
 
     tr = pd.concat(
         [
-            df["high"] - df["low"],
+            df["high"]
+            - df["low"],
+
             (
                 df["high"]
                 - prev_close
             ).abs(),
+
             (
                 df["low"]
                 - prev_close
             ).abs(),
         ],
         axis=1,
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     atr = (
         tr
@@ -530,18 +536,29 @@ def build_event_setup(
             "ATR unavailable"
         )
 
-    atr = float(atr)
+    atr = float(
+        atr
+    )
 
-    risk_pct = (
+    risk_pct_raw = (
         atr
         / entry_price
         * 100.0
     )
 
+    if not (
+        float("-inf")
+        < risk_pct_raw
+        < float("inf")
+    ):
+        raise ValueError(
+            "Invalid ATR-derived risk"
+        )
+
     risk_pct = max(
         0.50,
         min(
-            risk_pct,
+            risk_pct_raw,
             5.00,
         ),
     )
@@ -559,11 +576,13 @@ def build_event_setup(
             entry_price
             * (
                 1.0
-                + 2.0 * risk_pct / 100.0
+                + 2.0
+                * risk_pct
+                / 100.0
             )
         )
 
-    elif direction == "SHORT":
+    else:
         invalidation = (
             entry_price
             * (
@@ -576,60 +595,63 @@ def build_event_setup(
             entry_price
             * (
                 1.0
-                - 2.0 * risk_pct / 100.0
+                - 2.0
+                * risk_pct
+                / 100.0
             )
-        )
-
-    else:
-        raise ValueError(
-            f"Invalid direction={direction}"
         )
 
     return {
         "entry_reference": entry_price,
+
         "invalidation_price": invalidation,
+
         "target_price": target,
+
+        "risk_pct": risk_pct,
+
         "target_rr": 2.0,
 
-        # 30% @ 1R
-        # 30% @ 1.5R
-        # 40% @ 2R
-        #
-        # weighted RR:
-        # 0.30*1 + 0.30*1.5 + 0.40*2 = 1.55
+        # This is a planning metric, NOT realized performance.
         "planned_weighted_rr": 1.55,
 
-        # This is NOT known at setup time.
+        # Kept for backwards compatibility with existing consumers.
         "realized_rr": None,
 
         "trigger_ok": True,
-        "atr": atr,
-        "risk_pct": risk_pct,
     }
 
 
 def build_tp_levels(
     setup: dict,
     direction: str,
-) -> Tuple[
-    float,
-    List[dict],
-]:
+) -> Tuple[float, List[dict]]:
     direction = str(
         direction
     ).upper()
 
     entry = float(
-        setup["entry_reference"]
+        setup[
+            "entry_reference"
+        ]
     )
 
     sl_price = float(
-        setup["invalidation_price"]
+        setup[
+            "invalidation_price"
+        ]
     )
 
     final_tp_price = float(
-        setup["target_price"]
+        setup[
+            "target_price"
+        ]
     )
+
+    if entry <= 0:
+        raise ValueError(
+            "entry_reference must be > 0"
+        )
 
     if direction == "LONG":
         sl_pct = (
@@ -675,13 +697,11 @@ def build_tp_levels(
         )
 
     if (
-        not pd.notna(sl_pct)
-        or not pd.notna(tp_pct)
-        or sl_pct <= 0
+        sl_pct <= 0
         or tp_pct <= 0
     ):
         raise ValueError(
-            "invalid TP/SL percentages"
+            "Invalid SL/TP percentages"
         )
 
     tp_levels = [
@@ -710,6 +730,22 @@ def build_tp_levels(
             "close_fraction": 0.40,
         },
     ]
+
+    setup[
+        "risk_pct"
+    ] = sl_pct
+
+    setup[
+        "planned_weighted_rr"
+    ] = 1.55
+
+    setup[
+        "realized_rr"
+    ] = None
+
+    setup[
+        "tp_levels"
+    ] = tp_levels
 
     return (
         sl_pct,
