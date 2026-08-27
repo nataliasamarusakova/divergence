@@ -535,27 +535,57 @@ def reconcile_all_open_positions() -> None:
                 )
 
 
-def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
+def execute_new_position(
+    symbol: str,
+    direction: str,
+    price: float,
+    setup: dict,
+    event_id: str,
+    ev: dict,
+    df_1h: pd.DataFrame,
+) -> dict:
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
+    signal_price = float(price)
 
     try:
-        opened = open_market(symbol, direction, price, trade_id)
+        opened = open_market(
+            symbol,
+            direction,
+            signal_price,
+            trade_id,
+        )
     except Exception as exc:
-        return {"status": "OPEN_EXCEPTION", "mode": EXECUTION_MODE, "order_id": None, "error": str(exc)}
+        return {
+            "status": "OPEN_EXCEPTION",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "error": str(exc),
+            "signal_price": signal_price,
+        }
 
     if not isinstance(opened, dict):
-        return {"status": "OPEN_INVALID_RESPONSE", "mode": EXECUTION_MODE, "order_id": None, "raw": repr(opened)}
+        return {
+            "status": "OPEN_INVALID_RESPONSE",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "raw": repr(opened),
+            "signal_price": signal_price,
+        }
 
     open_status = str(opened.get("status", "")).lower()
+
     if open_status not in {"opened", "success", "ok"}:
         return {
             "status": "OPEN_FAILED",
             "mode": EXECUTION_MODE,
             "order_id": opened.get("order_id"),
             "open_result": opened,
-            "error": opened.get("error") or opened.get("msg") or "unknown_open_error",
+            "error": opened.get("error")
+            or opened.get("msg")
+            or "unknown_open_error",
             "bingx_code": opened.get("code"),
+            "signal_price": signal_price,
         }
 
     order_id = opened.get("order_id")
@@ -574,35 +604,60 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "order_id": order_id,
             "open_result": opened,
             "error": str(exc),
+            "signal_price": signal_price,
         }
 
-    if not isinstance(position, dict) or str(position.get("status", "")).lower() != "found":
+    if (
+        not isinstance(position, dict)
+        or str(position.get("status", "")).lower() != "found"
+    ):
         return {
             "status": "POSITION_NOT_CONFIRMED",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
             "open_result": opened,
             "position": position,
+            "signal_price": signal_price,
         }
 
     try:
         actual_qty = abs(float(position.get("positionAmt", 0) or 0))
-        actual_avg_price = float(position.get("avgPrice", 0) or position.get("entryPrice", 0) or 0)
+        actual_avg_price = float(
+            position.get("avgPrice", 0)
+            or position.get("entryPrice", 0)
+            or 0
+        )
     except (TypeError, ValueError):
         actual_qty = 0.0
         actual_avg_price = 0.0
 
-    if actual_qty <= 0 or actual_avg_price <= 0:
+    if (
+        not math.isfinite(actual_qty)
+        or not math.isfinite(actual_avg_price)
+        or actual_qty <= 0
+        or actual_avg_price <= 0
+    ):
         return {
             "status": "POSITION_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
             "open_result": opened,
             "position": position,
+            "signal_price": signal_price,
         }
 
+    # Build the setup again from the exchange-confirmed fill.
     try:
-        sl_pct, tp_levels = build_tp_levels(setup, direction)
+        actual_setup = build_event_setup(
+            ev=ev,
+            df_1h=df_1h,
+            entry_price=actual_avg_price,
+        )
+
+        sl_pct, tp_levels = build_tp_levels(
+            actual_setup,
+            direction,
+        )
     except Exception as exc:
         return {
             "status": "PROTECTION_SETUP_INVALID",
@@ -611,19 +666,28 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "position": position,
             "open_result": opened,
             "error": str(exc),
+            "signal_price": signal_price,
+            "actual_avg_price": actual_avg_price,
         }
 
     protection = install_protection(
         symbol=symbol,
         direction=direction,
-        position={**position, "positionAmt": actual_qty, "avgPrice": actual_avg_price},
-        setup=setup,
+        position={
+            **position,
+            "positionAmt": actual_qty,
+            "avgPrice": actual_avg_price,
+        },
+        setup=actual_setup,
         sl_pct=sl_pct,
         tp_levels=tp_levels,
         trade_id=trade_id,
     )
 
-    protection_status = str(protection.get("status", "")).upper()
+    protection_status = str(
+        protection.get("status", "")
+    ).upper()
+
     if protection_status == "PROTECTED":
         final_status = "opened_protected"
     elif protection_status == "SL_ONLY":
@@ -631,19 +695,45 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     else:
         final_status = "opened_protection_failed"
 
+    entry_price_deviation_pct = (
+        (
+            actual_avg_price - signal_price
+        )
+        / signal_price
+        * 100.0
+        if signal_price > 0
+        else None
+    )
+
+    # Store both the original signal and the actual-fill setup.
+    actual_setup = {
+        **actual_setup,
+        "signal_price": signal_price,
+        "actual_avg_price": actual_avg_price,
+        "entry_price_deviation_pct": entry_price_deviation_pct,
+    }
+
     return {
         "status": final_status,
         "mode": EXECUTION_MODE,
         "order_id": order_id,
+
+        "signal_price": signal_price,
+        "actual_avg_price": actual_avg_price,
+        "entry_price_deviation_pct": entry_price_deviation_pct,
+
         "open_result": opened,
+
         "position": {
             **position,
             "positionAmt": actual_qty,
             "avgPrice": actual_avg_price,
         },
+
         "protection": protection,
         "sl_pct": sl_pct,
         "tp_levels": tp_levels,
+        "setup": actual_setup,
     }
 
 
@@ -839,18 +929,43 @@ def main() -> None:
             execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
-            execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
+            execution_result = execute_new_position(
+                symbol=symbol,
+                direction=direction,
+                price=price,
+                setup=setup,
+                event_id=event_id,
+                ev=ev,
+                df_1h=d1,
+            )
 
             record_trade({
                 "event_id": event_id,
                 "symbol": symbol,
                 "direction": direction,
-                "price": price,
+            
+                # Original signal/reference price.
+                "signal_price": price,
+            
+                # Exchange-confirmed values.
+                "actual_avg_price": execution_result.get("actual_avg_price"),
+                "actual_qty": execution_result.get("position", {}).get("positionAmt"),
+            
+                "entry_price_deviation_pct": execution_result.get(
+                    "entry_price_deviation_pct"
+                ),
+            
                 "score": score,
                 "event_type": ev.get("event_type"),
-                "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+            
+                "ts": int(
+                    pd.Timestamp.utcnow().timestamp() * 1000
+                ),
+            
                 "result": execution_result,
-                "setup": setup,
+            
+                # This setup is now based on ACTUAL fill.
+                "setup": execution_result.get("setup", setup),
             })
 
             status = str(execution_result.get("status", ""))
