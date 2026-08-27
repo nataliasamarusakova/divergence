@@ -1,6 +1,5 @@
 # telegram.py
 
-
 from __future__ import annotations
 
 import html
@@ -63,13 +62,15 @@ def format_signal(
 
     score_str = f" · Score: <b>{score:.0f}/100</b>" if score is not None else ""
 
+    require_trig = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
+    trigger_suffix = " + trigger 15m (Vol Confirmed)" if require_trig else ""
     lines = [
         f"<b>{title}</b>{score_str}",
         "",
         f"<b>{esc(getattr(coinalyze_row, 'name', None) or event.get('symbol'))}</b> "
         f"(<code>{esc(event.get('symbol'))}</code>)",
         f"Event: <code>{esc(event.get('event_type'))}</code>",
-        f"TF: <b>{esc(event.get('timeframe', '1h'))}</b> + trigger 15m (Vol Confirmed)",
+        f"TF: <b>{esc(event.get('timeframe', '1h'))}</b>{trigger_suffix}",
         f"Price: <code>{esc(fact.get('detection_close_price'))}</code>",
         f"Detected: <code>{esc(ts.get('detected_at_ts'))}</code>",
     ]
@@ -93,7 +94,7 @@ def format_signal(
 
     if coinalyze_row is not None:
         oi_chg = getattr(coinalyze_row, "oi_chg4h_pct", None)
-        oi_chg_str = f"${oi_chg:,.0f}" if oi_chg is not None and abs(oi_chg) > 1000 else (f"{oi_chg:.2f}%" if oi_chg is not None else "—")
+        oi_chg_str = f"{oi_chg:+.2f}%" if oi_chg is not None else "—"
 
         lines += [
             "",
@@ -105,14 +106,14 @@ def format_signal(
         ]
 
     if setup:
-        rr = setup.get("realized_rr", setup.get("target_rr", 2.0))
+        rr = setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 2.0)))
         lines += [
             "",
             "<b>SETUP</b>",
             f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
             f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
             f"TP: <code>{esc(setup.get('target_price'))}</code>",
-            f"R:R (Realized): <code>{esc(rr)}</code>",
+            f"R:R (Planned Weighted): <code>{esc(rr)}</code>",
         ]
 
     if execution:
