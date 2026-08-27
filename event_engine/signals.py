@@ -24,7 +24,8 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
 
     rsi = rsi.where(~zero_loss, 100.0)
     rsi = rsi.where(~zero_both, 50.0)
-    return rsi.fillna(50.0)
+    valid_warmup = avg_gain.notna() & avg_loss.notna()
+    return rsi.where(valid_warmup, np.nan)
 
 
 def _bbands(series: pd.Series, n: int = 20, std: float = 2.0):
