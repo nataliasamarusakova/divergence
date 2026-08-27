@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,7 @@ import pandas as pd
 
 def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
     delta = series.diff()
+
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -24,18 +26,44 @@ def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
         min_periods=n,
     ).mean()
 
-    zero_loss = (avg_loss == 0) & (avg_gain > 0)
-    zero_both = (avg_loss == 0) & (avg_gain == 0)
+    zero_loss = (
+        (avg_loss == 0)
+        & (avg_gain > 0)
+    )
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    zero_both = (
+        (avg_loss == 0)
+        & (avg_gain == 0)
+    )
 
-    rsi = rsi.where(~zero_loss, 100.0)
-    rsi = rsi.where(~zero_both, 50.0)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan,
+    )
 
-    valid_warmup = avg_gain.notna() & avg_loss.notna()
+    rsi = 100.0 - (
+        100.0 / (1.0 + rs)
+    )
 
-    return rsi.where(valid_warmup, np.nan)
+    rsi = rsi.where(
+        ~zero_loss,
+        100.0,
+    )
+
+    rsi = rsi.where(
+        ~zero_both,
+        50.0,
+    )
+
+    valid_warmup = (
+        avg_gain.notna()
+        & avg_loss.notna()
+    )
+
+    return rsi.where(
+        valid_warmup,
+        np.nan,
+    )
 
 
 def _bbands(
@@ -51,13 +79,14 @@ def _bbands(
     sd = series.rolling(
         n,
         min_periods=n,
-    ).std(ddof=0)
-
-    return (
-        mid + std * sd,
-        mid,
-        mid - std * sd,
+    ).std(
+        ddof=0
     )
+
+    upper = mid + std * sd
+    lower = mid - std * sd
+
+    return upper, mid, lower
 
 
 def _atr(
@@ -66,12 +95,20 @@ def _atr(
 ) -> pd.Series:
     tr = pd.concat(
         [
-            df.high - df.low,
-            (df.high - df.close.shift()).abs(),
-            (df.low - df.close.shift()).abs(),
+            df["high"] - df["low"],
+            (
+                df["high"]
+                - df["close"].shift()
+            ).abs(),
+            (
+                df["low"]
+                - df["close"].shift()
+            ).abs(),
         ],
         axis=1,
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return tr.rolling(
         n,
@@ -84,23 +121,58 @@ def _pivots(
     left: int = 3,
     right: int = 2,
 ):
-    lows = []
-    highs = []
+    lows: list[int] = []
+    highs: list[int] = []
 
-    for i in range(left, len(df) - right):
+    for i in range(
+        left,
+        len(df) - right,
+    ):
+        current_low = float(
+            df["low"].iloc[i]
+        )
+
+        previous_lows = df[
+            "low"
+        ].iloc[
+            i - left:i
+        ]
+
+        next_lows = df[
+            "low"
+        ].iloc[
+            i + 1:i + right + 1
+        ]
+
+        current_high = float(
+            df["high"].iloc[i]
+        )
+
+        previous_highs = df[
+            "high"
+        ].iloc[
+            i - left:i
+        ]
+
+        next_highs = df[
+            "high"
+        ].iloc[
+            i + 1:i + right + 1
+        ]
+
         if (
-            float(df.low.iloc[i])
-            <= float(df.low.iloc[i - left:i].min())
-            and float(df.low.iloc[i])
-            < float(df.low.iloc[i + 1:i + right + 1].min())
+            current_low
+            <= float(previous_lows.min())
+            and current_low
+            < float(next_lows.min())
         ):
             lows.append(i)
 
         if (
-            float(df.high.iloc[i])
-            >= float(df.high.iloc[i - left:i].max())
-            and float(df.high.iloc[i])
-            > float(df.high.iloc[i + 1:i + right + 1].max())
+            current_high
+            >= float(previous_highs.max())
+            and current_high
+            > float(next_highs.max())
         ):
             highs.append(i)
 
@@ -180,10 +252,13 @@ def add_cvd(
         work.loc[
             valid_idx,
             "bingx_cvd",
-        ] = work.loc[
-            valid_idx,
-            "bar_delta_usdt",
-        ].cumsum()
+        ] = (
+            work.loc[
+                valid_idx,
+                "bar_delta_usdt",
+            ]
+            .cumsum()
+        )
 
     return work
 
@@ -203,6 +278,43 @@ def detect_divergences(
         return []
 
     work = df.copy()
+
+    required = {
+        "close",
+        "high",
+        "low",
+        "close_time",
+    }
+
+    if not required.issubset(
+        work.columns
+    ):
+        return []
+
+    for col in (
+        "close",
+        "high",
+        "low",
+        "close_time",
+    ):
+        work[col] = pd.to_numeric(
+            work[col],
+            errors="coerce",
+        )
+
+    work = work.dropna(
+        subset=[
+            "close",
+            "high",
+            "low",
+            "close_time",
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    if len(work) < 60:
+        return []
 
     work["rsi"] = _rsi(
         work["close"],
@@ -227,7 +339,8 @@ def detect_divergences(
         p2i: int,
         indicator: str,
         is_low: bool,
-    ):
+    ) -> None:
+
         bars = p2i - p1i
 
         if not (
@@ -237,21 +350,35 @@ def detect_divergences(
         ):
             return
 
-        atr_value = work.atr.iloc[p2i]
+        atr_value = work[
+            "atr"
+        ].iloc[p2i]
 
-        atr = (
-            float(atr_value)
-            if pd.notna(atr_value)
-            else 0.0
-        )
-
-        if atr <= 0:
+        if pd.isna(atr_value):
             return
 
-        p1v = work[indicator].iloc[p1i]
-        p2v = work[indicator].iloc[p2i]
+        atr = float(
+            atr_value
+        )
 
-        if pd.isna(p1v) or pd.isna(p2v):
+        if not math.isfinite(atr) or atr <= 0:
+            return
+
+        if indicator not in work.columns:
+            return
+
+        p1v = work[
+            indicator
+        ].iloc[p1i]
+
+        p2v = work[
+            indicator
+        ].iloc[p2i]
+
+        if (
+            pd.isna(p1v)
+            or pd.isna(p2v)
+        ):
             return
 
         detected = p2i + right
@@ -260,20 +387,34 @@ def detect_divergences(
             return
 
         if indicator == "bingx_cvd":
+
+            if (
+                "bar_delta_usdt"
+                not in work.columns
+            ):
+                return
+
             span = work.iloc[
                 p1i:detected + 1
             ]
 
+            if not span[
+                "bar_delta_usdt"
+            ].notna().all():
+                return
+
             if (
-                not span[
-                    "bar_delta_usdt"
-                ].notna().all()
-                or work.cvd_segment_id.iloc[p1i]
-                != work.cvd_segment_id.iloc[detected]
+                work[
+                    "cvd_segment_id"
+                ].iloc[p1i]
+                !=
+                work[
+                    "cvd_segment_id"
+                ].iloc[detected]
             ):
                 return
 
-        price_col = (
+        price_column = (
             "low"
             if is_low
             else "high"
@@ -281,25 +422,29 @@ def detect_divergences(
 
         p1_price = float(
             work[
-                price_col
+                price_column
             ].iloc[p1i]
         )
 
         p2_price = float(
             work[
-                price_col
+                price_column
             ].iloc[p2i]
         )
 
         price_delta_atr = (
             abs(
-                p2_price - p1_price
+                p2_price
+                - p1_price
             )
             / atr
         )
 
         if (
-            price_delta_atr
+            not math.isfinite(
+                price_delta_atr
+            )
+            or price_delta_atr
             < min_delta_atr
         ):
             return
@@ -311,21 +456,23 @@ def detect_divergences(
 
             if (
                 p2_price < p1_price
-                and p2v > p1v
+                and float(p2v)
+                > float(p1v)
             ):
                 typ = (
                     "REGULAR_BULLISH_"
-                    f"{indicator.upper()}"
+                    + indicator.upper()
                 )
                 direction = "LONG"
 
             elif (
                 p2_price > p1_price
-                and p2v < p1v
+                and float(p2v)
+                < float(p1v)
             ):
                 typ = (
                     "HIDDEN_BULLISH_"
-                    f"{indicator.upper()}"
+                    + indicator.upper()
                 )
                 direction = "LONG"
 
@@ -333,21 +480,23 @@ def detect_divergences(
 
             if (
                 p2_price > p1_price
-                and p2v < p1v
+                and float(p2v)
+                < float(p1v)
             ):
                 typ = (
                     "REGULAR_BEARISH_"
-                    f"{indicator.upper()}"
+                    + indicator.upper()
                 )
                 direction = "SHORT"
 
             elif (
                 p2_price < p1_price
-                and p2v > p1v
+                and float(p2v)
+                > float(p1v)
             ):
                 typ = (
                     "HIDDEN_BEARISH_"
-                    f"{indicator.upper()}"
+                    + indicator.upper()
                 )
                 direction = "SHORT"
 
@@ -355,15 +504,21 @@ def detect_divergences(
             return
 
         p1_ts = int(
-            work.close_time.iloc[p1i]
+            work[
+                "close_time"
+            ].iloc[p1i]
         )
 
         p2_ts = int(
-            work.close_time.iloc[p2i]
+            work[
+                "close_time"
+            ].iloc[p2i]
         )
 
         detected_ts = int(
-            work.close_time.iloc[detected]
+            work[
+                "close_time"
+            ].iloc[detected]
         )
 
         events.append(
@@ -386,7 +541,9 @@ def detect_divergences(
                 },
                 "event_fact": {
                     "detection_close_price": float(
-                        work.close.iloc[detected]
+                        work[
+                            "close"
+                        ].iloc[detected]
                     ),
                     "p1_price": p1_price,
                     "p2_price": p2_price,
@@ -403,18 +560,31 @@ def detect_divergences(
     def scan_pivots(
         pivots: list[int],
         is_low: bool,
-    ):
-        num_piv = len(pivots)
+    ) -> None:
 
-        for i in range(num_piv):
+        num_piv = len(
+            pivots
+        )
 
-            for step in (1, 2):
+        for i in range(
+            num_piv
+        ):
 
-                if i + step >= num_piv:
+            for step in (
+                1,
+                2,
+            ):
+
+                if (
+                    i + step
+                    >= num_piv
+                ):
                     continue
 
                 p1 = pivots[i]
-                p2 = pivots[i + step]
+                p2 = pivots[
+                    i + step
+                ]
 
                 emit_divergence(
                     p1,
@@ -455,10 +625,47 @@ def detect_squeeze_release(
     if len(df) < 40:
         return []
 
+    required = {
+        "close",
+        "high",
+        "low",
+        "close_time",
+    }
+
+    if not required.issubset(
+        df.columns
+    ):
+        return []
+
     b = df.copy()
 
+    for col in (
+        "close",
+        "high",
+        "low",
+        "close_time",
+    ):
+        b[col] = pd.to_numeric(
+            b[col],
+            errors="coerce",
+        )
+
+    b = b.dropna(
+        subset=[
+            "close",
+            "high",
+            "low",
+            "close_time",
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    if len(b) < 40:
+        return []
+
     bb_u, mid, bb_l = _bbands(
-        b.close,
+        b["close"],
         20,
         2.0,
     )
@@ -468,8 +675,15 @@ def detect_squeeze_release(
         20,
     )
 
-    kc_u = mid + 1.5 * atr
-    kc_l = mid - 1.5 * atr
+    kc_u = (
+        mid
+        + 1.5 * atr
+    )
+
+    kc_l = (
+        mid
+        - 1.5 * atr
+    )
 
     in_sq = (
         (bb_u <= kc_u)
@@ -479,8 +693,16 @@ def detect_squeeze_release(
     if (
         len(b)
         < min_squeeze_bars + 2
-        or pd.isna(bb_u.iloc[-1])
-        or pd.isna(kc_u.iloc[-1])
+    ):
+        return []
+
+    if (
+        pd.isna(
+            bb_u.iloc[-1]
+        )
+        or pd.isna(
+            kc_u.iloc[-1]
+        )
     ):
         return []
 
@@ -499,11 +721,16 @@ def detect_squeeze_release(
         return []
 
     sq_duration = 0
-    idx = len(in_sq) - 2
+
+    idx = (
+        len(in_sq) - 2
+    )
 
     while (
         idx >= 0
-        and in_sq.iloc[idx]
+        and bool(
+            in_sq.iloc[idx]
+        )
     ):
         sq_duration += 1
         idx -= 1
@@ -515,7 +742,7 @@ def detect_squeeze_release(
         return []
 
     close_val = float(
-        b.close.iloc[-1]
+        b["close"].iloc[-1]
     )
 
     kc_u_val = float(
@@ -526,17 +753,23 @@ def detect_squeeze_release(
         kc_l.iloc[-1]
     )
 
-    if close_val > kc_u_val:
+    if (
+        close_val
+        > kc_u_val
+    ):
         direction = "LONG"
 
-    elif close_val < kc_l_val:
+    elif (
+        close_val
+        < kc_l_val
+    ):
         direction = "SHORT"
 
     else:
         return []
 
     ts = int(
-        b.close_time.iloc[-1]
+        b["close_time"].iloc[-1]
     )
 
     typ = (
@@ -554,7 +787,7 @@ def detect_squeeze_release(
     )
 
     compression_ratio = (
-        float(bb_w / kc_w)
+        bb_w / kc_w
         if kc_w > 0
         else 1.0
     )
@@ -582,7 +815,9 @@ def detect_squeeze_release(
                 "bb_width": bb_w,
                 "kc_width": kc_w,
                 "squeeze_duration_bars": sq_duration,
-                "compression_ratio": compression_ratio,
+                "compression_ratio": float(
+                    compression_ratio
+                ),
             },
         }
     ]
@@ -591,186 +826,493 @@ def detect_squeeze_release(
 def diagnose_15m_trigger(
     df15: pd.DataFrame,
     direction: str,
-    min_vol_mult: float = 1.0,
+    event_detected_at_ts: int | None = None,
+    max_trigger_delay_min: float = 60.0,
+    min_vol_mult: float = 1.05,
 ) -> dict[str, Any]:
     """
-    Диагностический вариант 15M trigger.
+    Event-aware 15M confirmation.
 
-    Торговую логику НЕ меняет.
-    Возвращает точную причину PASS/FAIL.
+    Не проверяет только последнюю свечу.
+
+    Для события с detected_at_ts:
+        event
+           ↓
+        15M закрытия после события
+           ↓
+        ищем первый подтвержденный breakout
+           ↓
+        volume >= SMA20 * min_vol_mult
+
+    Никакие бары, закрывшиеся до event_detected_at_ts,
+    не используются как trigger-кандидаты.
     """
 
-    result = {
+    result: dict[str, Any] = {
         "ok": False,
         "reason": None,
-        "direction": str(direction).upper(),
-        "breakout_pass": False,
-        "volume_pass": True,
-        "data_pass": True,
-        "direction_pass": True,
+        "direction": str(
+            direction
+        ).upper(),
+        "event_detected_at_ts": (
+            event_detected_at_ts
+        ),
+        "max_trigger_delay_min": float(
+            max_trigger_delay_min
+        ),
+        "bars_after_event": 0,
+        "bars_considered": 0,
+        "trigger_bar_close_ts": None,
+        "trigger_delay_min": None,
         "previous_high": None,
         "previous_low": None,
         "current_close": None,
         "current_volume": None,
         "volume_sma20": None,
         "volume_ratio": None,
+        "breakout_pass": False,
+        "volume_pass": True,
+        "data_pass": True,
+        "direction_pass": True,
+        "scanned_bar_details": [],
     }
 
     if not isinstance(
         df15,
         pd.DataFrame,
-    ) or len(df15) < 2:
+    ):
+        result["reason"] = (
+            "invalid_15m_data"
+        )
+        result["data_pass"] = False
+        return result
 
-        result["ok"] = False
+    if len(df15) < 2:
         result["reason"] = (
             "insufficient_data"
         )
         result["data_pass"] = False
         return result
 
-    d = str(direction).upper()
+    d = str(
+        direction
+    ).upper()
 
     if d not in {
         "LONG",
         "SHORT",
     }:
-        result["ok"] = False
         result["reason"] = (
             "invalid_direction"
         )
-        result["direction_pass"] = False
+        result[
+            "direction_pass"
+        ] = False
         return result
 
-    h = df15.iloc[-1]
-    p = df15.iloc[-2]
+    required = {
+        "close",
+        "high",
+        "low",
+        "close_time",
+    }
 
-    try:
-        current_close = float(
-            h["close"]
-        )
+    missing = required - set(
+        df15.columns
+    )
 
-        previous_high = float(
-            p["high"]
-        )
-
-        previous_low = float(
-            p["low"]
-        )
-
-        current_volume = (
-            float(h["volume"])
-            if "volume" in df15.columns
-            else None
-        )
-
-    except (
-        TypeError,
-        ValueError,
-        KeyError,
-    ) as exc:
-
-        result["ok"] = False
+    if missing:
         result["reason"] = (
             "invalid_15m_data"
         )
         result["data_pass"] = False
-        result["error"] = str(exc)
-        return result
-
-    result[
-        "previous_high"
-    ] = previous_high
-
-    result[
-        "previous_low"
-    ] = previous_low
-
-    result[
-        "current_close"
-    ] = current_close
-
-    result[
-        "current_volume"
-    ] = current_volume
-
-    if d == "LONG":
-        breakout_pass = (
-            current_close
-            > previous_high
-        )
-    else:
-        breakout_pass = (
-            current_close
-            < previous_low
-        )
-
-    result[
-        "breakout_pass"
-    ] = bool(breakout_pass)
-
-    if not breakout_pass:
-        result["ok"] = False
-        result["reason"] = (
-            "breakout_failed"
+        result["error"] = (
+            "missing columns: "
+            + ", ".join(
+                sorted(missing)
+            )
         )
         return result
 
-    # Same volume logic as before.
-    if (
-        "volume" in df15.columns
-        and len(df15) >= 20
-        and min_vol_mult > 0
+    work = df15.copy()
+
+    for col in (
+        "close",
+        "high",
+        "low",
+        "close_time",
     ):
-
-        volume_series = pd.to_numeric(
-            df15["volume"],
+        work[col] = pd.to_numeric(
+            work[col],
             errors="coerce",
         )
 
-        vol_sma = volume_series.iloc[
-            -21:-1
-        ].mean()
+    if "volume" in work.columns:
+        work["volume"] = pd.to_numeric(
+            work["volume"],
+            errors="coerce",
+        )
 
-        if (
-            pd.notna(vol_sma)
-            and float(vol_sma) > 0
+    work = (
+        work.dropna(
+            subset=[
+                "close",
+                "high",
+                "low",
+                "close_time",
+            ]
+        )
+        .sort_values(
+            "close_time"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    if len(work) < 2:
+        result["reason"] = (
+            "insufficient_data"
+        )
+        result["data_pass"] = False
+        return result
+
+    if event_detected_at_ts is None:
+
+        candidate_indices = list(
+            range(
+                1,
+                len(work),
+            )
+        )
+
+    else:
+
+        try:
+            event_ts = int(
+                event_detected_at_ts
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            result["reason"] = (
+                "invalid_event_timestamp"
+            )
+            result["data_pass"] = False
+            return result
+
+        candidate_indices = []
+
+        for i in range(
+            1,
+            len(work),
         ):
 
-            vol_sma = float(vol_sma)
+            close_ts = int(
+                work[
+                    "close_time"
+                ].iloc[i]
+            )
 
-            result[
-                "volume_sma20"
-            ] = vol_sma
+            if close_ts <= event_ts:
+                continue
 
-            if current_volume is not None:
-                volume_ratio = (
-                    current_volume
-                    / vol_sma
+            delay_min = (
+                close_ts - event_ts
+            ) / 60000.0
+
+            if delay_min < 0:
+                continue
+
+            if (
+                delay_min
+                > max_trigger_delay_min
+            ):
+                continue
+
+            candidate_indices.append(
+                i
+            )
+
+    result[
+        "bars_after_event"
+    ] = len(
+        candidate_indices
+    )
+
+    if not candidate_indices:
+
+        result["reason"] = (
+            "no_trigger_window"
+        )
+
+        return result
+
+    saw_breakout = False
+    saw_breakout_without_volume = False
+    last_diagnostic = None
+
+    for i in candidate_indices:
+
+        h = work.iloc[i]
+        p = work.iloc[i - 1]
+
+        try:
+
+            current_close = float(
+                h["close"]
+            )
+
+            previous_high = float(
+                p["high"]
+            )
+
+            previous_low = float(
+                p["low"]
+            )
+
+            close_ts = int(
+                h["close_time"]
+            )
+
+            current_volume = None
+
+            if (
+                "volume"
+                in work.columns
+                and pd.notna(
+                    h["volume"]
+                )
+            ):
+                current_volume = float(
+                    h["volume"]
                 )
 
-                result[
-                    "volume_ratio"
-                ] = float(volume_ratio)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if event_detected_at_ts is not None:
+
+            delay_min = (
+                close_ts
+                - int(
+                    event_detected_at_ts
+                )
+            ) / 60000.0
+
+        else:
+            delay_min = 0.0
+
+        if d == "LONG":
+
+            breakout_pass = (
+                current_close
+                > previous_high
+            )
+
+        else:
+
+            breakout_pass = (
+                current_close
+                < previous_low
+            )
+
+        volume_sma20 = None
+        volume_ratio = None
+        volume_pass = True
+
+        if (
+            "volume"
+            in work.columns
+            and i >= 20
+            and min_vol_mult > 0
+        ):
+
+            volume_window = pd.to_numeric(
+                work[
+                    "volume"
+                ].iloc[
+                    i - 20:i
+                ],
+                errors="coerce",
+            )
+
+            if (
+                len(volume_window)
+                == 20
+                and volume_window.notna().all()
+            ):
+
+                volume_sma20 = float(
+                    volume_window.mean()
+                )
 
                 if (
-                    current_volume
-                    < vol_sma
-                    * min_vol_mult
+                    volume_sma20 > 0
+                    and current_volume
+                    is not None
                 ):
-                    result[
-                        "volume_pass"
-                    ] = False
 
-                    result["ok"] = False
-                    result["reason"] = (
-                        "volume_failed"
+                    volume_ratio = (
+                        current_volume
+                        / volume_sma20
                     )
 
-                    return result
+                    volume_pass = (
+                        current_volume
+                        >= (
+                            volume_sma20
+                            * min_vol_mult
+                        )
+                    )
 
-    result["volume_pass"] = True
-    result["ok"] = True
-    result["reason"] = "passed"
+        detail = {
+            "close_ts": close_ts,
+            "delay_min": round(
+                delay_min,
+                3,
+            ),
+            "previous_high": (
+                previous_high
+            ),
+            "previous_low": (
+                previous_low
+            ),
+            "current_close": (
+                current_close
+            ),
+            "current_volume": (
+                current_volume
+            ),
+            "volume_sma20": (
+                volume_sma20
+            ),
+            "volume_ratio": (
+                volume_ratio
+            ),
+            "breakout_pass": bool(
+                breakout_pass
+            ),
+            "volume_pass": bool(
+                volume_pass
+            ),
+        }
+
+        result[
+            "scanned_bar_details"
+        ].append(
+            detail
+        )
+
+        result[
+            "bars_considered"
+        ] += 1
+
+        last_diagnostic = detail
+
+        if not breakout_pass:
+            continue
+
+        saw_breakout = True
+
+        if not volume_pass:
+            saw_breakout_without_volume = True
+            continue
+
+        result.update(
+            {
+                "ok": True,
+                "reason": "passed",
+                "breakout_pass": True,
+                "volume_pass": True,
+                "trigger_bar_close_ts": (
+                    close_ts
+                ),
+                "trigger_delay_min": round(
+                    delay_min,
+                    3,
+                ),
+                "previous_high": (
+                    previous_high
+                ),
+                "previous_low": (
+                    previous_low
+                ),
+                "current_close": (
+                    current_close
+                ),
+                "current_volume": (
+                    current_volume
+                ),
+                "volume_sma20": (
+                    volume_sma20
+                ),
+                "volume_ratio": (
+                    volume_ratio
+                ),
+            }
+        )
+
+        return result
+
+    if (
+        saw_breakout
+        and saw_breakout_without_volume
+    ):
+        result["reason"] = (
+            "volume_failed"
+        )
+    else:
+        result["reason"] = (
+            "breakout_failed"
+        )
+
+    if last_diagnostic:
+
+        result.update(
+            {
+                "previous_high": (
+                    last_diagnostic[
+                        "previous_high"
+                    ]
+                ),
+                "previous_low": (
+                    last_diagnostic[
+                        "previous_low"
+                    ]
+                ),
+                "current_close": (
+                    last_diagnostic[
+                        "current_close"
+                    ]
+                ),
+                "current_volume": (
+                    last_diagnostic[
+                        "current_volume"
+                    ]
+                ),
+                "volume_sma20": (
+                    last_diagnostic[
+                        "volume_sma20"
+                    ]
+                ),
+                "volume_ratio": (
+                    last_diagnostic[
+                        "volume_ratio"
+                    ]
+                ),
+                "breakout_pass": bool(
+                    saw_breakout
+                ),
+                "volume_pass": not (
+                    saw_breakout_without_volume
+                ),
+            }
+        )
 
     return result
 
@@ -779,25 +1321,29 @@ def build_15m_trigger(
     df15: pd.DataFrame,
     direction: str,
     min_vol_mult: float = 1.0,
+    event_detected_at_ts: int | None = None,
+    max_trigger_delay_min: float = 60.0,
 ) -> bool:
     """
     Compatibility wrapper.
 
-    Старый контракт функции сохраняется:
-    возвращает только bool.
-
-    Внутри используется тот же самый
-    диагностический механизм.
+    Старые тесты и внешние вызовы могут по-прежнему
+    использовать build_15m_trigger().
     """
 
     diagnostic = diagnose_15m_trigger(
-        df15,
-        direction,
-        min_vol_mult,
+        df15=df15,
+        direction=direction,
+        event_detected_at_ts=event_detected_at_ts,
+        max_trigger_delay_min=max_trigger_delay_min,
+        min_vol_mult=min_vol_mult,
     )
 
     return bool(
-        diagnostic["ok"]
+        diagnostic.get(
+            "ok",
+            False,
+        )
     )
 
 
@@ -805,11 +1351,28 @@ def check_btc_regime(
     btc_1h_df: pd.DataFrame,
     direction: str,
 ) -> tuple[bool, str]:
+    """
+    Защита от торговли альтами против сильного
+    импульса Bitcoin.
+    """
 
     if len(btc_1h_df) < 5:
         return True, "INSUFFICIENT_DATA"
 
-    close = btc_1h_df["close"]
+    required = {"close"}
+
+    if not required.issubset(
+        btc_1h_df.columns
+    ):
+        return True, "INSUFFICIENT_DATA"
+
+    close = pd.to_numeric(
+        btc_1h_df["close"],
+        errors="coerce",
+    )
+
+    if close.isna().any():
+        return True, "INSUFFICIENT_DATA"
 
     last_close = float(
         close.iloc[-1]
@@ -823,8 +1386,12 @@ def check_btc_regime(
         close.iloc[-5]
     )
 
-    if prev_1h <= 0 or prev_4h <= 0:
-        return False, "INVALID_BTC_PRICE"
+    if (
+        last_close <= 0
+        or prev_1h <= 0
+        or prev_4h <= 0
+    ):
+        return True, "INSUFFICIENT_DATA"
 
     chg_1h_pct = (
         (
@@ -849,29 +1416,37 @@ def check_btc_regime(
     if d == "LONG":
 
         if chg_1h_pct < -1.2:
+
             return (
                 False,
-                f"BTC_DUMPING_1H ({chg_1h_pct:.2f}%)",
+                f"BTC_DUMPING_1H "
+                f"({chg_1h_pct:.2f}%)",
             )
 
         if chg_4h_pct < -2.5:
+
             return (
                 False,
-                f"BTC_DUMPING_4H ({chg_4h_pct:.2f}%)",
+                f"BTC_DUMPING_4H "
+                f"({chg_4h_pct:.2f}%)",
             )
 
     elif d == "SHORT":
 
         if chg_1h_pct > 1.5:
+
             return (
                 False,
-                f"BTC_PUMPING_1H (+{chg_1h_pct:.2f}%)",
+                f"BTC_PUMPING_1H "
+                f"(+{chg_1h_pct:.2f}%)",
             )
 
         if chg_4h_pct > 3.0:
+
             return (
                 False,
-                f"BTC_PUMPING_4H (+{chg_4h_pct:.2f}%)",
+                f"BTC_PUMPING_4H "
+                f"(+{chg_4h_pct:.2f}%)",
             )
 
     return True, "OK"
