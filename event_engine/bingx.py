@@ -1,3 +1,5 @@
+# bingx.py
+
 from __future__ import annotations
 
 import hashlib
@@ -2979,11 +2981,12 @@ def ensure_directional_protection(
             )
         )
 
+        # ПРАВКА 4: Исполняем по маркету ту долю, которая уже пересекла профит, вместо откладывания
         if trigger_invalid:
             log.warning(
-                "[BINGX_TP_DEFERRED] "
+                "[BINGX_TP_MARKET_EXECUTION] "
                 "%s %s price=%s current=%s: "
-                "trigger already crossed",
+                "trigger already crossed, executing MARKET close",
                 symbol,
                 leg,
                 _format_price(
@@ -2996,19 +2999,52 @@ def ensure_directional_protection(
                 ),
             )
 
-            tp_results.append(
-                {
-                    "leg": leg,
-                    "status": "deferred",
-                    "reason": (
-                        "trigger_already_crossed"
-                    ),
-                    "price": tp_price,
-                    "current_price": current_price,
-                    "qty": tp_qty,
-                    "pnl_pct": pnl_pct,
-                }
-            )
+            client_order_id = build_tp_client_order_id(leg, trade_id)
+
+            market_params = {
+                "symbol": bx_symbol,
+                "side": "SELL" if direction == "LONG" else "BUY",
+                "positionSide": direction,
+                "type": "MARKET",
+                "quantity": _format_qty(tp_qty, precision),
+                "clientOrderId": client_order_id,
+            }
+
+            resp = _request("POST", ORDER_PATH, market_params)
+
+            if resp.get("code") != 0:
+                log.error(
+                    "[BINGX_TP_MARKET_FAILED] "
+                    "%s code=%s msg=%s",
+                    leg,
+                    resp.get("code"),
+                    resp.get("msg"),
+                )
+                tp_results.append(
+                    {
+                        "leg": leg,
+                        "status": "error",
+                        "error": (
+                            f"code={resp.get('code')} "
+                            f"msg={resp.get('msg')}"
+                        ),
+                        "qty": tp_qty,
+                        "pnl_pct": pnl_pct,
+                    }
+                )
+            else:
+                order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+                tp_results.append(
+                    {
+                        "leg": leg,
+                        "status": "created",
+                        "order_id": str(order.get("orderId", "")),
+                        "client_order_id": order.get("clientOrderId") or client_order_id,
+                        "price": current_price,
+                        "qty": tp_qty,
+                        "pnl_pct": pnl_pct,
+                    }
+                )
 
             continue
 
