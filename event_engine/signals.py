@@ -1,3 +1,5 @@
+# signals.py
+
 from __future__ import annotations
 
 import hashlib
@@ -972,6 +974,9 @@ def diagnose_15m_trigger(
             previous_low = float(
                 p["low"]
             )
+            previous_close = float(
+                p["close"]
+            )
         except (
             TypeError,
             ValueError,
@@ -1000,15 +1005,16 @@ def diagnose_15m_trigger(
             ):
                 current_volume = None
 
+        # ПРАВКА 5: Смягченный триггер. Смотрим закрытие свечи относительно прошлого закрытия
         if d == "LONG":
             breakout_pass = (
                 current_close
-                > previous_high
+                > previous_close
             )
         else:
             breakout_pass = (
                 current_close
-                < previous_low
+                < previous_close
             )
 
         volume_sma20 = None
@@ -1245,6 +1251,10 @@ def diagnose_15m_trigger(
                 p["low"]
             )
 
+            previous_close = float(
+                p["close"]
+            )
+
             close_ts = int(
                 h["close_time"]
             )
@@ -1277,18 +1287,19 @@ def diagnose_15m_trigger(
             close_ts - event_ts
         ) / 60000.0
 
+        # ПРАВКА 5: Смягченный триггер для Event-Aware Mode
         if d == "LONG":
 
             breakout_pass = (
                 current_close
-                > previous_high
+                > previous_close
             )
 
         else:
 
             breakout_pass = (
                 current_close
-                < previous_low
+                < previous_close
             )
 
         volume_sma20 = None
