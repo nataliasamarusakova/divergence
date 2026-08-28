@@ -245,7 +245,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         raise ValueError("ATR unavailable")
 
     atr = float(atr)
-    risk_pct_raw = (atr * 1.5) / entry_price * 100.0
+    sl_atr_multiplier = 1.5
+    risk_pct_raw = (atr * sl_atr_multiplier) / entry_price * 100.0
 
     if not (float("-inf") < risk_pct_raw < float("inf")):
         raise ValueError("Invalid ATR-derived risk")
@@ -416,12 +417,10 @@ def reconcile_all_open_positions() -> None:
         sl_orders = list(prot.get("sl_orders", []))
         tp_orders = list(prot.get("tp_orders", []))
 
-        # Ищем сделку в трекере
         matched_trade = _find_active_trade_for_position(bx_symbol, direction, active_trades)
         hit_legs = set(matched_trade.get("hit_legs", [])) if matched_trade else set()
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
 
-        # Ожидаемые тейки — только те, которые еще не были исполнены!
         all_possible_legs = {"tp1", "tp2", "tp3"}
         remaining_expected_legs = all_possible_legs - hit_legs
 
@@ -432,7 +431,6 @@ def reconcile_all_open_positions() -> None:
             if leg.upper() in str(order.get("clientOrderId", "")).upper()
         }
 
-        # Валидация Стоп-Лосса (с учетом безубытка!)
         sl_valid = False
         if sl_orders:
             try:
@@ -441,14 +439,12 @@ def reconcile_all_open_positions() -> None:
 
                 if sl_price > 0 and sl_amt > 0:
                     if direction == "LONG":
-                        # Если БУ активирован, стоп может быть равен цене входа (или чуть выше)
                         sl_valid = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
                     elif direction == "SHORT":
                         sl_valid = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
             except (TypeError, ValueError):
                 sl_valid = False
 
-        # Защита считается полной, если есть валидный SL и выставлены ВСЕ оставшиеся тейки
         protection_complete = sl_valid and remaining_expected_legs.issubset(known_tp_legs)
 
         if protection_complete:
@@ -497,7 +493,6 @@ def reconcile_all_open_positions() -> None:
         except Exception as exc:
             print(f"[RECONCILIATION_ATR_ERROR] {bx_symbol}: {exc}")
 
-        # Создаем только те уровни TP, которые еще не были взяты
         tp_levels = []
         if "tp1" not in hit_legs:
             tp_levels.append({"leg": "tp1", "pnl_pct": round(tp_pct * 0.50, 6), "close_fraction": 0.30})
@@ -668,13 +663,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 def main() -> None:
     if EXECUTION_ENABLED:
-        # ПРАВИЛЬНЫЙ ПОРЯДОК: Сначала обновляем трекер (тейки, безубыток, выходы)
         try:
             update_active_trades()
         except Exception as exc:
             print(f"[TRACKER_ERROR] {exc}")
 
-        # Затем ревизор сверяет фактическое состояние, уважая взятые тейки и БУ
         try:
             reconcile_all_open_positions()
         except Exception as exc:
@@ -1029,10 +1022,14 @@ def main() -> None:
         else:
             execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
 
-        label = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
-        msg = format_signal(ev, setup=setup, coinalyze_row=r, execution=execution_result, score=score)
-        if not (msg.startswith("🚨 LONG SIGNAL") or msg.startswith("🔻 SHORT SIGNAL")):
-            msg = f"{label}\n\n{msg}"
+        # Форматируем сообщение по чистому шаблону (без дублирования заголовка)
+        msg = format_signal(
+            ev,
+            setup=setup,
+            coinalyze_row=r,
+            execution=execution_result,
+            score=score,
+        )
 
         is_real_execution = execution_result.get("status") in {
             "opened_protected",
