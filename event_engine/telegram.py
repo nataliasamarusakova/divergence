@@ -1,5 +1,3 @@
-# telegram.py
-
 from __future__ import annotations
 
 import html
@@ -52,78 +50,55 @@ def format_signal(
     score: Optional[float] = None,
 ) -> str:
     direction = str(event.get("direction", "")).upper()
-    title = "🚨 LONG SIGNAL" if direction == "LONG" else "🔻 SHORT SIGNAL"
+    header_prefix = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+    
     fact = event.get("event_fact", {})
     ts = event.get("timestamps", {})
     setup = setup or {}
+    execution = execution or {}
 
     def esc(v: Any) -> str:
-        return html.escape("—" if v is None else str(v), quote=False)
+        return html.escape("—" if v is None or v == "" else str(v), quote=False)
 
-    score_str = f" · Score: <b>{score:.0f}/100</b>" if score is not None else ""
+    name = getattr(coinalyze_row, "name", None) or event.get("symbol", "")
+    symbol = event.get("symbol", "")
+    event_type = event.get("event_type", "")
+    timeframe = event.get("timeframe", "1h")
+    price = fact.get("detection_close_price") or fact.get("close")
+    detected_ts = ts.get("detected_at_ts")
 
     require_trig = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
     trigger_suffix = " + trigger 15m (Vol Confirmed)" if require_trig else ""
+    score_str = f"{score:.0f}/100" if score is not None else "—"
+
     lines = [
-        f"<b>{title}</b>{score_str}",
-        "",
-        f"<b>{esc(getattr(coinalyze_row, 'name', None) or event.get('symbol'))}</b> "
-        f"(<code>{esc(event.get('symbol'))}</code>)",
-        f"Event: <code>{esc(event.get('event_type'))}</code>",
-        f"TF: <b>{esc(event.get('timeframe', '1h'))}</b>{trigger_suffix}",
-        f"Price: <code>{esc(fact.get('detection_close_price'))}</code>",
-        f"Detected: <code>{esc(ts.get('detected_at_ts'))}</code>",
+        f"<b>{header_prefix} - {esc(name)} ({esc(symbol)})</b>",
+        f"Score: <b>{score_str}</b>",
+        f"Event: <code>{esc(event_type)}</code>",
+        f"TF: <b>{esc(timeframe)}</b>{trigger_suffix}",
+        f"Price: <code>{esc(price)}</code>",
+        f"Detected: <code>{esc(detected_ts)}</code>",
     ]
 
-    if "p1_price" in fact:
-        lines += [
-            "",
-            "<b>Divergence</b>",
-            f"P1: <code>{esc(fact.get('p1_price'))}</code>",
-            f"P2: <code>{esc(fact.get('p2_price'))}</code>",
-            f"Price Δ / ATR: <code>{esc(round(float(fact.get('price_delta_atr', 0)), 3))}</code>",
-        ]
-
-    if "squeeze_duration_bars" in fact:
-        lines += [
-            "",
-            "<b>Volatility Squeeze</b>",
-            f"Duration: <code>{esc(fact.get('squeeze_duration_bars'))} bars</code>",
-            f"BB / KC Width: <code>{esc(round(float(fact.get('compression_ratio', 0)), 3))}</code>",
-        ]
-
-    if coinalyze_row is not None:
-        oi_chg = getattr(coinalyze_row, "oi_chg4h_pct", None)
-        oi_chg_str = f"{oi_chg:+.2f}%" if oi_chg is not None else "—"
-
-        lines += [
-            "",
-            "<b>Coinalyze Derivatives</b>",
-            f"Vol24H: <code>{esc(getattr(coinalyze_row, 'volume24', None))}</code>",
-            f"OI: <code>{esc(getattr(coinalyze_row, 'oi', None))}</code>",
-            f"OI Chg 4H: <code>{esc(oi_chg_str)}</code>",
-            f"Funding OI-W: <code>{esc(getattr(coinalyze_row, 'fr_oiw', None))}</code>",
-        ]
-
     if setup:
-        rr = setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 2.0)))
-        lines += [
+        rr = setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.55)))
+        lines.extend([
             "",
             "<b>SETUP</b>",
             f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
             f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
             f"TP: <code>{esc(setup.get('target_price'))}</code>",
             f"R:R (Planned Weighted): <code>{esc(rr)}</code>",
-        ]
+        ])
 
     if execution:
-        lines += [
+        order_id = execution.get("order_id")
+        lines.extend([
             "",
             "<b>EXECUTION</b>",
             f"Mode: <code>{esc(execution.get('mode', 'vst'))}</code>",
             f"Status: <code>{esc(execution.get('status'))}</code>",
-            f"Order: <code>{esc(execution.get('order_id'))}</code>",
-        ]
+            f"Order: <code>{esc(order_id)}</code>",
+        ])
 
-    lines += ["", "⚡ Event-driven — 5×5m lifecycle is NOT used"]
     return "\n".join(lines)
