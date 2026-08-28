@@ -1,3 +1,5 @@
+# run_once.py
+
 from __future__ import annotations
 
 import json
@@ -55,10 +57,11 @@ MAX_CANDIDATES = int(
     )
 )
 
+# ПРАВКА 1: Поднят минимальный порог дневного объема до $50M для избежания slippage
 MIN_VOL = float(
     os.environ.get(
         "MIN_VOLUME_24H",
-        "10000000",
+        "50000000", 
     )
 )
 
@@ -611,12 +614,12 @@ def build_event_setup(
             "ATR unavailable"
         )
 
-    atr = float(
-        atr
-    )
+    atr = float(atr)
 
+    # ПРАВКА 2: SL расширен до 1.5 ATR во избежание закрытия позиции по шуму
+    sl_atr_multiplier = 1.5
     risk_pct_raw = (
-        atr
+        (atr * sl_atr_multiplier)
         / entry_price
         * 100.0
     )
@@ -1374,7 +1377,7 @@ def reconcile_all_open_positions() -> None:
                     risk_pct = max(
                         0.50,
                         min(
-                            float(atr)
+                            float(atr) * 1.5 # Также используем коэффициент для ремонта
                             / avg_price
                             * 100.0,
                             5.00,
@@ -2378,27 +2381,22 @@ def main() -> None:
                                 ]
                             )
 
-                            prev_high = float(
+                            # ПРАВКА 3: Теперь логика проверки учитывает previous_close для смягчения пробоя
+                            prev_close_val = float(
                                 p[
-                                    "high"
-                                ]
-                            )
-
-                            prev_low = float(
-                                p[
-                                    "low"
+                                    "close"
                                 ]
                             )
 
                             if direction == "LONG":
                                 price_confirmed = (
                                     close_val
-                                    > prev_high
+                                    > prev_close_val
                                 )
                             else:
                                 price_confirmed = (
                                     close_val
-                                    < prev_low
+                                    < prev_close_val
                                 )
 
                             if not price_confirmed:
@@ -3176,3 +3174,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 
+ 
