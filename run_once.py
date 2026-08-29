@@ -53,7 +53,10 @@ HEALTH = DATA / "health.jsonl"
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "50000000"))
-MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "5000000"))
+
+# ИЗМЕНЕНИЕ 1: Порог Open Interest поднят с 5M до 15M
+MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "15000000"))
+
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
@@ -149,6 +152,7 @@ def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) ->
     score = 50.0
     fact = ev.get("event_fact", {})
     direction = str(ev.get("direction", "LONG")).upper()
+    event_type = str(ev.get("event_type", "")).upper()
 
     try:
         delta_atr = float(fact.get("price_delta_atr", 0))
@@ -160,10 +164,13 @@ def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) ->
     elif delta_atr >= 0.5:
         score += 10.0
 
-    if "CVD" in str(ev.get("event_type", "")):
+    if "CVD" in event_type:
         score += 15.0
 
-    if "VOLATILITY_SQUEEZE_RELEASE" in str(ev.get("event_type", "")):
+    # ИЗМЕНЕНИЕ 2: Бонус за Сквиз повышен до +25 баллов
+    if "VOLATILITY_SQUEEZE_RELEASE" in event_type:
+        score += 25.0
+
         try:
             comp_ratio = float(fact.get("compression_ratio", 1.0))
         except (TypeError, ValueError):
@@ -746,7 +753,6 @@ def main() -> None:
         stats["scan_errors"] += 1
         log.error("[BINGX] Contracts refresh error: %s", exc)
 
-    # === ИСПРАВЛЕНИЕ RATE LIMIT ===
     current_open_positions = {}
     try:
         for p in get_positions():
@@ -765,7 +771,6 @@ def main() -> None:
                 current_open_positions[(bx_sym, want_dir)] = True
     except Exception as exc:
         log.error("[BINGX] Failed to pre-fetch positions for deduplication: %s", exc)
-    # ==============================
 
     candidates: List[Any] = []
     for r in rows:
@@ -832,7 +837,6 @@ def main() -> None:
                     stats["trigger_direction_failed"] += 1
                     continue
 
-                # Проверяем локальный кэш вместо запроса к бирже
                 bx_symbol = to_bx_symbol(symbol)
                 if bx_symbol and current_open_positions.get((bx_symbol, direction)):
                     continue
