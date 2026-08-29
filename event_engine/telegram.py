@@ -53,7 +53,7 @@ def format_signal(
 ) -> str:
     direction = str(event.get("direction", "")).upper()
     header_prefix = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-    
+
     fact = event.get("event_fact", {})
     ts = event.get("timestamps", {})
     setup = setup or {}
@@ -75,12 +75,30 @@ def format_signal(
 
     lines = [
         f"<b>{header_prefix} - {esc(name)} ({esc(symbol)})</b>",
+        "",
         f"Score: <b>{score_str}</b>",
         f"Event: <code>{esc(event_type)}</code>",
         f"TF: <b>{esc(timeframe)}</b>{trigger_suffix}",
         f"Price: <code>{esc(price)}</code>",
         f"Detected: <code>{esc(detected_ts)}</code>",
     ]
+
+    # Причина открытия сделки (Divergence или Squeeze)
+    if "p1_price" in fact:
+        lines.extend([
+            "",
+            "<b>Divergence</b>",
+            f"P1: <code>{esc(fact.get('p1_price'))}</code>",
+            f"P2: <code>{esc(fact.get('p2_price'))}</code>",
+            f"Price Δ / ATR: <code>{esc(round(float(fact.get('price_delta_atr', 0)), 3))}</code>",
+        ])
+    elif "squeeze_duration_bars" in fact:
+        lines.extend([
+            "",
+            "<b>Volatility Squeeze</b>",
+            f"Duration: <code>{esc(fact.get('squeeze_duration_bars'))} bars</code>",
+            f"BB / KC Width: <code>{esc(round(float(fact.get('compression_ratio', 0)), 3))}</code>",
+        ])
 
     if setup:
         rr = setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.55)))
