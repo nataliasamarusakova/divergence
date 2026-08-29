@@ -42,6 +42,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
 )
+log = logging.getLogger("event_engine.main")
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
@@ -386,7 +387,7 @@ def reconcile_all_open_positions() -> None:
     try:
         positions = get_positions()
     except Exception as exc:
-        print(f"[RECONCILIATION_ERROR] Failed to fetch positions: {exc}")
+        log.error("[RECONCILIATION_ERROR] Failed to fetch positions: %s", exc)
         return
 
     active_trades = _load_active_trades()
@@ -411,7 +412,7 @@ def reconcile_all_open_positions() -> None:
 
         prot = get_open_protection_directional(bx_symbol, direction)
         if prot.get("status") != "ok":
-            print(f"[RECONCILIATION] Cannot inspect protection for {bx_symbol}: {prot.get('error')}")
+            log.warning("[RECONCILIATION] Cannot inspect protection for %s: %s", bx_symbol, prot.get("error"))
             continue
 
         sl_orders = list(prot.get("sl_orders", []))
@@ -448,7 +449,6 @@ def reconcile_all_open_positions() -> None:
         protection_complete = sl_valid and remaining_expected_legs.issubset(known_tp_legs)
 
         if protection_complete:
-            print(f"[RECONCILIATION] {bx_symbol} ({direction}) protection OK: SL=1 TP={len(known_tp_legs)}; no changes")
             tracker_tp = _tp_orders_to_tracker(tp_orders)
             tracker_sl = _sl_order_to_tracker(sl_orders)
             if tracker_tp and tracker_sl:
@@ -460,9 +460,9 @@ def reconcile_all_open_positions() -> None:
                 )
             continue
 
-        print(
-            f"[RECONCILIATION] {bx_symbol} ({direction}) protection incomplete: "
-            f"SL={len(sl_orders)} TP={len(known_tp_legs)} (expected {len(remaining_expected_legs)}); repairing missing..."
+        log.warning(
+            "[RECONCILIATION] %s (%s) Incomplete: SL=%s, TPs=%d/%d. Repairing missing protection...",
+            bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs)
         )
 
         sl_pct = 2.0
@@ -491,7 +491,7 @@ def reconcile_all_open_positions() -> None:
                     sl_pct = risk_pct
                     tp_pct = risk_pct * 2.0
         except Exception as exc:
-            print(f"[RECONCILIATION_ATR_ERROR] {bx_symbol}: {exc}")
+            log.error("[RECONCILIATION_ATR_ERROR] %s: %s", bx_symbol, exc)
 
         tp_levels = []
         if "tp1" not in hit_legs:
@@ -540,7 +540,8 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
-            # Сообщение о восстановлении защиты с чистым переносом строк (без ━━━━━━━━━━━━━━━━━━)
+            log.info("[RECONCILIATION_RESTORED] 🛡 %s (%s) Protection repaired (SL: %.2f%%, TP: +%.2f%%)", bx_symbol, direction, sl_pct, tp_pct)
+
             send_tg(
                 f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n\n"
                 f"Недостающая защита восстановлена:\n"
@@ -554,6 +555,8 @@ def reconcile_all_open_positions() -> None:
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
+
+    log.info("[EXECUTION_OPENING] %s %s at target price %.8g...", direction, symbol, price)
 
     try:
         opened = open_market(symbol, direction, price, trade_id)
@@ -595,6 +598,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         return {"status": "POSITION_INVALID", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "position": position}
 
     execution_quality = calculate_execution_slippage(signal_price=price, actual_entry_price=actual_avg_price, direction=direction)
+    log.info(
+        "[EXECUTION_FILLED] %s %s fill confirmed at %.8g (Qty: %.8g, Slippage: %+.2f%%)",
+        direction, symbol, actual_avg_price, actual_qty, execution_quality.get("slippage_pct") or 0.0
+    )
 
     try:
         setup_for_fill = dict(setup)
@@ -657,6 +664,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     else:
         final_status = "opened_protection_failed"
 
+    log.info("[EXECUTION_PROTECTED] %s %s Protection installed: Status=%s, SL=%.2f%%, TPs=%d legs", direction, symbol, final_status, sl_pct, len(tp_levels))
+
     return {
         "status": final_status,
         "mode": EXECUTION_MODE,
@@ -676,12 +685,12 @@ def main() -> None:
         try:
             update_active_trades()
         except Exception as exc:
-            print(f"[TRACKER_ERROR] {exc}")
+            log.error("[TRACKER_ERROR] %s", exc)
 
         try:
             reconcile_all_open_positions()
         except Exception as exc:
-            print(f"[RECONCILIATION_ERROR] {exc}")
+            log.error("[RECONCILIATION_ERROR] %s", exc)
 
     stats = {
         "coinalyze_rows": 0,
@@ -718,14 +727,14 @@ def main() -> None:
         if btc_klines:
             btc_regime_df = pd.DataFrame(btc_klines)
     except Exception as exc:
-        print(f"[BTC_FETCH_ERROR] {exc}")
+        log.error("[BTC_FETCH_ERROR] %s", exc)
 
     rows: list[Any] = []
     try:
         rows = fetch_data()
     except Exception as exc:
         stats["scan_errors"] += 1
-        print(f"[COINALYZE_SCRAPE_ERROR] {exc}")
+        log.error("[COINALYZE_SCRAPE_ERROR] %s", exc)
 
     stats["coinalyze_rows"] = len(rows)
 
@@ -733,7 +742,7 @@ def main() -> None:
         refresh_contracts()
     except Exception as exc:
         stats["scan_errors"] += 1
-        print(f"[BINGX] contracts refresh error={exc}")
+        log.error("[BINGX_CONTRACTS_ERROR] %s", exc)
 
     candidates: List[Any] = []
     for r in rows:
@@ -849,7 +858,7 @@ def main() -> None:
                     except Exception as exc:
                         stats["trigger_data_failed"] += 1
                         stats["scan_errors"] += 1
-                        print(f"[15M_FETCH_ERROR] {symbol}: {exc}")
+                        log.warning("[15M_FETCH_ERROR] %s: %s", symbol, exc)
                         continue
 
                     if len(k15) < 20:
@@ -936,7 +945,7 @@ def main() -> None:
 
         except Exception as exc:
             stats["scan_errors"] += 1
-            print(f"[SCAN_ERROR] {symbol}: {exc}")
+            log.error("[SCAN_ERROR] %s: %s", symbol, exc)
 
     stats["valid_signals"] = len(opportunities)
     opportunities.sort(key=lambda x: x["score"], reverse=True)
@@ -1025,7 +1034,7 @@ def main() -> None:
                         requested_entry_price=price,
                     )
                 except Exception as exc:
-                    print(f"[REGISTER_ACTIVE_TRADE_ERROR] {symbol}: {exc}")
+                    log.error("[REGISTER_ACTIVE_TRADE_ERROR] %s: %s", symbol, exc)
 
         elif not EXECUTION_ENABLED:
             execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
@@ -1073,42 +1082,13 @@ def main() -> None:
     try:
         append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES)
     except Exception as exc:
-        print(f"[SHADOW_HEALTH_ERROR] {exc}")
+        log.error("[SHADOW_HEALTH_ERROR] %s", exc)
 
-    print("==============================")
-    print("[FORENSIC SUMMARY]")
-    for key in (
-        "coinalyze_rows",
-        "liquidity_candidates",
-        "contract_candidates",
-        "candidates_scanned",
-        "divergence_events",
-        "squeeze_events",
-        "events_total",
-        "fresh_events",
-        "fresh_long",
-        "fresh_short",
-        "fresh_divergence",
-        "fresh_squeeze",
-        "rejected_age",
-        "rejected_btc",
-        "trigger_passed",
-        "trigger_no_window",
-        "trigger_breakout_failed",
-        "trigger_volume_failed",
-        "trigger_data_failed",
-        "trigger_direction_failed",
-        "rejected_trigger",
-        "rejected_cvd",
-        "valid_signals",
-        "execution_attempts",
-        "trades",
-        "scan_errors",
-    ):
-        print(f"{key}={stats[key]}")
-    print("==============================")
-    print(f"[ENGINE] trades_this_cycle={trades_this_cycle}")
-    print("[ENGINE_SUMMARY] " + " ".join(f"{k}={v}" for k, v in stats.items()))
+    log.info(
+        "[CYCLE_COMPLETED] Scanned: %d | Candidates: %d | Divergences: %d | Squeezes: %d | Signals: %d | Trades: %d",
+        stats["candidates_scanned"], stats["liquidity_candidates"], stats["divergence_events"],
+        stats["squeeze_events"], stats["valid_signals"], stats["trades"]
+    )
 
 
 if __name__ == "__main__":
