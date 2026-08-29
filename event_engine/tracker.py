@@ -1,5 +1,3 @@
-# tracker.py
-
 from __future__ import annotations
 
 import json
@@ -241,7 +239,7 @@ def format_trade_closed_message(
     name: str, symbol: str, direction: str, entry_price: float, exit_price: float,
     pnl_pct: float, realized_rr: float | None, planned_rr: float | None,
     duration_min: float, peak_pnl: float, max_drawdown: float,
-    exit_reason: str, event_type: str, research: dict | None = None,
+    exit_reason: str, event_type: str,
 ) -> str:
     is_win = pnl_pct >= 0.0
     emoji = "💚" if is_win else "💔"
@@ -543,7 +541,7 @@ def update_active_trades() -> None:
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 
                     log.info(
-                        "[TRACKER] TP hit: %s (%s) Leg: %s | PnL: +%.2f%% | Exec: %.8g | Remaining: %.8f (%.1f%%)",
+                        "[TRACKER_TP_HIT] 💰 %s (%s) Leg: %s | PnL: +%.2f%% | Exec: %.8g | Remaining: %.8f (%.1f%%)",
                         trade.get("name", symbol), symbol, leg, pnl_tp, exec_price, rem_qty, rem_pct
                     )
 
@@ -563,7 +561,7 @@ def update_active_trades() -> None:
                     except Exception:
                         pass
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Логируется в консоль)
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Только в консоль)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
                         old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
                         new_sl = _move_sl_to_break_even(
@@ -579,12 +577,12 @@ def update_active_trades() -> None:
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
                             log.info(
-                                "[TRACKER] BE activated: %s (%s) Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                "[TRACKER_BE_ACTIVATED] 🛡 %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
                             )
                         else:
                             log.error(
-                                "[TRACKER] BE failed: %s (%s) Error: %s",
+                                "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")
                             )
 
@@ -642,7 +640,7 @@ def update_active_trades() -> None:
 
             emoji = "💚" if final_pnl >= 0 else "💔"
             log.info(
-                "[TRACKER] Trade closed: %s %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min",
+                "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min",
                 emoji, trade.get("name", symbol), symbol, final_pnl,
                 (f"{realized_rr:.3f}" if realized_rr is not None else "—"),
                 planned_rr, exit_price, exit_reason, duration_min
@@ -686,4 +684,4 @@ def update_active_trades() -> None:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
             updated_trades[event_id] = trade
 
-    _save_active_trades(updated_trades) 
+    _save_active_trades(updated_trades)
