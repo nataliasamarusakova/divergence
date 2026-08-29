@@ -42,7 +42,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
 )
-log = logging.getLogger("event_engine.main")
+log = logging.getLogger("event_engine")
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
@@ -387,7 +387,7 @@ def reconcile_all_open_positions() -> None:
     try:
         positions = get_positions()
     except Exception as exc:
-        log.error("[RECONCILIATION_ERROR] Failed to fetch positions: %s", exc)
+        log.error("[RECONCILIATION] Failed to fetch positions: %s", exc)
         return
 
     active_trades = _load_active_trades()
@@ -461,8 +461,8 @@ def reconcile_all_open_positions() -> None:
             continue
 
         log.warning(
-            "[RECONCILIATION] %s (%s) Incomplete: SL=%s, TPs=%d/%d. Repairing missing protection...",
-            bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs)
+            "[RECONCILIATION] %s (%s) Incomplete: SL=%s, TPs=%d/%d (hit: %s). Repairing missing...",
+            bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs), list(hit_legs)
         )
 
         sl_pct = 2.0
@@ -491,7 +491,7 @@ def reconcile_all_open_positions() -> None:
                     sl_pct = risk_pct
                     tp_pct = risk_pct * 2.0
         except Exception as exc:
-            log.error("[RECONCILIATION_ATR_ERROR] %s: %s", bx_symbol, exc)
+            log.error("[RECONCILIATION] ATR error for %s: %s", bx_symbol, exc)
 
         tp_levels = []
         if "tp1" not in hit_legs:
@@ -540,7 +540,7 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
-            log.info("[RECONCILIATION_RESTORED] 🛡 %s (%s) Protection repaired (SL: %.2f%%, TP: +%.2f%%)", bx_symbol, direction, sl_pct, tp_pct)
+            log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, TP=+%.2f%%", bx_symbol, direction, sl_pct, tp_pct)
 
             send_tg(
                 f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n\n"
@@ -556,7 +556,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
 
-    log.info("[EXECUTION_OPENING] %s %s at target price %.8g...", direction, symbol, price)
+    log.info("[EXECUTION] Opening market position: %s %s at ref price %.8g...", direction, symbol, price)
 
     try:
         opened = open_market(symbol, direction, price, trade_id)
@@ -599,7 +599,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     execution_quality = calculate_execution_slippage(signal_price=price, actual_entry_price=actual_avg_price, direction=direction)
     log.info(
-        "[EXECUTION_FILLED] %s %s fill confirmed at %.8g (Qty: %.8g, Slippage: %+.2f%%)",
+        "[EXECUTION] Fill confirmed: %s %s at avgPrice=%.8g (Qty: %.8g, Slippage: %+.2f%%)",
         direction, symbol, actual_avg_price, actual_qty, execution_quality.get("slippage_pct") or 0.0
     )
 
@@ -664,7 +664,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     else:
         final_status = "opened_protection_failed"
 
-    log.info("[EXECUTION_PROTECTED] %s %s Protection installed: Status=%s, SL=%.2f%%, TPs=%d legs", direction, symbol, final_status, sl_pct, len(tp_levels))
+    log.info("[EXECUTION] Protection installed for %s %s: Status=%s, SL=%.2f%%, TPs=%d legs", direction, symbol, final_status, sl_pct, len(tp_levels))
 
     return {
         "status": final_status,
@@ -681,16 +681,20 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 
 def main() -> None:
+    log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
+
     if EXECUTION_ENABLED:
         try:
+            log.info("[TRACKER] Checking active trades lifecycle & TP execution...")
             update_active_trades()
         except Exception as exc:
-            log.error("[TRACKER_ERROR] %s", exc)
+            log.error("[TRACKER] Update error: %s", exc)
 
         try:
+            log.info("[RECONCILIATION] Reconciling open positions and protection...")
             reconcile_all_open_positions()
         except Exception as exc:
-            log.error("[RECONCILIATION_ERROR] %s", exc)
+            log.error("[RECONCILIATION] Error: %s", exc)
 
     stats = {
         "coinalyze_rows": 0,
@@ -726,23 +730,31 @@ def main() -> None:
         btc_klines = fetch_klines("BTC-USDT", "1h", limit=10)
         if btc_klines:
             btc_regime_df = pd.DataFrame(btc_klines)
+            last_c = float(btc_regime_df["close"].iloc[-1])
+            prev_1h = float(btc_regime_df["close"].iloc[-2])
+            prev_4h = float(btc_regime_df["close"].iloc[-5])
+            chg_1h = ((last_c - prev_1h) / prev_1h) * 100.0
+            chg_4h = ((last_c - prev_4h) / prev_4h) * 100.0
+            log.info("[BTC_REGIME] BTC: %.1f | 1H: %+.2f%% | 4H: %+.2f%% | Filter: OK", last_c, chg_1h, chg_4h)
     except Exception as exc:
-        log.error("[BTC_FETCH_ERROR] %s", exc)
+        log.error("[BTC_REGIME] Fetch error: %s", exc)
 
     rows: list[Any] = []
     try:
         rows = fetch_data()
+        log.info("[COINALYZE] Ingested %d rows from Coinalyze.", len(rows))
     except Exception as exc:
         stats["scan_errors"] += 1
-        log.error("[COINALYZE_SCRAPE_ERROR] %s", exc)
+        log.error("[COINALYZE] Scrape error: %s", exc)
 
     stats["coinalyze_rows"] = len(rows)
 
     try:
-        refresh_contracts()
+        contracts = refresh_contracts()
+        log.info("[BINGX] Refreshed %d active perpetual contracts.", len(contracts))
     except Exception as exc:
         stats["scan_errors"] += 1
-        log.error("[BINGX_CONTRACTS_ERROR] %s", exc)
+        log.error("[BINGX] Contracts refresh error: %s", exc)
 
     candidates: List[Any] = []
     for r in rows:
@@ -771,6 +783,8 @@ def main() -> None:
         candidates = candidates[:MAX_CANDIDATES]
 
     stats["candidates_scanned"] = len(candidates)
+    log.info("[UNIVERSE] %d liquidity candidates ($%.0fM Vol, $%.0fM OI) -> %d scanned on BingX.", stats["liquidity_candidates"], MIN_VOL/1e6, MIN_OI/1e6, len(candidates))
+
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
     telegram_sent_event_ids = load_ids(ACTIONS)
@@ -842,14 +856,17 @@ def main() -> None:
                 else:
                     stats["fresh_divergence"] += 1
 
+                log.info("[SIGNALS] Fresh event: %s %s | Type: %s | Age: %.1fm", direction, symbol, event_type, age)
+
                 if event_id not in seen_events:
                     emit_event(ev)
                     seen_events.add(event_id)
 
                 if btc_regime_df is not None and symbol != "BTC-USDT":
-                    btc_ok, _ = check_btc_regime(btc_regime_df, direction)
+                    btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
                     if not btc_ok:
                         stats["rejected_btc"] += 1
+                        log.info("[SIGNALS] %s %s blocked by BTC: %s", direction, symbol, btc_reason)
                         continue
 
                 if d15 is None:
@@ -858,7 +875,7 @@ def main() -> None:
                     except Exception as exc:
                         stats["trigger_data_failed"] += 1
                         stats["scan_errors"] += 1
-                        log.warning("[15M_FETCH_ERROR] %s: %s", symbol, exc)
+                        log.warning("[SIGNALS] 15M fetch error for %s: %s", symbol, exc)
                         continue
 
                     if len(k15) < 20:
@@ -886,6 +903,7 @@ def main() -> None:
                     trigger_ok = build_15m_trigger(d15, direction, min_vol_mult=1.05)
                     if not trigger_ok:
                         stats["rejected_trigger"] += 1
+                        log.info("[SIGNALS] %s %s (%s) failed 15m trigger.", direction, symbol, event_type)
                         continue
                     stats["trigger_passed"] += 1
                 else:
@@ -901,6 +919,7 @@ def main() -> None:
 
                     if not pd.notna(cvd24_value) or cvd24_value <= CVD_MIN_CONFIRMATION:
                         stats["rejected_cvd"] += 1
+                        log.info("[SIGNALS] %s %s CVD low (%.1f <= %.1f)", direction, symbol, cvd24_value or 0, CVD_MIN_CONFIRMATION)
                         continue
 
                 fact = ev.get("event_fact", {})
@@ -930,6 +949,9 @@ def main() -> None:
                     continue
                 opportunity_keys.add(opportunity_key)
 
+                log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g",
+                         direction, symbol, score, event_type, signal_price, setup['invalidation_price'], setup['target_price'])
+
                 opportunities.append(
                     {
                         "event": ev,
@@ -945,10 +967,14 @@ def main() -> None:
 
         except Exception as exc:
             stats["scan_errors"] += 1
-            log.error("[SCAN_ERROR] %s: %s", symbol, exc)
+            log.error("[SCAN] Error scanning %s: %s", symbol, exc)
 
     stats["valid_signals"] = len(opportunities)
     opportunities.sort(key=lambda x: x["score"], reverse=True)
+
+    log.info("[RANKING] Valid signals count: %d.", len(opportunities))
+    for i, opp in enumerate(opportunities[:5], start=1):
+        log.info("  [RANKING] #%d: %s %s | Score: %.0f | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
     trades_this_cycle = 0
 
@@ -964,8 +990,10 @@ def main() -> None:
 
         if event_id in executed_event_ids:
             execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
+            log.info("[EXECUTION] %s (%s) - Already executed previously.", symbol, event_id)
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
+            log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle + 1, MAX_TRADES, direction, symbol, score, price)
             execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
 
             actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
@@ -1034,12 +1062,14 @@ def main() -> None:
                         requested_entry_price=price,
                     )
                 except Exception as exc:
-                    log.error("[REGISTER_ACTIVE_TRADE_ERROR] %s: %s", symbol, exc)
+                    log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
 
         elif not EXECUTION_ENABLED:
             execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
+            log.info("[EXECUTION] %s %s skipped: EXECUTION_ENABLED is false.", direction, symbol)
         else:
             execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
+            log.info("[EXECUTION] %s %s skipped: cycle limit reached (%d/%d).", direction, symbol, trades_this_cycle, MAX_TRADES)
 
         msg = format_signal(
             ev,
@@ -1065,6 +1095,7 @@ def main() -> None:
                 sent = False
             if sent:
                 telegram_sent_event_ids.add(event_id)
+                log.info("[TELEGRAM] Notification sent for %s %s (%s).", direction, symbol, event_id)
 
         record_action(
             {
@@ -1082,13 +1113,12 @@ def main() -> None:
     try:
         append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES)
     except Exception as exc:
-        log.error("[SHADOW_HEALTH_ERROR] %s", exc)
+        log.error("[SHADOW] Health snapshot error: %s", exc)
 
-    log.info(
-        "[CYCLE_COMPLETED] Scanned: %d | Candidates: %d | Divergences: %d | Squeezes: %d | Signals: %d | Trades: %d",
-        stats["candidates_scanned"], stats["liquidity_candidates"], stats["divergence_events"],
-        stats["squeeze_events"], stats["valid_signals"], stats["trades"]
-    )
+    summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
+    log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)
+    log.info("[SUMMARY] [ENGINE_SUMMARY] trades_this_cycle=%d %s", trades_this_cycle, summary_str)
+    log.info("========== [ENGINE] CYCLE END: trades_this_cycle=%d ==========", trades_this_cycle)
 
 
 if __name__ == "__main__":
