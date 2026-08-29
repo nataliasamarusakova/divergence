@@ -50,10 +50,10 @@ def _load_active_trades() -> dict[str, dict]:
         data = json.loads(ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
-        log.error("[TRACKER_INVALID_STATE] %s is not a JSON object", ACTIVE_TRADES_PATH)
+        log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
         return {}
     except Exception as exc:
-        log.error("[TRACKER_CORRUPT_STATE] Failed to read %s: %s", ACTIVE_TRADES_PATH, exc)
+        log.error("[TRACKER] Corrupt state in %s: %s", ACTIVE_TRADES_PATH, exc)
         return {}
 
 
@@ -294,7 +294,7 @@ def _move_sl_to_break_even(
                     try:
                         cancel_order(symbol, old_sl_id)
                     except Exception as exc:
-                        log.warning("[TRACKER_BE_OLD_SL_CANCEL_ERROR] %s: %s", symbol, exc)
+                        log.warning("[TRACKER] Old SL cancel error for %s: %s", symbol, exc)
                 return {
                     "status": "created",
                     "order_id": existing_id,
@@ -421,7 +421,7 @@ def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | Non
     try:
         sl_info = get_order(symbol, sl_order_id)
     except Exception as exc:
-        log.warning("[TRACKER_SL_ORDER_ERROR] %s: %s", symbol, exc)
+        log.warning("[TRACKER] SL order query error for %s: %s", symbol, exc)
         return None, None
 
     if sl_info.get("status") != "ok":
@@ -485,7 +485,7 @@ def update_active_trades() -> None:
                     cur_price = _safe_float(k1m[-1].get("close"), entry_price)
                     _update_mfe_mae(trade, k1m)
             except Exception as exc:
-                log.warning("[TRACKER_KLINE_ERROR] %s: %s", symbol, exc)
+                log.warning("[TRACKER] Kline fetch error for %s: %s", symbol, exc)
 
             current_pnl = _calc_trade_pnl_pct(entry_price, cur_price, direction)
             trade["current_pnl_pct"] = current_pnl
@@ -542,9 +542,8 @@ def update_active_trades() -> None:
                     hit_legs.add(leg)
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 
-                    # Лог исполнения Тейка в консоль
                     log.info(
-                        "[TRACKER_TP_HIT] 💰 %s (%s) Leg: %s | PnL: +%.2f%% | Exec: %.8g | Remaining: %.8f (%.1f%%)",
+                        "[TRACKER] TP hit: %s (%s) Leg: %s | PnL: +%.2f%% | Exec: %.8g | Remaining: %.8f (%.1f%%)",
                         trade.get("name", symbol), symbol, leg, pnl_tp, exec_price, rem_qty, rem_pct
                     )
 
@@ -564,7 +563,7 @@ def update_active_trades() -> None:
                     except Exception:
                         pass
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Лог в консоль, без отправки в TG)
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Логируется в консоль)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
                         old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
                         new_sl = _move_sl_to_break_even(
@@ -580,12 +579,12 @@ def update_active_trades() -> None:
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
                             log.info(
-                                "[TRACKER_BE_ACTIVATED] 🛡 %s (%s) TP1 taken. Stop Loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                "[TRACKER] BE activated: %s (%s) Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
                             )
                         else:
                             log.error(
-                                "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
+                                "[TRACKER] BE failed: %s (%s) Error: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")
                             )
 
@@ -641,10 +640,9 @@ def update_active_trades() -> None:
             trade["duration_min"] = duration_min
             trade["closed"] = True
 
-            # Лог закрытия сделки в консоль
             emoji = "💚" if final_pnl >= 0 else "💔"
             log.info(
-                "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min",
+                "[TRACKER] Trade closed: %s %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min",
                 emoji, trade.get("name", symbol), symbol, final_pnl,
                 (f"{realized_rr:.3f}" if realized_rr is not None else "—"),
                 planned_rr, exit_price, exit_reason, duration_min
@@ -671,7 +669,6 @@ def update_active_trades() -> None:
             except Exception:
                 pass
 
-            # Отмена оставшихся защитных ордеров
             for tp in trade.get("tp_orders", []):
                 if tp.get("leg") not in hit_legs and tp.get("order_id"):
                     try:
@@ -686,7 +683,7 @@ def update_active_trades() -> None:
                     pass
 
         except Exception as exc:
-            log.exception("[TRACKER_FATAL_TRADE_ERROR] %s: %s", event_id, exc)
+            log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
             updated_trades[event_id] = trade
 
-    _save_active_trades(updated_trades)
+    _save_active_trades(updated_trades) 
