@@ -141,7 +141,7 @@ def detect_divergences(
     left: int = 3,
     right: int = 2,
     min_bars: int = 5,
-    max_bars: int = 16,  # ИЗМЕНЕНИЕ: Сокращено с 35 до 16 баров
+    max_bars: int = 16,  # Сокращено с 35 до 16 свечей
     min_delta_atr: float = 0.25,
 ) -> list[dict[str, Any]]:
 
