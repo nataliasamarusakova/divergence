@@ -160,9 +160,9 @@ def test_allocate_tp_quantities_exact_sum():
         position_qty=100.0,
         precision=0,
         min_qty=10.0,
-        fractions=[0.30, 0.30, 0.40],
+        fractions=[0.35, 0.35, 0.30],
     )
-    assert qtys == [30.0, 30.0, 40.0]
+    assert qtys == [35.0, 35.0, 30.0]
     assert sum(qtys) == 100.0
 
     # 2. Fractional precision
@@ -170,9 +170,9 @@ def test_allocate_tp_quantities_exact_sum():
         position_qty=1.0,
         precision=2,
         min_qty=0.1,
-        fractions=[0.30, 0.30, 0.40],
+        fractions=[0.35, 0.35, 0.30],
     )
-    assert qtys_frac == [0.30, 0.30, 0.40]
+    assert qtys_frac == [0.35, 0.35, 0.30]
     assert round(sum(qtys_frac), 2) == 1.0
 
     # 3. Step rounding remainder distribution
@@ -191,7 +191,7 @@ def test_allocate_tp_quantities_exact_sum():
             position_qty=2.0,
             precision=0,
             min_qty=1.0,
-            fractions=[0.30, 0.30, 0.40],
+            fractions=[0.35, 0.35, 0.30],
         )
 
 
@@ -239,7 +239,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == 1.55
+    assert setup_long["planned_weighted_rr"] == 1.05
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 3
@@ -249,7 +249,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == 1.55
+    assert setup_short["planned_weighted_rr"] == 1.05
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 3
@@ -265,5 +265,3 @@ def test_rsi_warmup_preserves_nan():
     # Post-warmup bars must be valid numbers
     assert pd.notna(rsi.iloc[14])
     assert pd.notna(rsi.iloc[-1])
-
-
