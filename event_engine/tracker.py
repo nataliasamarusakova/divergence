@@ -1,6 +1,6 @@
 # tracker.py
 
-from __future__ import annotations
+ from __future__ import annotations
 
 import json
 import logging
@@ -228,8 +228,7 @@ def format_tp_hit_message(
     exec_price: float, closed_qty: float, remaining_qty: float, remaining_pct: float,
 ) -> str:
     return (
-        f"💰 <b>{name} ({symbol})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>{name} ({symbol})</b>\n\n"
         f"Leg: <b>{leg}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
         f"Цена исполнения: <code>{exec_price:.8g}</code>\n"
@@ -238,20 +237,11 @@ def format_tp_hit_message(
     )
 
 
-def format_be_message(name: str, symbol: str, entry_price: float) -> str:
-    return (
-        f"🛡 <b>{name} ({symbol}) — БЕЗУБЫТОК</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"TP1 взят! Стоп-лосс перенесен на точку входа: <code>{entry_price:.8g}</code>\n"
-        f"Текущий риск по сделке: <b>0.00%</b>"
-    )
-
-
 def format_trade_closed_message(
     name: str, symbol: str, direction: str, entry_price: float, exit_price: float,
     pnl_pct: float, realized_rr: float | None, planned_rr: float | None,
     duration_min: float, peak_pnl: float, max_drawdown: float,
-    exit_reason: str, event_type: str, research: dict,
+    exit_reason: str, event_type: str, research: dict | None = None,
 ) -> str:
     is_win = pnl_pct >= 0.0
     emoji = "💚" if is_win else "💔"
@@ -261,28 +251,13 @@ def format_trade_closed_message(
 
     lines = [
         f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
-        "━━━━━━━━━━━━━━━━━━",
+        "",
         f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Выход по: <b>{exit_reason}</b>",
         f"Вход был: <code>{event_type}</code> · TF <b>1h</b>",
     ]
-
-    if research:
-        lines.append("━━━━━━━━━━━━━━━━━━")
-        lines.append("📊 Research")
-        res_parts = []
-        mappings = [
-            ("FR·OI", "fr_oiw"), ("PFR·OI", "pfr_oiw"), ("L/S", "ls_accounts"),
-            ("LiqShort", "liq_short24"), ("LiqLong", "liq_long24"),
-            ("OI Chg 4H", "oi_chg4h_pct"), ("CVD24", "cvd24"), ("LLS24", "lls24"),
-        ]
-        for label, key in mappings:
-            value = research.get(key)
-            if value is not None:
-                res_parts.append(f"{label}: <code>{value}</code>")
-        lines.append(" · ".join(res_parts) if res_parts else "—")
 
     return "\n".join(lines)
 
@@ -583,7 +558,7 @@ def update_active_trades() -> None:
                     except Exception:
                         pass
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Уведомление в TG отключено по запросу)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
                         old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
                         new_sl = _move_sl_to_break_even(
@@ -598,10 +573,6 @@ def update_active_trades() -> None:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
-                            try:
-                                send_tg(format_be_message(trade.get("name", symbol), symbol, entry_price))
-                            except Exception:
-                                pass
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
@@ -671,7 +642,6 @@ def update_active_trades() -> None:
                         max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
                         exit_reason=exit_reason,
                         event_type=trade.get("event_type", "DIVERGENCE"),
-                        research=trade.get("research", {}),
                     )
                 )
             except Exception:
