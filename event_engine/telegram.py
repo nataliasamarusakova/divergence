@@ -1,5 +1,3 @@
-# telegram.py
-
 from __future__ import annotations
 
 import html
@@ -83,7 +81,6 @@ def format_signal(
         f"Detected: <code>{esc(detected_ts)}</code>",
     ]
 
-    # Причина открытия сделки (Divergence или Squeeze)
     if "p1_price" in fact:
         lines.extend([
             "",
