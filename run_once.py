@@ -1,5 +1,3 @@
-# run_once.py
-
 from __future__ import annotations
 
 import json
@@ -21,6 +19,7 @@ from event_engine.bingx import (
     get_positions,
     get_open_protection_directional,
     ensure_directional_protection,
+    has_open_position,
 )
 from event_engine.signals import (
     add_cvd,
@@ -569,11 +568,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     open_status = str(opened.get("status", "")).lower()
     if open_status not in {"opened", "success", "ok"}:
         return {
-            "status": "OPEN_FAILED",
+            "status": "EXISTING_POSITION" if open_status == "existing_position" else "OPEN_FAILED",
             "mode": EXECUTION_MODE,
             "order_id": opened.get("order_id"),
             "open_result": opened,
-            "error": opened.get("error") or opened.get("msg") or "unknown_open_error",
+            "error": opened.get("error") or opened.get("msg") or open_status,
             "bingx_code": opened.get("code"),
         }
 
@@ -683,6 +682,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 def main() -> None:
     log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
 
+    active_trades = _load_active_trades()
+
     if EXECUTION_ENABLED:
         try:
             log.info("[TRACKER] Checking active trades lifecycle & TP execution...")
@@ -789,8 +790,7 @@ def main() -> None:
     executed_event_ids = load_successful_trade_ids(TRADES)
     telegram_sent_event_ids = load_ids(ACTIONS)
 
-    opportunities: List[dict] = []
-    opportunity_keys: set[tuple] = set()
+    best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     for r in candidates:
         symbol = r.symbol
@@ -820,6 +820,9 @@ def main() -> None:
                 direction = str(ev.get("direction", "")).upper()
                 if direction not in {"LONG", "SHORT"}:
                     stats["trigger_direction_failed"] += 1
+                    continue
+
+                if has_open_position(symbol, direction):
                     continue
 
                 timestamps = ev.get("timestamps", {})
@@ -937,42 +940,36 @@ def main() -> None:
                 setup = build_event_setup(ev=ev, df_1h=d1, entry_price=signal_price)
                 score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15)
 
-                opportunity_key = (
-                    symbol,
-                    direction,
-                    event_type,
-                    timestamps.get("pivot_1_ts"),
-                    timestamps.get("pivot_2_ts"),
-                )
+                opp_key = (symbol, direction)
+                new_candidate = {
+                    "event": ev,
+                    "event_id": event_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "price": signal_price,
+                    "setup": setup,
+                    "score": score,
+                    "coinalyze_row": r,
+                }
 
-                if opportunity_key in opportunity_keys:
-                    continue
-                opportunity_keys.add(opportunity_key)
+                if opp_key in best_opportunities_map:
+                    if score > best_opportunities_map[opp_key]["score"]:
+                        best_opportunities_map[opp_key] = new_candidate
+                else:
+                    best_opportunities_map[opp_key] = new_candidate
 
                 log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g",
                          direction, symbol, score, event_type, signal_price, setup['invalidation_price'], setup['target_price'])
-
-                opportunities.append(
-                    {
-                        "event": ev,
-                        "event_id": event_id,
-                        "symbol": symbol,
-                        "direction": direction,
-                        "price": signal_price,
-                        "setup": setup,
-                        "score": score,
-                        "coinalyze_row": r,
-                    }
-                )
 
         except Exception as exc:
             stats["scan_errors"] += 1
             log.error("[SCAN] Error scanning %s: %s", symbol, exc)
 
+    opportunities = list(best_opportunities_map.values())
     stats["valid_signals"] = len(opportunities)
     opportunities.sort(key=lambda x: x["score"], reverse=True)
 
-    log.info("[RANKING] Valid signals count: %d.", len(opportunities))
+    log.info("[RANKING] Unique signals ready: %d.", len(opportunities))
     for i, opp in enumerate(opportunities[:5], start=1):
         log.info("  [RANKING] #%d: %s %s | Score: %.0f | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
@@ -988,9 +985,9 @@ def main() -> None:
         r = opp["coinalyze_row"]
         ev = opp["event"]
 
-        if event_id in executed_event_ids:
+        if event_id in executed_event_ids or has_open_position(symbol, direction):
             execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
-            log.info("[EXECUTION] %s (%s) - Already executed previously.", symbol, event_id)
+            log.info("[EXECUTION] %s (%s) - Already open/executed.", symbol, direction)
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
             log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle + 1, MAX_TRADES, direction, symbol, score, price)
@@ -1086,9 +1083,9 @@ def main() -> None:
             "opened_protection_failed",
         }
 
-        telegram_already_sent = event_id in telegram_sent_event_ids and not is_real_execution
+        telegram_already_sent = event_id in telegram_sent_event_ids
         sent = False
-        if not telegram_already_sent:
+        if is_real_execution and not telegram_already_sent:
             try:
                 sent = bool(send_tg(msg))
             except Exception:
