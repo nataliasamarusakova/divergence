@@ -1,6 +1,6 @@
 # run_once.py
 
-from __future__ import annotations
+ from __future__ import annotations
 
 import json
 import logging
@@ -540,6 +540,16 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
+            # Сообщение о восстановлении защиты с чистым переносом строк (без ━━━━━━━━━━━━━━━━━━)
+            send_tg(
+                f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n\n"
+                f"Недостающая защита восстановлена:\n"
+                f"• Направление: <b>{direction}</b>\n"
+                f"• Цена входа: <code>{avg_price:.8g}</code>\n"
+                f"• SL: <code>{sl_pct:.2f}%</code>\n"
+                f"• TP: <code>+{tp_pct:.2f}%</code> (каскад)"
+            )
+
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
     direction = str(direction).upper()
@@ -1022,7 +1032,6 @@ def main() -> None:
         else:
             execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
 
-        # Форматируем сообщение по чистому шаблону (без дублирования заголовка)
         msg = format_signal(
             ev,
             setup=setup,
