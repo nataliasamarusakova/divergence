@@ -542,6 +542,12 @@ def update_active_trades() -> None:
                     hit_legs.add(leg)
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 
+                    # Лог исполнения Тейка в консоль
+                    log.info(
+                        "[TRACKER_TP_HIT] 💰 %s (%s) Leg: %s | PnL: +%.2f%% | Exec: %.8g | Remaining: %.8f (%.1f%%)",
+                        trade.get("name", symbol), symbol, leg, pnl_tp, exec_price, rem_qty, rem_pct
+                    )
+
                     try:
                         send_tg(
                             format_tp_hit_message(
@@ -558,7 +564,7 @@ def update_active_trades() -> None:
                     except Exception:
                         pass
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Уведомление в TG отключено по запросу)
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Лог в консоль, без отправки в TG)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
                         old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
                         new_sl = _move_sl_to_break_even(
@@ -573,6 +579,15 @@ def update_active_trades() -> None:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
+                            log.info(
+                                "[TRACKER_BE_ACTIVATED] 🛡 %s (%s) TP1 taken. Stop Loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                trade.get("name", symbol), symbol, entry_price
+                            )
+                        else:
+                            log.error(
+                                "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
+                                trade.get("name", symbol), symbol, new_sl.get("error")
+                            )
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
@@ -625,6 +640,15 @@ def update_active_trades() -> None:
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
             trade["closed"] = True
+
+            # Лог закрытия сделки в консоль
+            emoji = "💚" if final_pnl >= 0 else "💔"
+            log.info(
+                "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min",
+                emoji, trade.get("name", symbol), symbol, final_pnl,
+                (f"{realized_rr:.3f}" if realized_rr is not None else "—"),
+                planned_rr, exit_price, exit_reason, duration_min
+            )
 
             try:
                 send_tg(
