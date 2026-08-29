@@ -10,7 +10,7 @@
     "entry_slippage_pct": 0.2633744855967123,
     "adverse_entry_slippage_pct": 0.0,
     "initial_qty": 54.86,
-    "remaining_qty": 54.86,
+    "remaining_qty": 35.66,
     "entry_ts": 1788040059664,
     "tp_orders": [
       {
@@ -26,27 +26,22 @@
         "order_id": "2093817883389419520",
         "price": 0.17359,
         "qty": 19.2
-      },
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2093817882345037824",
-        "price": 0.17816,
-        "qty": 19.2
       }
     ],
     "sl_order": {
       "status": "already_exists",
-      "order_id": "2093817878016516096",
-      "stop_price": 0.19187,
-      "qty": 54.86
+      "order_id": "2093819945321848832",
+      "stop_price": 0.18273,
+      "qty": 35.66
     },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
-    "peak_pnl_pct": 3.135774092923993,
-    "max_drawdown_pct": -3.409401849723643,
-    "current_pnl_pct": 0.47611229683139583,
+    "hit_legs": [
+      "tp1"
+    ],
+    "be_activated": true,
+    "be_activation_ts": 1788040547357,
+    "peak_pnl_pct": 3.2890056367317984,
+    "max_drawdown_pct": -5.76260055820063,
+    "current_pnl_pct": 0.22437476057570932,
     "score": 75.0,
     "event_type": "REGULAR_BEARISH_RSI",
     "research": {
@@ -82,10 +77,12 @@
     "planned_invalidation_price": 0.1913625,
     "planned_target_price": 0.166303125,
     "tp_levels": [],
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null,
+    "tp_filled_qty": {
+      "tp1": 19.2
+    },
+    "realized_pnl_qty": 19.2,
+    "realized_pnl_weighted_sum": 8.615990806107531,
+    "last_tp_exec_price": 0.18191,
     "last_close_exec_price": null,
     "realized_pnl_pct": null,
     "realized_rr": null,
@@ -94,9 +91,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788040255240,
+    "last_observation_ts": 1788040547357,
     "last_exchange_avg_price": 0.18273,
-    "current_position_qty": 54.86,
-    "protection_last_updated_ts": 1788040259562
+    "current_position_qty": 35.66,
+    "protection_last_updated_ts": 1788040552550
   }
 }
