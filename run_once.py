@@ -541,15 +541,6 @@ def reconcile_all_open_positions() -> None:
 
             log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, TP=+%.2f%%", bx_symbol, direction, sl_pct, tp_pct)
 
-            send_tg(
-                f"🛡 <b>[ЗАЩИТА ВОССТАНОВЛЕНА] {bx_symbol}</b>\n\n"
-                f"Недостающая защита восстановлена:\n"
-                f"• Направление: <b>{direction}</b>\n"
-                f"• Цена входа: <code>{avg_price:.8g}</code>\n"
-                f"• SL: <code>{sl_pct:.2f}%</code>\n"
-                f"• TP: <code>+{tp_pct:.2f}%</code> (каскад)"
-            )
-
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
     direction = str(direction).upper()
@@ -682,8 +673,6 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 def main() -> None:
     log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
 
-    active_trades = _load_active_trades()
-
     if EXECUTION_ENABLED:
         try:
             log.info("[TRACKER] Checking active trades lifecycle & TP execution...")
@@ -757,6 +746,27 @@ def main() -> None:
         stats["scan_errors"] += 1
         log.error("[BINGX] Contracts refresh error: %s", exc)
 
+    # === ИСПРАВЛЕНИЕ RATE LIMIT ===
+    current_open_positions = {}
+    try:
+        for p in get_positions():
+            bx_sym = str(p.get("symbol", "")).upper()
+            side = str(p.get("positionSide", p.get("positionAmt", ""))).upper()
+            try:
+                amt = float(p.get("positionAmt", 0) or 0)
+            except Exception:
+                amt = 0.0
+            
+            if amt != 0:
+                if side in {"LONG", "SHORT"}:
+                    want_dir = side
+                else:
+                    want_dir = "LONG" if amt > 0 else "SHORT"
+                current_open_positions[(bx_sym, want_dir)] = True
+    except Exception as exc:
+        log.error("[BINGX] Failed to pre-fetch positions for deduplication: %s", exc)
+    # ==============================
+
     candidates: List[Any] = []
     for r in rows:
         try:
@@ -822,7 +832,9 @@ def main() -> None:
                     stats["trigger_direction_failed"] += 1
                     continue
 
-                if has_open_position(symbol, direction):
+                # Проверяем локальный кэш вместо запроса к бирже
+                bx_symbol = to_bx_symbol(symbol)
+                if bx_symbol and current_open_positions.get((bx_symbol, direction)):
                     continue
 
                 timestamps = ev.get("timestamps", {})
@@ -985,7 +997,9 @@ def main() -> None:
         r = opp["coinalyze_row"]
         ev = opp["event"]
 
-        if event_id in executed_event_ids or has_open_position(symbol, direction):
+        bx_symbol = to_bx_symbol(symbol)
+        
+        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))):
             execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
             log.info("[EXECUTION] %s (%s) - Already open/executed.", symbol, direction)
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
