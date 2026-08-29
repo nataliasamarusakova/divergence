@@ -54,8 +54,8 @@ HEALTH = DATA / "health.jsonl"
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "50000000"))
 
-# ИЗМЕНЕНИЕ 1: Порог Open Interest поднят с 5M до 15M
-MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "15000000"))
+# Установлен порог Open Interest $10 000 000 по вашему запросу
+MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "10000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
@@ -167,7 +167,7 @@ def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) ->
     if "CVD" in event_type:
         score += 15.0
 
-    # ИЗМЕНЕНИЕ 2: Бонус за Сквиз повышен до +25 баллов
+    # Бонус за Сквиз: +25 баллов (лидер по прибыли)
     if "VOLATILITY_SQUEEZE_RELEASE" in event_type:
         score += 25.0
 
@@ -260,20 +260,23 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
 
     risk_pct = max(0.50, min(risk_pct_raw, 5.00))
 
+    # TP3 (финальная цель) ставится на 1.75R
     if direction == "LONG":
         invalidation = entry_price * (1.0 - risk_pct / 100.0)
-        target = entry_price * (1.0 + 2.0 * risk_pct / 100.0)
+        target = entry_price * (1.0 + 1.75 * risk_pct / 100.0)
     else:
         invalidation = entry_price * (1.0 + risk_pct / 100.0)
-        target = entry_price * (1.0 - 2.0 * risk_pct / 100.0)
+        target = entry_price * (1.0 - 1.75 * risk_pct / 100.0)
 
+    # Взвешенный R:R при фиксациях 35% на 0.50R, 35% на 1.00R, 30% на 1.75R:
+    # 0.35 * 0.50 + 0.35 * 1.00 + 0.30 * 1.75 = 1.05
     return {
         "entry_reference": entry_price,
         "invalidation_price": invalidation,
         "target_price": target,
         "risk_pct": risk_pct,
-        "target_rr": 2.0,
-        "planned_weighted_rr": 1.55,
+        "target_rr": 1.75,
+        "planned_weighted_rr": 1.05,
         "realized_rr": None,
         "trigger_ok": True,
     }
@@ -283,31 +286,32 @@ def build_tp_levels(setup: dict, direction: str) -> Tuple[float, List[dict]]:
     direction = str(direction).upper()
     entry = float(setup["entry_reference"])
     sl_price = float(setup["invalidation_price"])
-    final_tp_price = float(setup["target_price"])
 
     if entry <= 0:
         raise ValueError("entry_reference must be > 0")
 
     if direction == "LONG":
         sl_pct = (entry - sl_price) / entry * 100.0
-        tp_pct = (final_tp_price - entry) / entry * 100.0
     elif direction == "SHORT":
         sl_pct = (sl_price - entry) / entry * 100.0
-        tp_pct = (entry - final_tp_price) / entry * 100.0
     else:
         raise ValueError(f"Invalid direction={direction}")
 
-    if sl_pct <= 0 or tp_pct <= 0:
-        raise ValueError("Invalid SL/TP percentages")
+    if sl_pct <= 0:
+        raise ValueError("Invalid SL percentage")
 
+    # Оптимальный 3-уровневый каскад:
+    # TP1: 0.50 * SL (35% объема + перевод в БУ)
+    # TP2: 1.00 * SL (35% объема)
+    # TP3: 1.75 * SL (30% объема)
     tp_levels = [
-        {"leg": "tp1", "pnl_pct": round(tp_pct * 0.50, 6), "close_fraction": 0.30},
-        {"leg": "tp2", "pnl_pct": round(tp_pct * 0.75, 6), "close_fraction": 0.30},
-        {"leg": "tp3", "pnl_pct": round(tp_pct, 6), "close_fraction": 0.40},
+        {"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35},
+        {"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35},
+        {"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30},
     ]
 
     setup["risk_pct"] = sl_pct
-    setup["planned_weighted_rr"] = 1.55
+    setup["planned_weighted_rr"] = 1.05
     setup["realized_rr"] = None
     setup["tp_levels"] = tp_levels
 
@@ -472,8 +476,6 @@ def reconcile_all_open_positions() -> None:
         )
 
         sl_pct = 2.0
-        tp_pct = 4.0
-
         try:
             k1 = fetch_klines(bx_symbol, "1h", limit=30)
             if len(k1) >= 20:
@@ -495,20 +497,19 @@ def reconcile_all_open_positions() -> None:
                 if pd.notna(atr) and float(atr) > 0:
                     risk_pct = max(0.50, min(float(atr) * 1.5 / avg_price * 100.0, 5.00))
                     sl_pct = risk_pct
-                    tp_pct = risk_pct * 2.0
         except Exception as exc:
             log.error("[RECONCILIATION] ATR error for %s: %s", bx_symbol, exc)
 
         tp_levels = []
         if "tp1" not in hit_legs:
-            tp_levels.append({"leg": "tp1", "pnl_pct": round(tp_pct * 0.50, 6), "close_fraction": 0.30})
+            tp_levels.append({"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35})
         if "tp2" not in hit_legs:
-            tp_levels.append({"leg": "tp2", "pnl_pct": round(tp_pct * 0.75, 6), "close_fraction": 0.30})
+            tp_levels.append({"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35})
         if "tp3" not in hit_legs:
-            tp_levels.append({"leg": "tp3", "pnl_pct": round(tp_pct, 6), "close_fraction": 0.40})
+            tp_levels.append({"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30})
 
         if not tp_levels:
-            tp_levels = [{"leg": "tp3", "pnl_pct": round(tp_pct, 6), "close_fraction": 1.0}]
+            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
@@ -546,7 +547,7 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
-            log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, TP=+%.2f%%", bx_symbol, direction, sl_pct, tp_pct)
+            log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, TP1=+%.2f%%", bx_symbol, direction, sl_pct, sl_pct * 0.5)
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
@@ -610,10 +611,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
         if direction == "LONG":
             invalidation = actual_avg_price * (1.0 - planned_risk_pct / 100.0)
-            target = actual_avg_price * (1.0 + 2.0 * planned_risk_pct / 100.0)
+            target = actual_avg_price * (1.0 + 1.75 * planned_risk_pct / 100.0)
         else:
             invalidation = actual_avg_price * (1.0 + planned_risk_pct / 100.0)
-            target = actual_avg_price * (1.0 - 2.0 * planned_risk_pct / 100.0)
+            target = actual_avg_price * (1.0 - 1.75 * planned_risk_pct / 100.0)
 
         setup_for_fill["invalidation_price"] = invalidation
         setup_for_fill["target_price"] = target
