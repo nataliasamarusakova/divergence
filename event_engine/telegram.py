@@ -34,11 +34,19 @@ def send(text: str) -> bool:
                 timeout=15,
             )
             r.raise_for_status()
-            payload = r.json()
+            try:
+                payload = r.json()
+            except ValueError:
+                payload = {"ok": False, "description": r.text[:500]}
             if not payload.get("ok"):
                 all_ok = False
-        except Exception:
+                print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {payload.get('description', 'unknown error')}")
+        except requests.RequestException as exc:
             all_ok = False
+            print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {exc}")
+        except Exception as exc:
+            all_ok = False
+            print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {exc}")
     return all_ok
 
 
@@ -98,14 +106,19 @@ def format_signal(
         ])
 
     if setup:
-        rr = setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.55)))
+        rr = setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.05))))
+        tp_mode = setup.get("tp_mode")
+        trigger = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
         lines.extend([
             "",
             "<b>SETUP</b>",
             f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
             f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
             f"TP: <code>{esc(setup.get('target_price'))}</code>",
-            f"R:R (Planned Weighted): <code>{esc(rr)}</code>",
+            f"R:R (Effective Weighted): <code>{esc(rr)}</code>",
+            f"TP Mode: <code>{esc(tp_mode or 'multi_tp')}</code>",
+            f"Trigger Price: <code>{esc(trigger.get('trigger_price'))}</code>",
+            f"Trigger Delay: <code>{esc(trigger.get('trigger_delay_min'))} min</code>",
         ])
 
     if execution:
