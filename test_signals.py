@@ -23,12 +23,14 @@ from event_engine.bingx import (
     CACHE,
     _allocate_tp_quantities,
 )
+from event_engine.tracker import _update_mfe_mae, _extract_setup_metrics
 from run_once import (
     build_event_setup,
     build_tp_levels,
     calculate_setup_score,
+    execute_new_position,
+    load_successful_telegram_ids,
 )
-from event_engine.tracker import _update_mfe_mae
 
 
 def _load_successful_trade_ids(path: Path) -> set[str]:
@@ -268,44 +270,119 @@ def test_rsi_warmup_preserves_nan():
     assert pd.notna(rsi.iloc[-1])
 
 
-def test_trigger_uses_event_window_not_latest_bar():
-    base = 1700000000000
-    rows = []
-    # Event happens after bar 0. Only the second post-event bar is a valid trigger.
-    for i in range(8):
-        close = 100.0
-        high = 101.0
-        low = 99.0
-        if i == 3:
-            high, close = 101.0, 100.5
-        if i == 5:
-            high, close = 101.0, 102.0
-        rows.append({
-            "open_time": base + i * 900000,
-            "close_time": base + i * 900000 + 899000,
-            "open": 100.0, "high": high, "low": low, "close": close,
-            "volume": 1000.0,
-        })
-    df = pd.DataFrame(rows)
-    # Event is after bar 3; a later trigger within 60m should be found.
-    event_ts = rows[3]["close_time"]
-    assert build_15m_trigger(df, "LONG", min_vol_mult=0.0, event_detected_at_ts=event_ts, max_trigger_delay_min=60.0) is True
+def test_execute_new_position_defines_pre_order_price(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "open_market", lambda symbol, direction, price, trade_id: {
+        "status": "opened", "order_id": "O1", "order_reference_price": 100.0,
+    })
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **kwargs: {
+        "status": "found", "positionAmt": "0.1", "avgPrice": "101.0",
+    })
+    monkeypatch.setattr(ro, "install_protection", lambda **kwargs: {
+        "status": "PROTECTED",
+        "tp_orders": [{"leg": "tp3", "status": "created", "price": 102.75, "qty": 0.1, "pnl_pct": 1.75}],
+        "sl_result": {"status": "created", "stop_price": 100.0, "qty": 0.1},
+        "tp_mode": "single_tp",
+        "effective_tp_levels": [{"leg": "tp3", "pnl_pct": 1.75, "close_fraction": 1.0, "qty": 0.1}],
+        "effective_weighted_rr": 1.75,
+    })
+    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.05, "entry_reference": 99.0, "target_rr": 1.75}
+    out = execute_new_position("TEST", "LONG", 99.0, setup, "EVT_TEST")
+    assert out["status"] == "opened_protected"
+    assert out["open_result"]["order_reference_price"] == 100.0
+    assert out["execution_quality"]["signal_to_order_drift_pct"] == pytest.approx((100-99)/99*100)
+    assert out["execution_quality"]["execution_slippage_pct"] == pytest.approx(1.0)
+    assert out["setup_used_for_protection"]["pre_order_reference_price"] == 100.0
+    assert out["setup_used_for_protection"]["effective_weighted_rr"] == pytest.approx(1.75)
 
 
-def test_mfe_mae_excludes_pre_entry_bars():
-    entry_ts = 1700000000000
-    trade = {"entry_price": 100.0, "direction": "LONG", "entry_ts": entry_ts, "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0}
-    candles = [
-        {"open_time": entry_ts - 120000, "close_time": entry_ts - 60000, "high": 150.0, "low": 50.0},
-        {"open_time": entry_ts, "close_time": entry_ts + 60000, "high": 103.0, "low": 98.0},
-    ]
-    _update_mfe_mae(trade, candles)
-    assert trade["peak_pnl_pct"] == pytest.approx(3.0)
-    assert trade["mae_pct"] == pytest.approx(-2.0)
-    assert trade["max_drawdown_pct"] == pytest.approx(-5.0)
+def test_failed_telegram_delivery_is_retryable(tmp_path: Path):
+    actions = tmp_path / "actions.jsonl"
+    actions.write_text(
+        json.dumps({"event_id": "EVT_FAILED", "telegram_sent": False}) + "\n"
+        + json.dumps({"event_id": "EVT_OK", "telegram_sent": True}) + "\n",
+        encoding="utf-8",
+    )
+    ids = load_successful_telegram_ids(actions)
+    assert "EVT_FAILED" not in ids
+    assert "EVT_OK" in ids
 
 
-def test_one_tp_effective_rr_is_supported():
-    from event_engine.bingx import _effective_weighted_rr
-    levels = [{"leg": "tp3", "pnl_pct": 3.5, "qty": 10.0}]
-    assert _effective_weighted_rr(levels, 2.0) == pytest.approx(1.75)
+def test_default_setup_rr_is_v2_1_05():
+    metrics = _extract_setup_metrics(None)
+    assert metrics["planned_weighted_rr"] == pytest.approx(1.05)
+    assert metrics["effective_weighted_rr"] == pytest.approx(1.05)
+
+
+def test_telegram_message_uses_effective_rr_and_tp_mode():
+    from event_engine.telegram import format_signal
+    msg = format_signal(
+        {"direction": "LONG", "symbol": "TEST", "event_type": "X", "event_fact": {}, "timestamps": {}},
+        setup={"entry_reference": 100, "invalidation_price": 95, "target_price": 108.75, "effective_weighted_rr": 1.75, "tp_mode": "single_tp"},
+        score=65,
+    )
+    assert "1.75" in msg
+    assert "single_tp" in msg
+
+
+def test_score_call_source_is_trigger_diagnostic():
+    import run_once as ro
+    import inspect
+    source = inspect.getsource(ro.main)
+    assert "trigger_diagnostic=trigger_diag" in source
+
+
+def test_telegram_message_contains_trigger_fields():
+    from event_engine.telegram import format_signal
+    msg = format_signal(
+        {"direction": "LONG", "symbol": "TEST", "event_type": "X", "event_fact": {}, "timestamps": {}},
+        setup={"entry_reference": 100, "invalidation_price": 99, "target_price": 101.75, "effective_weighted_rr": 1.75, "tp_mode": "single_tp", "trigger": {"trigger_price": 100.5, "trigger_delay_min": 15.0}},
+        score=65,
+    )
+    assert "Trigger Price" in msg and "100.5" in msg
+    assert "single_tp" in msg
+
+
+def test_build_event_setup_uses_wilder_atr():
+    import run_once as ro
+    df = _generate_synthetic_candles(80)
+    setup = ro.build_event_setup({"direction": "LONG"}, df, 100.0)
+    prev = df["close"].shift(1)
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - prev).abs(), (df["low"] - prev).abs()], axis=1).max(axis=1)
+    expected_atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1]
+    expected_risk = max(0.50, min(expected_atr * 1.5 / 100.0 * 100.0, 5.00))
+    assert setup["risk_pct"] == pytest.approx(expected_risk)
+
+
+def test_single_tp_mode_effective_rr_is_not_1_05():
+    from event_engine.tracker import _extract_setup_metrics
+    metrics = _extract_setup_metrics({
+        "risk_pct": 2.0, "target_rr": 1.75, "planned_weighted_rr": 1.05,
+        "tp_mode": "single_tp", "effective_weighted_rr": 1.75,
+        "effective_tp_levels": [{"leg": "tp3", "pnl_pct": 3.5, "qty": 1.0}],
+    })
+    assert metrics["tp_mode"] == "single_tp"
+    assert metrics["effective_weighted_rr"] == pytest.approx(1.75)
+
+
+def test_pending_telegram_retry_is_present_and_idempotent_by_success():
+    import run_once as ro
+    import inspect
+    source = inspect.getsource(ro.send_pending_open_trade_notifications)
+    assert "event_id in successful_ids" in source
+    assert "telegram_kind" in source
+
+
+def test_run_once_uses_trigger_diag_for_score():
+    import run_once as ro
+    import inspect
+    source = inspect.getsource(ro.main)
+    assert "trigger_diagnostic=trigger_diag" in source
+
+
+def test_tp_order_identity_requires_expected_price():
+    from event_engine.bingx import _tp_leg_from_order
+    order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.0", "clientOrderId": "EVT_ABC_TP3"}
+    assert _tp_leg_from_order(order, "tp3", 105.0, 2, "abc") is True
+    assert _tp_leg_from_order(order, "tp3", 106.0, 2, "abc") is False

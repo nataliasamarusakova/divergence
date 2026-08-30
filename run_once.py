@@ -46,8 +46,8 @@ log = logging.getLogger("event_engine")
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        result = float(value)
-        return result if pd.notna(result) and result not in (float("inf"), float("-inf")) else default
+        x = float(value)
+        return x if pd.notna(x) and abs(x) != float("inf") else default
     except (TypeError, ValueError):
         return default
 
@@ -71,7 +71,7 @@ CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
-MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "65"))
+MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "0"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
@@ -92,6 +92,99 @@ def load_ids(path: Path) -> set[str]:
             if val:
                 ids.add(str(val))
     return ids
+
+
+def load_successful_telegram_ids(path: Path) -> set[str]:
+    """Return only event IDs for which Telegram actually reported success.
+
+    A failed send must remain retryable on a later cycle. Historically the code
+    used load_ids(ACTIONS), which incorrectly treated telegram_sent=false rows
+    as already delivered forever.
+    """
+    if not path.exists():
+        return set()
+    ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if bool(obj.get("telegram_sent")):
+            event_id = obj.get("event_id")
+            if event_id:
+                ids.add(str(event_id))
+    return ids
+
+
+def send_pending_open_trade_notifications(
+    current_positions: dict[tuple[str, str], dict],
+    successful_ids: set[str],
+) -> set[str]:
+    """Retry Telegram alerts for already-open trades that were never confirmed delivered.
+
+    This is independent of event freshness: a notification failure must not become
+    permanent merely because the 1H event aged out of the scanning window.
+    Returns event IDs attempted during this cycle so the normal candidate loop does
+    not send the same retry twice.
+    """
+    attempted: set[str] = set()
+    active = _load_active_trades()
+    for event_id, trade in active.items():
+        event_id = str(event_id)
+        if trade.get("closed", False) or event_id in successful_ids:
+            continue
+
+        symbol = str(trade.get("symbol", ""))
+        direction = str(trade.get("direction", "")).upper()
+        bx_symbol = to_bx_symbol(symbol)
+        if not bx_symbol or (bx_symbol, direction) not in current_positions:
+            continue
+
+        event = {
+            "event_id": event_id,
+            "symbol": symbol,
+            "timeframe": "1h",
+            "direction": direction,
+            "event_type": trade.get("event_type", "TRADE_OPEN"),
+            "timestamps": {},
+            "event_fact": {},
+        }
+        position = current_positions[(bx_symbol, direction)]
+        execution = {
+            "status": "OPENED_CONFIRMED_RETRY",
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "position": position,
+        }
+        setup = trade.get("setup", {}) if isinstance(trade.get("setup"), dict) else {}
+        msg = format_signal(event, setup=setup, execution=execution, score=trade.get("score"))
+        attempted.add(event_id)
+        try:
+            sent = bool(send_tg(msg))
+        except Exception as exc:
+            sent = False
+            log.error("[TELEGRAM] Pending-open retry exception for %s %s (%s): %s", direction, symbol, event_id, exc)
+        record_action({
+            "event_id": event_id,
+            "symbol": symbol,
+            "direction": direction,
+            "score": trade.get("score"),
+            "event_type": trade.get("event_type"),
+            "telegram_sent": sent,
+            "telegram_kind": "open_retry",
+            "execution_status": "OPENED_CONFIRMED_RETRY",
+            "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+        })
+        if sent:
+            successful_ids.add(event_id)
+            log.info("[TELEGRAM] Pending open notification delivered for %s %s (%s).", direction, symbol, event_id)
+        else:
+            log.error("[TELEGRAM] Pending open notification failed for %s %s (%s); will retry.", direction, symbol, event_id)
+    return attempted
 
 
 def load_successful_trade_ids(path: Path) -> set[str]:
@@ -137,9 +230,7 @@ def record_action(obj: dict) -> None:
 
 
 def calculate_execution_slippage(
-    signal_price: float,
-    actual_entry_price: float,
-    direction: str,
+    signal_price: float, actual_entry_price: float, direction: str,
     pre_order_price: float | None = None,
 ) -> dict:
     try:
@@ -148,36 +239,32 @@ def calculate_execution_slippage(
         pre_order = float(pre_order_price) if pre_order_price is not None else None
     except (TypeError, ValueError):
         return {"slippage_pct": None, "adverse_slippage_pct": None}
-
-    direction = str(direction).upper()
     if signal_price <= 0 or actual_entry_price <= 0:
         return {"slippage_pct": None, "adverse_slippage_pct": None}
-
-    def signed_move(ref: float, fill: float) -> float:
-        return (fill - ref) / ref * 100.0 if ref > 0 else 0.0
-
-    signal_to_fill = signed_move(signal_price, actual_entry_price)
-    signal_to_order = signed_move(signal_price, pre_order) if pre_order and pre_order > 0 else None
-    execution_move = signed_move(pre_order, actual_entry_price) if pre_order and pre_order > 0 else None
-
-    def adverse(raw: float | None) -> float | None:
-        if raw is None:
-            return None
-        if direction == "LONG":
-            return max(0.0, raw)
-        if direction == "SHORT":
-            return max(0.0, -raw)
-        return None
-
+    d = str(direction).upper()
+    signed_total = (actual_entry_price - signal_price) / signal_price * 100.0
+    signal_to_order = None
+    execution_move = None
+    if pre_order and pre_order > 0:
+        signal_to_order = (pre_order - signal_price) / signal_price * 100.0
+        execution_move = (actual_entry_price - pre_order) / pre_order * 100.0
+    def adverse(x):
+        if x is None: return None
+        return max(0.0, x) if d == "LONG" else max(0.0, -x)
     return {
-        "slippage_pct": signal_to_fill,
-        "adverse_slippage_pct": adverse(signal_to_fill),
+        "slippage_pct": signed_total,
+        "adverse_slippage_pct": adverse(signed_total),
         "signal_to_order_drift_pct": signal_to_order,
         "execution_slippage_pct": execution_move,
         "adverse_execution_slippage_pct": adverse(execution_move),
     }
 
-def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) -> float:
+def calculate_setup_score(
+    ev: dict,
+    coinalyze_row: Any,
+    df_15m: pd.DataFrame,
+    trigger_diagnostic: dict | None = None,
+) -> float:
     score = 50.0
     fact = ev.get("event_fact", {})
     direction = str(ev.get("direction", "LONG")).upper()
@@ -232,8 +319,15 @@ def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) ->
         except (TypeError, ValueError):
             pass
 
-    if "volume" in df_15m.columns and len(df_15m) >= 20:
-        try:
+    try:
+        if isinstance(trigger_diagnostic, dict) and trigger_diagnostic.get("volume_ratio") is not None:
+            vol_ratio = float(trigger_diagnostic["volume_ratio"])
+            if vol_ratio >= 1.5:
+                score += 10.0
+            elif vol_ratio >= 1.2:
+                score += 5.0
+        elif "volume" in df_15m.columns and len(df_15m) >= 20:
+            # Backward-compatible fallback for direct unit/test callers.
             recent_avg = df_15m["volume"].iloc[-21:-1].mean()
             if pd.notna(recent_avg) and recent_avg > 0:
                 vol_ratio = float(df_15m["volume"].iloc[-1]) / float(recent_avg)
@@ -241,8 +335,8 @@ def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) ->
                     score += 10.0
                 elif vol_ratio >= 1.2:
                     score += 5.0
-        except (TypeError, ValueError):
-            pass
+    except (TypeError, ValueError):
+        pass
 
     return max(0.0, min(100.0, score))
 
@@ -276,7 +370,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         axis=1,
     ).max(axis=1)
 
-    atr = tr.rolling(window=14, min_periods=14).mean().iloc[-1]
+    atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
     if pd.isna(atr) or float(atr) <= 0:
         raise ValueError("ATR unavailable")
 
@@ -462,12 +556,7 @@ def reconcile_all_open_positions() -> None:
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
 
         effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
-        if isinstance(effective_levels, list) and effective_levels:
-            configured_legs = {str(x.get("leg")) for x in effective_levels if x.get("leg")}
-        elif matched_trade and matched_trade.get("tp_orders"):
-            configured_legs = {str(x.get("leg")) for x in matched_trade.get("tp_orders", []) if x.get("leg")}
-        else:
-            configured_legs = {"tp1", "tp2", "tp3"}
+        configured_legs = {str(x.get("leg")) for x in effective_levels} if isinstance(effective_levels, list) and effective_levels else {"tp1", "tp2", "tp3"}
         remaining_expected_legs = configured_legs - hit_legs
 
         known_tp_legs = {
@@ -533,7 +622,7 @@ def reconcile_all_open_positions() -> None:
                     axis=1,
                 ).max(axis=1)
 
-                atr = tr.rolling(14, min_periods=14).mean().iloc[-1]
+                atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
                 if pd.notna(atr) and float(atr) > 0:
                     risk_pct = max(0.50, min(float(atr) * 1.5 / avg_price * 100.0, 5.00))
                     sl_pct = risk_pct
@@ -590,7 +679,8 @@ def reconcile_all_open_positions() -> None:
                     event_type="RECONCILED_POSITION",
                 )
 
-            log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, TP1=+%.2f%%", bx_symbol, direction, sl_pct, sl_pct * 0.5)
+            first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)
+            log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, first TP=+%.2f%%", bx_symbol, direction, sl_pct, first_tp)
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
@@ -638,7 +728,12 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     if actual_qty <= 0 or actual_avg_price <= 0:
         return {"status": "POSITION_INVALID", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "position": position}
 
-    execution_quality = calculate_execution_slippage(signal_price=price, actual_entry_price=actual_avg_price, direction=direction)
+    pre_order_price = _safe_float(opened.get("order_reference_price"), 0.0)
+    execution_quality = calculate_execution_slippage(
+        signal_price=price, actual_entry_price=actual_avg_price, direction=direction,
+        pre_order_price=pre_order_price if pre_order_price > 0 else None,
+    )
+    fill_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     log.info(
         "[EXECUTION] Fill confirmed: %s %s at avgPrice=%.8g (Qty: %.8g, Slippage: %+.2f%%)",
         direction, symbol, actual_avg_price, actual_qty, execution_quality.get("slippage_pct") or 0.0
@@ -700,10 +795,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     )
 
     if protection.get("effective_tp_levels"):
-        setup_for_fill["effective_tp_levels"] = protection.get("effective_tp_levels")
+        setup_for_fill["effective_tp_levels"] = protection["effective_tp_levels"]
     setup_for_fill["tp_mode"] = protection.get("tp_mode", "multi_tp")
     if protection.get("effective_weighted_rr") is not None:
-        setup_for_fill["effective_weighted_rr"] = protection.get("effective_weighted_rr")
+        setup_for_fill["effective_weighted_rr"] = protection["effective_weighted_rr"]
 
     protection_status = str(protection.get("status", "")).upper()
     if protection_status == "PROTECTED":
@@ -769,10 +864,13 @@ def main() -> None:
         "trigger_volume_failed": 0,
         "trigger_data_failed": 0,
         "trigger_direction_failed": 0,
+        "rejected_score": 0,
         "valid_signals": 0,
         "execution_attempts": 0,
         "trades": 0,
         "scan_errors": 0,
+        "telegram_pending_retries": 0,
+        "telegram_pending_retry_success": 0,
     }
 
     btc_regime_df = None
@@ -806,24 +904,32 @@ def main() -> None:
         stats["scan_errors"] += 1
         log.error("[BINGX] Contracts refresh error: %s", exc)
 
-    current_open_positions = {}
+    current_open_positions: dict[tuple[str, str], bool] = {}
+    current_positions: dict[tuple[str, str], dict] = {}
     try:
-        for p in get_positions():
-            bx_sym = str(p.get("symbol", "")).upper()
-            side = str(p.get("positionSide", p.get("positionAmt", ""))).upper()
+        for position in get_positions():
+            bx_sym = str(position.get("symbol", "")).upper()
+            side = str(position.get("positionSide", position.get("positionAmt", ""))).upper()
             try:
-                amt = float(p.get("positionAmt", 0) or 0)
+                amt = float(position.get("positionAmt", 0) or 0)
             except Exception:
                 amt = 0.0
-            
+
             if amt != 0:
-                if side in {"LONG", "SHORT"}:
-                    want_dir = side
-                else:
-                    want_dir = "LONG" if amt > 0 else "SHORT"
-                current_open_positions[(bx_sym, want_dir)] = True
+                want_dir = side if side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
+                key = (bx_sym, want_dir)
+                current_open_positions[key] = True
+                current_positions[key] = position
     except Exception as exc:
         log.error("[BINGX] Failed to pre-fetch positions for deduplication: %s", exc)
+
+    telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
+    telegram_attempted_this_cycle = send_pending_open_trade_notifications(
+        current_positions=current_positions,
+        successful_ids=telegram_sent_event_ids,
+    )
+    stats["telegram_pending_retries"] = len(telegram_attempted_this_cycle)
+    stats["telegram_pending_retry_success"] = sum(1 for eid in telegram_attempted_this_cycle if eid in telegram_sent_event_ids)
 
     candidates: List[Any] = []
     for r in rows:
@@ -856,8 +962,6 @@ def main() -> None:
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
-    telegram_sent_event_ids = load_ids(ACTIONS)
-
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     for r in candidates:
@@ -967,38 +1071,27 @@ def main() -> None:
                     stats["trigger_data_failed"] += 1
                     continue
 
-                trigger_diagnostic = {"ok": True, "reason": "not_required"}
                 if REQUIRE_TRIGGER:
-                    trigger_diagnostic = diagnose_15m_trigger(
-                        d15,
-                        direction,
-                        event_detected_at_ts=detected_at,
-                        max_trigger_delay_min=MAX_TRIGGER_DELAY,
-                        min_vol_mult=1.05,
+                    trigger_diag = diagnose_15m_trigger(
+                        d15, direction, event_detected_at_ts=detected_at,
+                        max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05,
                     )
-                    if not trigger_diagnostic.get("ok"):
-                        reason = trigger_diagnostic.get("reason") or "failed"
+                    if not trigger_diag.get("ok"):
+                        reason = trigger_diag.get("reason") or "failed"
                         stats["rejected_trigger"] += 1
-                        if reason == "no_trigger_window":
-                            stats["trigger_no_window"] += 1
-                        elif reason == "breakout_failed":
-                            stats["trigger_breakout_failed"] += 1
-                        elif reason == "volume_failed":
-                            stats["trigger_volume_failed"] += 1
-                        else:
-                            stats["trigger_data_failed"] += 1
+                        if reason == "no_trigger_window": stats["trigger_no_window"] += 1
+                        elif reason == "breakout_failed": stats["trigger_breakout_failed"] += 1
+                        elif reason == "volume_failed": stats["trigger_volume_failed"] += 1
+                        else: stats["trigger_data_failed"] += 1
                         log.info("[SIGNALS] %s %s (%s) failed 15m trigger: %s", direction, symbol, event_type, reason)
                         continue
                     stats["trigger_passed"] += 1
                 else:
+                    trigger_diag = {"ok": True, "reason": "not_required"}
                     stats["trigger_passed"] += 1
 
-                trigger_price = None
-                trigger_ts = trigger_diagnostic.get("trigger_bar_close_ts") if isinstance(trigger_diagnostic, dict) else None
-                try:
-                    trigger_price = float(trigger_diagnostic.get("current_close")) if trigger_diagnostic.get("current_close") is not None else None
-                except (TypeError, ValueError):
-                    trigger_price = None
+                trigger_price = _safe_float(trigger_diag.get("current_close"), 0.0) or None
+                trigger_ts = trigger_diag.get("trigger_bar_close_ts")
 
                 if REQUIRE_CVD:
                     cvd24 = getattr(r, "cvd24", None)
@@ -1026,16 +1119,21 @@ def main() -> None:
                     continue
 
                 setup = build_event_setup(ev=ev, df_1h=d1, entry_price=signal_price)
-                score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15)
                 setup["trigger"] = {
                     "event_detected_at_ts": detected_at,
                     "trigger_bar_close_ts": trigger_ts,
                     "trigger_price": trigger_price,
-                    "trigger_delay_min": trigger_diagnostic.get("trigger_delay_min"),
-                    "volume_ratio": trigger_diagnostic.get("volume_ratio"),
+                    "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
+                    "volume_ratio": trigger_diag.get("volume_ratio"),
                 }
+                score = calculate_setup_score(
+                    ev=ev,
+                    coinalyze_row=r,
+                    df_15m=d15,
+                    trigger_diagnostic=trigger_diag,
+                )
 
-                if score < MIN_SCORE:
+                if MIN_SCORE > 0 and score < MIN_SCORE:
                     stats.setdefault("rejected_score", 0)
                     stats["rejected_score"] += 1
                     log.info("[SIGNALS] %s %s (%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, event_type, score, MIN_SCORE)
@@ -1089,8 +1187,24 @@ def main() -> None:
         bx_symbol = to_bx_symbol(symbol)
         
         if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))):
-            execution_result = {"status": "ALREADY_EXECUTED", "mode": EXECUTION_MODE, "order_id": None}
-            log.info("[EXECUTION] %s (%s) - Already open/executed.", symbol, direction)
+            existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
+            active_trade = None
+            try:
+                active_trade = next(
+                    (x for x in _load_active_trades().values()
+                     if not x.get("closed", False) and str(x.get("event_id", "")) == event_id),
+                    None,
+                )
+            except Exception:
+                active_trade = None
+            execution_result = {
+                "status": "ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "position": existing_position,
+                "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
+            }
+            log.info("[EXECUTION] %s (%s) - Already open/executed.%s", symbol, direction, " Position confirmed; Telegram retry eligible." if existing_position else "")
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
             log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle + 1, MAX_TRADES, direction, symbol, score, price)
@@ -1118,12 +1232,13 @@ def main() -> None:
                     "execution": {
                         "requested_price": price,
                         "signal_price": price,
-                        "pre_order_reference_price": execution_result.get("open_result", {}).get("order_reference_price") if isinstance(execution_result.get("open_result"), dict) else None,
+                        "pre_order_reference_price": ((execution_result.get("open_result") or {}).get("order_reference_price") if isinstance(execution_result.get("open_result"), dict) else None),
                         "actual_entry_price": actual_entry,
                         "actual_qty": actual_qty,
                         "order_id": execution_result.get("order_id"),
                         "status": execution_result.get("status"),
                         "slippage_pct": execution_quality.get("slippage_pct"),
+                        "signal_to_fill_drift_pct": execution_quality.get("slippage_pct"),
                         "adverse_slippage_pct": execution_quality.get("adverse_slippage_pct"),
                         "signal_to_order_drift_pct": execution_quality.get("signal_to_order_drift_pct"),
                         "execution_slippage_pct": execution_quality.get("execution_slippage_pct"),
@@ -1134,8 +1249,10 @@ def main() -> None:
                     "result": execution_result,
                     "setup": setup,
                     "planned_metrics": {
-                        "target_rr": setup.get("target_rr"),
-                        "planned_weighted_rr": setup.get("planned_weighted_rr"),
+                        "target_rr": (execution_result.get("setup_used_for_protection") or setup).get("target_rr"),
+                        "planned_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("planned_weighted_rr"),
+                        "effective_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("effective_weighted_rr"),
+                        "tp_mode": (execution_result.get("setup_used_for_protection") or setup).get("tp_mode"),
                         "realized_rr": None,
                     },
                 }
@@ -1163,7 +1280,7 @@ def main() -> None:
                         coinalyze_row=r,
                         score=score,
                         setup=execution_result.get("setup_used_for_protection", setup),
-                        requested_entry_price=_safe_float(execution_result.get("open_result", {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
+                        requested_entry_price=_safe_float((execution_result.get("open_result") or {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
                         entry_ts_ms=execution_result.get("fill_ts_ms"),
                     )
                 except Exception as exc:
@@ -1176,9 +1293,12 @@ def main() -> None:
             execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
             log.info("[EXECUTION] %s %s skipped: cycle limit reached (%d/%d).", direction, symbol, trades_this_cycle, MAX_TRADES)
 
+        telegram_setup = execution_result.get("setup_used_for_protection") if isinstance(execution_result, dict) else None
+        if not isinstance(telegram_setup, dict):
+            telegram_setup = setup
         msg = format_signal(
             ev,
-            setup=setup,
+            setup=telegram_setup,
             coinalyze_row=r,
             execution=execution_result,
             score=score,
@@ -1189,18 +1309,22 @@ def main() -> None:
             "opened",
             "opened_protection_check_required",
             "opened_protection_failed",
+            "ALREADY_EXECUTED_WITH_POSITION",
         }
 
         telegram_already_sent = event_id in telegram_sent_event_ids
         sent = False
-        if is_real_execution and not telegram_already_sent:
+        if is_real_execution and not telegram_already_sent and event_id not in telegram_attempted_this_cycle:
             try:
                 sent = bool(send_tg(msg))
-            except Exception:
+            except Exception as exc:
                 sent = False
+                log.error("[TELEGRAM] Exception while sending %s %s (%s): %s", direction, symbol, event_id, exc)
             if sent:
                 telegram_sent_event_ids.add(event_id)
                 log.info("[TELEGRAM] Notification sent for %s %s (%s).", direction, symbol, event_id)
+            else:
+                log.error("[TELEGRAM] Notification NOT sent for %s %s (%s); will retry on a later cycle.", direction, symbol, event_id)
 
         record_action(
             {
