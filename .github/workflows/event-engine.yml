@@ -16,6 +16,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    env:
+      COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
+      COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
+      COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+      BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+      BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+      BINGX_ENV: vst
+      BINGX_BASE_URL: https://open-api-vst.bingx.com
+      BINGX_MARGIN_USDT: "1"
+      BINGX_LEVERAGE: "10"
+      BINGX_MAX_LEVERAGE: "10"
+      BINGX_POSITION_MODE: HEDGE
+      EXECUTION_ENABLED: "true"
+      EXECUTION_MODE: vst
+      REQUIRE_CVD_CONFIRMATION: "false"
+      REQUIRE_15M_TRIGGER: "true"
+      MAX_TRIGGER_DELAY_MIN: "60"
+      MAX_EVENT_AGE_MIN: "90"
+      MIN_SETUP_SCORE: "65"
+      MAX_TRADES_PER_CYCLE: "3"
+      MIN_VOLUME_24H: "50000000"
+      MIN_OPEN_INTEREST: "10000000"
+      MAX_CANDIDATES: "0"
+      KLINE_LIMIT_1H: "250"
+      KLINE_LIMIT_15M: "250"
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,39 +95,33 @@ jobs:
         run: |
           python -m pytest -q
 
+      - name: Verify production configuration
+        run: |
+          python - <<'PY'
+          import os
+          expected = {
+              "EXECUTION_ENABLED": "true",
+              "EXECUTION_MODE": "vst",
+              "MAX_TRIGGER_DELAY_MIN": "60",
+              "MAX_EVENT_AGE_MIN": "90",
+              "MIN_SETUP_SCORE": "65",
+              "MAX_TRADES_PER_CYCLE": "3",
+              "MIN_VOLUME_24H": "50000000",
+              "MIN_OPEN_INTEREST": "10000000",
+              "BINGX_LEVERAGE": "10",
+              "BINGX_MAX_LEVERAGE": "10",
+          }
+          for key, value in expected.items():
+              actual = os.environ.get(key)
+              if actual != value:
+                  raise SystemExit(f"Production config mismatch: {key}={actual!r}, expected {value!r}")
+          for key in ("BINGX_API_KEY", "BINGX_SECRET_KEY", "TG_BOT_TOKEN", "TG_CHAT_IDS"):
+              if not os.environ.get(key, "").strip():
+                  raise SystemExit(f"Required secret/env is empty: {key}")
+          print("Production configuration and required secrets are present.")
+          PY
+
       - name: Run engine
-        env:
-          COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
-          COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
-          COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
-
-          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
-          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-          BINGX_ENV: vst
-          BINGX_BASE_URL: https://open-api-vst.bingx.com
-          BINGX_MARGIN_USDT: "1"
-          BINGX_LEVERAGE: "10"
-          BINGX_POSITION_MODE: HEDGE
-
-          EXECUTION_ENABLED: "true"
-          EXECUTION_MODE: vst
-
-          REQUIRE_CVD_CONFIRMATION: "false"
-          REQUIRE_15M_TRIGGER: "true"
-          MAX_TRIGGER_DELAY_MIN: "60"
-          MAX_EVENT_AGE_MIN: "90"
-          MAX_TRADES_PER_CYCLE: "5"
-
-          MIN_VOLUME_24H: "10000000"
-          MIN_OPEN_INTEREST: "5000000"
-          MAX_CANDIDATES: "0"
-
-          KLINE_LIMIT_1H: "250"
-          KLINE_LIMIT_15M: "250"
-
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
-
         run: |
           python run_once.py
 
@@ -113,45 +135,33 @@ jobs:
           git config user.email "actions@github.com"
 
           git status --short
-
-          git add data/*.jsonl 2>/dev/null || true
+          git add data/*.jsonl data/active_trades.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
           fi
 
-          git commit \
-            -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git commit -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           max_attempts=5
-
           for attempt in $(seq 1 "$max_attempts"); do
             git fetch origin main
 
             if [ -n "$(git status --porcelain)" ]; then
               git add -A
-
               if ! git diff --cached --quiet; then
-                git commit \
-                  -m "event engine snapshot-extra $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                git commit -m "event engine snapshot-extra $(date -u +%Y-%m-%dT%H:%M:%SZ)"
               fi
             fi
 
-            if ! git rebase origin/main; then
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo "State pushed successfully"
+                exit 0
+              fi
+            else
               git rebase --abort 2>/dev/null || true
-
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                sleep $((attempt * 3))
-                continue
-              fi
-
-              exit 1
-            fi
-
-            if git push origin HEAD:main; then
-              echo "State pushed successfully"
-              exit 0
             fi
 
             if [ "$attempt" -lt "$max_attempts" ]; then
