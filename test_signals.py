@@ -28,6 +28,7 @@ from run_once import (
     build_tp_levels,
     calculate_setup_score,
 )
+from event_engine.tracker import _update_mfe_mae
 
 
 def _load_successful_trade_ids(path: Path) -> set[str]:
@@ -265,3 +266,46 @@ def test_rsi_warmup_preserves_nan():
     # Post-warmup bars must be valid numbers
     assert pd.notna(rsi.iloc[14])
     assert pd.notna(rsi.iloc[-1])
+
+
+def test_trigger_uses_event_window_not_latest_bar():
+    base = 1700000000000
+    rows = []
+    # Event happens after bar 0. Only the second post-event bar is a valid trigger.
+    for i in range(8):
+        close = 100.0
+        high = 101.0
+        low = 99.0
+        if i == 3:
+            high, close = 101.0, 100.5
+        if i == 5:
+            high, close = 101.0, 102.0
+        rows.append({
+            "open_time": base + i * 900000,
+            "close_time": base + i * 900000 + 899000,
+            "open": 100.0, "high": high, "low": low, "close": close,
+            "volume": 1000.0,
+        })
+    df = pd.DataFrame(rows)
+    # Event is after bar 3; a later trigger within 60m should be found.
+    event_ts = rows[3]["close_time"]
+    assert build_15m_trigger(df, "LONG", min_vol_mult=0.0, event_detected_at_ts=event_ts, max_trigger_delay_min=60.0) is True
+
+
+def test_mfe_mae_excludes_pre_entry_bars():
+    entry_ts = 1700000000000
+    trade = {"entry_price": 100.0, "direction": "LONG", "entry_ts": entry_ts, "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0}
+    candles = [
+        {"open_time": entry_ts - 120000, "close_time": entry_ts - 60000, "high": 150.0, "low": 50.0},
+        {"open_time": entry_ts, "close_time": entry_ts + 60000, "high": 103.0, "low": 98.0},
+    ]
+    _update_mfe_mae(trade, candles)
+    assert trade["peak_pnl_pct"] == pytest.approx(3.0)
+    assert trade["mae_pct"] == pytest.approx(-2.0)
+    assert trade["max_drawdown_pct"] == pytest.approx(-5.0)
+
+
+def test_one_tp_effective_rr_is_supported():
+    from event_engine.bingx import _effective_weighted_rr
+    levels = [{"leg": "tp3", "pnl_pct": 3.5, "qty": 10.0}]
+    assert _effective_weighted_rr(levels, 2.0) == pytest.approx(1.75)

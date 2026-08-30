@@ -26,6 +26,7 @@ from event_engine.signals import (
     detect_divergences,
     detect_squeeze_release,
     build_15m_trigger,
+    diagnose_15m_trigger,
     check_btc_regime,
 )
 from event_engine.telegram import send as send_tg, format_signal
@@ -42,6 +43,13 @@ logging.basicConfig(
     format="%(message)s",
 )
 log = logging.getLogger("event_engine")
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if pd.notna(result) and result not in (float("inf"), float("-inf")) else default
+    except (TypeError, ValueError):
+        return default
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
@@ -62,6 +70,8 @@ REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "tr
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
+MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
+MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "65"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
@@ -126,10 +136,16 @@ def record_action(obj: dict) -> None:
     append_jsonl(ACTIONS, obj)
 
 
-def calculate_execution_slippage(signal_price: float, actual_entry_price: float, direction: str) -> dict:
+def calculate_execution_slippage(
+    signal_price: float,
+    actual_entry_price: float,
+    direction: str,
+    pre_order_price: float | None = None,
+) -> dict:
     try:
         signal_price = float(signal_price)
         actual_entry_price = float(actual_entry_price)
+        pre_order = float(pre_order_price) if pre_order_price is not None else None
     except (TypeError, ValueError):
         return {"slippage_pct": None, "adverse_slippage_pct": None}
 
@@ -137,16 +153,29 @@ def calculate_execution_slippage(signal_price: float, actual_entry_price: float,
     if signal_price <= 0 or actual_entry_price <= 0:
         return {"slippage_pct": None, "adverse_slippage_pct": None}
 
-    raw_pct = (actual_entry_price - signal_price) / signal_price * 100.0
-    if direction == "LONG":
-        adverse = max(0.0, raw_pct)
-    elif direction == "SHORT":
-        adverse = max(0.0, -raw_pct)
-    else:
-        adverse = None
+    def signed_move(ref: float, fill: float) -> float:
+        return (fill - ref) / ref * 100.0 if ref > 0 else 0.0
 
-    return {"slippage_pct": raw_pct, "adverse_slippage_pct": adverse}
+    signal_to_fill = signed_move(signal_price, actual_entry_price)
+    signal_to_order = signed_move(signal_price, pre_order) if pre_order and pre_order > 0 else None
+    execution_move = signed_move(pre_order, actual_entry_price) if pre_order and pre_order > 0 else None
 
+    def adverse(raw: float | None) -> float | None:
+        if raw is None:
+            return None
+        if direction == "LONG":
+            return max(0.0, raw)
+        if direction == "SHORT":
+            return max(0.0, -raw)
+        return None
+
+    return {
+        "slippage_pct": signal_to_fill,
+        "adverse_slippage_pct": adverse(signal_to_fill),
+        "signal_to_order_drift_pct": signal_to_order,
+        "execution_slippage_pct": execution_move,
+        "adverse_execution_slippage_pct": adverse(execution_move),
+    }
 
 def calculate_setup_score(ev: dict, coinalyze_row: Any, df_15m: pd.DataFrame) -> float:
     score = 50.0
@@ -432,8 +461,14 @@ def reconcile_all_open_positions() -> None:
         hit_legs = set(matched_trade.get("hit_legs", [])) if matched_trade else set()
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
 
-        all_possible_legs = {"tp1", "tp2", "tp3"}
-        remaining_expected_legs = all_possible_legs - hit_legs
+        effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
+        if isinstance(effective_levels, list) and effective_levels:
+            configured_legs = {str(x.get("leg")) for x in effective_levels if x.get("leg")}
+        elif matched_trade and matched_trade.get("tp_orders"):
+            configured_legs = {str(x.get("leg")) for x in matched_trade.get("tp_orders", []) if x.get("leg")}
+        else:
+            configured_legs = {"tp1", "tp2", "tp3"}
+        remaining_expected_legs = configured_legs - hit_legs
 
         known_tp_legs = {
             leg
@@ -467,6 +502,9 @@ def reconcile_all_open_positions() -> None:
                     direction=direction,
                     tp_orders=tracker_tp,
                     sl_result=tracker_sl,
+                    effective_tp_levels=matched_trade.get("effective_tp_levels") if matched_trade else None,
+                    tp_mode=matched_trade.get("tp_mode") if matched_trade else None,
+                    effective_weighted_rr=matched_trade.get("effective_weighted_rr") if matched_trade else None,
                 )
             continue
 
@@ -475,10 +513,12 @@ def reconcile_all_open_positions() -> None:
             bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs), list(hit_legs)
         )
 
-        sl_pct = 2.0
+        sl_pct = _safe_float(matched_trade.get("planned_risk_pct"), 0.0) if matched_trade else 0.0
+        if sl_pct <= 0:
+            sl_pct = 2.0
         try:
             k1 = fetch_klines(bx_symbol, "1h", limit=30)
-            if len(k1) >= 20:
+            if not matched_trade and len(k1) >= 20:
                 df1 = pd.DataFrame(k1)
                 for col in ("high", "low", "close"):
                     df1[col] = pd.to_numeric(df1[col], errors="coerce")
@@ -533,6 +573,9 @@ def reconcile_all_open_positions() -> None:
                 direction=direction,
                 tp_orders=repaired_tp,
                 sl_result=repaired_sl,
+                effective_tp_levels=res.get("effective_tp_levels"),
+                tp_mode=res.get("tp_mode"),
+                effective_weighted_rr=res.get("effective_weighted_rr"),
             )
             if not tracked and not matched_trade:
                 register_active_trade(
@@ -604,6 +647,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     try:
         setup_for_fill = dict(setup)
         setup_for_fill["entry_reference"] = actual_avg_price
+        setup_for_fill["signal_price"] = float(price)
+        setup_for_fill["pre_order_reference_price"] = pre_order_price if pre_order_price > 0 else None
         planned_risk_pct = float(setup.get("risk_pct", 0) or 0)
 
         if not pd.notna(planned_risk_pct) or planned_risk_pct <= 0:
@@ -654,6 +699,12 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         trade_id=trade_id,
     )
 
+    if protection.get("effective_tp_levels"):
+        setup_for_fill["effective_tp_levels"] = protection.get("effective_tp_levels")
+    setup_for_fill["tp_mode"] = protection.get("tp_mode", "multi_tp")
+    if protection.get("effective_weighted_rr") is not None:
+        setup_for_fill["effective_weighted_rr"] = protection.get("effective_weighted_rr")
+
     protection_status = str(protection.get("status", "")).upper()
     if protection_status == "PROTECTED":
         final_status = "opened_protected"
@@ -675,6 +726,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         "tp_levels": tp_levels,
         "execution_quality": execution_quality,
         "setup_used_for_protection": setup_for_fill,
+        "fill_ts_ms": fill_ts_ms,
     }
 
 
@@ -915,19 +967,38 @@ def main() -> None:
                     stats["trigger_data_failed"] += 1
                     continue
 
-                if trigger_delay_min < 0 or trigger_delay_min > MAX_AGE:
-                    stats["trigger_no_window"] += 1
-                    continue
-
+                trigger_diagnostic = {"ok": True, "reason": "not_required"}
                 if REQUIRE_TRIGGER:
-                    trigger_ok = build_15m_trigger(d15, direction, min_vol_mult=1.05)
-                    if not trigger_ok:
+                    trigger_diagnostic = diagnose_15m_trigger(
+                        d15,
+                        direction,
+                        event_detected_at_ts=detected_at,
+                        max_trigger_delay_min=MAX_TRIGGER_DELAY,
+                        min_vol_mult=1.05,
+                    )
+                    if not trigger_diagnostic.get("ok"):
+                        reason = trigger_diagnostic.get("reason") or "failed"
                         stats["rejected_trigger"] += 1
-                        log.info("[SIGNALS] %s %s (%s) failed 15m trigger.", direction, symbol, event_type)
+                        if reason == "no_trigger_window":
+                            stats["trigger_no_window"] += 1
+                        elif reason == "breakout_failed":
+                            stats["trigger_breakout_failed"] += 1
+                        elif reason == "volume_failed":
+                            stats["trigger_volume_failed"] += 1
+                        else:
+                            stats["trigger_data_failed"] += 1
+                        log.info("[SIGNALS] %s %s (%s) failed 15m trigger: %s", direction, symbol, event_type, reason)
                         continue
                     stats["trigger_passed"] += 1
                 else:
                     stats["trigger_passed"] += 1
+
+                trigger_price = None
+                trigger_ts = trigger_diagnostic.get("trigger_bar_close_ts") if isinstance(trigger_diagnostic, dict) else None
+                try:
+                    trigger_price = float(trigger_diagnostic.get("current_close")) if trigger_diagnostic.get("current_close") is not None else None
+                except (TypeError, ValueError):
+                    trigger_price = None
 
                 if REQUIRE_CVD:
                     cvd24 = getattr(r, "cvd24", None)
@@ -956,6 +1027,19 @@ def main() -> None:
 
                 setup = build_event_setup(ev=ev, df_1h=d1, entry_price=signal_price)
                 score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15)
+                setup["trigger"] = {
+                    "event_detected_at_ts": detected_at,
+                    "trigger_bar_close_ts": trigger_ts,
+                    "trigger_price": trigger_price,
+                    "trigger_delay_min": trigger_diagnostic.get("trigger_delay_min"),
+                    "volume_ratio": trigger_diagnostic.get("volume_ratio"),
+                }
+
+                if score < MIN_SCORE:
+                    stats.setdefault("rejected_score", 0)
+                    stats["rejected_score"] += 1
+                    log.info("[SIGNALS] %s %s (%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, event_type, score, MIN_SCORE)
+                    continue
 
                 opp_key = (symbol, direction)
                 new_candidate = {
@@ -1033,12 +1117,16 @@ def main() -> None:
                     },
                     "execution": {
                         "requested_price": price,
+                        "signal_price": price,
+                        "pre_order_reference_price": execution_result.get("open_result", {}).get("order_reference_price") if isinstance(execution_result.get("open_result"), dict) else None,
                         "actual_entry_price": actual_entry,
                         "actual_qty": actual_qty,
                         "order_id": execution_result.get("order_id"),
                         "status": execution_result.get("status"),
                         "slippage_pct": execution_quality.get("slippage_pct"),
                         "adverse_slippage_pct": execution_quality.get("adverse_slippage_pct"),
+                        "signal_to_order_drift_pct": execution_quality.get("signal_to_order_drift_pct"),
+                        "execution_slippage_pct": execution_quality.get("execution_slippage_pct"),
                     },
                     "score": score,
                     "event_type": ev.get("event_type"),
@@ -1074,8 +1162,9 @@ def main() -> None:
                         event_type=ev.get("event_type", ""),
                         coinalyze_row=r,
                         score=score,
-                        setup=setup,
-                        requested_entry_price=price,
+                        setup=execution_result.get("setup_used_for_protection", setup),
+                        requested_entry_price=_safe_float(execution_result.get("open_result", {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
+                        entry_ts_ms=execution_result.get("fill_ts_ms"),
                     )
                 except Exception as exc:
                     log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
