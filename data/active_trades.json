@@ -12,7 +12,7 @@
     "entry_slippage_pct": 0.0,
     "adverse_entry_slippage_pct": 0.0,
     "initial_qty": 0.045,
-    "remaining_qty": 0.045,
+    "remaining_qty": 0.012999999999999998,
     "entry_ts": 1788122821587,
     "tp_orders": [
       {
@@ -21,37 +21,26 @@
         "order_id": "2094165031008165888",
         "price": 216.77,
         "qty": 0.013
-      },
-      {
-        "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2094165028374142976",
-        "price": 218.49,
-        "qty": 0.016
-      },
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2094165025824006144",
-        "price": 219.63,
-        "qty": 0.016
       }
     ],
     "sl_order": {
       "status": "already_exists",
-      "order_id": "2094165018240704512",
-      "stop_price": 223.07,
-      "qty": 0.045
+      "order_id": "2094194997687050240",
+      "stop_price": 220.78,
+      "qty": 0.013
     },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
+    "hit_legs": [
+      "tp1",
+      "tp2"
+    ],
+    "be_activated": true,
+    "be_activation_ts": 1788129959802,
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 0.4574689736389125,
+    "peak_pnl_pct": 2.359815200652237,
     "mae_pct": -0.525409910317962,
-    "max_drawdown_pct": -0.9828788839568745,
-    "current_pnl_pct": 0.4393513905245035,
+    "max_drawdown_pct": -1.938581393242142,
+    "current_pnl_pct": 0.4302925989672926,
     "score": 65.0,
     "event_type": "HIDDEN_BEARISH_RSI",
     "research": {
@@ -173,10 +162,13 @@
     ],
     "tp_mode": "multi_tp",
     "effective_weighted_rr": 1.0388891122387245,
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null,
+    "tp_filled_qty": {
+      "tp2": 0.016,
+      "tp1": 0.016
+    },
+    "realized_pnl_qty": 0.032,
+    "realized_pnl_weighted_sum": 0.01304465984237711,
+    "last_tp_exec_price": 219.88,
     "last_close_exec_price": null,
     "realized_pnl_pct": null,
     "realized_rr": null,
@@ -185,9 +177,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788129660088,
+    "last_observation_ts": 1788129959802,
     "last_exchange_avg_price": 220.78,
-    "current_position_qty": 0.045,
-    "protection_last_updated_ts": 1788129664608
+    "current_position_qty": 0.013,
+    "protection_last_updated_ts": 1788129972808
   }
 }
