@@ -30,7 +30,7 @@ SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
 BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
-MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "50"))
+MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "10"))
 
 SYMBOL_MAP = {}
 try:
@@ -356,11 +356,31 @@ def get_order(symbol: str, order_id: str | int) -> dict:
     data = resp.get("data") or {}
     order = data.get("order") or data
 
+    avg_price_raw = order.get("avgPrice")
+    price_raw = order.get("price")
+    stop_price_raw = order.get("stopPrice")
+    try:
+        avg_price = float(avg_price_raw) if avg_price_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        avg_price = 0.0
+    try:
+        order_price = float(price_raw) if price_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        order_price = 0.0
+    try:
+        trigger_price = float(stop_price_raw) if stop_price_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        trigger_price = 0.0
+
     return {
         "status": "ok",
         "order_id": str(order.get("orderId", order_id)),
         "order_status": str(order.get("status", "")).upper(),
-        "avg_price": float(order.get("avgPrice", 0) or order.get("price", 0) or order.get("stopPrice", 0) or 0),
+        # avgPrice is the only field accepted as an actual execution price.
+        # Never silently substitute planned/trigger prices into realized PnL.
+        "avg_price": avg_price,
+        "order_price": order_price,
+        "trigger_price": trigger_price,
         "executed_qty": float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0),
         "orig_qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
         "client_order_id": str(order.get("clientOrderId", "")),
@@ -433,20 +453,28 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
-    leverage = min(LEVERAGE, max_lev)
-    qty = (MARGIN_USDT * leverage) / max(price * mult, 1e-12)
+    # Use a fresh market reference for sizing; the event price may be minutes old.
+    sizing_price = _current_close_price(symbol) or float(price)
+    if sizing_price <= 0:
+        return {"status": "error", "error": "invalid sizing price", "symbol": bx}
+
+    leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
+    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
-    if qty < min_qty:
-        need = math.ceil((min_qty * price * mult) / max(MARGIN_USDT, 1e-9))
-        leverage = min(max(need, leverage), max_lev)
-        qty = (MARGIN_USDT * leverage) / max(price * mult, 1e-12)
-        q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        qty = float(q)
-
+    # A $1 position can legitimately be too small for multiple TP legs.
+    # Do not increase leverage behind the caller's back just to satisfy minQty.
     if qty <= 0 or qty < min_qty:
-        return {"status": "error", "error": f"qty={qty} < min_qty={min_qty}", "symbol": bx, "qty": qty, "min_qty": min_qty}
+        return {
+            "status": "error",
+            "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
+            "symbol": bx,
+            "qty": qty,
+            "min_qty": min_qty,
+            "leverage": leverage,
+            "sizing_price": sizing_price,
+        }
 
     if not _set_leverage(bx, leverage, direction):
         return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
@@ -476,6 +504,9 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         "symbol": bx,
         "qty": qty,
         "leverage": leverage,
+        "sizing_price": sizing_price,
+        "signal_price": float(price),
+        "order_reference_price": sizing_price,
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
@@ -700,6 +731,35 @@ def _current_close_price(symbol: str) -> float | None:
     return price if (math.isfinite(price) and price > 0) else None
 
 
+def _qty_matches_position(order_qty: float, position_qty: float, tolerance_steps: float = 1.0) -> bool:
+    if order_qty <= 0 or position_qty <= 0:
+        return False
+    tolerance = max(abs(position_qty) * 1e-6, tolerance_steps * 1e-12)
+    return abs(order_qty - position_qty) <= tolerance
+
+
+def _effective_weighted_rr(tp_levels: list[dict], stop_loss_pct: float, position_qty: float | None = None) -> float | None:
+    if stop_loss_pct <= 0 or not tp_levels:
+        return None
+    total_qty = 0.0
+    weighted = 0.0
+    for level in tp_levels:
+        try:
+            pnl_pct = float(level.get("pnl_pct", 0))
+            qty = float(level.get("qty", 0))
+            fraction = float(level.get("close_fraction", 0))
+        except (TypeError, ValueError):
+            continue
+        weight = qty if qty > 0 else fraction
+        if pnl_pct <= 0 or weight <= 0:
+            continue
+        total_qty += weight
+        weighted += weight * (pnl_pct / stop_loss_pct)
+    if total_qty <= 0:
+        return None
+    return weighted / total_qty
+
+
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
@@ -757,7 +817,7 @@ def ensure_directional_protection(
             continue
 
         protective_side = (sl_price <= avg_price * 1.002) if direction == "LONG" else (sl_price >= avg_price * 0.998)
-        if protective_side:
+        if protective_side and _qty_matches_position(sl_qty, position_qty):
             valid_existing_sl = sl
             break
 
@@ -819,8 +879,13 @@ def ensure_directional_protection(
             "error": "SL created but not visible on exchange",
         }
 
+    tp_mode = "multi_tp"
     if min_qty > 0 and position_qty < min_qty * len(tp_levels_norm):
+        # Deliberate micro-position mode: only the farthest requested target is
+        # placed, because the position cannot satisfy the exchange minQty for
+        # all requested legs. This is expected for very small ($1-class) trades.
         tp_levels_norm = [{"leg": tp_levels_norm[-1]["leg"], "pnl_pct": tp_levels_norm[-1]["pnl_pct"], "close_fraction": 1.0}]
+        tp_mode = "single_tp"
 
     try:
         desired_qtys = _allocate_tp_quantities(
@@ -859,18 +924,19 @@ def ensure_directional_protection(
 
         if existing_leg:
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
-            tp_results.append(
-                {
-                    "leg": leg,
-                    "status": "already_exists",
-                    "order_id": str(existing_leg.get("orderId", "")),
-                    "client_order_id": str(existing_leg.get("clientOrderId", "")),
-                    "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
-                    "qty": existing_qty,
-                    "pnl_pct": pnl_pct,
-                }
-            )
-            continue
+            if min_qty <= 0 or (existing_qty >= min_qty and existing_qty <= position_qty + 1e-12):
+                tp_results.append(
+                    {
+                        "leg": leg,
+                        "status": "already_exists",
+                        "order_id": str(existing_leg.get("orderId", "")),
+                        "client_order_id": str(existing_leg.get("clientOrderId", "")),
+                        "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
+                        "qty": existing_qty,
+                        "pnl_pct": pnl_pct,
+                    }
+                )
+                continue
 
         if not current_price_checked:
             current_price = _current_close_price(symbol)
@@ -947,6 +1013,16 @@ def ensure_directional_protection(
     else:
         final_status = "SL_ONLY"
 
+    effective_levels = []
+    for level, qty in zip(tp_levels_norm, desired_qtys):
+        effective_levels.append({
+            "leg": str(level["leg"]),
+            "pnl_pct": float(level["pnl_pct"]),
+            "close_fraction": float(qty / position_qty) if position_qty > 0 else 0.0,
+            "qty": float(qty),
+        })
+    effective_weighted_rr = _effective_weighted_rr(effective_levels, stop_loss_pct)
+
     return {
         "status": final_status,
         "symbol": symbol,
@@ -954,6 +1030,9 @@ def ensure_directional_protection(
         "direction": direction,
         "avg_price": avg_price,
         "qty": position_qty,
+        "tp_mode": tp_mode,
+        "effective_tp_levels": effective_levels,
+        "effective_weighted_rr": effective_weighted_rr,
         "tp_orders": tp_results,
         "sl_result": sl_result,
     }

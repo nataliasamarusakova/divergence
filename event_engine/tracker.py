@@ -27,6 +27,7 @@ log = logging.getLogger("event_engine.tracker")
 
 DATA = Path("data")
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
+TRADES_PATH = DATA / "trades.jsonl"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -63,6 +64,12 @@ def _save_active_trades(trades: dict[str, dict]) -> None:
     os.replace(tmp_path, ACTIVE_TRADES_PATH)
 
 
+def _append_trade_record(record: dict) -> None:
+    TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with TRADES_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def _normalize_direction(direction: str) -> str:
     d = str(direction or "").upper()
     if d not in {"LONG", "SHORT"}:
@@ -79,6 +86,9 @@ def update_active_trade_protection(
     direction: str,
     tp_orders: list[dict],
     sl_result: dict,
+    effective_tp_levels: list[dict] | None = None,
+    tp_mode: str | None = None,
+    effective_weighted_rr: float | None = None,
 ) -> bool:
     trades = _load_active_trades()
     want_bx = to_bx_symbol(symbol) or _normalized_symbol(symbol)
@@ -93,6 +103,12 @@ def update_active_trade_protection(
         if trade_bx == want_bx and trade_direction == want_direction:
             trade["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
             trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
+            if effective_tp_levels is not None:
+                trade["effective_tp_levels"] = effective_tp_levels
+            if tp_mode:
+                trade["tp_mode"] = tp_mode
+            if effective_weighted_rr is not None:
+                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, trade.get("effective_weighted_rr", 1.05))
             trade["protection_last_updated_ts"] = int(time.time() * 1000)
             _save_active_trades(trades)
             return True
@@ -105,17 +121,23 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         return {
             "planned_risk_pct": None,
             "planned_target_rr": None,
-            "planned_weighted_rr": 1.55,
+            "planned_weighted_rr": 1.05,
             "entry_reference": None,
             "invalidation_price": None,
             "target_price": None,
             "tp_levels": [],
+            "effective_tp_levels": [],
+            "effective_weighted_rr": 1.05,
+            "tp_mode": "multi_tp",
         }
 
     return {
         "planned_risk_pct": _safe_float(setup.get("risk_pct"), 0.0) if setup.get("risk_pct") is not None else None,
         "planned_target_rr": _safe_float(setup.get("target_rr"), 0.0) if setup.get("target_rr") is not None else None,
-        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.55), 1.55),
+        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.05), 1.05),
+        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.05)), 1.05),
+        "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
+        "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "entry_reference": _safe_float(setup.get("entry_reference"), 0.0) if setup.get("entry_reference") is not None else None,
         "invalidation_price": _safe_float(setup.get("invalidation_price"), 0.0) if setup.get("invalidation_price") is not None else None,
         "target_price": _safe_float(setup.get("target_price"), 0.0) if setup.get("target_price") is not None else None,
@@ -137,10 +159,12 @@ def register_active_trade(
     score: float = 50.0,
     setup: dict | None = None,
     requested_entry_price: float | None = None,
+    entry_ts_ms: int | None = None,
 ) -> None:
     direction = _normalize_direction(direction)
     trades = _load_active_trades()
     now_ms = int(time.time() * 1000)
+    actual_entry_ts = int(entry_ts_ms) if entry_ts_ms is not None and int(entry_ts_ms) > 0 else now_ms
 
     actual_entry_price = _safe_float(entry_price)
     actual_qty = abs(_safe_float(qty))
@@ -171,6 +195,11 @@ def register_active_trade(
         else:
             adverse_entry_slippage_pct = max(0.0, -entry_slippage_pct)
 
+    signal_reference_price = _safe_float(setup.get("signal_price"), 0.0) if isinstance(setup, dict) else 0.0
+    if signal_reference_price <= 0:
+        signal_reference_price = _safe_float(setup_metrics.get("entry_reference"), 0.0) if isinstance(setup, dict) else 0.0
+    pre_order_reference_price = _safe_float(setup.get("pre_order_reference_price"), 0.0) if isinstance(setup, dict) else 0.0
+
     trades[event_id] = {
         "event_id": event_id,
         "symbol": symbol,
@@ -179,17 +208,23 @@ def register_active_trade(
         "entry_price": actual_entry_price,
         "actual_entry_price": actual_entry_price,
         "requested_entry_price": requested_price,
+        "signal_reference_price": signal_reference_price if signal_reference_price > 0 else None,
+        "pre_order_reference_price": pre_order_reference_price if pre_order_reference_price > 0 else requested_price,
+        "signal_to_fill_drift_pct": _safe_float(_calc_trade_pnl_pct(signal_reference_price, actual_entry_price, direction), 0.0) if signal_reference_price > 0 else None,
         "entry_slippage_pct": entry_slippage_pct,
         "adverse_entry_slippage_pct": adverse_entry_slippage_pct,
         "initial_qty": actual_qty,
         "remaining_qty": actual_qty,
-        "entry_ts": now_ms,
+        "entry_ts": actual_entry_ts,
         "tp_orders": tp_orders if isinstance(tp_orders, list) else [],
         "sl_order": sl_result if isinstance(sl_result, dict) else {},
         "hit_legs": [],
         "be_activated": False,
         "be_activation_ts": None,
+        "be_required": False,
+        "be_last_error": None,
         "peak_pnl_pct": 0.0,
+        "mae_pct": 0.0,
         "max_drawdown_pct": 0.0,
         "current_pnl_pct": 0.0,
         "score": _safe_float(score, 50.0),
@@ -203,6 +238,18 @@ def register_active_trade(
         "planned_invalidation_price": setup_metrics["invalidation_price"],
         "planned_target_price": setup_metrics["target_price"],
         "tp_levels": setup_metrics["tp_levels"],
+        "effective_tp_levels": (setup_metrics["effective_tp_levels"] or [
+            {
+                "leg": str(x.get("leg")),
+                "pnl_pct": _safe_float(x.get("pnl_pct")),
+                "close_fraction": _safe_float(x.get("qty")) / actual_qty if actual_qty > 0 else 0.0,
+                "qty": _safe_float(x.get("qty")),
+            }
+            for x in (tp_orders if isinstance(tp_orders, list) else [])
+            if x.get("leg") and str(x.get("status", "")).lower() in {"created", "already_exists"}
+        ]),
+        "tp_mode": setup_metrics["tp_mode"] if setup_metrics["effective_tp_levels"] else ("single_tp" if len([x for x in (tp_orders if isinstance(tp_orders, list) else []) if x.get("leg")]) == 1 else "multi_tp"),
+        "effective_weighted_rr": setup_metrics["effective_weighted_rr"],
         "tp_filled_qty": {},
         "realized_pnl_qty": 0.0,
         "realized_pnl_weighted_sum": 0.0,
@@ -386,13 +433,22 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
         return
     entry_price = _safe_float(trade.get("entry_price"))
     direction = str(trade.get("direction", "LONG")).upper()
+    entry_ts = int(_safe_float(trade.get("entry_ts"), 0.0))
     if entry_price <= 0:
         return
 
     peak = _safe_float(trade.get("peak_pnl_pct", 0.0))
+    mae = _safe_float(trade.get("mae_pct", 0.0))
     max_drawdown = _safe_float(trade.get("max_drawdown_pct", 0.0))
 
-    for candle in candles:
+    # Only use completed 1m bars whose OPEN is at/after entry. This prevents
+    # pre-entry price action (and the partial entry candle) from contaminating MFE/MAE.
+    for candle in sorted(candles, key=lambda x: int(_safe_float(x.get("open_time"), x.get("close_time", 0)))):
+        open_ts = int(_safe_float(candle.get("open_time"), 0.0))
+        close_ts = int(_safe_float(candle.get("close_time"), 0.0))
+        if entry_ts and ((open_ts and open_ts < entry_ts) or (not open_ts and close_ts <= entry_ts)):
+            continue
+
         high = _safe_float(candle.get("high"), 0.0)
         low = _safe_float(candle.get("low"), 0.0)
         if high <= 0 or low <= 0:
@@ -405,13 +461,17 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
             favorable = (entry_price - low) / entry_price * 100.0
             adverse = (entry_price - high) / entry_price * 100.0
 
+        previous_peak = peak
         peak = max(peak, favorable)
-        current_drawdown = adverse - peak
-        max_drawdown = min(max_drawdown, current_drawdown)
+        mae = min(mae, adverse)
+        drawdown_from_peak = adverse - max(previous_peak, favorable)
+        max_drawdown = min(max_drawdown, drawdown_from_peak)
 
     trade["peak_pnl_pct"] = peak
+    trade["mae_pct"] = mae
+    # Backward-compatible field now explicitly means peak-to-trough drawdown,
+    # while mae_pct is the classical adverse excursion from entry.
     trade["max_drawdown_pct"] = max_drawdown
-
 
 def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
     if not sl_order_id:
@@ -490,6 +550,29 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
+            # Retry a failed TP1 -> BE move on every subsequent cycle while the
+            # position is still alive. The original SL remains in place meanwhile.
+            if ("tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated")
+                    and rem_qty > 0):
+                old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
+                be_retry = _move_sl_to_break_even(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    qty=rem_qty,
+                    old_sl_id=old_sl_id,
+                    trade_id=str(event_id).replace("EVT_", ""),
+                )
+                if be_retry.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                    trade["sl_order"] = be_retry
+                    trade["be_activated"] = True
+                    trade["be_required"] = False
+                    trade["be_last_error"] = None
+                    trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
+                else:
+                    trade["be_required"] = True
+                    trade["be_last_error"] = be_retry.get("error")
+
             # Проверка исполнения Тейк-Профитов
             for tp in trade.get("tp_orders", []):
                 leg = str(tp.get("leg", ""))
@@ -518,13 +601,13 @@ def update_active_trades() -> None:
                         hit_legs.add(leg)
                     continue
 
-                exec_price = _safe_float(order_info.get("avg_price") or tp.get("price") or cur_price, cur_price)
+                exec_price = _safe_float(order_info.get("avg_price"), 0.0)
                 if exec_price <= 0:
+                    log.warning("[TRACKER_TP] %s %s %s filled without avgPrice; deferring realized PnL accounting", symbol, direction, leg)
                     continue
 
-                pnl_tp = _safe_float(tp.get("pnl_pct"), 0.0)
-                if pnl_tp <= 0:
-                    pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
+                # Realized PnL is always derived from the actual execution price.
+                pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
 
                 rem_qty = max(0.0, rem_qty - delta_qty)
                 realized_qty += delta_qty
@@ -581,6 +664,8 @@ def update_active_trades() -> None:
                                 trade.get("name", symbol), symbol, entry_price
                             )
                         else:
+                            trade["be_required"] = True
+                            trade["be_last_error"] = new_sl.get("error")
                             log.error(
                                 "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")
@@ -623,9 +708,14 @@ def update_active_trades() -> None:
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
+            if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
+                if direction == "LONG":
+                    exit_price = entry_price * (1.0 + final_pnl / 100.0)
+                else:
+                    exit_price = entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct)
-            planned_rr = _safe_float(trade.get("planned_weighted_rr", 1.55), 1.55)
+            planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
 
             trade["remaining_qty"] = 0.0
             trade["realized_pnl_pct"] = final_pnl
@@ -637,6 +727,39 @@ def update_active_trades() -> None:
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
             trade["closed"] = True
+            trade["mae_pct"] = _safe_float(trade.get("mae_pct"), 0.0)
+            if trade.get("last_tp_exec_price"):
+                trade["last_close_exec_price"] = trade.get("last_tp_exec_price")
+            trade["exit_price_source"] = "sl_fill" if sl_exit_price is not None else ("tp_fills_weighted" if closed_by_tp else "position_observation")
+
+            # Persist a durable close record before removing the live trade from state.
+            _append_trade_record({
+                "record_type": "TRADE_CLOSE",
+                "event_id": event_id,
+                "symbol": symbol,
+                "direction": direction,
+                "event_type": trade.get("event_type"),
+                "closed_ts": now_ms,
+                "exit_reason": exit_reason,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "realized_pnl_pct": final_pnl,
+                "realized_rr": realized_rr,
+                "effective_weighted_rr": planned_rr,
+                "tp_mode": trade.get("tp_mode"),
+                "effective_tp_levels": trade.get("effective_tp_levels", []),
+                "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),
+                "mae_pct": _safe_float(trade.get("mae_pct")),
+                "max_drawdown_pct": _safe_float(trade.get("max_drawdown_pct")),
+                "duration_min": duration_min,
+                "hit_legs": sorted(hit_legs),
+                "tp_filled_qty": filled_by_leg,
+                "be_activated": bool(trade.get("be_activated")),
+                "entry_slippage_pct": trade.get("entry_slippage_pct"),
+                "adverse_entry_slippage_pct": trade.get("adverse_entry_slippage_pct"),
+                "research": trade.get("research", {}),
+                "setup": trade.get("setup", {}),
+            })
 
             emoji = "💚" if final_pnl >= 0 else "💔"
             log.info(

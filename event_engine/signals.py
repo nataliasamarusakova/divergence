@@ -64,7 +64,9 @@ def _atr(
         axis=1,
     ).max(axis=1)
 
-    return tr.rolling(n, min_periods=n).mean()
+    # Wilder ATR (RMA): matches the intended ATR(14) definition used by the
+    # strategy documentation and avoids a mismatch between signal/risk math.
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
 def _pivots(
