@@ -60,9 +60,7 @@ ACTIONS = DATA / "actions.jsonl"
 HEALTH = DATA / "health.jsonl"
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
-MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "50000000"))
-
-# Установлен порог Open Interest $10 000 000 по вашему запросу
+MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "25000000"))
 MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "10000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
@@ -71,7 +69,7 @@ CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
-MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "0"))
+MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
