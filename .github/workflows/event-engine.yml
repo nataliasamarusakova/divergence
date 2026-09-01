@@ -49,6 +49,10 @@ jobs:
       # Audit fix B5: cross-process (file-lock) rate limiter shared by
       # processes on the same host / workspace.
       BINGX_GLOBAL_RATE_LIMITER: "true"
+      # Reconciliation must fail fast; deferred checks are retried next cycle.
+      RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
+      RECONCILIATION_MAX_SECONDS: "45"
+      BINGX_HTTP_TIMEOUT_SEC: "10"
       # Audit fix B3: forced-liquidation squeeze thresholds.
       LIQ_SQUEEZE_MIN_LIQ_OI_RATIO: "0.01"
       LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
