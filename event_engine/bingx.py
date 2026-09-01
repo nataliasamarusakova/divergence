@@ -232,12 +232,26 @@ def contract_exists(symbol: str) -> bool:
     return bool(c and c.get("status") == 1 and str(c.get("apiStateOpen", "")).lower() == "true")
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[dict]:
+def fetch_klines(
+    symbol: str,
+    interval: str,
+    limit: int = 250,
+    *,
+    timeout_sec: float | None = None,
+    retryable: bool = True,
+) -> list[dict]:
     bx = to_bx_symbol(symbol)
     if not bx:
         raise ValueError(f"[BINGX] No contract found for {symbol}")
 
-    resp = _request("GET", KLINE_PATH, {"symbol": bx, "interval": interval, "limit": limit}, signed=False)
+    resp = _request(
+        "GET",
+        KLINE_PATH,
+        {"symbol": bx, "interval": interval, "limit": limit},
+        signed=False,
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
     code = resp.get("code")
     if code not in (0, "0"):
         raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={resp.get('msg')}")
