@@ -243,8 +243,28 @@ def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
     lock_path = lock_dir / ".bingx_rate_lock"
     stamp_path = lock_dir / ".bingx_rate_stamp"
 
+    try:
+        lock_timeout = float(os.environ.get("BINGX_RATE_LOCK_TIMEOUT_SEC", "10"))
+    except (TypeError, ValueError):
+        lock_timeout = 10.0
+    lock_timeout = max(1.0, min(lock_timeout, 60.0))
+
     with open(lock_path, "a+") as lock_f:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + lock_timeout
+        acquired = False
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                time.sleep(0.1)
+
+        if not acquired:
+            raise TimeoutError(
+                f"global BingX rate-limit lock unavailable after {lock_timeout:.1f}s: {lock_path}"
+            )
+
         try:
             try:
                 last = float(stamp_path.read_text(encoding="utf-8").strip())
@@ -299,9 +319,25 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
+        log.info(
+            "[BINGX_KLINE] START %s/%s attempt %d/%d (rate interval=%.2fs)...",
+            symbol, timeframe, attempt + 1, max_attempts, min_interval
+        )
+        slot_started = time.monotonic()
         _acquire_scan_slot(min_interval)
+        log.info(
+            "[BINGX_KLINE] slot acquired %s/%s after %.2fs; requesting...",
+            symbol, timeframe, time.monotonic() - slot_started
+        )
+        request_started = time.monotonic()
         try:
-            return fetch_klines(symbol, timeframe, limit)
+            result = fetch_klines(symbol, timeframe, limit)
+            log.info(
+                "[BINGX_KLINE] END %s/%s attempt %d/%d in %.2fs; rows=%d.",
+                symbol, timeframe, attempt + 1, max_attempts,
+                time.monotonic() - request_started, len(result or [])
+            )
+            return result
         except (RuntimeError, requests.RequestException, TimeoutError) as exc:
             last_error = exc
             if attempt + 1 >= max_attempts:
@@ -1327,7 +1363,10 @@ def main() -> None:
 
     btc_regime_df = None
     try:
+        log.info("[ENGINE_STAGE] BTC regime fetch START (1h, limit=10)...")
+        stage_started = time.monotonic()
         btc_klines = _fetch_klines_scan("BTC-USDT", "1h", limit=10)
+        log.info("[ENGINE_STAGE] BTC regime fetch END in %.2fs; rows=%d.", time.monotonic() - stage_started, len(btc_klines or []))
         if btc_klines:
             btc_regime_df = pd.DataFrame(btc_klines)
             last_c = float(btc_regime_df["close"].iloc[-1])
@@ -1341,7 +1380,10 @@ def main() -> None:
 
     rows: list[Any] = []
     try:
+        log.info("[ENGINE_STAGE] Coinalyze fetch START...")
+        stage_started = time.monotonic()
         rows = fetch_data()
+        log.info("[ENGINE_STAGE] Coinalyze fetch END in %.2fs; rows=%d.", time.monotonic() - stage_started, len(rows))
         log.info("[COINALYZE] Ingested %d rows from Coinalyze.", len(rows))
     except Exception as exc:
         stats["scan_errors"] += 1
