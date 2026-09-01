@@ -159,15 +159,28 @@ def _build_header_map(soup: BeautifulSoup) -> dict[str, int]:
                 f"[COINALYZE] Schema error: field {field_name!r} matched multiple columns at indices {matches}"
             )
 
-    required_fields = {
-        "price", "price_chg24", "volume24", "oi", "oi_chg24_pct", "oi_chg4h_pct",
-        "oi_vol_ratio", "oi_mktcap_ratio", "fr_oiw", "pfr_oiw", "liq_short24",
-        "liq_long24", "ls_accounts", "btc_corr7d", "cvd24", "lls24",
+    # Audit B8 mitigation (defensive parsing): the full schema used to be
+    # all-or-nothing -- a renamed secondary column disabled the whole pipeline
+    # for the cycle. Now only the columns the universe filter genuinely needs
+    # are mandatory; missing optional columns degrade to None values and are
+    # reported loudly so the header rename is still visible in logs.
+    required_fields = {"price", "volume24", "oi"}
+    optional_fields = {
+        "price_chg24", "oi_chg24_pct", "oi_chg4h_pct", "oi_vol_ratio",
+        "oi_mktcap_ratio", "fr_oiw", "pfr_oiw", "liq_short24", "liq_long24",
+        "ls_accounts", "btc_corr7d", "cvd24", "lls24",
     }
 
-    missing = sorted(required_fields - header_map.keys())
-    if missing:
-        raise ValueError("[COINALYZE] Schema error: required columns not found: " + ", ".join(missing))
+    missing_required = sorted(required_fields - header_map.keys())
+    if missing_required:
+        raise ValueError("[COINALYZE] Schema error: required columns not found: " + ", ".join(missing_required))
+
+    missing_optional = sorted(optional_fields - header_map.keys())
+    if missing_optional:
+        log.warning(
+            "[COINALYZE] Optional columns missing (features degrade): %s",
+            ", ".join(missing_optional),
+        )
 
     log.info(
         "[COINALYZE] Field mapping: %s",

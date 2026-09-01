@@ -489,7 +489,38 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     }
 
     response = _request("POST", ORDER_PATH, params)
-    if response.get("code") != 0:
+
+    if isinstance(response, dict) and response.get("code") != 0:
+        # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
+        # the outcome unknown -- the order may have been created even though we
+        # did not receive an ack. Never blindly retry a POST; verify the result
+        # via the position instead. The pre-flight has_open_position check above
+        # guarantees any position present now was opened by THIS order.
+        transport_error = (
+            response.get("code") == -1
+            and "missing bingx credentials" not in str(response.get("msg", "")).lower()
+        )
+        if transport_error:
+            log.warning("[BINGX] Order POST transport error for %s (%s); verifying via position...", bx, response.get("msg"))
+            try:
+                if has_open_position(symbol, direction):
+                    log.warning("[BINGX] Position found after transport error -> treating order as filled (idempotent).")
+                    return {
+                        "status": "opened",
+                        "symbol": bx,
+                        "qty": qty,
+                        "leverage": leverage,
+                        "sizing_price": sizing_price,
+                        "signal_price": float(price),
+                        "order_reference_price": sizing_price,
+                        "order_id": None,
+                        "client_order_id": client_order_id,
+                        "idempotency": "position_verified_after_transport_error",
+                        "response": response,
+                    }
+            except Exception as exc:
+                log.error("[BINGX] Post-error position verification failed: %s", exc)
+
         return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
 
     data = response.get("data") or {}

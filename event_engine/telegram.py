@@ -129,6 +129,22 @@ def format_signal(
             f"Duration: <code>{esc(fact.get('squeeze_duration_bars'))} bars</code>",
             f"BB / KC Width: <code>{esc(round(float(fact.get('compression_ratio', 0)), 3))}</code>",
         ])
+    elif "liq_ratio_24h" in fact:
+        # Audit B3: forced-liquidation squeeze event card.
+        ratio_pct = None
+        try:
+            ratio_pct = float(fact.get("liq_ratio_24h", 0)) * 100.0
+        except (TypeError, ValueError):
+            ratio_pct = None
+        lines.extend([
+            "",
+            "<b>Liquidation Squeeze</b>",
+            f"Liq/OI 24h: <code>{esc(round(ratio_pct, 3) if ratio_pct is not None else None)}%</code>",
+            f"Spike (ATR mult): <code>{esc(round(float(fact.get('spike_atr_mult', 0) or 0), 2))}</code>",
+            f"OI chg 4h: <code>{esc(fact.get('oi_chg4h_pct'))}%</code>",
+            f"Funding OI-w: <code>{esc(fact.get('fr_oiw'))}</code>",
+            f"L/S accounts: <code>{esc(fact.get('ls_accounts'))}</code>",
+        ])
 
     if setup:
         rr = setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.05))))

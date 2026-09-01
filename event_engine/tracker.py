@@ -330,9 +330,68 @@ def format_trade_closed_message(
     return "\n".join(lines)
 
 
+def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_attempts: int = 3) -> tuple[bool, str]:
+    """Cancel an SL order and verify it actually disappeared (audit fix B4).
+
+    Returns (cancelled, message). After failing DELETE attempts we re-query
+    open orders: some exchanges answer an already-executed/expired cancel with
+    an error code while the order is in fact gone.
+    """
+    last_error = ""
+    for attempt in range(max_attempts):
+        try:
+            resp = cancel_order(symbol, order_id)
+        except Exception as exc:
+            resp = {"code": -1, "msg": str(exc)}
+        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+            return True, "cancelled"
+        last_error = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
+        if attempt + 1 < max_attempts:
+            time.sleep(0.3 * (attempt + 1))
+
+    try:
+        prot = get_open_protection_directional(symbol, direction)
+        if prot.get("status") == "ok":
+            open_ids = {str(o.get("orderId", "")) for o in (prot.get("sl_orders", []) + prot.get("tp_orders", []))}
+            if str(order_id) not in open_ids:
+                return True, "already_gone_from_open_orders"
+    except Exception as exc:
+        last_error = f"{last_error}; openOrders verify failed: {exc}"
+
+    return False, last_error
+
+
+def _notify_be_failure(symbol: str, direction: str, detail: str) -> None:
+    """Best-effort Telegram alert when the BE swap could not be completed."""
+    try:
+        send_tg(
+            f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
+            f"Status: <code>{detail}</code>\n"
+            f"Позиция может остаться со старым SL или без SL — требуется проверка."
+        )
+    except Exception:
+        pass
+
+
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
+    old_sl_price: float | None = None,
 ) -> dict:
+    """Move the stop-loss to break-even without ever holding two SL orders.
+
+    Audit fix B4 (race condition): the previous implementation created the new
+    STOP_MARKET first and cancelled the old SL only afterwards, leaving two
+    live stops for a ms-to-seconds window; if both triggered the position
+    could be over-closed or flipped. The order is now:
+
+      Step 1: if a BE SL already exists -> keep it, try to cancel the old one.
+      Step 2: cancel the OLD SL first and verify the cancellation.
+              If it fails -> DO NOT create the new SL (position stays protected
+              by the old stop; no double-SL window is possible).
+      Step 3: create the new STOP_MARKET at entry price.
+      Step 4: verify the new SL on the exchange; on failure restore the old
+              stop price (best effort) and raise an error status.
+    """
     direction = str(direction).upper()
     bx = to_bx_symbol(symbol)
     contract = get_contract(symbol) or {}
@@ -358,17 +417,73 @@ def _move_sl_to_break_even(
 
             if be_client_id.upper() in cid or price_matches:
                 existing_id = str(order.get("orderId", ""))
+                old_cancelled = True
+                cancel_note = ""
                 if old_sl_id and existing_id and str(old_sl_id) != existing_id:
-                    try:
-                        cancel_order(symbol, old_sl_id)
-                    except Exception as exc:
-                        log.warning("[TRACKER] Old SL cancel error for %s: %s", symbol, exc)
+                    old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
+                status = "created" if old_cancelled else "created_old_sl_cancel_failed"
+                if not old_cancelled:
+                    log.warning(
+                        "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s",
+                        symbol, old_sl_id, cancel_note,
+                    )
                 return {
-                    "status": "created",
+                    "status": status,
                     "order_id": existing_id,
                     "client_order_id": cid or be_client_id,
                     "stop_price": entry_price,
                 }
+
+    # Step 2 (audit fix B4): cancel the old SL BEFORE creating the new one.
+    if old_sl_id:
+        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
+        if not old_cancelled:
+            log.error(
+                "[TRACKER] %s %s: old SL %s could not be cancelled (%s); new BE SL NOT created to avoid double-SL race.",
+                direction, symbol, old_sl_id, cancel_note,
+            )
+            return {
+                "status": "error",
+                "error": f"old SL cancel failed: {cancel_note}; new SL not created (no double-SL window)",
+                "order_id": "",
+                "stop_price": entry_price,
+                "old_sl_id": str(old_sl_id),
+            }
+
+    def _restore_old_sl() -> bool:
+        """Best-effort restore of protection when the new SL could not be placed."""
+        if not old_sl_price or old_sl_price <= 0 or abs(old_sl_price - entry_price) / max(entry_price, 1e-12) < 1e-9:
+            return False
+        restore_side = "SELL" if direction == "LONG" else "BUY"
+        restore_params = {
+            "symbol": bx,
+            "side": restore_side,
+            "positionSide": direction,
+            "type": "STOP_MARKET",
+            "stopPrice": _format_price(old_sl_price, price_precision),
+            "quantity": _format_qty(qty, precision),
+            "clientOrderId": f"EVT_BE_RST_{trade_token}",
+        }
+        try:
+            restore_resp = _request("POST", ORDER_PATH, restore_params)
+        except Exception:
+            return False
+        return isinstance(restore_resp, dict) and restore_resp.get("code") == 0
+
+    def _fail(error: str) -> dict:
+        restored = _restore_old_sl()
+        log.error(
+            "[TRACKER] BE move failed for %s %s: %s; old SL restore %s.",
+            direction, symbol, error, "succeeded" if restored else "FAILED",
+        )
+        _notify_be_failure(symbol, direction, f"{error}; restore={'ok' if restored else 'failed'}")
+        return {
+            "status": "error",
+            "error": error,
+            "order_id": "",
+            "stop_price": entry_price,
+            "old_sl_restored": bool(restored),
+        }
 
     sl_side = "SELL" if direction == "LONG" else "BUY"
     params = {
@@ -384,34 +499,23 @@ def _move_sl_to_break_even(
     try:
         resp = _request("POST", ORDER_PATH, params)
     except Exception as exc:
-        return {"status": "error", "error": str(exc), "order_id": "", "stop_price": entry_price}
+        return _fail(f"BE stop request exception: {exc}")
 
     if not isinstance(resp, dict) or resp.get("code") != 0:
-        return {
-            "status": "error",
-            "error": f"BE stop failed: {resp}",
-            "order_id": "",
-            "stop_price": entry_price,
-        }
+        return _fail(f"BE stop failed: {resp}")
 
     order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
     new_order_id = str(order.get("orderId", ""))
     if not new_order_id:
-        return {"status": "error", "error": "BE stop response has no orderId", "order_id": "", "stop_price": entry_price}
+        return _fail("BE stop response has no orderId")
 
     verified_after = get_open_protection_directional(symbol, direction)
     if verified_after.get("status") != "ok":
-        return {"status": "error", "error": "BE stop verification failed", "order_id": new_order_id, "stop_price": entry_price}
+        return _fail("BE stop verification failed")
 
     found = any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", []))
     if not found:
-        return {"status": "error", "error": "BE stop not visible on exchange", "order_id": new_order_id, "stop_price": entry_price}
-
-    if old_sl_id and str(old_sl_id) != new_order_id:
-        try:
-            cancel_order(symbol, old_sl_id)
-        except Exception:
-            pass
+        return _fail("BE stop not visible on exchange")
 
     return {
         "status": "created",
@@ -564,8 +668,10 @@ def update_active_trades() -> None:
 
             # Retry a failed TP1 -> BE transition while the position remains open.
             if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0:
-                old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
-                retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""))
+                old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
+                old_sl_id = old_sl.get("order_id")
+                old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
+                retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
                 if retry.get("status") in {"created", "created_old_sl_cancel_failed"}:
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
@@ -645,9 +751,11 @@ def update_active_trades() -> None:
                     except Exception:
                         pass
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (Только в консоль)
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (audit fix B4: cancel-first swap)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
-                        old_sl_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
+                        old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
+                        old_sl_id = old_sl.get("order_id")
+                        old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
                         new_sl = _move_sl_to_break_even(
                             symbol=symbol,
                             direction=direction,
@@ -655,6 +763,7 @@ def update_active_trades() -> None:
                             qty=rem_qty,
                             old_sl_id=old_sl_id,
                             trade_id=str(event_id).replace("EVT_", ""),
+                            old_sl_price=old_sl_price,
                         )
                         if new_sl.get("status") in {"created", "created_old_sl_cancel_failed"}:
                             trade["sl_order"] = new_sl
@@ -664,6 +773,14 @@ def update_active_trades() -> None:
                                 "[TRACKER_BE_ACTIVATED] 🛡 %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
                             )
+                            # Audit P2-7: notify Telegram about BE activation (was console-only).
+                            try:
+                                send_tg(
+                                    f"🛡 <b>{trade.get('name', symbol)} ({symbol}) — Break-Even</b>\n"
+                                    f"TP1 исполнен, SL перенесён в безубыток: <code>{entry_price:.8g}</code> (риск 0.00%)"
+                                )
+                            except Exception:
+                                pass
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")

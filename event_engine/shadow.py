@@ -49,23 +49,30 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
         )
         bucket = structures.setdefault(key, set())
         et = str(event.get("event_type", ""))
-        if "RSI" in et:
-            bucket.add("RSI")
-        if "CVD" in et:
-            bucket.add("CVD")
+        for tag in ("RSI", "CVD", "MACD", "STOCH", "OBV"):
+            if tag in et:
+                bucket.add(tag)
+        if et.endswith("_OI"):
+            bucket.add("OI")
 
     rsi_only = sum(v == {"RSI"} for v in structures.values())
     cvd_only = sum(v == {"CVD"} for v in structures.values())
     joint = sum(v == {"RSI", "CVD"} for v in structures.values())
     latest_event = max((e.get("timestamps", {}).get("detected_at_ts", 0) for e in events), default=0)
+    types = [str(e.get("event_type", "")) for e in events]
 
     return {
         "timestamp": now_ms,
         "events": {
             "total": len(events),
             "unique_structures": len(structures),
-            "rsi_events": sum("RSI" in str(e.get("event_type", "")) for e in events),
-            "cvd_events": sum("CVD" in str(e.get("event_type", "")) for e in events),
+            "rsi_events": sum("RSI" in t for t in types),
+            "cvd_events": sum("CVD" in t for t in types),
+            "macd_events": sum("MACD" in t for t in types),
+            "stoch_events": sum("STOCH" in t for t in types),
+            "obv_events": sum("OBV" in t for t in types),
+            "oi_events": sum(t.endswith("_OI") for t in types),
+            "liq_squeeze_events": sum(t in {"SHORT_SQUEEZE", "LONG_SQUEEZE"} for t in types),
             "rsi_only_structures": rsi_only,
             "cvd_only_structures": cvd_only,
             "joint_structures": joint,
