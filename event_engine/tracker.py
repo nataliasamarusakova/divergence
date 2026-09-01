@@ -187,6 +187,7 @@ def register_active_trade(
     tp_orders: list[dict],
     sl_result: dict,
     event_type: str,
+    timeframe: str | None = None,
     coinalyze_row: Any = None,
     score: float = 50.0,
     setup: dict | None = None,
@@ -259,6 +260,7 @@ def register_active_trade(
         "current_pnl_pct": 0.0,
         "score": _safe_float(score, 50.0),
         "event_type": event_type,
+        "timeframe": str(timeframe or (setup or {}).get("event_timeframe") or (setup or {}).get("timeframe") or "1h").lower(),
         "research": research,
         "setup": setup.copy() if isinstance(setup, dict) else {},
         "planned_risk_pct": setup_metrics["planned_risk_pct"],
@@ -307,7 +309,7 @@ def format_trade_closed_message(
     name: str, symbol: str, direction: str, entry_price: float, exit_price: float,
     pnl_pct: float, realized_rr: float | None, planned_rr: float | None,
     duration_min: float, peak_pnl: float, max_drawdown: float,
-    exit_reason: str, event_type: str,
+    exit_reason: str, event_type: str, timeframe: str = "1h",
 ) -> str:
     is_win = pnl_pct >= 0.0
     emoji = "💚" if is_win else "💔"
@@ -321,7 +323,7 @@ def format_trade_closed_message(
         f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
-        f"Вход: <code>{event_type}</code> · TF <b>1h</b>",
+        f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or "1h").lower()}</b>",
         f"Выход: <b>{exit_reason}</b>",
     ]
 
@@ -774,6 +776,7 @@ def update_active_trades() -> None:
                         max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
                         exit_reason=exit_reason,
                         event_type=trade.get("event_type", "DIVERGENCE"),
+                        timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
                     )
                 )
             except Exception:

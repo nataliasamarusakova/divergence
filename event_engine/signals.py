@@ -282,7 +282,15 @@ def detect_squeeze_release(
     symbol: str,
     timeframe: str = "1h",
     min_squeeze_bars: int = 3,
+    release_lookback_bars: int = 4,
 ) -> list[dict[str, Any]]:
+    """Detect recent volatility-squeeze releases without changing release math.
+
+    The original detector evaluated only the final closed bar. That creates a
+    missed-event hole if a scheduled scan is delayed or a runner misses a
+    timeframe bucket. We preserve the exact BB/KC transition rule and simply
+    inspect a short recent tail. Freshness is enforced by the caller/event TTL.
+    """
 
     if len(df) < 40:
         return []
@@ -308,63 +316,63 @@ def detect_squeeze_release(
     if len(b) < (min_squeeze_bars + 2):
         return []
 
-    if pd.isna(bb_u.iloc[-1]) or pd.isna(kc_u.iloc[-1]):
-        return []
+    lookback = max(1, int(release_lookback_bars))
+    first_release_idx = max(1, len(b) - lookback)
+    releases: list[dict[str, Any]] = []
 
-    is_currently_in = bool(in_sq.iloc[-1])
-    was_previously_in = bool(in_sq.iloc[-2])
+    for current_idx in range(first_release_idx, len(b)):
+        prev_idx = current_idx - 1
+        if pd.isna(bb_u.iloc[current_idx]) or pd.isna(kc_u.iloc[current_idx]):
+            continue
+        if bool(in_sq.iloc[current_idx]) or not bool(in_sq.iloc[prev_idx]):
+            continue
 
-    if is_currently_in or not was_previously_in:
-        return []
+        sq_duration = 0
+        idx = prev_idx
+        while idx >= 0 and bool(in_sq.iloc[idx]):
+            sq_duration += 1
+            idx -= 1
+        if sq_duration < min_squeeze_bars:
+            continue
 
-    sq_duration = 0
-    idx = len(in_sq) - 2
+        close_val = float(b["close"].iloc[current_idx])
+        kc_u_val = float(kc_u.iloc[current_idx])
+        kc_l_val = float(kc_l.iloc[current_idx])
+        if close_val > kc_u_val:
+            direction = "LONG"
+        elif close_val < kc_l_val:
+            direction = "SHORT"
+        else:
+            continue
 
-    while idx >= 0 and bool(in_sq.iloc[idx]):
-        sq_duration += 1
-        idx -= 1
+        ts = int(b["close_time"].iloc[current_idx])
+        typ = "VOLATILITY_SQUEEZE_RELEASE"
+        bb_w = float(bb_u.iloc[current_idx] - bb_l.iloc[current_idx])
+        kc_w = float(kc_u.iloc[current_idx] - kc_l.iloc[current_idx])
+        compression_ratio = bb_w / kc_w if kc_w > 0 else 1.0
+        releases.append(
+            {
+                "event_id": _event_id(symbol, timeframe, typ, ts, ts),
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": typ,
+                "timestamps": {
+                    "pivot_1_ts": ts,
+                    "pivot_2_ts": ts,
+                    "detected_at_ts": ts,
+                },
+                "event_fact": {
+                    "detection_close_price": close_val,
+                    "bb_width": bb_w,
+                    "kc_width": kc_w,
+                    "squeeze_duration_bars": sq_duration,
+                    "compression_ratio": float(compression_ratio),
+                },
+            }
+        )
 
-    if sq_duration < min_squeeze_bars:
-        return []
-
-    close_val = float(b["close"].iloc[-1])
-    kc_u_val = float(kc_u.iloc[-1])
-    kc_l_val = float(kc_l.iloc[-1])
-
-    if close_val > kc_u_val:
-        direction = "LONG"
-    elif close_val < kc_l_val:
-        direction = "SHORT"
-    else:
-        return []
-
-    ts = int(b["close_time"].iloc[-1])
-    typ = "VOLATILITY_SQUEEZE_RELEASE"
-    bb_w = float(bb_u.iloc[-1] - bb_l.iloc[-1])
-    kc_w = float(kc_u.iloc[-1] - kc_l.iloc[-1])
-    compression_ratio = bb_w / kc_w if kc_w > 0 else 1.0
-
-    return [
-        {
-            "event_id": _event_id(symbol, timeframe, typ, ts, ts),
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "direction": direction,
-            "event_type": typ,
-            "timestamps": {
-                "pivot_1_ts": ts,
-                "pivot_2_ts": ts,
-                "detected_at_ts": ts,
-            },
-            "event_fact": {
-                "detection_close_price": close_val,
-                "bb_width": bb_w,
-                "kc_width": kc_w,
-                "squeeze_duration_bars": sq_duration,
-                "compression_ratio": float(compression_ratio),
-            },
-        }
-    ]
+    return releases
 
 
 def diagnose_15m_trigger(

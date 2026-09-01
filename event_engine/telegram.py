@@ -85,9 +85,34 @@ def format_signal(
         f"Score: <b>{score_str}</b>",
         f"Event: <code>{esc(event_type)}</code>",
         f"TF: <b>{esc(timeframe)}</b>{trigger_suffix}",
+    ]
+
+    confluence_events = setup.get("confluence_events", []) if isinstance(setup, dict) else []
+    if isinstance(confluence_events, list) and confluence_events:
+        labels = []
+        for item in confluence_events:
+            if not isinstance(item, dict):
+                continue
+            label = f"{str(item.get('timeframe', '1h')).lower()} {str(item.get('event_type', 'EVENT'))}"
+            labels.append(f"<code>{esc(label)}</code>")
+        if labels:
+            lines.append(f"🔗 <b>CONFLUENCE:</b> {' + '.join(labels)}")
+
+    conflict_events = setup.get("conflict_events", []) if isinstance(setup, dict) else []
+    if isinstance(conflict_events, list) and conflict_events:
+        labels = []
+        for item in conflict_events:
+            if not isinstance(item, dict):
+                continue
+            label = f"{str(item.get('timeframe', '1h')).lower()} {str(item.get('direction', ''))}"
+            labels.append(f"<code>{esc(label)}</code>")
+        if labels:
+            lines.append(f"⚠️ <b>CONFLICT:</b> {' + '.join(labels)}")
+
+    lines.extend([
         f"Price: <code>{esc(price)}</code>",
         f"Detected: <code>{esc(detected_ts)}</code>",
-    ]
+    ])
 
     if "p1_price" in fact:
         lines.extend([

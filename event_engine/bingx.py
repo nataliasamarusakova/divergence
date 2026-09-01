@@ -57,7 +57,17 @@ SESSION = requests.Session()
 _adapter = HTTPAdapter(
     pool_connections=20,
     pool_maxsize=20,
-    max_retries=Retry(total=2, backoff_factor=0.3),
+    max_retries=Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    ),
 )
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
