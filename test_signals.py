@@ -564,3 +564,36 @@ def test_squeeze_release_lookback_recovers_recent_closed_release(monkeypatch):
     events = sig.detect_squeeze_release(df, "TEST-USDT", "4h", min_squeeze_bars=3, release_lookback_bars=4)
     assert any(ev["timestamps"]["detected_at_ts"] == int(df["close_time"].iloc[n - 2]) for ev in events)
 
+
+def test_tf_stats_assigned_before_first_use_in_fresh_event_loop():
+    """Regression guard for the production crash:
+
+    UnboundLocalError: cannot access local variable 'tf_stats' where it is
+    not associated with a value
+
+    `tf_stats = _tf_stats(stats, tf)` must appear before any `tf_stats[...]`
+    subscript use inside the per-event fresh-signal loop in main(). This is
+    checked structurally (source order) rather than by driving a full
+    main() run, since main() has many external dependencies (Coinalyze,
+    BingX, Telegram) that a live crash does not require to reproduce this
+    particular class of bug -- it only requires one fresh event to reach
+    the loop body, which is exactly what happened in production.
+    """
+    import inspect
+    import run_once as ro
+
+    source = inspect.getsource(ro.main)
+    marker = "for ev in sorted(all_events"
+    assert marker in source, "fresh-event loop marker not found; test needs updating"
+    loop_body = source[source.index(marker):]
+
+    assign_marker = "tf_stats = _tf_stats(stats, tf)"
+    assert assign_marker in loop_body, "tf_stats assignment not found in fresh-event loop"
+    assign_idx = loop_body.index(assign_marker)
+
+    first_use_idx = loop_body.index("tf_stats[")
+    assert assign_idx < first_use_idx, (
+        "tf_stats is subscripted before it is assigned in the fresh-event "
+        "loop; this reproduces the production UnboundLocalError crash."
+    )
+

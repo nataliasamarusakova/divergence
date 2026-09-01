@@ -1275,6 +1275,9 @@ def main() -> None:
             if age < 0 or age > MAX_AGE:
                 continue
 
+            tf = str(ev.get("timeframe", "1h")).lower()
+            tf_stats = _tf_stats(stats, tf)
+
             stats["fresh_events"] += 1
             tf_stats["fresh_events"] += 1
             stats["fresh_long"] += int(direction == "LONG")
@@ -1284,8 +1287,6 @@ def main() -> None:
             stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
             tf_stats["fresh_squeeze"] += int("SQUEEZE" in event_type)
             tf_stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
-            tf = str(ev.get("timeframe", "1h")).lower()
-            tf_stats = _tf_stats(stats, tf)
             log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
             if btc_regime_df is not None and symbol != "BTC-USDT":
