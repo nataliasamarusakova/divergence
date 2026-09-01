@@ -324,6 +324,7 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
             symbol, timeframe, attempt + 1, max_attempts, min_interval
         )
         slot_started = time.monotonic()
+        log.info("[BINGX_KLINE] WAIT_SLOT %s/%s attempt %d/%d...", symbol, timeframe, attempt + 1, max_attempts)
         _acquire_scan_slot(min_interval)
         log.info(
             "[BINGX_KLINE] slot acquired %s/%s after %.2fs; requesting...",
@@ -331,7 +332,14 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
         )
         request_started = time.monotonic()
         try:
-            result = fetch_klines(symbol, timeframe, limit)
+            # Scan requests are intentionally fail-fast: the outer loop already
+            # provides bounded retries/backoff, so urllib3 must not add another
+            # hidden retry chain here.
+            result = fetch_klines(
+                symbol, timeframe, limit,
+                timeout_sec=float(os.environ.get("BINGX_KLINE_HTTP_TIMEOUT_SEC", "5")),
+                retryable=False,
+            )
             log.info(
                 "[BINGX_KLINE] END %s/%s attempt %d/%d in %.2fs; rows=%d.",
                 symbol, timeframe, attempt + 1, max_attempts,
