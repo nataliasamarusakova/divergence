@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, List, Tuple
 
 import pandas as pd
+import requests
 
 from event_engine.coinalyze import fetch_data
 from event_engine.bingx import (
@@ -878,15 +879,48 @@ def _find_active_trade_for_position(bx_symbol: str, direction: str, active_trade
 
 
 def reconcile_all_open_positions() -> None:
+    # Reconciliation must never monopolize the 5-minute event loop. The normal
+    # BingX session intentionally retries GETs, but that can turn one network
+    # problem into a long sequence of waits. Reconciliation uses fail-fast GETs
+    # and a cycle budget; anything deferred is retried on the next workflow run.
     try:
-        positions = get_positions()
+        recon_timeout = float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5"))
+    except (TypeError, ValueError):
+        recon_timeout = 5.0
+    recon_timeout = max(2.0, min(recon_timeout, 15.0))
+    try:
+        recon_budget = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
+    except (TypeError, ValueError):
+        recon_budget = 45.0
+    recon_budget = max(10.0, min(recon_budget, 180.0))
+
+    started = time.monotonic()
+    log.info(
+        "[RECONCILIATION] Fetching open positions (timeout=%.1fs, retryable=false, budget=%.1fs)...",
+        recon_timeout,
+        recon_budget,
+    )
+    try:
+        positions = get_positions(timeout_sec=recon_timeout, retryable=False)
     except Exception as exc:
         log.error("[RECONCILIATION] Failed to fetch positions: %s", exc)
         return
 
+    log.info("[RECONCILIATION] Open-position response received: %d records.", len(positions))
     active_trades = _load_active_trades()
+    log.info("[RECONCILIATION] Active trade state loaded: %d records.", len(active_trades))
 
-    for p in positions:
+    for position_index, p in enumerate(positions, start=1):
+        elapsed = time.monotonic() - started
+        if elapsed >= recon_budget:
+            log.warning(
+                "[RECONCILIATION] Time budget reached after %.1fs; deferred %d/%d position records to next cycle.",
+                elapsed,
+                max(0, len(positions) - position_index + 1),
+                len(positions),
+            )
+            break
+
         bx_symbol = str(p.get("symbol", "")).upper()
         if not bx_symbol:
             continue
@@ -904,7 +938,13 @@ def reconcile_all_open_positions() -> None:
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
 
-        prot = get_open_protection_directional(bx_symbol, direction)
+        log.info("[RECONCILIATION] Position %d/%d: %s %s | checking protection...", position_index, len(positions), bx_symbol, direction)
+        prot = get_open_protection_directional(
+            bx_symbol,
+            direction,
+            timeout_sec=recon_timeout,
+            retryable=False,
+        )
         if prot.get("status") != "ok":
             log.warning("[RECONCILIATION] Cannot inspect protection for %s: %s", bx_symbol, prot.get("error"))
             continue
@@ -967,7 +1007,12 @@ def reconcile_all_open_positions() -> None:
         # immediately before repairing. A TP fill, BE move or manual change
         # that happened between the first check and now is picked up here,
         # preventing duplicate repair orders.
-        recheck = get_open_protection_directional(bx_symbol, direction)
+        recheck = get_open_protection_directional(
+            bx_symbol,
+            direction,
+            timeout_sec=recon_timeout,
+            retryable=False,
+        )
         if recheck.get("status") == "ok":
             recheck_tp = list(recheck.get("tp_orders", []))
             recheck_sl = list(recheck.get("sl_orders", []))
@@ -1081,6 +1126,8 @@ def reconcile_all_open_positions() -> None:
                 )
             except Exception:
                 pass
+
+    log.info("[RECONCILIATION] Finished in %.1fs.", time.monotonic() - started)
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
