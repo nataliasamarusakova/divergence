@@ -323,7 +323,7 @@ def format_trade_closed_message(
         f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
-        f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or "1h").lower()}</b>",
+        f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
         f"Выход: <b>{exit_reason}</b>",
     ]
 
