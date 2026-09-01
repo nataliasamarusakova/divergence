@@ -227,74 +227,15 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
     return updated
 
 
-def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
-    """Cross-process pacing backed by an exclusive file lock (audit fix B5).
-
-    All processes that share this filesystem (self-hosted runners on the same
-    host, local multi-process runs, several engine containers) serialize on the
-    lock file and read a shared last-request timestamp, so the effective
-    request spacing is >= min_interval GLOBALLY, not just per process.
-    time.monotonic() is system-wide (CLOCK_MONOTONIC) on Linux, which makes the
-    shared stamp comparable between processes on the same host.
-    """
-    import fcntl
-
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / ".bingx_rate_lock"
-    stamp_path = lock_dir / ".bingx_rate_stamp"
-
-    try:
-        lock_timeout = float(os.environ.get("BINGX_RATE_LOCK_TIMEOUT_SEC", "10"))
-    except (TypeError, ValueError):
-        lock_timeout = 10.0
-    lock_timeout = max(1.0, min(lock_timeout, 60.0))
-
-    with open(lock_path, "a+") as lock_f:
-        deadline = time.monotonic() + lock_timeout
-        acquired = False
-        while time.monotonic() < deadline:
-            try:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                time.sleep(0.1)
-
-        if not acquired:
-            raise TimeoutError(
-                f"global BingX rate-limit lock unavailable after {lock_timeout:.1f}s: {lock_path}"
-            )
-
-        try:
-            try:
-                last = float(stamp_path.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError):
-                last = 0.0
-            now = time.monotonic()
-            wait = last + min_interval - now
-            if wait > 0:
-                time.sleep(wait)
-            stamped = time.monotonic()
-            stamp_path.write_text(f"{stamped}", encoding="utf-8")
-            return stamped
-        finally:
-            try:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-
-
 def _acquire_scan_slot(min_interval: float) -> None:
-    """Serialize kline scans globally when possible, process-locally otherwise."""
-    enabled = os.environ.get("BINGX_GLOBAL_RATE_LIMITER", "true").strip().lower() in {"1", "true", "yes", "on"}
-    if enabled:
-        lock_dir = Path(os.environ.get("BINGX_RATE_LIMIT_DIR", "data"))
-        try:
-            _file_lock_pace(lock_dir, min_interval)
-            return
-        except Exception as exc:
-            log.debug("[BINGX] Global rate limiter unavailable (%s); using process-local pacing.", exc)
+    """Process-local pacing for BingX kline scans.
 
+    GitHub-hosted runners are ephemeral and may execute on different VMs.
+    Persisting time.monotonic() across runs is invalid because monotonic clocks
+    are only comparable within the same boot/environment. Keep the pacing
+    timestamp in process memory only.
+    """
+    min_interval = max(0.0, float(min_interval))
     now = time.monotonic()
     last = getattr(_acquire_scan_slot, "_last_call", None)
     if last is not None:
@@ -302,6 +243,18 @@ def _acquire_scan_slot(min_interval: float) -> None:
         if wait > 0:
             time.sleep(wait)
     _acquire_scan_slot._last_call = time.monotonic()
+
+def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
+    """Backward-compatible name; pacing is intentionally process-local.
+
+    The old implementation persisted time.monotonic() in a file. That is
+    invalid across ephemeral GitHub Actions runners because monotonic clocks
+    are not comparable between different VMs. The lock_dir argument is retained
+    only for API/test compatibility and is intentionally unused.
+    """
+    _ = lock_dir
+    _acquire_scan_slot(min_interval)
+    return time.monotonic()
 
 
 def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
