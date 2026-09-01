@@ -1,6 +1,9 @@
 name: Event Driven Divergence Monitor
 
 on:
+  # The engine cadence is owned by an external scheduler site that fires
+  # repository_dispatch (audit finding B6 re-classified as by-design:
+  # no in-repo cron schedule is wanted).
   repository_dispatch:
     types: [run_event_engine]
 
@@ -43,6 +46,14 @@ jobs:
       KLINE_LIMIT_1H: "250"
       KLINE_LIMIT_15M: "250"
       KLINE_LIMIT_4H: "250"
+      # Audit fix B5: cross-process (file-lock) rate limiter shared by
+      # processes on the same host / workspace.
+      BINGX_GLOBAL_RATE_LIMITER: "true"
+      # Audit fix B3: forced-liquidation squeeze thresholds.
+      LIQ_SQUEEZE_MIN_LIQ_OI_RATIO: "0.01"
+      LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
+      LIQ_SQUEEZE_FUNDING_EXTREME: "0.03"
+      LIQ_SQUEEZE_PRICE_SPIKE_ATR: "1.0"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
 
@@ -96,6 +107,33 @@ jobs:
       - name: Run tests
         run: |
           python -m pytest -q
+
+      - name: Verify production configuration
+        run: |
+          python - <<'PY'
+          import os
+          expected = {
+              "EXECUTION_ENABLED": "true",
+              "EXECUTION_MODE": "vst",
+              "MAX_TRIGGER_DELAY_MIN": "60",
+              "MAX_EVENT_AGE_MIN": "90",
+              "SQUEEZE_RELEASE_LOOKBACK_BARS": "4",
+              "MIN_SETUP_SCORE": "60",
+              "MAX_TRADES_PER_CYCLE": "3",
+              "MIN_VOLUME_24H": "25000000",
+              "MIN_OPEN_INTEREST": "10000000",
+              "BINGX_LEVERAGE": "10",
+              "BINGX_MAX_LEVERAGE": "10",
+          }
+          for key, value in expected.items():
+              actual = os.environ.get(key)
+              if actual != value:
+                  raise SystemExit(f"Production config mismatch: {key}={actual!r}, expected {value!r}")
+          for key in ("BINGX_API_KEY", "BINGX_SECRET_KEY", "TG_BOT_TOKEN", "TG_CHAT_IDS"):
+              if not os.environ.get(key, "").strip():
+                  raise SystemExit(f"Required secret/env is empty: {key}")
+          print("Production configuration and required secrets are present.")
+          PY
 
       - name: Run engine
         run: |
