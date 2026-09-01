@@ -1,8 +1,6 @@
 name: Event Driven Divergence Monitor
 
 on:
-  # The engine cadence is owned by an external scheduler site that fires
-  # repository_dispatch (audit finding B6 re-classified as by-design:
   # no in-repo cron schedule is wanted).
   repository_dispatch:
     types: [run_event_engine]
@@ -39,18 +37,16 @@ jobs:
       MAX_EVENT_AGE_MIN: "90"
       SQUEEZE_RELEASE_LOOKBACK_BARS: "4"
       MIN_SETUP_SCORE: "60"
-      MAX_TRADES_PER_CYCLE: "3"
+      MAX_TRADES_PER_CYCLE: "5"
       MIN_VOLUME_24H: "25000000"
       MIN_OPEN_INTEREST: "10000000"
       MAX_CANDIDATES: "0"
       KLINE_LIMIT_1H: "250"
       KLINE_LIMIT_15M: "250"
       KLINE_LIMIT_4H: "250"
-      # Reconciliation must fail fast; deferred checks are retried next cycle.
       RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
       RECONCILIATION_MAX_SECONDS: "45"
       BINGX_HTTP_TIMEOUT_SEC: "10"
-      # Audit fix B3: forced-liquidation squeeze thresholds.
       LIQ_SQUEEZE_MIN_LIQ_OI_RATIO: "0.01"
       LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
       LIQ_SQUEEZE_FUNDING_EXTREME: "0.03"
@@ -99,11 +95,6 @@ jobs:
       - name: Syntax check
         run: |
           python -m compileall -q event_engine run_once.py
-
-      - name: Clean Python cache
-        run: |
-          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
-          find . -type f -name "*.pyc" -delete
 
       - name: Run tests
         run: |
