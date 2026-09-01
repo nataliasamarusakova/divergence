@@ -1114,16 +1114,7 @@ def reconcile_all_open_positions() -> None:
 
             first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)
             log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, first TP=+%.2f%%", bx_symbol, direction, sl_pct, first_tp)
-
-            # Audit P2-8: notify Telegram about reconciliation repair (was console-only).
-            try:
-                send_tg(
-                    f"🔧 <b>Reconciliation repair ({bx_symbol} {direction})</b>\n"
-                    f"SL: <code>{sl_pct:.2f}%</code> · first TP: <code>+{first_tp:.2f}%</code> · status: <code>{status}</code>"
-                )
-            except Exception:
-                pass
-
+    
     log.info("[RECONCILIATION] Finished in %.1fs.", time.monotonic() - started)
 
 
