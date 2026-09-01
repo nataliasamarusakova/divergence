@@ -14,8 +14,11 @@ from event_engine.signals import (
     _rsi,
     add_cvd,
     build_15m_trigger,
+    diagnose_15m_trigger,
     detect_divergences,
     detect_squeeze_release,
+    detect_liquidation_squeeze,
+    attach_oi_series,
     check_btc_regime,
 )
 from event_engine.bingx import (
@@ -270,6 +273,39 @@ def test_rsi_warmup_preserves_nan():
     assert pd.notna(rsi.iloc[-1])
 
 
+def _wilder_rsi_reference(series: pd.Series, n: int = 14) -> pd.Series:
+    """Classic Wilder RSI: SMA seed, then Wilder recursion (TradingView ta.rsi)."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    arr_g = gain.to_numpy(dtype=float)
+    arr_l = loss.to_numpy(dtype=float)
+    avg_g = np.full(len(series), np.nan)
+    avg_l = np.full(len(series), np.nan)
+    if len(series) > n:
+        avg_g[n] = np.nanmean(arr_g[1 : n + 1])
+        avg_l[n] = np.nanmean(arr_l[1 : n + 1])
+        for i in range(n + 1, len(series)):
+            avg_g[i] = (avg_g[i - 1] * (n - 1) + arr_g[i]) / n
+            avg_l[i] = (avg_l[i - 1] * (n - 1) + arr_l[i]) / n
+    rs = np.divide(avg_g, avg_l, out=np.full(len(series), np.nan), where=avg_l != 0)
+    out = 100.0 - 100.0 / (1.0 + rs)
+    out = np.where((avg_l == 0) & (avg_g > 0), 100.0, out)
+    out = np.where((avg_l == 0) & (avg_g == 0), 50.0, out)
+    out[np.isnan(avg_g) | np.isnan(avg_l)] = np.nan
+    return pd.Series(out, index=series.index)
+
+
+def test_rsi_matches_wilder_sma_seed_reference():
+    """Audit B1 regression guard: code RSI must equal the Wilder SMA-seed
+    reference (TradingView parity). The old EMA-seeded implementation drifted
+    by up to 14.24 RSI points on this exact scenario."""
+    np.random.seed(42)
+    rw = pd.Series(100 + np.cumsum(np.random.normal(0, 1.0, 100)))
+    diff = (_rsi(rw, 14) - _wilder_rsi_reference(rw, 14)).abs()
+    assert float(diff.max()) < 0.1
+
+
 def test_execute_new_position_defines_pre_order_price(monkeypatch):
     import run_once as ro
 
@@ -434,7 +470,9 @@ def test_scheduler_uses_rate_limited_scan_wrapper():
 def test_incomplete_kline_response_defers_watermark(monkeypatch):
     import run_once as ro
     from types import SimpleNamespace
-    ro._fetch_klines_scan._last_call = None
+    # Keep the test hermetic: no cross-process file lock under repo data/.
+    monkeypatch.setenv("BINGX_GLOBAL_RATE_LIMITER", "false")
+    ro._acquire_scan_slot._last_call = None
     monkeypatch.setattr(ro, "fetch_klines", lambda symbol, timeframe, limit: [{"close": 100}] * 20)
     monkeypatch.setattr(ro, "add_cvd", lambda df: df)
     stats = {"divergence_events": 0, "squeeze_events": 0, "events_total": 0, "scan_errors": 0}
@@ -596,4 +634,313 @@ def test_tf_stats_assigned_before_first_use_in_fresh_event_loop():
         "tf_stats is subscripted before it is assigned in the fresh-event "
         "loop; this reproduces the production UnboundLocalError crash."
     )
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes v8: regression tests for B1-B8
+# ---------------------------------------------------------------------------
+
+
+def _divergence_fixture(n: int = 120, seed: int = 7) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    base = 100 + np.cumsum(rng.normal(0, 0.8, n))
+    return pd.DataFrame({
+        "open_time": [1_700_000_000_000 + i * 3_600_000 - 3_600_000 for i in range(n)],
+        "close_time": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+        "open": base,
+        "high": base + 0.5,
+        "low": base - 0.5,
+        "close": base,
+        "volume": np.abs(rng.normal(1000, 100, n)),
+        "quote_volume": np.abs(rng.normal(100000, 1000, n)),
+        "taker_buy_base": np.abs(rng.normal(500, 50, n)),
+        "taker_buy_quote": np.abs(rng.normal(50000, 500, n)),
+        "taker_flow_valid": [True] * n,
+        "bar_delta_usdt": [0.0] * n,
+    })
+
+
+def test_divergence_detectors_emit_macd_stoch_obv_and_oi_types():
+    """Audit B2: Price-vs-OI divergence plus P2 MACD/Stoch/Volume detectors."""
+    df = _divergence_fixture()
+    df.loc[70, "low"] = float(df.loc[70, "low"]) - 6
+    df.loc[70, "close"] = float(df.loc[70, "close"]) - 5.5
+    df.loc[90, "low"] = float(df.loc[90, "low"]) - 9
+    df.loc[90, "close"] = float(df.loc[90, "close"]) - 8.5
+
+    d = add_cvd(df)
+    ct0 = int(df.loc[0, "close_time"])
+    oi_hist = {str((ct0 - 1) // 3_600_000 + i): 1_000_000.0 + i * 2_000.0 for i in range(len(df))}
+    d = attach_oi_series(d, oi_hist)
+
+    types: set[str] = set()
+    for max_bars in (16, 20):
+        for ev in detect_divergences(d, "TEST-USDT", "1h", max_bars=max_bars):
+            types.add(ev["event_type"])
+
+    assert any(t.endswith("_MACD") for t in types), "MACD divergence missing"
+    assert any(t.endswith("_STOCH") for t in types), "Stochastic divergence missing"
+    assert any(t.endswith("_OBV") for t in types), "Volume (OBV) divergence missing"
+    assert any(t.endswith("_OI") for t in types), "OI divergence missing"
+
+
+def test_liquidation_squeeze_detector_emits_short_squeeze():
+    """Audit B3: forced-liquidation squeeze detection."""
+    df = _divergence_fixture()
+    last = len(df) - 1
+    prev_close = float(df.loc[last - 1, "close"])
+    df.loc[last, "close"] = prev_close * 1.05
+    df.loc[last, "high"] = prev_close * 1.055
+    df.loc[last - 1, "high"] = prev_close * 1.001
+    df.loc[last - 1, "low"] = prev_close * 0.999
+
+    row = CoinalyzeRow(
+        symbol="TEST", name="TEST", price=prev_close * 1.05, price_chg24=None,
+        volume24=1e9, oi=100_000_000.0, oi_chg24_pct=None, oi_chg4h_pct=2.5,
+        oi_vol_ratio=None, oi_mktcap_ratio=None, fr_oiw=0.05, pfr_oiw=None,
+        liq_short24=1_500_000.0, liq_long24=100_000.0, ls_accounts=0.6,
+        btc_corr7d=None, cvd24=None, lls24=None, raw={},
+    )
+    events = detect_liquidation_squeeze(row, df, "TEST-USDT", "1h")
+    assert any(e["event_type"] == "SHORT_SQUEEZE" and e["direction"] == "LONG" for e in events)
+    ev = next(e for e in events if e["event_type"] == "SHORT_SQUEEZE")
+    assert ev["event_fact"]["liq_ratio_24h"] == pytest.approx(0.015)
+    assert ev["event_fact"]["oi_surge"] is True
+
+    # Missing Coinalyze data must yield no events (no guessing).
+    assert detect_liquidation_squeeze(None, df, "TEST-USDT", "1h") == []
+    empty_row = CoinalyzeRow(
+        symbol="TEST", name="TEST", price=1.0, price_chg24=None, volume24=1.0,
+        oi=None, oi_chg24_pct=None, oi_chg4h_pct=None, oi_vol_ratio=None,
+        oi_mktcap_ratio=None, fr_oiw=None, pfr_oiw=None, liq_short24=None,
+        liq_long24=None, ls_accounts=None, btc_corr7d=None, cvd24=None,
+        lls24=None, raw={},
+    )
+    assert detect_liquidation_squeeze(empty_row, df, "TEST-USDT", "1h") == []
+
+
+def test_move_sl_to_break_even_cancels_old_sl_before_creating_new(monkeypatch):
+    """Audit B4: old SL must be cancelled (and verified) BEFORE the new BE SL."""
+    import event_engine.tracker as tr
+
+    calls: list[tuple] = []
+
+    monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+
+    ok_empty = {"status": "ok", "sl_orders": [], "tp_orders": []}
+    ok_with_new = {"status": "ok", "sl_orders": [{"orderId": "NEW1", "clientOrderId": "EVT_BE_T"}], "tp_orders": []}
+    posted = {"done": False}
+
+    def fake_protection(symbol, direction):
+        return ok_with_new if posted["done"] else ok_empty
+
+    monkeypatch.setattr(tr, "get_open_protection_directional", fake_protection)
+
+    def fake_cancel(symbol, order_id):
+        calls.append(("cancel", str(order_id)))
+        return {"code": 0}
+
+    monkeypatch.setattr(tr, "cancel_order", fake_cancel)
+
+    def fake_request(method, path, params=None, signed=True):
+        calls.append((method.lower(),))
+        posted["done"] = True
+        return {"code": 0, "data": {"order": {"orderId": "NEW1", "clientOrderId": "EVT_BE_T"}}}
+
+    monkeypatch.setattr(tr, "_request", fake_request)
+
+    result = tr._move_sl_to_break_even(
+        "TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0,
+    )
+    assert result["status"] == "created"
+    assert result["order_id"] == "NEW1"
+    assert calls[0] == ("cancel", "OLD1"), "old SL must be cancelled first"
+    assert calls[1] == ("post",), "new BE SL must be created after old cancel"
+
+
+def test_move_sl_to_break_even_aborts_when_old_cancel_fails(monkeypatch):
+    """Audit B4: if the old SL cannot be cancelled, the new SL must NOT be
+    created (the position keeps the old stop; no double-SL window)."""
+    import event_engine.tracker as tr
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+
+    ok_empty = {"status": "ok", "sl_orders": [], "tp_orders": []}
+    still_there = {"status": "ok", "sl_orders": [{"orderId": "OLD1"}], "tp_orders": []}
+    responses = [ok_empty, still_there]
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda s, d: responses[min(len(responses) - 1, 0)] if False else responses.pop(0) if responses else still_there)
+
+    def fake_cancel(symbol, order_id):
+        calls.append(("cancel", str(order_id)))
+        return {"code": 1, "msg": "busy"}
+
+    monkeypatch.setattr(tr, "cancel_order", fake_cancel)
+
+    def fake_request(method, path, params=None, signed=True):
+        calls.append((method.lower(),))
+        return {"code": 0, "data": {"order": {"orderId": "NEW1"}}}
+
+    monkeypatch.setattr(tr, "_request", fake_request)
+    monkeypatch.setattr(tr.time, "sleep", lambda s: None)
+
+    result = tr._move_sl_to_break_even("TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0)
+    assert result["status"] == "error"
+    assert "old SL cancel failed" in (result.get("error") or "")
+    assert not any(c[0] == "post" for c in calls), "no new SL may be created after a failed old-SL cancel"
+
+
+def test_diagnose_15m_trigger_marks_missing_event_ts():
+    """Audit B7: last-bar fallback must be explicit and optionally forbidden."""
+    df = pd.DataFrame({"high": [100, 105], "low": [95, 100], "close": [99, 106]})
+    diag = diagnose_15m_trigger(df, "LONG", event_detected_at_ts=None)
+    assert diag["event_ts_missing"] is True
+
+    strict = diagnose_15m_trigger(df, "LONG", event_detected_at_ts=None, require_event_ts=True)
+    assert strict["ok"] is False
+    assert strict["reason"] == "event_ts_required"
+
+    with_ts = pd.DataFrame({
+        "high": [100, 105], "low": [95, 100], "close": [99, 106],
+        "close_time": [1_000, 2_000],
+    })
+    diag2 = diagnose_15m_trigger(with_ts, "LONG", event_detected_at_ts=500)
+    assert diag2["event_ts_missing"] is False
+
+
+def test_global_rate_limiter_serializes_processes(tmp_path):
+    """Audit B5: the file-lock limiter enforces spacing across independent
+    limiter instances sharing one lock directory."""
+    import run_once as ro
+    import time as time_mod
+
+    min_interval = 0.3
+    ro._file_lock_pace(tmp_path, min_interval)  # first call: no wait, stamps t0
+    started = time_mod.monotonic()
+    ro._file_lock_pace(tmp_path, min_interval)
+    waited = time_mod.monotonic() - started
+    assert waited >= min_interval - 0.05
+
+
+def test_open_market_verifies_position_after_transport_error(monkeypatch):
+    """Audit P1-4: unknown POST outcome must be verified via the position
+    instead of failing outright or blindly retrying."""
+    from event_engine import bingx as bx
+
+    CACHE["data"] = {
+        "TEST-USDT": {"symbol": "TEST-USDT", "displayName": "TEST-USDT", "status": 1,
+                      "apiStateOpen": "true", "quantityPrecision": 3,
+                      "tradeMinQuantity": 0.001, "multiplier": 1,
+                      "maxLongLeverage": 10, "maxShortLeverage": 10}
+    }
+    CACHE["ts"] = 9_999_999_999
+
+    position_states = iter([False, True])
+    monkeypatch.setattr(bx, "has_open_position", lambda s, d: next(position_states))
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: {"code": -1, "msg": "HTTPSConnectionPool read timed out"})
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD1")
+    assert out["status"] == "opened"
+    assert out["idempotency"] == "position_verified_after_transport_error"
+
+    # Missing credentials must still fail fast (not treated as transport error).
+    position_states2 = iter([False])
+    monkeypatch.setattr(bx, "has_open_position", lambda s, d: next(position_states2))
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: {"code": -1, "msg": "missing BingX credentials"})
+    out2 = bx.open_market("TEST", "LONG", 100.0, "TRD2")
+    assert out2["status"] == "error"
+
+
+def test_workflow_triggers_via_external_scheduler_only():
+    """Audit B6 re-classified as by-design: the engine cadence is owned by an
+    external scheduler site that fires repository_dispatch. The workflow must
+    keep that trigger and must NOT add its own cron schedule."""
+    from pathlib import Path
+    wf = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    assert wf.exists(), "event-engine.yml is missing"
+    text = wf.read_text(encoding="utf-8")
+    assert "repository_dispatch" in text
+    assert "run_event_engine" in text
+    # No in-repo cadence: the external site owns scheduling.
+    assert "schedule:" not in text
+    assert "cron:" not in text
+    assert "cancel-in-progress: false" in text
+
+
+def test_coinalyze_header_map_degrades_gracefully():
+    """Audit B8: only price/volume24/oi are mandatory; missing optional
+    columns must not disable the whole pipeline."""
+    from bs4 import BeautifulSoup
+    from event_engine.coinalyze import _build_header_map
+
+    html_full = """
+    <table><thead><tr>
+      <th><span title="Price">Price</span></th>
+      <th><span title="Volume 24h">Volume 24h</span></th>
+      <th><span title="Open Interest">Open Interest</span></th>
+    </tr></thead></table>
+    """
+    header_map = _build_header_map(BeautifulSoup(html_full, "lxml"))
+    assert header_map["price"] == 0
+    assert header_map["volume24"] == 1
+    assert header_map["oi"] == 2
+
+    html_broken = """
+    <table><thead><tr>
+      <th><span title="Price">Price</span></th>
+    </tr></thead></table>
+    """
+    with pytest.raises(ValueError):
+        _build_header_map(BeautifulSoup(html_broken, "lxml"))
+
+
+def test_oi_history_recorder_persists_bucket_snapshots(tmp_path, monkeypatch):
+    """Audit B2: OI snapshots are stored per symbol per 1h bucket."""
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "OI_HISTORY", tmp_path / "oi_history.json")
+    monkeypatch.setattr(ro, "_OI_HIST_CACHE", {"ts": 0.0, "data": {}})
+    rows = [
+        SimpleNamespace(symbol="TEST-USDT", oi=5_000_000.0),
+        SimpleNamespace(symbol="BAD", oi=None),
+    ]
+    updated = ro._record_oi_snapshots(rows, 1_700_000_000_123)
+    assert updated == 1
+    history = ro._load_oi_history()
+    assert history["TEST-USDT"]["472222"] == 5_000_000.0
+    assert "BAD" not in history
+
+    # attach maps a closed bar to the recorded bucket value
+    bar = pd.DataFrame({"close_time": [1_700_000_002_000_000 // 1_000]})
+    # choose close_time inside bucket 472222: 472222*3600000 <= ct < 472223*3600000
+    ct = 472_222 * 3_600_000 + 1_800_000
+    bar = pd.DataFrame({"close_time": [ct]})
+    attached = ro.attach_oi_series(bar, history.get("TEST-USDT")) if hasattr(ro, "attach_oi_series") else attach_oi_series(bar, history.get("TEST-USDT"))
+    assert float(attached["oi"].iloc[0]) == 5_000_000.0
+
+
+def test_score_gives_squeeze_bonus_to_liquidation_squeezes():
+    """New event types must be scored: liq squeeze gets the +25 squeeze bonus,
+    new divergence families get the CVD-class +15 bonus."""
+    import run_once as ro
+    ev_liq = {
+        "direction": "LONG",
+        "event_type": "SHORT_SQUEEZE",
+        "event_fact": {"price_delta_atr": 1.2, "liq_ratio_24h": 0.02},
+    }
+    score = ro.calculate_setup_score(ev=ev_liq, coinalyze_row=None, df_15m=pd.DataFrame({"close": [1]}))
+    assert score >= 75  # 50 base + 15 delta_atr + 25 squeeze (vol-factors absent)
+
+    ev_oi = {
+        "direction": "LONG",
+        "event_type": "REGULAR_BULLISH_OI",
+        "event_fact": {"price_delta_atr": 0.6},
+    }
+    score_oi = ro.calculate_setup_score(ev=ev_oi, coinalyze_row=None, df_15m=pd.DataFrame({"close": [1]}))
+    assert score_oi >= 60  # 50 base + 10 delta_atr + 15 OI family bonus
 

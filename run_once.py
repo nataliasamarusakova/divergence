@@ -26,6 +26,8 @@ from event_engine.signals import (
     add_cvd,
     detect_divergences,
     detect_squeeze_release,
+    detect_liquidation_squeeze,
+    attach_oi_series,
     build_15m_trigger,
     diagnose_15m_trigger,
     check_btc_regime,
@@ -166,12 +168,128 @@ def _merge_event_cache(existing: list[dict], new_events: list[dict]) -> list[dic
     return list(by_id.values())
 
 
+OI_HISTORY = DATA / "oi_history.json"
+_OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+_OI_HIST_CACHE_TTL = 30.0
+_OI_HIST_MAX_BUCKETS = 500
+
+
+def _load_oi_history() -> dict[str, dict[str, float]]:
+    """Cached view of the accumulated OI snapshot history (audit fix B2)."""
+    now = time.monotonic()
+    if now - float(_OI_HIST_CACHE.get("ts", 0.0)) < _OI_HIST_CACHE_TTL and "data" in _OI_HIST_CACHE:
+        return _OI_HIST_CACHE["data"]
+    raw = _load_json(OI_HISTORY, {})
+    data = raw if isinstance(raw, dict) else {}
+    _OI_HIST_CACHE["ts"] = now
+    _OI_HIST_CACHE["data"] = data
+    return data
+
+
+def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
+    """Persist per-symbol OI snapshots keyed by the current 1h bucket.
+
+    Snapshots are written only while their bucket is active, so a stored value
+    always predates the bucket close. Divergence detectors can therefore map
+    bucket -> OI without look-ahead. Returns the number of symbols updated.
+    """
+    if not rows:
+        return 0
+    history = _load_json(OI_HISTORY, {})
+    if not isinstance(history, dict):
+        history = {}
+    bucket = str(int(now_ms // 3_600_000))
+    updated = 0
+    for r in rows:
+        try:
+            symbol = str(getattr(r, "symbol", "") or "").upper()
+            oi = getattr(r, "oi", None)
+            if not symbol or oi is None:
+                continue
+            oi = float(oi)
+        except (TypeError, ValueError):
+            continue
+        if oi <= 0:
+            continue
+        rec = history.setdefault(symbol, {})
+        if not isinstance(rec, dict):
+            rec = history[symbol] = {}
+        rec[bucket] = oi
+        if len(rec) > _OI_HIST_MAX_BUCKETS:
+            for key in sorted(rec, key=lambda k: int(k))[: len(rec) - _OI_HIST_MAX_BUCKETS]:
+                del rec[key]
+        updated += 1
+
+    if updated:
+        _save_json_atomic(OI_HISTORY, history)
+        _OI_HIST_CACHE["ts"] = 0.0
+    return updated
+
+
+def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
+    """Cross-process pacing backed by an exclusive file lock (audit fix B5).
+
+    All processes that share this filesystem (self-hosted runners on the same
+    host, local multi-process runs, several engine containers) serialize on the
+    lock file and read a shared last-request timestamp, so the effective
+    request spacing is >= min_interval GLOBALLY, not just per process.
+    time.monotonic() is system-wide (CLOCK_MONOTONIC) on Linux, which makes the
+    shared stamp comparable between processes on the same host.
+    """
+    import fcntl
+
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".bingx_rate_lock"
+    stamp_path = lock_dir / ".bingx_rate_stamp"
+
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                last = float(stamp_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                last = 0.0
+            now = time.monotonic()
+            wait = last + min_interval - now
+            if wait > 0:
+                time.sleep(wait)
+            stamped = time.monotonic()
+            stamp_path.write_text(f"{stamped}", encoding="utf-8")
+            return stamped
+        finally:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+def _acquire_scan_slot(min_interval: float) -> None:
+    """Serialize kline scans globally when possible, process-locally otherwise."""
+    enabled = os.environ.get("BINGX_GLOBAL_RATE_LIMITER", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if enabled:
+        lock_dir = Path(os.environ.get("BINGX_RATE_LIMIT_DIR", "data"))
+        try:
+            _file_lock_pace(lock_dir, min_interval)
+            return
+        except Exception as exc:
+            log.debug("[BINGX] Global rate limiter unavailable (%s); using process-local pacing.", exc)
+
+    now = time.monotonic()
+    last = getattr(_acquire_scan_slot, "_last_call", None)
+    if last is not None:
+        wait = min_interval - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+    _acquire_scan_slot._last_call = time.monotonic()
+
+
 def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
     """Fetch Klines with serialized pacing and bounded transient-error retry.
 
     This protects the runner from burst traffic and BingX application-level
     errors while never marking a symbol/timeframe processed until the caller
-    validates the returned dataset.
+    validates the returned dataset. Pacing is cross-process when the file lock
+    is available (audit fix B5).
     """
     min_interval = float(os.environ.get("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "1.05"))
     max_attempts = int(os.environ.get("BINGX_KLINE_RETRY_ATTEMPTS", "3"))
@@ -180,13 +298,7 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
-        now = time.monotonic()
-        last = getattr(_fetch_klines_scan, "_last_call", None)
-        if last is not None:
-            wait = min_interval - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-        _fetch_klines_scan._last_call = time.monotonic()
+        _acquire_scan_slot(min_interval)
         try:
             return fetch_klines(symbol, timeframe, limit)
         except (RuntimeError, requests.RequestException, TimeoutError) as exc:
@@ -237,18 +349,24 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
                 log.warning("[SIGNALS] %s %s returned only %d candles; watermark deferred.", timeframe.upper(), symbol, len(klines))
                 continue
             d = add_cvd(pd.DataFrame(klines))
+            # Audit fix B2: attach the accumulated OI snapshot history so
+            # detect_divergences can emit Price-vs-OI divergence when coverage
+            # is sufficient (no events until enough buckets are recorded).
+            d = attach_oi_series(d, _load_oi_history().get(symbol))
             divs = detect_divergences(d, symbol, timeframe)
             sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
+            # Audit fix B3: forced-liquidation squeeze from Coinalyze factors.
+            liqs = detect_liquidation_squeeze(r, d, symbol, timeframe)
             # Advance watermark ONLY after the full response was structurally
             # usable and the detector completed without exception.
             _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
             tf_stats["scanned"] += 1
             stats["divergence_events"] += len(divs)
-            stats["squeeze_events"] += len(sqs)
+            stats["squeeze_events"] += len(sqs) + len(liqs)
             tf_stats["divergence_events"] += len(divs)
-            tf_stats["squeeze_events"] += len(sqs)
-            stats["events_total"] += len(divs) + len(sqs)
-            for ev in divs + sqs:
+            tf_stats["squeeze_events"] += len(sqs) + len(liqs)
+            stats["events_total"] += len(divs) + len(sqs) + len(liqs)
+            for ev in divs + sqs + liqs:
                 if not _event_is_fresh(ev, now_ms, MAX_AGE):
                     continue
                 fresh.append(ev)
@@ -518,11 +636,16 @@ def calculate_setup_score(
     elif delta_atr >= 0.5:
         score += 10.0
 
+    if event_type.endswith(("_MACD", "_STOCH", "_OBV", "_OI")):
+        # Audit P1-1/P2-1/P2-2: new divergence families score like CVD.
+        score += 15.0
+
     if "CVD" in event_type:
         score += 15.0
 
-    # Бонус за Сквиз: +25 баллов (лидер по прибыли)
-    if "VOLATILITY_SQUEEZE_RELEASE" in event_type:
+    # Бонус за Сквиз: +25 баллов (лидер по прибыли).
+    # Audit P1-2: applies to volatility and forced-liquidation squeezes alike.
+    if "SQUEEZE" in event_type:
         score += 25.0
 
         try:
@@ -840,6 +963,36 @@ def reconcile_all_open_positions() -> None:
             bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs), list(hit_legs)
         )
 
+        # Audit P1-3 (check/repair skew mitigation): re-inspect protection
+        # immediately before repairing. A TP fill, BE move or manual change
+        # that happened between the first check and now is picked up here,
+        # preventing duplicate repair orders.
+        recheck = get_open_protection_directional(bx_symbol, direction)
+        if recheck.get("status") == "ok":
+            recheck_tp = list(recheck.get("tp_orders", []))
+            recheck_sl = list(recheck.get("sl_orders", []))
+            recheck_known_legs = {
+                leg
+                for order in recheck_tp
+                for leg in ("tp1", "tp2", "tp3")
+                if leg.upper() in str(order.get("clientOrderId", "")).upper()
+            }
+            recheck_sl_valid = False
+            if recheck_sl:
+                try:
+                    r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
+                    r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
+                    if r_sl_price > 0 and r_sl_amt > 0:
+                        if direction == "LONG":
+                            recheck_sl_valid = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
+                        elif direction == "SHORT":
+                            recheck_sl_valid = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
+                except (TypeError, ValueError):
+                    recheck_sl_valid = False
+            if recheck_sl_valid and remaining_expected_legs.issubset(recheck_known_legs):
+                log.info("[RECONCILIATION] %s (%s) complete on re-check; skipping repair.", bx_symbol, direction)
+                continue
+
         sl_pct = _safe_float(matched_trade.get("planned_risk_pct"), 0.0) if matched_trade else 0.0
         if sl_pct <= 0:
             sl_pct = 2.0
@@ -919,6 +1072,15 @@ def reconcile_all_open_positions() -> None:
 
             first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)
             log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, first TP=+%.2f%%", bx_symbol, direction, sl_pct, first_tp)
+
+            # Audit P2-8: notify Telegram about reconciliation repair (was console-only).
+            try:
+                send_tg(
+                    f"🔧 <b>Reconciliation repair ({bx_symbol} {direction})</b>\n"
+                    f"SL: <code>{sl_pct:.2f}%</code> · first TP: <code>+{first_tp:.2f}%</code> · status: <code>{status}</code>"
+                )
+            except Exception:
+                pass
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
@@ -1139,6 +1301,13 @@ def main() -> None:
         log.error("[COINALYZE] Scrape error: %s", exc)
 
     stats["coinalyze_rows"] = len(rows)
+
+    # Audit fix B2: persist OI snapshots per 1h bucket so Price-vs-OI swing
+    # divergence becomes computable once enough history has accumulated.
+    try:
+        stats["oi_snapshots_recorded"] = _record_oi_snapshots(rows, int(pd.Timestamp.utcnow().timestamp() * 1000))
+    except Exception as exc:
+        log.error("[OI_HISTORY] Snapshot record error: %s", exc)
 
     try:
         contracts = refresh_contracts()
