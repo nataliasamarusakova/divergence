@@ -54,6 +54,11 @@ TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
 
 SESSION = requests.Session()
+# Fast-fail session used by reconciliation/health-sensitive GETs. It deliberately
+# has no urllib3 retry adapter so a single stalled request cannot consume several
+# consecutive 10-second retry windows before the reconciliation loop can continue.
+FAST_SESSION = requests.Session()
+
 _adapter = HTTPAdapter(
     pool_connections=20,
     pool_maxsize=20,
@@ -100,8 +105,22 @@ def _update_server_time_offset(response: requests.Response) -> bool:
     return True
 
 
-def _request(method: str, path: str, params: dict[str, Any] | None = None, signed: bool = True):
+def _request(
+    method: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    signed: bool = True,
+    *,
+    timeout_sec: float | None = None,
+    retryable: bool = True,
+):
     base_params = dict(params or {})
+    try:
+        request_timeout = float(timeout_sec) if timeout_sec is not None else float(os.environ.get("BINGX_HTTP_TIMEOUT_SEC", "10"))
+    except (TypeError, ValueError):
+        request_timeout = 10.0
+    request_timeout = max(1.0, min(request_timeout, 60.0))
+    session = SESSION if retryable else FAST_SESSION
     headers = {}
     max_timestamp_retries = 1 if signed else 0
 
@@ -116,12 +135,12 @@ def _request(method: str, path: str, params: dict[str, Any] | None = None, signe
             _apply_request_timestamp(request_params)
 
         try:
-            response = SESSION.request(
+            response = session.request(
                 method=method,
                 url=BASE_URL + path,
                 params=request_params,
                 headers=headers,
-                timeout=10,
+                timeout=request_timeout,
             )
             payload = response.json()
         except Exception as exc:
@@ -347,8 +366,15 @@ def _normalize_orders_list(resp: dict) -> list[dict]:
     return []
 
 
-def get_positions() -> list[dict]:
-    resp = _request("GET", POSITION_PATH, {}, signed=True)
+def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
+    resp = _request(
+        "GET",
+        POSITION_PATH,
+        {},
+        signed=True,
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
     if resp.get("code") != 0:
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
     return _normalize_orders_list(resp)
@@ -598,13 +624,25 @@ def wait_for_position_fill_directional(symbol: str, direction: str, timeout_sec:
     return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper()}
 
 
-def get_open_protection_directional(symbol: str, direction: str) -> dict:
+def get_open_protection_directional(
+    symbol: str,
+    direction: str,
+    *,
+    timeout_sec: float | None = None,
+    retryable: bool = True,
+) -> dict:
     bx_symbol = to_bx_symbol(symbol)
     direction = str(direction).upper()
     if not bx_symbol:
         return {"status": "error", "error": "contract_not_found", "tp_orders": [], "sl_orders": []}
 
-    resp = _request("GET", OPEN_ORDERS_PATH, {"symbol": bx_symbol})
+    resp = _request(
+        "GET",
+        OPEN_ORDERS_PATH,
+        {"symbol": bx_symbol},
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
     if resp.get("code") != 0:
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
 
