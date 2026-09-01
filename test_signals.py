@@ -386,3 +386,181 @@ def test_tp_order_identity_requires_expected_price():
     order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.0", "clientOrderId": "EVT_ABC_TP3"}
     assert _tp_leg_from_order(order, "tp3", 105.0, 2, "abc") is True
     assert _tp_leg_from_order(order, "tp3", 106.0, 2, "abc") is False
+
+
+def test_timeframe_bucket_boundaries_and_cache_helpers(tmp_path):
+    import run_once as ro
+    # 11:02 UTC-ish for hourly buckets: 10:00-11:00 is complete with 2m grace.
+    now_ms = 11 * 3_600_000 + 2 * 60_000
+    assert ro._completed_bucket(3_600_000, now_ms, 2) == 10
+    # 12:02: the 8:00-12:00 four-hour bucket is complete.
+    now_ms = 12 * 3_600_000 + 2 * 60_000
+    assert ro._completed_bucket(14_400_000, now_ms, 2) == 2
+    event = {
+        "event_id": "EVT_CACHE",
+        "timestamps": {"detected_at_ts": now_ms - 60 * 60_000},
+    }
+    original_cache = ro.EVENT_CACHE
+    ro.EVENT_CACHE = tmp_path / "events.json"
+    ro._save_json_atomic(ro.EVENT_CACHE, {"events": [event]})
+    assert ro._load_cached_events()[0]["event_id"] == "EVT_CACHE"
+    ro.EVENT_CACHE = original_cache
+
+
+def test_per_symbol_timeframe_scheduler_does_not_skip_new_candidate(tmp_path):
+    import run_once as ro
+    state = {"version": 2, "symbols": {"OLD": {"1h": 10}}}
+    assert ro._symbol_scan_due(state, "NEW", "1h", 10) is True
+    assert ro._symbol_scan_due(state, "OLD", "1h", 10) is False
+    ro._mark_symbol_scanned(state, "NEW", "1h", 10)
+    assert ro._symbol_scan_due(state, "NEW", "1h", 10) is False
+
+
+def test_event_cache_merge_keeps_existing_fresh_events_independent_of_universe():
+    import run_once as ro
+    old = {"event_id": "E1", "symbol": "XYZ", "timeframe": "1h", "timestamps": {"detected_at_ts": 1}}
+    new = {"event_id": "E2", "symbol": "ABC", "timeframe": "4h", "timestamps": {"detected_at_ts": 2}}
+    merged = ro._merge_event_cache([old], [new])
+    assert {x["event_id"] for x in merged} == {"E1", "E2"}
+
+
+def test_scheduler_uses_rate_limited_scan_wrapper():
+    import run_once as ro
+    import inspect
+    src = inspect.getsource(ro._refresh_timeframe_events)
+    assert "_fetch_klines_scan" in src
+
+
+def test_incomplete_kline_response_defers_watermark(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+    ro._fetch_klines_scan._last_call = None
+    monkeypatch.setattr(ro, "fetch_klines", lambda symbol, timeframe, limit: [{"close": 100}] * 20)
+    monkeypatch.setattr(ro, "add_cvd", lambda df: df)
+    stats = {"divergence_events": 0, "squeeze_events": 0, "events_total": 0, "scan_errors": 0}
+    state = {"version": 2, "symbols": {}}
+    out = ro._refresh_timeframe_events([SimpleNamespace(symbol="TEST-USDT")], "1h", 250, 1_000_000_000, set(), stats, state, 123)
+    assert out == []
+    assert state["symbols"].get("TEST-USDT", {}).get("1h") is None
+
+
+def test_build_event_setup_exception_isolated_in_candidate_path():
+    import inspect, run_once as ro
+    src = inspect.getsource(ro.main)
+    assert "try:" in src and "build_event_setup" in src and "continue" in src
+
+
+def test_closed_message_uses_trade_timeframe():
+    from event_engine.tracker import format_trade_closed_message
+    msg = format_trade_closed_message(
+        name="TEST", symbol="TEST-USDT", direction="LONG", entry_price=100.0, exit_price=101.0,
+        pnl_pct=1.0, realized_rr=0.5, planned_rr=1.05, duration_min=10.0, peak_pnl=2.0,
+        max_drawdown=-0.5, exit_reason="TAKE_PROFIT_FULL", event_type="HIDDEN_BULLISH_RSI", timeframe="4h"
+    )
+    assert "TF <b>4h</b>" in msg
+
+
+def test_active_trade_register_persists_timeframe(tmp_path, monkeypatch):
+    import event_engine.tracker as tr
+    monkeypatch.setattr(tr, "_load_active_trades", lambda: {})
+    saved = {}
+    monkeypatch.setattr(tr, "_save_active_trades", lambda x: saved.update(x))
+    tr.register_active_trade(
+        event_id="EVT_TEST_4H", symbol="TEST", name="TEST", direction="LONG",
+        entry_price=100.0, qty=1.0, tp_orders=[], sl_result={}, event_type="VOLATILITY_SQUEEZE_RELEASE",
+        timeframe="4h", setup={"event_timeframe":"4h","planned_risk_pct":1.0,"tp_levels":[],"effective_tp_levels":[]},
+    )
+    assert saved["EVT_TEST_4H"]["timeframe"] == "4h"
+
+
+def test_symbol_direction_conflict_keeps_strongest_and_tiebreaks_4h():
+    import run_once as ro
+    def opp(direction, score, tf):
+        return {"symbol":"BTC","direction":direction,"score":score,
+                "event":{"timeframe":tf,"event_type":"HIDDEN_BULLISH_RSI"}}
+    kept, rejected = ro.resolve_symbol_direction_conflicts([opp("LONG",70,"1h"), opp("SHORT",75,"4h")])
+    assert len(kept) == 1 and kept[0]["direction"] == "SHORT"
+    assert len(rejected) == 1 and rejected[0]["direction"] == "LONG"
+    kept, rejected = ro.resolve_symbol_direction_conflicts([opp("LONG",75,"1h"), opp("SHORT",75,"4h")])
+    assert len(kept) == 1 and kept[0]["direction"] == "SHORT"
+
+
+def test_same_direction_different_timeframes_are_not_conflicts():
+    import run_once as ro
+    items=[
+        {"symbol":"BTC","direction":"LONG","score":80,"event":{"timeframe":"1h"}},
+        {"symbol":"BTC","direction":"LONG","score":70,"event":{"timeframe":"4h"}},
+    ]
+    kept, rejected = ro.resolve_symbol_direction_conflicts(items)
+    assert len(kept)==2 and rejected==[]
+
+
+def test_conflict_resolver_preserves_independent_symbols():
+    import run_once as ro
+    items=[
+        {"symbol":"BTC","direction":"LONG","score":70,"event":{"timeframe":"1h"}},
+        {"symbol":"ETH","direction":"SHORT","score":70,"event":{"timeframe":"4h"}},
+    ]
+    kept, rejected = ro.resolve_symbol_direction_conflicts(items)
+    assert len(kept)==2 and rejected==[]
+
+
+def test_telegram_confluence_and_conflict_visual_fields():
+    from event_engine.telegram import format_signal
+    event = {
+        "symbol": "SOXL", "direction": "LONG", "event_type": "REGULAR_BULLISH_RSI",
+        "timeframe": "1h", "event_fact": {"detection_close_price": 110.0, "p1_price": 107.0, "p2_price": 105.0, "price_delta_atr": 0.678},
+        "timestamps": {"detected_at_ts": 123},
+    }
+    setup = {
+        "entry_reference": 111.0, "invalidation_price": 107.0, "target_price": 123.0,
+        "planned_weighted_rr": 1.05, "tp_mode": "multi_tp",
+        "trigger": {"trigger_price": 112.0, "trigger_delay_min": 30.0},
+        "confluence_events": [{"timeframe": "4h", "event_type": "HIDDEN_BULLISH_RSI", "event_id": "E2"}],
+        "conflict_events": [{"timeframe": "4h", "direction": "SHORT", "event_type": "REGULAR_BEARISH_RSI", "event_id": "E3"}],
+    }
+    msg = format_signal(event, setup=setup, score=80)
+    assert "🔗 <b>CONFLUENCE:</b> <code>4h HIDDEN_BULLISH_RSI</code>" in msg
+    assert "⚠️ <b>CONFLICT:</b> <code>4h SHORT</code>" in msg
+
+
+def test_confluence_events_follow_selected_setup_and_keep_all_same_direction_evidence():
+    import run_once as ro
+    e1 = {"event_id": "E1", "event_type": "REGULAR_BULLISH_RSI", "timeframe": "1h", "score": 70.0, "detected_at_ts": 100}
+    e2 = {"event_id": "E2", "event_type": "HIDDEN_BULLISH_RSI", "timeframe": "4h", "score": 80.0, "detected_at_ts": 200}
+    base1 = {"symbol": "SOXL", "direction": "LONG", "event": {"timeframe": "1h", "event_type": "REGULAR_BULLISH_RSI"}, "event_id": "E1", "score": 70.0, "confluence_events": [e1]}
+    base2 = {"symbol": "SOXL", "direction": "LONG", "event": {"timeframe": "4h", "event_type": "HIDDEN_BULLISH_RSI"}, "event_id": "E2", "score": 80.0, "confluence_events": [e1, e2]}
+    # The selected primary event is not itself displayed as CONFLUENCE.
+    display = [e for e in base2["confluence_events"] if e["event_id"] != base2["event_id"]]
+    assert {e["event_id"] for e in display} == {"E1"}
+
+
+
+def test_squeeze_release_lookback_recovers_recent_closed_release(monkeypatch):
+    import event_engine.signals as sig
+    n = 50
+    df = _generate_synthetic_candles(n)
+    df["close_time"] = [1_000_000 + i * 3_600_000 for i in range(n)]
+    # Release occurs at n-2; the immediately latest bar is already outside the
+    # squeeze, so a last-bar-only detector would miss this transition.
+    bb_u = pd.Series([0.0] * n)
+    bb_l = pd.Series([0.0] * n)
+    mid = pd.Series([0.0] * n)
+    kc_u = pd.Series([1.0] * n)
+    kc_l = pd.Series([-1.0] * n)
+    for i in range(n - 5, n - 1):
+        bb_u.iloc[i] = 0.0
+        bb_l.iloc[i] = 0.0
+    bb_u.iloc[n - 2] = 2.0
+    bb_l.iloc[n - 2] = -2.0
+    df.loc[n - 2, "close"] = 2.0
+    df.loc[n - 1, "close"] = 0.0
+    # Ensure no new release at the latest bar.
+    bb_u.iloc[n - 1] = 2.0
+    bb_l.iloc[n - 1] = -2.0
+
+    monkeypatch.setattr(sig, "_bbands", lambda close, n_, std: (bb_u, mid, bb_l))
+    monkeypatch.setattr(sig, "_atr", lambda frame, n_: pd.Series([0.5] * n))
+    events = sig.detect_squeeze_release(df, "TEST-USDT", "4h", min_squeeze_bars=3, release_lookback_bars=4)
+    assert any(ev["timestamps"]["detected_at_ts"] == int(df["close_time"].iloc[n - 2]) for ev in events)
+

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -58,9 +59,15 @@ EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
 HEALTH = DATA / "health.jsonl"
+TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
+EVENT_CACHE = DATA / "recent_event_cache.json"
+# BingX Kline endpoint is rate-limited per IP; serialize heavyweight scan requests.
+BAR_CLOSE_GRACE_MIN = float(os.environ.get("BAR_CLOSE_GRACE_MIN", "2"))
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "25000000"))
+
+# Установлен порог Open Interest $10 000 000 по вашему запросу
 MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "10000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
@@ -72,6 +79,188 @@ MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _save_json_atomic(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _completed_bucket(interval_ms: int, now_ms: int, grace_min: float) -> int:
+    adjusted = max(0, int(now_ms - grace_min * 60_000))
+    return (adjusted // interval_ms) - 1
+
+
+def _event_is_fresh(ev: dict, now_ms: int, max_age_min: int) -> bool:
+    try:
+        ts = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    age_min = (now_ms - ts) / 60_000.0
+    return 0 <= age_min <= max_age_min
+
+
+def _load_cached_events() -> list[dict]:
+    data = _load_json(EVENT_CACHE, {})
+    events = data.get("events", []) if isinstance(data, dict) else []
+    return [e for e in events if isinstance(e, dict) and e.get("event_id")]
+
+
+def _load_timeframe_scan_state() -> dict:
+    """Load per-symbol/per-timeframe scan state, migrating old global buckets."""
+    raw = _load_json(TIMEFRAME_STATE, {})
+    if not isinstance(raw, dict):
+        return {"symbols": {}}
+    symbols = raw.get("symbols")
+    if isinstance(symbols, dict):
+        return {"version": 2, "symbols": symbols}
+    # Legacy format used one bucket for the whole universe. Do not copy it to
+    # symbols: doing so would hide newly discovered symbols. Start them from
+    # scratch once, then persist their own last-scanned closed bar.
+    return {"version": 2, "symbols": {}}
+
+
+def _save_timeframe_scan_state(state: dict) -> None:
+    _save_json_atomic(TIMEFRAME_STATE, state)
+
+
+def _symbol_scan_due(state: dict, symbol: str, timeframe: str, completed_bucket: int) -> bool:
+    symbols = state.setdefault("symbols", {})
+    rec = symbols.get(symbol)
+    if not isinstance(rec, dict):
+        return True
+    last = rec.get(timeframe)
+    try:
+        return int(last) < completed_bucket
+    except (TypeError, ValueError):
+        return True
+
+
+def _mark_symbol_scanned(state: dict, symbol: str, timeframe: str, completed_bucket: int) -> None:
+    symbols = state.setdefault("symbols", {})
+    rec = symbols.setdefault(symbol, {})
+    rec[timeframe] = int(completed_bucket)
+    rec["updated_ts"] = int(time.time() * 1000)
+
+
+def _merge_event_cache(existing: list[dict], new_events: list[dict]) -> list[dict]:
+    """Merge by event_id while preserving events independent of current universe."""
+    by_id: dict[str, dict] = {}
+    for ev in existing + new_events:
+        if not isinstance(ev, dict):
+            continue
+        eid = ev.get("event_id")
+        if eid:
+            by_id[str(eid)] = ev
+    return list(by_id.values())
+
+
+def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch Klines with serialized pacing and bounded transient-error retry.
+
+    This protects the runner from burst traffic and BingX application-level
+    errors while never marking a symbol/timeframe processed until the caller
+    validates the returned dataset.
+    """
+    min_interval = float(os.environ.get("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "1.05"))
+    max_attempts = int(os.environ.get("BINGX_KLINE_RETRY_ATTEMPTS", "3"))
+    max_attempts = max(1, min(max_attempts, 5))
+    backoff_base = float(os.environ.get("BINGX_KLINE_RETRY_BACKOFF_SEC", "1.0"))
+
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        now = time.monotonic()
+        last = getattr(_fetch_klines_scan, "_last_call", None)
+        if last is not None:
+            wait = min_interval - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+        _fetch_klines_scan._last_call = time.monotonic()
+        try:
+            return fetch_klines(symbol, timeframe, limit)
+        except (RuntimeError, requests.RequestException, TimeoutError) as exc:
+            last_error = exc
+            if attempt + 1 >= max_attempts:
+                break
+            delay = max(0.0, backoff_base) * (2 ** attempt)
+            log.warning("[BINGX] Kline retry %d/%d for %s/%s after error: %s; sleeping %.1fs", attempt + 1, max_attempts - 1, symbol, timeframe, exc, delay)
+            if delay:
+                time.sleep(delay)
+    raise RuntimeError(f"Kline fetch failed for {symbol}/{timeframe} after {max_attempts} attempts: {last_error}") from last_error
+
+
+def _tf_stats(stats: dict, timeframe: str) -> dict:
+    by_tf = stats.setdefault("by_timeframe", {})
+    tf = str(timeframe).lower()
+    rec = by_tf.setdefault(tf, {
+        "scanned": 0,
+        "divergence_events": 0,
+        "squeeze_events": 0,
+        "scan_errors": 0,
+        "fresh_events": 0,
+        "fresh_divergence": 0,
+        "fresh_squeeze": 0,
+        "trigger_passed": 0,
+        "trigger_no_window": 0,
+        "trigger_breakout_failed": 0,
+        "trigger_volume_failed": 0,
+        "trigger_data_failed": 0,
+        "rejected_btc": 0,
+        "rejected_cvd": 0,
+        "rejected_score": 0,
+        "valid_signals": 0,
+    })
+    return rec
+
+
+def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: int, seen_ids: set[str], stats: dict, scan_state: dict, completed_bucket: int) -> list[dict]:
+    fresh: list[dict] = []
+    for r in candidates:
+        symbol = str(r.symbol).upper()
+        if not _symbol_scan_due(scan_state, symbol, timeframe, completed_bucket):
+            continue
+        tf_stats = _tf_stats(stats, timeframe)
+        try:
+            klines = _fetch_klines_scan(symbol, timeframe, limit)
+            if len(klines) < 60:
+                log.warning("[SIGNALS] %s %s returned only %d candles; watermark deferred.", timeframe.upper(), symbol, len(klines))
+                continue
+            d = add_cvd(pd.DataFrame(klines))
+            divs = detect_divergences(d, symbol, timeframe)
+            sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
+            # Advance watermark ONLY after the full response was structurally
+            # usable and the detector completed without exception.
+            _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
+            tf_stats["scanned"] += 1
+            stats["divergence_events"] += len(divs)
+            stats["squeeze_events"] += len(sqs)
+            tf_stats["divergence_events"] += len(divs)
+            tf_stats["squeeze_events"] += len(sqs)
+            stats["events_total"] += len(divs) + len(sqs)
+            for ev in divs + sqs:
+                if not _event_is_fresh(ev, now_ms, MAX_AGE):
+                    continue
+                fresh.append(ev)
+                eid = ev.get("event_id")
+                if eid and eid not in seen_ids:
+                    emit_event(ev)
+                    seen_ids.add(eid)
+        except Exception as exc:
+            stats["scan_errors"] += 1
+            tf_stats["scan_errors"] += 1
+            log.warning("[SIGNALS] %s %s fetch/detection error: %s", timeframe.upper(), symbol, exc)
+    return fresh
 
 
 def load_ids(path: Path) -> set[str]:
@@ -145,7 +334,7 @@ def send_pending_open_trade_notifications(
         event = {
             "event_id": event_id,
             "symbol": symbol,
-            "timeframe": "1h",
+            "timeframe": str(trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h").lower(),
             "direction": direction,
             "event_type": trade.get("event_type", "TRADE_OPEN"),
             "timestamps": {},
@@ -256,6 +445,57 @@ def calculate_execution_slippage(
         "execution_slippage_pct": execution_move,
         "adverse_execution_slippage_pct": adverse(execution_move),
     }
+
+def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Allow one direction per symbol; resolve only true LONG/SHORT conflicts.
+
+    The existing best_opportunities_map has already deduplicated multiple events
+    in the same (symbol, direction). Here we prevent simultaneous opposite-side
+    setups for the same symbol. Score is primary; 4H is the deterministic tie-break.
+    """
+    by_symbol: dict[str, list[dict]] = {}
+    for opp in opportunities:
+        by_symbol.setdefault(str(opp.get("symbol", "")), []).append(opp)
+
+    kept: list[dict] = []
+    rejected: list[dict] = []
+    tf_rank = {"4h": 2, "1h": 1}
+    for symbol, items in by_symbol.items():
+        directions = {str(x.get("direction", "")).upper() for x in items}
+        if len(directions) <= 1:
+            kept.extend(items)
+            continue
+
+        ranked = sorted(
+            items,
+            key=lambda x: (
+                float(x.get("score", 0.0)),
+                tf_rank.get(str(x.get("event", {}).get("timeframe", "1h")).lower(), 0),
+                1 if "SQUEEZE" in str(x.get("event", {}).get("event_type", "")).upper() else 0,
+                int(x.get("event", {}).get("timestamps", {}).get("detected_at_ts", 0) or 0),
+            ),
+            reverse=True,
+        )
+        winner = ranked[0]
+        winner.setdefault("conflict_events", [])
+        kept.append(winner)
+        for loser in ranked[1:]:
+            winner["conflict_events"].append({
+                "event_id": loser.get("event_id"),
+                "event_type": loser.get("event", {}).get("event_type"),
+                "timeframe": loser.get("event", {}).get("timeframe", "1h"),
+                "direction": loser.get("direction"),
+                "score": float(loser.get("score", 0.0)),
+            })
+            loser["conflict_rejected_against"] = {
+                "direction": winner.get("direction"),
+                "score": winner.get("score"),
+                "timeframe": winner.get("event", {}).get("timeframe"),
+                "event_id": winner.get("event_id"),
+            }
+            rejected.append(loser)
+    return kept, rejected
+
 
 def calculate_setup_score(
     ev: dict,
@@ -604,7 +844,7 @@ def reconcile_all_open_positions() -> None:
         if sl_pct <= 0:
             sl_pct = 2.0
         try:
-            k1 = fetch_klines(bx_symbol, "1h", limit=30)
+            k1 = _fetch_klines_scan(bx_symbol, "1h", limit=30)
             if not matched_trade and len(k1) >= 20:
                 df1 = pd.DataFrame(k1)
                 for col in ("high", "low", "close"):
@@ -863,17 +1103,22 @@ def main() -> None:
         "trigger_data_failed": 0,
         "trigger_direction_failed": 0,
         "rejected_score": 0,
+        "conflict_rejected": 0,
         "valid_signals": 0,
         "execution_attempts": 0,
         "trades": 0,
         "scan_errors": 0,
+        "cached_events": 0,
+        "timeframe_scanned_symbols_1h": 0,
+        "timeframe_scanned_symbols_4h": 0,
         "telegram_pending_retries": 0,
         "telegram_pending_retry_success": 0,
+        "by_timeframe": {},
     }
 
     btc_regime_df = None
     try:
-        btc_klines = fetch_klines("BTC-USDT", "1h", limit=10)
+        btc_klines = _fetch_klines_scan("BTC-USDT", "1h", limit=10)
         if btc_klines:
             btc_regime_df = pd.DataFrame(btc_klines)
             last_c = float(btc_regime_df["close"].iloc[-1])
@@ -962,217 +1207,244 @@ def main() -> None:
     executed_event_ids = load_successful_trade_ids(TRADES)
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    scan_state = _load_timeframe_scan_state()
+    event_cache = _load_cached_events()
+
+    completed_1h = _completed_bucket(3_600_000, now_ms, BAR_CLOSE_GRACE_MIN)
+    completed_4h = _completed_bucket(14_400_000, now_ms, BAR_CLOSE_GRACE_MIN)
+
+    # Per-symbol watermarks preserve the existing event math while ensuring that a
+    # symbol entering the liquidity universe late is scanned immediately for its
+    # latest completed bar. Failures do not advance the watermark.
+    new_1h = _refresh_timeframe_events(
+        candidates, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")),
+        now_ms, seen_events, stats, scan_state, completed_1h,
+    )
+    new_4h = _refresh_timeframe_events(
+        candidates, "4h", int(os.environ.get("KLINE_LIMIT_4H", "250")),
+        now_ms, seen_events, stats, scan_state, completed_4h,
+    )
+    event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
+    event_cache = [ev for ev in event_cache if _event_is_fresh(ev, now_ms, MAX_AGE)]
+    _save_json_atomic(EVENT_CACHE, {"updated_ts": now_ms, "events": event_cache})
+    _save_timeframe_scan_state(scan_state)
+
+    stats["cached_events"] = len(event_cache)
+    stats["timeframe_scanned_symbols_1h"] = sum(1 for rec in scan_state.get("symbols", {}).values() if isinstance(rec, dict) and rec.get("1h") == completed_1h)
+    stats["timeframe_scanned_symbols_4h"] = sum(1 for rec in scan_state.get("symbols", {}).values() if isinstance(rec, dict) and rec.get("4h") == completed_4h)
+    stats["fresh_events"] = 0
+    stats["fresh_long"] = 0
+    stats["fresh_short"] = 0
+    stats["fresh_divergence"] = 0
+    stats["fresh_squeeze"] = 0
+
+    events_by_symbol: dict[str, list[dict]] = {}
+    for ev in event_cache:
+        events_by_symbol.setdefault(str(ev.get("symbol", "")), []).append(ev)
+
+    # Fresh 1H ATR is fetched only after an event passes the cheap 15M trigger + score gate.
+    risk_1h_cache: dict[str, pd.DataFrame] = {}
     for r in candidates:
-        symbol = r.symbol
-        try:
-            k1 = fetch_klines(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
-            if len(k1) < 60:
+        symbol = str(r.symbol)
+        all_events = events_by_symbol.get(symbol, [])
+        if not all_events:
+            continue
+
+        d15 = None
+        for ev in sorted(all_events, key=lambda x: int(x.get("timestamps", {}).get("detected_at_ts", 0) or 0), reverse=True):
+            event_id = ev.get("event_id")
+            if not event_id or event_id in executed_event_ids:
+                continue
+            direction = str(ev.get("direction", "")).upper()
+            if direction not in {"LONG", "SHORT"}:
+                stats["trigger_direction_failed"] += 1
+                continue
+            bx_symbol = to_bx_symbol(symbol)
+            if bx_symbol and current_open_positions.get((bx_symbol, direction)):
+                continue
+            try:
+                detected_at = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+            except (TypeError, ValueError):
+                stats["trigger_data_failed"] += 1
+                continue
+            if detected_at <= 0:
+                stats["trigger_data_failed"] += 1
+                continue
+            age = (now_ms - detected_at) / 60_000.0
+            if age < 0 or age > MAX_AGE:
                 continue
 
-            d1 = add_cvd(pd.DataFrame(k1))
-            divergence_events = detect_divergences(d1, symbol, "1h")
-            squeeze_events = detect_squeeze_release(d1, symbol, "1h", min_squeeze_bars=3)
+            stats["fresh_events"] += 1
+            tf_stats["fresh_events"] += 1
+            stats["fresh_long"] += int(direction == "LONG")
+            stats["fresh_short"] += int(direction == "SHORT")
+            event_type = str(ev.get("event_type", "")).upper()
+            stats["fresh_squeeze"] += int("SQUEEZE" in event_type)
+            stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
+            tf_stats["fresh_squeeze"] += int("SQUEEZE" in event_type)
+            tf_stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
+            tf = str(ev.get("timeframe", "1h")).lower()
+            tf_stats = _tf_stats(stats, tf)
+            log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
-            stats["divergence_events"] += len(divergence_events)
-            stats["squeeze_events"] += len(squeeze_events)
-            all_events = divergence_events + squeeze_events
-            stats["events_total"] += len(all_events)
+            if btc_regime_df is not None and symbol != "BTC-USDT":
+                btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
+                if not btc_ok:
+                    stats["rejected_btc"] += 1
+                    tf_stats["rejected_btc"] += 1
+                    continue
 
-            if not all_events:
+            if d15 is None:
+                try:
+                    k15 = _fetch_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
+                except Exception as exc:
+                    stats["trigger_data_failed"] += 1
+                    stats["scan_errors"] += 1
+                    log.warning("[SIGNALS] 15M fetch error for %s: %s", symbol, exc)
+                    continue
+                if len(k15) < 20:
+                    stats["trigger_data_failed"] += 1
+                    continue
+                d15 = pd.DataFrame(k15)
+
+            if not {"close_time", "close", "high", "low", "volume"}.issubset(d15.columns):
+                stats["trigger_data_failed"] += 1
                 continue
 
-            d15 = None
-            for ev in all_events:
-                event_id = ev.get("event_id")
-                if not event_id:
+            if REQUIRE_TRIGGER:
+                trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
+                if not trigger_diag.get("ok"):
+                    reason = trigger_diag.get("reason") or "failed"
+                    stats["rejected_trigger"] += 1
+                    if reason == "no_trigger_window":
+                        stats["trigger_no_window"] += 1; tf_stats["trigger_no_window"] += 1
+                    elif reason == "breakout_failed":
+                        stats["trigger_breakout_failed"] += 1; tf_stats["trigger_breakout_failed"] += 1
+                    elif reason == "volume_failed":
+                        stats["trigger_volume_failed"] += 1; tf_stats["trigger_volume_failed"] += 1
+                    else:
+                        stats["trigger_data_failed"] += 1; tf_stats["trigger_data_failed"] += 1
+                    log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
+                    continue
+                stats["trigger_passed"] += 1
+                tf_stats["trigger_passed"] += 1
+            else:
+                trigger_diag = {"ok": True, "reason": "not_required"}
+                stats["trigger_passed"] += 1
+                tf_stats["trigger_passed"] += 1
+
+            if REQUIRE_CVD:
+                try: cvd24_value = float(getattr(r, "cvd24", 0.0))
+                except (TypeError, ValueError): stats["rejected_cvd"] += 1; continue
+                if not pd.notna(cvd24_value) or cvd24_value <= CVD_MIN_CONFIRMATION:
+                    stats["rejected_cvd"] += 1
+                    tf_stats["rejected_cvd"] += 1
                     continue
 
-                direction = str(ev.get("direction", "")).upper()
-                if direction not in {"LONG", "SHORT"}:
-                    stats["trigger_direction_failed"] += 1
-                    continue
+            signal_price = _safe_float(ev.get("event_fact", {}).get("detection_close_price") or r.price, 0.0)
+            if signal_price <= 0:
+                stats["scan_errors"] += 1
+                continue
 
-                bx_symbol = to_bx_symbol(symbol)
-                if bx_symbol and current_open_positions.get((bx_symbol, direction)):
-                    continue
+            score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
+            if MIN_SCORE > 0 and score < MIN_SCORE:
+                stats["rejected_score"] += 1
+                tf_stats["rejected_score"] += 1
+                log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, tf, event_type, score, MIN_SCORE)
+                continue
 
-                timestamps = ev.get("timestamps", {})
+            if symbol not in risk_1h_cache:
                 try:
-                    detected_at = int(timestamps.get("detected_at_ts", 0) or 0)
-                except (TypeError, ValueError):
-                    stats["trigger_data_failed"] += 1
-                    continue
-
-                if detected_at <= 0:
-                    stats["trigger_data_failed"] += 1
-                    continue
-
-                try:
-                    latest_close = int(d1["close_time"].iloc[-1])
-                except (TypeError, ValueError, IndexError, KeyError):
-                    stats["scan_errors"] += 1
-                    continue
-
-                age = (latest_close - detected_at) / 60000.0
-                if age < 0 or age > MAX_AGE:
-                    stats["rejected_age"] += 1
-                    continue
-
-                stats["fresh_events"] += 1
-                if direction == "LONG":
-                    stats["fresh_long"] += 1
-                else:
-                    stats["fresh_short"] += 1
-
-                event_type = str(ev.get("event_type", "")).upper()
-                if "SQUEEZE" in event_type:
-                    stats["fresh_squeeze"] += 1
-                else:
-                    stats["fresh_divergence"] += 1
-
-                log.info("[SIGNALS] Fresh event: %s %s | Type: %s | Age: %.1fm", direction, symbol, event_type, age)
-
-                if event_id not in seen_events:
-                    emit_event(ev)
-                    seen_events.add(event_id)
-
-                if btc_regime_df is not None and symbol != "BTC-USDT":
-                    btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
-                    if not btc_ok:
-                        stats["rejected_btc"] += 1
-                        log.info("[SIGNALS] %s %s blocked by BTC: %s", direction, symbol, btc_reason)
-                        continue
-
-                if d15 is None:
-                    try:
-                        k15 = fetch_klines(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
-                    except Exception as exc:
-                        stats["trigger_data_failed"] += 1
-                        stats["scan_errors"] += 1
-                        log.warning("[SIGNALS] 15M fetch error for %s: %s", symbol, exc)
-                        continue
-
-                    if len(k15) < 20:
+                    k1_risk = _fetch_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
+                    if len(k1_risk) < 20:
                         stats["trigger_data_failed"] += 1
                         continue
-                    d15 = pd.DataFrame(k15)
-
-                required_15m = {"close_time", "close", "high", "low", "volume"}
-                if not required_15m.issubset(d15.columns):
-                    stats["trigger_data_failed"] += 1
-                    continue
-
-                try:
-                    latest_15m_close_ts = int(d15["close_time"].iloc[-1])
-                    trigger_delay_min = (latest_15m_close_ts - detected_at) / 60000.0
-                except (TypeError, ValueError, IndexError):
-                    stats["trigger_data_failed"] += 1
-                    continue
-
-                if REQUIRE_TRIGGER:
-                    trigger_diag = diagnose_15m_trigger(
-                        d15, direction, event_detected_at_ts=detected_at,
-                        max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05,
-                    )
-                    if not trigger_diag.get("ok"):
-                        reason = trigger_diag.get("reason") or "failed"
-                        stats["rejected_trigger"] += 1
-                        if reason == "no_trigger_window": stats["trigger_no_window"] += 1
-                        elif reason == "breakout_failed": stats["trigger_breakout_failed"] += 1
-                        elif reason == "volume_failed": stats["trigger_volume_failed"] += 1
-                        else: stats["trigger_data_failed"] += 1
-                        log.info("[SIGNALS] %s %s (%s) failed 15m trigger: %s", direction, symbol, event_type, reason)
-                        continue
-                    stats["trigger_passed"] += 1
-                else:
-                    trigger_diag = {"ok": True, "reason": "not_required"}
-                    stats["trigger_passed"] += 1
-
-                trigger_price = _safe_float(trigger_diag.get("current_close"), 0.0) or None
-                trigger_ts = trigger_diag.get("trigger_bar_close_ts")
-
-                if REQUIRE_CVD:
-                    cvd24 = getattr(r, "cvd24", None)
-                    try:
-                        cvd24_value = float(cvd24)
-                    except (TypeError, ValueError):
-                        stats["rejected_cvd"] += 1
-                        continue
-
-                    if not pd.notna(cvd24_value) or cvd24_value <= CVD_MIN_CONFIRMATION:
-                        stats["rejected_cvd"] += 1
-                        log.info("[SIGNALS] %s %s CVD low (%.1f <= %.1f)", direction, symbol, cvd24_value or 0, CVD_MIN_CONFIRMATION)
-                        continue
-
-                fact = ev.get("event_fact", {})
-                raw_price = fact.get("detection_close_price") or fact.get("close") or r.price
-                try:
-                    signal_price = float(raw_price)
-                except (TypeError, ValueError):
+                    risk_1h_cache[symbol] = pd.DataFrame(k1_risk)
+                except Exception as exc:
                     stats["scan_errors"] += 1
+                    log.warning("[RISK] Fresh 1H ATR fetch error for %s: %s", symbol, exc)
                     continue
 
-                if not pd.notna(signal_price) or signal_price <= 0:
-                    stats["scan_errors"] += 1
-                    continue
+            try:
+                setup = build_event_setup(ev=ev, df_1h=risk_1h_cache[symbol], entry_price=signal_price)
+            except (TypeError, ValueError, KeyError) as exc:
+                stats["trigger_data_failed"] += 1
+                log.warning("[RISK] Invalid setup for %s %s (%s/%s): %s", direction, symbol, tf, event_type, exc)
+                continue
+            except Exception as exc:
+                stats["scan_errors"] += 1
+                log.exception("[RISK] Unexpected setup error for %s %s (%s/%s)", direction, symbol, tf, event_type)
+                continue
+            setup["trigger"] = {
+                "event_detected_at_ts": detected_at,
+                "trigger_bar_close_ts": trigger_diag.get("trigger_bar_close_ts"),
+                "trigger_price": _safe_float(trigger_diag.get("current_close"), 0.0) or None,
+                "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
+                "volume_ratio": trigger_diag.get("volume_ratio"),
+            }
+            setup["signal_price"] = signal_price
+            setup["event_timeframe"] = tf
+            setup["event_type"] = event_type
+            setup["trigger_ok"] = True
 
-                setup = build_event_setup(ev=ev, df_1h=d1, entry_price=signal_price)
-                setup["trigger"] = {
-                    "event_detected_at_ts": detected_at,
-                    "trigger_bar_close_ts": trigger_ts,
-                    "trigger_price": trigger_price,
-                    "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
-                    "volume_ratio": trigger_diag.get("volume_ratio"),
-                }
-                score = calculate_setup_score(
-                    ev=ev,
-                    coinalyze_row=r,
-                    df_15m=d15,
-                    trigger_diagnostic=trigger_diag,
-                )
+            key = (symbol, direction)
+            evidence = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "timeframe": tf,
+                "score": float(score),
+                "detected_at_ts": detected_at,
+            }
+            cand = {
+                "event": ev, "event_id": event_id, "symbol": symbol, "direction": direction,
+                "price": signal_price, "setup": setup, "score": score, "coinalyze_row": r,
+                "confluence_events": [evidence],
+            }
+            if key not in best_opportunities_map:
+                best_opportunities_map[key] = cand
+            else:
+                existing = best_opportunities_map[key]
+                existing.setdefault("confluence_events", []).append(evidence)
+                if score > existing["score"]:
+                    cand["confluence_events"] = existing["confluence_events"]
+                    best_opportunities_map[key] = cand
 
-                if MIN_SCORE > 0 and score < MIN_SCORE:
-                    stats.setdefault("rejected_score", 0)
-                    stats["rejected_score"] += 1
-                    log.info("[SIGNALS] %s %s (%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, event_type, score, MIN_SCORE)
-                    continue
-
-                opp_key = (symbol, direction)
-                new_candidate = {
-                    "event": ev,
-                    "event_id": event_id,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "price": signal_price,
-                    "setup": setup,
-                    "score": score,
-                    "coinalyze_row": r,
-                }
-
-                if opp_key in best_opportunities_map:
-                    if score > best_opportunities_map[opp_key]["score"]:
-                        best_opportunities_map[opp_key] = new_candidate
-                else:
-                    best_opportunities_map[opp_key] = new_candidate
-
-                log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g",
-                         direction, symbol, score, event_type, signal_price, setup['invalidation_price'], setup['target_price'])
-
-        except Exception as exc:
-            stats["scan_errors"] += 1
-            log.error("[SCAN] Error scanning %s: %s", symbol, exc)
+            log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g", direction, symbol, score, tf, event_type, signal_price, setup["invalidation_price"], setup["target_price"])
 
     opportunities = list(best_opportunities_map.values())
+    for opp in opportunities:
+        tf = str(opp.get("event", {}).get("timeframe", "1h")).lower()
+        _tf_stats(stats, tf)["valid_signals"] += 1
+    opportunities, conflict_rejected = resolve_symbol_direction_conflicts(opportunities)
+    stats["conflict_rejected"] = len(conflict_rejected)
     stats["valid_signals"] = len(opportunities)
     opportunities.sort(key=lambda x: x["score"], reverse=True)
 
-    log.info("[RANKING] Unique signals ready: %d.", len(opportunities))
+    for rejected in conflict_rejected:
+        loser = rejected.get("direction")
+        symbol = rejected.get("symbol")
+        against = rejected.get("conflict_rejected_against", {})
+        log.info("[RANKING] Conflict rejected: %s %s (Score %.0f, TF %s) vs %s %s (Score %.0f, TF %s).",
+                 loser, symbol, float(rejected.get("score", 0)), rejected.get("event", {}).get("timeframe"),
+                 against.get("direction"), symbol, float(against.get("score", 0)), against.get("timeframe"))
+
+    log.info("[RANKING] Unique non-conflicting signals ready: %d.", len(opportunities))
     for i, opp in enumerate(opportunities[:5], start=1):
         log.info("  [RANKING] #%d: %s %s | Score: %.0f | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
     trades_this_cycle = 0
 
     for opp in opportunities:
+        evidence = list(opp.get("confluence_events", []))
+        primary_id = str(opp.get("event_id", ""))
+        evidence = [e for e in evidence if str(e.get("event_id", "")) != primary_id]
+        evidence.sort(key=lambda e: (-{"4h": 2, "1h": 1}.get(str(e.get("timeframe", "1h")).lower(), 0), str(e.get("event_type", ""))))
+        conflicts = list(opp.get("conflict_events", []))
+        setup_obj = opp.get("setup") if isinstance(opp.get("setup"), dict) else {}
+        setup_obj["confluence_events"] = evidence
+        setup_obj["conflict_events"] = conflicts
+        opp["setup"] = setup_obj
         event_id = opp["event_id"]
         symbol = opp["symbol"]
         direction = opp["direction"]
@@ -1183,8 +1455,10 @@ def main() -> None:
         ev = opp["event"]
 
         bx_symbol = to_bx_symbol(symbol)
+        opposite_direction = "SHORT" if direction == "LONG" else "LONG"
+        opposite_position_open = bool(bx_symbol and current_open_positions.get((bx_symbol, opposite_direction)))
         
-        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))):
+        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open:
             existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
             active_trade = None
             try:
@@ -1196,13 +1470,15 @@ def main() -> None:
             except Exception:
                 active_trade = None
             execution_result = {
-                "status": "ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED",
+                "status": ("CONFLICTING_DIRECTION_POSITION" if opposite_position_open and not existing_position else ("ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED")),
                 "mode": EXECUTION_MODE,
                 "order_id": None,
                 "position": existing_position,
                 "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
             }
-            log.info("[EXECUTION] %s (%s) - Already open/executed.%s", symbol, direction, " Position confirmed; Telegram retry eligible." if existing_position else "")
+            log.info("[EXECUTION] %s (%s) - Already open/executed.%s%s", symbol, direction,
+                     " Position confirmed; Telegram retry eligible." if existing_position else "",
+                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else "")
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
             log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle + 1, MAX_TRADES, direction, symbol, score, price)
@@ -1275,6 +1551,7 @@ def main() -> None:
                         tp_orders=protection.get("tp_orders", []),
                         sl_result=protection.get("sl_result", {}),
                         event_type=ev.get("event_type", ""),
+                        timeframe=ev.get("timeframe") or setup.get("event_timeframe") or setup.get("timeframe") or "1h",
                         coinalyze_row=r,
                         score=score,
                         setup=execution_result.get("setup_used_for_protection", setup),
@@ -1341,6 +1618,9 @@ def main() -> None:
         append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES)
     except Exception as exc:
         log.error("[SHADOW] Health snapshot error: %s", exc)
+
+    for tf_name, tf_rec in sorted(stats.get("by_timeframe", {}).items()):
+        log.info("[TF_STATS] %s %s", tf_name.upper(), " ".join(f"{k}={v}" for k, v in tf_rec.items()))
 
     summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
     log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)
