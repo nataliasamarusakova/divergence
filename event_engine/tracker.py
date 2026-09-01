@@ -770,17 +770,9 @@ def update_active_trades() -> None:
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
                             log.info(
-                                "[TRACKER_BE_ACTIVATED] 🛡 %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
-                            )
-                            # Audit P2-7: notify Telegram about BE activation (was console-only).
-                            try:
-                                send_tg(
-                                    f"🛡 <b>{trade.get('name', symbol)} ({symbol}) — Break-Even</b>\n"
-                                    f"TP1 исполнен, SL перенесён в безубыток: <code>{entry_price:.8g}</code> (риск 0.00%)"
-                                )
-                            except Exception:
-                                pass
+                            )                             
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")
