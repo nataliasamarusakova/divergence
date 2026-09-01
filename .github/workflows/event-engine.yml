@@ -46,9 +46,6 @@ jobs:
       KLINE_LIMIT_1H: "250"
       KLINE_LIMIT_15M: "250"
       KLINE_LIMIT_4H: "250"
-      # Audit fix B5: cross-process (file-lock) rate limiter shared by
-      # processes on the same host / workspace.
-      BINGX_GLOBAL_RATE_LIMITER: "true"
       # Reconciliation must fail fast; deferred checks are retried next cycle.
       RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
       RECONCILIATION_MAX_SECONDS: "45"
