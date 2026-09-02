@@ -838,6 +838,76 @@ def _effective_weighted_rr(levels: list[dict], stop_loss_pct: float) -> float | 
     return weighted / total if total > 0 else None
 
 
+def _find_open_order_by_client_id(symbol: str, direction: str, client_order_id: str) -> tuple[str, dict | None]:
+    """Return (found/absent/unknown, order) for a deterministic client id."""
+    if not client_order_id:
+        return "unknown", None
+    try:
+        prot = get_open_protection_directional(symbol, direction, retryable=False)
+    except Exception as exc:
+        log.warning("[BINGX] Protection verification failed for %s %s: %s", symbol, direction, exc)
+        return "unknown", None
+    if prot.get("status") != "ok":
+        return "unknown", None
+    wanted = str(client_order_id).upper()
+    for order in list(prot.get("sl_orders", [])) + list(prot.get("tp_orders", [])):
+        if str(order.get("clientOrderId", "")).upper() == wanted:
+            return "found", order
+    return "absent", None
+
+
+def _post_protection_order_verified(
+    symbol: str, direction: str, params: dict, client_order_id: str,
+    *, max_attempts: int = 2, retry_delay: float = 0.25,
+) -> dict:
+    """POST protection order with idempotent recovery for transport failures.
+
+    A transport timeout makes the POST outcome unknown. We first query open orders
+    for the deterministic clientOrderId. We retry only after the exchange confirms
+    that the order is absent; an unavailable verification leaves the outcome unknown
+    and does not issue a potentially duplicating POST.
+    """
+    last_resp: dict = {"code": -1, "msg": "protection request not attempted"}
+    for attempt in range(max_attempts):
+        try:
+            resp = _request("POST", ORDER_PATH, params)
+        except Exception as exc:
+            resp = {"code": -1, "msg": str(exc)}
+        if isinstance(resp, dict) and resp.get("code") == 0:
+            return resp
+
+        last_resp = resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
+        is_transport = last_resp.get("code") == -1 and "missing bingx credentials" not in str(last_resp.get("msg", "")).lower()
+        if not is_transport:
+            return last_resp
+
+        state, found = _find_open_order_by_client_id(symbol, direction, client_order_id)
+        if state == "found" and found is not None:
+            return {
+                "code": 0,
+                "data": {"order": found},
+                "recovered": True,
+                "recovery": "open_order_verified_after_transport_error",
+            }
+        if state != "absent":
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; protection state unknown after POST",
+                "protection_state_unknown": True,
+            }
+
+        if attempt + 1 < max_attempts:
+            time.sleep(retry_delay)
+            continue
+        return last_resp
+
+    return last_resp
+
+
+def _sl_price_matches(actual_price: float, expected_price: float, tolerance: float = 0.002) -> bool:
+    return actual_price > 0 and expected_price > 0 and abs(actual_price - expected_price) / max(expected_price, 1e-12) <= tolerance
+
+
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
@@ -880,6 +950,7 @@ def ensure_directional_protection(
     existing_sl = list(existing.get("sl_orders", []))
     tp_levels_norm = _normalize_tp_levels(tp_levels)
 
+    desired_sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
     valid_existing_sl = None
     for sl in existing_sl:
         order_type = str(sl.get("type", "")).upper()
@@ -894,8 +965,8 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
-        protective_side = (sl_price <= avg_price * 1.002) if direction == "LONG" else (sl_price >= avg_price * 0.998)
-        if protective_side and _qty_matches_position(sl_qty, position_qty):
+        protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
+        if protective_side and _sl_price_matches(sl_price, desired_sl_price) and _qty_matches_position(sl_qty, position_qty):
             valid_existing_sl = sl
             break
 
@@ -909,7 +980,7 @@ def ensure_directional_protection(
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
         }
     else:
-        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
+        sl_price = desired_sl_price
         client_order_id = build_sl_client_order_id(trade_id)
         params = {
             "symbol": bx_symbol,
@@ -921,7 +992,7 @@ def ensure_directional_protection(
             "clientOrderId": client_order_id,
         }
 
-        resp = _request("POST", ORDER_PATH, params)
+        resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
         if resp.get("code") != 0:
             log.error("[BINGX] SL failed: code=%s msg=%s", resp.get("code"), resp.get("msg"))
             return {
@@ -942,7 +1013,10 @@ def ensure_directional_protection(
 
     verified = get_open_protection_directional(symbol, direction)
     verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
-    verified_sl_valid = any(_validate_sl_order_for_position(o, direction, avg_price) for o in verified_sl)
+    verified_sl_valid = any(
+        _validate_sl_order_for_position(o, direction, avg_price, expected_price=desired_sl_price, expected_qty=position_qty)
+        for o in verified_sl
+    )
 
     if not verified_sl_valid:
         return {
@@ -1082,7 +1156,7 @@ def ensure_directional_protection(
             "clientOrderId": client_order_id,
         }
 
-        resp = _request("POST", ORDER_PATH, params)
+        resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
         if resp.get("code") != 0:
             log.error("[BINGX] TP order failed: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
             tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
@@ -1133,7 +1207,10 @@ def ensure_directional_protection(
     }
 
 
-def _validate_sl_order_for_position(order: dict, direction: str, avg_price: float) -> bool:
+def _validate_sl_order_for_position(
+    order: dict, direction: str, avg_price: float,
+    *, expected_price: float | None = None, expected_qty: float | None = None,
+) -> bool:
     order_type = str(order.get("type", "")).upper()
     if order_type not in {"STOP", "STOP_MARKET"}:
         return False
@@ -1149,8 +1226,18 @@ def _validate_sl_order_for_position(order: dict, direction: str, avg_price: floa
 
     direction = str(direction).upper()
     if direction == "LONG":
-        return sl_price <= avg_price * 1.003
-    if direction == "SHORT":
-        return sl_price >= avg_price * 0.997
+        protective = sl_price < avg_price
+    elif direction == "SHORT":
+        protective = sl_price > avg_price
+    else:
+        return False
+
+    if not protective:
+        return False
+    if expected_price is not None and not _sl_price_matches(sl_price, float(expected_price)):
+        return False
+    if expected_qty is not None and not _qty_matches_position(qty, float(expected_qty)):
+        return False
+    return True
 
     return False
