@@ -944,3 +944,83 @@ def test_score_gives_squeeze_bonus_to_liquidation_squeezes():
     score_oi = ro.calculate_setup_score(ev=ev_oi, coinalyze_row=None, df_15m=pd.DataFrame({"close": [1]}))
     assert score_oi >= 60  # 50 base + 10 delta_atr + 15 OI family bonus
 
+
+
+def test_symbol_cooldown_uses_only_confirmed_position_opens(tmp_path: Path):
+    import run_once as ro
+    path = tmp_path / "trades.jsonl"
+    now = 2_000_000_000
+    records = [
+        {"record_type": "TRADE_OPEN", "symbol": "ABC", "ts": now - 60_000,
+         "execution": {"status": "opened_protected"}, "result": {"position": {"positionAmt": "1"}}},
+        {"record_type": "TRADE_OPEN", "symbol": "DEF", "ts": now - 30_000,
+         "execution": {"status": "OPEN_FAILED"}, "result": {}},
+    ]
+    path.write_text("\n".join(json.dumps(x) for x in records) + "\n", encoding="utf-8")
+    latest = ro._load_recent_successful_entries(path, now, 15)
+    assert ro._symbol_on_cooldown("ABC", latest, now, 15)
+    assert not ro._symbol_on_cooldown("DEF", latest, now, 15)
+
+
+def test_sl_validation_requires_expected_price_and_qty():
+    from event_engine import bingx as bx
+    order = {"type": "STOP_MARKET", "stopPrice": "95", "origQty": "1"}
+    assert bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=95.0, expected_qty=1.0)
+    assert not bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=90.0, expected_qty=1.0)
+    assert not bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=95.0, expected_qty=2.0)
+
+
+def test_protection_transport_error_verifies_existing_order_before_retry(monkeypatch):
+    from event_engine import bingx as bx
+    calls = []
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or {"code": -1, "msg": "read timed out"})
+    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: (
+        "found", {"orderId": "SL1", "clientOrderId": "CID", "type": "STOP_MARKET"}
+    ))
+    out = bx._post_protection_order_verified(
+        "TEST", "LONG", {"clientOrderId": "CID"}, "CID"
+    )
+    assert out["code"] == 0
+    assert out["recovered"] is True
+    assert len(calls) == 1
+
+
+def test_protection_transport_error_retries_only_after_confirmed_absence(monkeypatch):
+    from event_engine import bingx as bx
+    responses = iter([
+        {"code": -1, "msg": "read timed out"},
+        {"code": 0, "data": {"order": {"orderId": "SL2", "clientOrderId": "CID"}}},
+    ])
+    calls = []
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or next(responses))
+    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("absent", None))
+    monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
+    out = bx._post_protection_order_verified(
+        "TEST", "LONG", {"clientOrderId": "CID"}, "CID"
+    )
+    assert out["code"] == 0
+    assert len(calls) == 2
+
+
+def test_in_cycle_position_state_is_updated_immediately():
+    import run_once as ro
+    opened = {}
+    positions = {}
+    ro._mark_local_position_state(
+        opened, positions,
+        {"symbol": "ABC-USDT", "positionAmt": "1", "avgPrice": "100"},
+        "ABC", "LONG",
+    )
+    assert opened[("ABC-USDT", "LONG")] is True
+    assert positions[("ABC-USDT", "LONG")]["avgPrice"] == "100"
+
+
+def test_protection_transport_error_does_not_retry_when_verification_is_unknown(monkeypatch):
+    from event_engine import bingx as bx
+    calls = []
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or {"code": -1, "msg": "read timed out"})
+    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("unknown", None))
+    out = bx._post_protection_order_verified("TEST", "LONG", {"clientOrderId": "CID"}, "CID")
+    assert out["code"] == -1
+    assert out["protection_state_unknown"] is True
+    assert len(calls) == 1

@@ -81,6 +81,8 @@ MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
 MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
+# Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
+SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
 
@@ -103,6 +105,73 @@ def _save_json_atomic(path: Path, obj: Any) -> None:
 def _completed_bucket(interval_ms: int, now_ms: int, grace_min: float) -> int:
     adjusted = max(0, int(now_ms - grace_min * 60_000))
     return (adjusted // interval_ms) - 1
+
+
+def _load_recent_successful_entries(path: Path, now_ms: int, cooldown_min: float) -> dict[str, int]:
+    """Return most recent successful TRADE_OPEN timestamp per symbol.
+
+    Only real opened states count; OPEN_FAILED / protection failures without a
+    confirmed position are deliberately ignored so a transient API failure does
+    not permanently suppress a symbol.
+    """
+    if cooldown_min <= 0 or not path.exists():
+        return {}
+    cutoff = now_ms - int(cooldown_min * 60_000)
+    latest: dict[str, int] = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("record_type") != "TRADE_OPEN":
+                    continue
+                result = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+                execution = obj.get("execution") if isinstance(obj.get("execution"), dict) else {}
+                status = str(execution.get("status") or result.get("status") or "").lower()
+                position = result.get("position") if isinstance(result.get("position"), dict) else {}
+                qty = _safe_float(position.get("positionAmt"), 0.0)
+                if status not in {
+                    "opened_protected", "opened_protection_check_required", "opened_protection_failed",
+                } or qty <= 0:
+                    continue
+                symbol = str(obj.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                ts = int(_safe_float(obj.get("ts"), 0.0))
+                if ts >= cutoff and ts <= now_ms:
+                    latest[symbol] = max(latest.get(symbol, 0), ts)
+    except OSError as exc:
+        log.warning("[EXECUTION] Failed to inspect recent entries: %s", exc)
+    return latest
+
+
+def _symbol_on_cooldown(symbol: str, latest_entries: dict[str, int], now_ms: int, cooldown_min: float) -> bool:
+    key = str(symbol or "").strip().upper().replace("-USDT", "")
+    ts = latest_entries.get(key) or latest_entries.get(str(symbol or "").strip().upper())
+    if not ts or cooldown_min <= 0:
+        return False
+    return now_ms - ts < int(cooldown_min * 60_000)
+
+
+def _mark_local_position_state(
+    current_open_positions: dict[tuple[str, str], bool],
+    current_positions: dict[tuple[str, str], dict],
+    position: dict | None,
+    symbol: str,
+    direction: str,
+) -> None:
+    """Immediately update the in-cycle position snapshot after a successful fill."""
+    if isinstance(position, dict):
+        bx_symbol = str(position.get("symbol") or to_bx_symbol(symbol) or "").upper()
+        qty = _safe_float(position.get("positionAmt"), 0.0)
+        if bx_symbol and qty > 0:
+            key = (bx_symbol, str(direction).upper())
+            current_open_positions[key] = True
+            current_positions[key] = dict(position)
 
 
 def _event_is_fresh(ev: dict, now_ms: int, max_age_min: int) -> bool:
@@ -1357,6 +1426,7 @@ def main() -> None:
         stats["scan_errors"] += 1
         log.error("[BINGX] Contracts refresh error: %s", exc)
 
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     current_open_positions: dict[tuple[str, str], bool] = {}
     current_positions: dict[tuple[str, str], dict] = {}
     try:
@@ -1375,6 +1445,8 @@ def main() -> None:
                 current_positions[key] = position
     except Exception as exc:
         log.error("[BINGX] Failed to pre-fetch positions for deduplication: %s", exc)
+
+    recent_entry_ts = _load_recent_successful_entries(TRADES, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
 
     telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
     telegram_attempted_this_cycle = send_pending_open_trade_notifications(
@@ -1417,7 +1489,6 @@ def main() -> None:
     executed_event_ids = load_successful_trade_ids(TRADES)
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
-    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     scan_state = _load_timeframe_scan_state()
     event_cache = _load_cached_events()
 
@@ -1668,8 +1739,9 @@ def main() -> None:
         bx_symbol = to_bx_symbol(symbol)
         opposite_direction = "SHORT" if direction == "LONG" else "LONG"
         opposite_position_open = bool(bx_symbol and current_open_positions.get((bx_symbol, opposite_direction)))
-        
-        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open:
+        symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
+
+        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open or symbol_cooldown:
             existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
             active_trade = None
             try:
@@ -1681,7 +1753,10 @@ def main() -> None:
             except Exception:
                 active_trade = None
             execution_result = {
-                "status": ("CONFLICTING_DIRECTION_POSITION" if opposite_position_open and not existing_position else ("ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED")),
+                "status": (
+                    "SYMBOL_COOLDOWN" if symbol_cooldown and not existing_position and not opposite_position_open and event_id not in executed_event_ids
+                    else ("CONFLICTING_DIRECTION_POSITION" if opposite_position_open and not existing_position else ("ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED"))
+                ),
                 "mode": EXECUTION_MODE,
                 "order_id": None,
                 "position": existing_position,
@@ -1689,13 +1764,19 @@ def main() -> None:
             }
             log.info("[EXECUTION] %s (%s) - Already open/executed.%s%s", symbol, direction,
                      " Position confirmed; Telegram retry eligible." if existing_position else "",
-                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else "")
+                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else (f" Symbol cooldown active ({SYMBOL_ENTRY_COOLDOWN_MIN:g}m)." if symbol_cooldown else ""))
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
-            log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle + 1, MAX_TRADES, direction, symbol, score, price)
+            trades_this_cycle += 1
+            log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, MAX_TRADES, direction, symbol, score, price)
             execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
-
             actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
+            actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
+            if actual_qty_for_state > 0:
+                _mark_local_position_state(current_open_positions, current_positions, actual_position, symbol, direction)
+                executed_event_ids.add(event_id)
+                recent_entry_ts[str(symbol).upper()] = now_ms
+
             actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
             actual_qty = actual_position.get("positionAmt")
             execution_quality = execution_result.get("execution_quality", {}) if isinstance(execution_result, dict) else {}
@@ -1745,9 +1826,7 @@ def main() -> None:
 
             status = str(execution_result.get("status", ""))
             if status in {"opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
-                trades_this_cycle += 1
-                if status in {"opened_protected", "opened_protection_check_required"}:
-                    executed_event_ids.add(event_id)
+                if status in {"opened_protected", "opened_protection_check_required"} or actual_qty_for_state > 0:
                     stats["trades"] += 1
 
                 try:
