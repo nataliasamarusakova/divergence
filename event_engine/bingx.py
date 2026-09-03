@@ -1182,12 +1182,12 @@ def ensure_directional_protection(
 
             old_order_id = str(existing_leg.get("orderId", ""))
             if old_order_id:
-                cancel_resp = cancel_order(symbol, old_order_id)
-                if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                cancel_ok, cancel_note = _cancel_protection_order_verified(symbol, direction, existing_leg)
+                if not cancel_ok:
                     tp_results.append({
                         "leg": leg,
                         "status": "error",
-                        "error": f"stale TP cancel failed: code={cancel_resp.get('code') if isinstance(cancel_resp, dict) else None} msg={cancel_resp.get('msg') if isinstance(cancel_resp, dict) else cancel_resp}",
+                        "error": f"stale TP cancel failed: {cancel_note}",
                         "qty": tp_qty,
                         "pnl_pct": pnl_pct,
                     })
@@ -1215,7 +1215,7 @@ def ensure_directional_protection(
                 "clientOrderId": client_order_id,
             }
 
-            resp = _request("POST", ORDER_PATH, market_params)
+            resp = _post_protection_order_verified(symbol, direction, market_params, client_order_id, max_attempts=2, retry_delay=0.25)
             if resp.get("code") != 0:
                 log.error("[BINGX] TP market close failed: %s msg=%s", leg, resp.get("msg"))
                 tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})

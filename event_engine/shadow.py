@@ -61,6 +61,24 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
     latest_event = max((e.get("timestamps", {}).get("detected_at_ts", 0) for e in events), default=0)
     types = [str(e.get("event_type", "")) for e in events]
 
+    open_records = [t for t in trades if t.get("record_type") == "TRADE_OPEN"]
+    close_records = [t for t in trades if t.get("record_type") == "TRADE_CLOSE"]
+    confirmed_open = []
+    for t in open_records:
+        execution = t.get("execution") if isinstance(t.get("execution"), dict) else {}
+        result = t.get("result") if isinstance(t.get("result"), dict) else {}
+        position = result.get("position") if isinstance(result.get("position"), dict) else {}
+        status = str(execution.get("status") or result.get("status") or "").lower()
+        qty = 0.0
+        try:
+            qty = abs(float(position.get("positionAmt", 0) or 0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        if status in {"opened", "opened_protected", "opened_protection_check_required", "opened_protection_failed"} and qty > 0:
+            confirmed_open.append(t)
+
+    unique_trade_ids = {str(t.get("trade_id") or t.get("event_id")) for t in confirmed_open if t.get("trade_id") or t.get("event_id")}
+
     return {
         "timestamp": now_ms,
         "events": {
@@ -80,8 +98,13 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
             "event_feed_age_min": round((now_ms - latest_event) / 60000.0, 1) if latest_event else None,
         },
         "trades": {
-            "total": len(trades),
-            "opened": sum(t.get("result", {}).get("status") in {"opened", "opened_protected"} for t in trades),
+            "journal_records": len(trades),
+            "total": len(unique_trade_ids),
+            "opened": len(unique_trade_ids),
+            "open_records": len(open_records),
+            "confirmed_open_records": len(confirmed_open),
+            "close_records": len(close_records),
+            "unique_closed_trade_ids": len({str(t.get("trade_id") or t.get("event_id")) for t in close_records if t.get("trade_id") or t.get("event_id")}),
         },
         "gate_readiness": {
             "rsi_only_ready": rsi_only >= 40,

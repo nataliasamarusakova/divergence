@@ -21,6 +21,7 @@ from event_engine.bingx import (
     _format_qty,
     _request,
     ORDER_PATH,
+    _post_protection_order_verified,
 )
 from event_engine.telegram import send_detailed
 
@@ -167,6 +168,8 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.05))
+                t.setdefault("close_journal_pending", False)
+                t.setdefault("close_notification_pending", False)
                 normalized[str(event_id)] = t
             return normalized
         log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
@@ -339,7 +342,9 @@ def register_active_trade(
         else:
             adverse_entry_slippage_pct = max(0.0, -entry_slippage_pct)
 
+    trade_id = "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper()
     trades[event_id] = {
+        "trade_id": trade_id,
         "event_id": event_id,
         "symbol": symbol,
         "name": name or symbol,
@@ -550,38 +555,47 @@ def _move_sl_to_break_even(
 
             if (be_client_id.upper() in cid or price_matches) and qty_matches:
                 existing_id = str(order.get("orderId", ""))
-                old_cancelled = True
-                cancel_note = ""
-                if old_sl_id and existing_id and str(old_sl_id) != existing_id:
-                    old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
-                status = "created" if old_cancelled else "error"
-                if not old_cancelled:
-                    log.warning(
-                        "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s",
-                        symbol, old_sl_id, cancel_note,
-                    )
+                cleanup_ok = True
+                for other in verified.get("sl_orders", []):
+                    other_id = str(other.get("orderId", ""))
+                    if other_id and other_id != existing_id:
+                        ok, note = _cancel_old_sl_verified(symbol, direction, other_id)
+                        if not ok:
+                            cleanup_ok = False
+                            log.warning("[TRACKER] BE exists for %s but extra SL %s could not be removed: %s", symbol, other_id, note)
                 return {
-                    "status": status,
+                    "status": "created" if cleanup_ok else "error",
+                    "error": None if cleanup_ok else "duplicate SL cleanup failed",
                     "order_id": existing_id,
                     "client_order_id": cid or be_client_id,
                     "stop_price": entry_price,
                 }
 
-    # Step 2 (audit fix B4): cancel the old SL BEFORE creating the new one.
-    if old_sl_id:
-        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
-        if not old_cancelled:
-            log.error(
-                "[TRACKER] %s %s: old SL %s could not be cancelled (%s); new BE SL NOT created to avoid double-SL race.",
-                direction, symbol, old_sl_id, cancel_note,
-            )
-            return {
-                "status": "error",
-                "error": f"old SL cancel failed: {cancel_note}; new SL not created (no double-SL window)",
-                "order_id": "",
-                "stop_price": entry_price,
-                "old_sl_id": str(old_sl_id),
-            }
+    # Step 2: remove EVERY currently visible non-BE SL before creating the new BE SL.
+    # Relying only on local old_sl_id is unsafe after a restart/reconciliation because
+    # there may be additional stale SLs unknown to local state.
+    if verified.get("status") == "ok":
+        visible_sl_ids = [str(o.get("orderId", "")) for o in verified.get("sl_orders", []) if o.get("orderId")]
+        ids_to_cancel = []
+        for oid in visible_sl_ids:
+            if oid and oid not in ids_to_cancel:
+                ids_to_cancel.append(oid)
+        if old_sl_id and str(old_sl_id) not in ids_to_cancel:
+            ids_to_cancel.append(str(old_sl_id))
+        for oid in ids_to_cancel:
+            ok, cancel_note = _cancel_old_sl_verified(symbol, direction, oid)
+            if not ok:
+                log.error(
+                    "[TRACKER] %s %s: SL %s could not be cancelled (%s); new BE SL NOT created.",
+                    direction, symbol, oid, cancel_note,
+                )
+                return {
+                    "status": "error",
+                    "error": f"old SL cancel failed: {cancel_note}; new SL not created (no double-SL window)",
+                    "order_id": "",
+                    "stop_price": entry_price,
+                    "old_sl_id": oid,
+                }
 
     def _restore_old_sl() -> bool:
         """Best-effort restore of protection when the new SL could not be placed."""
@@ -598,10 +612,30 @@ def _move_sl_to_break_even(
             "clientOrderId": f"EVT_BE_RST_{trade_token}",
         }
         try:
-            restore_resp = _request("POST", ORDER_PATH, restore_params)
+            restore_resp = _post_protection_order_verified(
+                symbol, direction, restore_params, restore_params["clientOrderId"], max_attempts=3, retry_delay=0.25
+            )
+        except Exception as exc:
+            log.error("[TRACKER] Old SL restore exception for %s %s: %s", symbol, direction, exc)
+            return False
+        if not isinstance(restore_resp, dict) or restore_resp.get("code") != 0:
+            return False
+        restored_order = (restore_resp.get("data") or {}).get("order") or restore_resp.get("data") or {}
+        restored_id = str(restored_order.get("orderId", ""))
+        if not restored_id:
+            return False
+        try:
+            latest = get_open_protection_directional(symbol, direction)
+            if latest.get("status") != "ok":
+                return False
+            return any(
+                str(o.get("orderId", "")) == restored_id
+                and abs(_safe_float(o.get("stopPrice") or o.get("price"), 0.0) - old_sl_price) / max(old_sl_price, 1e-12) < 0.002
+                and _safe_float(o.get("origQty") or o.get("quantity"), 0.0) > 0
+                for o in latest.get("sl_orders", [])
+            )
         except Exception:
             return False
-        return isinstance(restore_resp, dict) and restore_resp.get("code") == 0
 
     def _fail(error: str) -> dict:
         restored = _restore_old_sl()
@@ -630,7 +664,9 @@ def _move_sl_to_break_even(
     }
 
     try:
-        resp = _request("POST", ORDER_PATH, params)
+        resp = _post_protection_order_verified(
+            symbol, direction, params, be_client_id, max_attempts=3, retry_delay=0.25
+        )
     except Exception as exc:
         return _fail(f"BE stop request exception: {exc}")
 
@@ -786,6 +822,12 @@ def update_active_trades() -> None:
 
     for event_id, trade in trades.items():
         if trade.get("closed", False):
+            if trade.get("close_notification_pending"):
+                try:
+                    nid = _notification_id(str(event_id), "TRADE_CLOSE")
+                    _retry_pending_notifications()
+                except Exception as exc:
+                    log.warning("[TELEGRAM] Closed trade notification retry failed %s: %s", event_id, exc)
             continue
 
         try:
@@ -999,10 +1041,12 @@ def update_active_trades() -> None:
             if exit_price <= 0:
                 exit_price = cur_price
 
-            if position_gone and rem_qty > 0 and init_qty > 0:
+            tp_closed_qty = realized_qty
+            residual_qty = rem_qty if position_gone and rem_qty > 0 and init_qty > 0 else 0.0
+            if residual_qty > 0:
                 residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
-                realized_weighted += rem_qty * residual_pnl
-                realized_qty += rem_qty
+                realized_weighted += residual_qty * residual_pnl
+                realized_qty += residual_qty
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
@@ -1010,6 +1054,14 @@ def update_active_trades() -> None:
                 exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct)
+            stored_sl_price = _safe_float((trade.get("sl_order") or {}).get("stop_price"), 0.0) if isinstance(trade.get("sl_order"), dict) else 0.0
+            actual_initial_sl_price = _safe_float(trade.get("planned_invalidation_price"), 0.0)
+            actual_initial_sl_risk_pct = None
+            if actual_initial_sl_price > 0 and entry_price > 0:
+                actual_initial_sl_risk_pct = abs(entry_price - actual_initial_sl_price) / entry_price * 100.0
+            elif stored_sl_price > 0 and entry_price > 0:
+                actual_initial_sl_risk_pct = abs(entry_price - stored_sl_price) / entry_price * 100.0
+            exit_reason_confidence = "confirmed" if exit_reason in {"TAKE_PROFIT_FULL", "STOP_LOSS", "BREAK_EVEN"} and (closed_by_tp or sl_exit_price is not None) else "unknown"
             planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
 
             trade["remaining_qty"] = 0.0
@@ -1021,36 +1073,51 @@ def update_active_trades() -> None:
             trade["exit_reason"] = exit_reason
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
-            trade["closed"] = True
-            if not _close_record_exists(event_id):
-                _append_trade_record({
-                "record_type": "TRADE_CLOSE",
-                "event_id": event_id,
-                "symbol": symbol,
-                "direction": direction,
-                "event_type": trade.get("event_type"),
-                "closed_ts": now_ms,
-                "exit_reason": exit_reason,
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "realized_pnl_pct": final_pnl,
-                "realized_rr": realized_rr,
-                "effective_weighted_rr": planned_rr,
-                "tp_mode": trade.get("tp_mode", "multi_tp"),
-                "effective_tp_levels": trade.get("effective_tp_levels", []),
-                "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),
-                "mae_pct": _safe_float(trade.get("mae_pct")),
-                "max_drawdown_pct": _safe_float(trade.get("max_drawdown_pct")),
-                "duration_min": duration_min,
-                "hit_legs": sorted(hit_legs),
-                "tp_filled_qty": filled_by_leg,
-                "be_activated": bool(trade.get("be_activated")),
-                "research": trade.get("research", {}),
-                "setup": trade.get("setup", {}),
-                })
+            trade["closed"] = False
+            close_journal_persisted = _close_record_exists(event_id)
+            if not close_journal_persisted:
+                try:
+                    _append_trade_record({
+                        "record_type": "TRADE_CLOSE",
+                        "trade_id": trade.get("trade_id") or ("TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper()),
+                        "event_id": event_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "event_type": trade.get("event_type"),
+                        "closed_ts": now_ms,
+                        "exit_reason": exit_reason,
+                        "exit_reason_confidence": exit_reason_confidence,
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "realized_pnl_pct": final_pnl,
+                        "realized_rr": realized_rr,
+                        "effective_weighted_rr": planned_rr,
+                        "tp_mode": trade.get("tp_mode", "multi_tp"),
+                        "effective_tp_levels": trade.get("effective_tp_levels", []),
+                        "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),
+                        "mae_pct": _safe_float(trade.get("mae_pct")),
+                        "max_drawdown_pct": _safe_float(trade.get("max_drawdown_pct")),
+                        "duration_min": duration_min,
+                        "hit_legs": sorted(hit_legs),
+                        "tp_filled_qty": filled_by_leg,
+                        "tp_closed_qty": tp_closed_qty,
+                        "sl_closed_qty": residual_qty if exit_reason in {"STOP_LOSS", "BREAK_EVEN", "POSITION_CLOSED"} else 0.0,
+                        "total_closed_qty": init_qty,
+                        "be_activated": bool(trade.get("be_activated")),
+                        "research": trade.get("research", {}),
+                        "setup": trade.get("setup", {}),
+                    })
+                    close_journal_persisted = True
+                except Exception as exc:
+                    log.error("[TRACKER] Trade close journal write failed for %s: %s", event_id, exc)
+                    trade["closed"] = False
+                    trade["close_journal_pending"] = True
+                    updated_trades[event_id] = trade
+                    continue
 
             log.info("[TRACKER_TRADE_CLOSED] %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
+            notification_persisted = True
             try:
                 nid = _notification_id(str(event_id), "TRADE_CLOSE")
                 _queue_notification(
@@ -1077,8 +1144,18 @@ def update_active_trades() -> None:
                     ),
                 )
             except Exception as exc:
+                notification_persisted = False
                 log.error("[TELEGRAM] Close notification queue error %s: %s", event_id, exc)
 
+            if not notification_persisted:
+                trade["closed"] = False
+                trade["close_notification_pending"] = True
+                updated_trades[event_id] = trade
+                continue
+
+            trade["close_notification_pending"] = False
+            trade["close_journal_pending"] = False
+            trade["closed"] = True
             for tp in trade.get("tp_orders", []):
                 if tp.get("leg") not in hit_legs and tp.get("order_id"):
                     try:
