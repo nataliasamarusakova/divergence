@@ -727,9 +727,10 @@ def test_move_sl_to_break_even_cancels_old_sl_before_creating_new(monkeypatch):
 
     monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
     monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "1"})
 
     ok_empty = {"status": "ok", "sl_orders": [], "tp_orders": []}
-    ok_with_new = {"status": "ok", "sl_orders": [{"orderId": "NEW1", "clientOrderId": "EVT_BE_T"}], "tp_orders": []}
+    ok_with_new = {"status": "ok", "sl_orders": [{"orderId": "NEW1", "clientOrderId": "EVT_BE_T", "stopPrice": "100.00", "origQty": "1.000"}], "tp_orders": []}
     posted = {"done": False}
 
     def fake_protection(symbol, direction):
@@ -767,6 +768,7 @@ def test_move_sl_to_break_even_aborts_when_old_cancel_fails(monkeypatch):
     calls: list[tuple] = []
     monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
     monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "1"})
 
     ok_empty = {"status": "ok", "sl_orders": [], "tp_orders": []}
     still_there = {"status": "ok", "sl_orders": [{"orderId": "OLD1"}], "tp_orders": []}
@@ -994,9 +996,10 @@ def test_protection_transport_error_retries_only_after_confirmed_absence(monkeyp
     calls = []
     monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or next(responses))
     monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("absent", None))
+    monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": "1"})
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
     out = bx._post_protection_order_verified(
-        "TEST", "LONG", {"clientOrderId": "CID"}, "CID"
+        "TEST", "LONG", {"clientOrderId": "CID", "type": "STOP_MARKET", "quantity": "1"}, "CID"
     )
     assert out["code"] == 0
     assert len(calls) == 2
@@ -1024,3 +1027,64 @@ def test_protection_transport_error_does_not_retry_when_verification_is_unknown(
     assert out["code"] == -1
     assert out["protection_state_unknown"] is True
     assert len(calls) == 1
+
+
+def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+    tr.NOTIFICATIONS_PATH = tmp_path / "notifications.json"
+    attempts = []
+
+    monkeypatch.setenv("TG_CHAT_IDS", "A,B")
+    def fake_send_detailed(text, only_chat_ids=None):
+        attempts.append(tuple(only_chat_ids or []))
+        if len(attempts) == 1:
+            return {"A": {"sent": True}, "B": {"sent": False, "error": "temporary"}}
+        return {cid: {"sent": True} for cid in (only_chat_ids or [])}
+
+    monkeypatch.setattr(tr, "send_detailed", fake_send_detailed)
+
+    nid = tr._notification_id("EVT_TEST", "TRADE_CLOSE")
+    assert tr._queue_notification(
+        nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
+    ) is False
+    assert attempts[-1] == ("A", "B")
+
+    # Only the undelivered chat is retried; the successful chat is never duplicated.
+    assert tr._queue_notification(
+        nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
+    ) is True
+    assert attempts[-1] == ("B",)
+
+
+def test_ensure_protection_refuses_second_sl_and_cleans_stale(monkeypatch):
+    from event_engine import bingx as bx
+    calls = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "ABC-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
+    live = {"old": True}
+    def fake_protection(s, d):
+        return {"status": "ok", "sl_orders": ([{"orderId": "OLD", "type": "STOP_MARKET", "stopPrice": "80", "origQty": "1"}] if live["old"] else []), "tp_orders": []}
+    monkeypatch.setattr(bx, "get_open_protection_directional", fake_protection)
+    def fake_cancel(s, oid):
+        calls.append(oid)
+        live["old"] = False
+        return {"code": 0}
+    monkeypatch.setattr(bx, "cancel_order", fake_cancel)
+    monkeypatch.setattr(bx, "_post_protection_order_verified", lambda *a, **k: calls.append("POST") or {"code": 0, "data": {"order": {"orderId": "NEW", "clientOrderId": "CID"}}})
+    result = bx.ensure_directional_protection("ABC", "LONG", 100.0, 1.0, 5.0, [], trade_id="T")
+    assert "OLD" in calls
+    assert "POST" in calls
+    assert calls.index("OLD") < calls.index("POST")
+
+
+def test_protection_timeout_aborts_when_position_disappeared(monkeypatch):
+    from event_engine import bingx as bx
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: {"code": -1, "msg": "read timed out"})
+    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("absent", None))
+    monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    out = bx._post_protection_order_verified(
+        "ABC", "LONG", {"clientOrderId": "CID", "type": "STOP_MARKET", "quantity": "1"}, "CID"
+    )
+    assert out["code"] == -1
+    assert out.get("position_gone") is True
+    assert out.get("protection_state_unknown") is True
