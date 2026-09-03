@@ -1522,8 +1522,10 @@ def main() -> None:
     _save_timeframe_scan_state(scan_state)
 
     stats["cached_events"] = len(event_cache)
-    stats["timeframe_scanned_symbols_1h"] = sum(1 for rec in scan_state.get("symbols", {}).values() if isinstance(rec, dict) and rec.get("1h") == completed_1h)
-    stats["timeframe_scanned_symbols_4h"] = sum(1 for rec in scan_state.get("symbols", {}).values() if isinstance(rec, dict) and rec.get("4h") == completed_4h)
+    # These counters describe symbols actually scanned in THIS cycle, not symbols whose
+    # persisted watermark already equals the current completed bucket.
+    stats["timeframe_scanned_symbols_1h"] = int(_tf_stats(stats, "1h").get("scanned", 0))
+    stats["timeframe_scanned_symbols_4h"] = int(_tf_stats(stats, "4h").get("scanned", 0))
     stats["fresh_events"] = 0
     stats["fresh_long"] = 0
     stats["fresh_short"] = 0
