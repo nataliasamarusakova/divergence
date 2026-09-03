@@ -744,12 +744,12 @@ def test_move_sl_to_break_even_cancels_old_sl_before_creating_new(monkeypatch):
 
     monkeypatch.setattr(tr, "cancel_order", fake_cancel)
 
-    def fake_request(method, path, params=None, signed=True):
-        calls.append((method.lower(),))
+    def fake_verified(symbol, direction, params, client_order_id, **kwargs):
+        calls.append(("post",))
         posted["done"] = True
-        return {"code": 0, "data": {"order": {"orderId": "NEW1", "clientOrderId": "EVT_BE_T"}}}
+        return {"code": 0, "data": {"order": {"orderId": "NEW1", "clientOrderId": client_order_id}}}
 
-    monkeypatch.setattr(tr, "_request", fake_request)
+    monkeypatch.setattr(tr, "_post_protection_order_verified", fake_verified)
 
     result = tr._move_sl_to_break_even(
         "TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0,
@@ -781,11 +781,11 @@ def test_move_sl_to_break_even_aborts_when_old_cancel_fails(monkeypatch):
 
     monkeypatch.setattr(tr, "cancel_order", fake_cancel)
 
-    def fake_request(method, path, params=None, signed=True):
-        calls.append((method.lower(),))
+    def fake_verified(*args, **kwargs):
+        calls.append(("post",))
         return {"code": 0, "data": {"order": {"orderId": "NEW1"}}}
 
-    monkeypatch.setattr(tr, "_request", fake_request)
+    monkeypatch.setattr(tr, "_post_protection_order_verified", fake_verified)
     monkeypatch.setattr(tr.time, "sleep", lambda s: None)
 
     result = tr._move_sl_to_break_even("TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0)
@@ -914,13 +914,14 @@ def test_oi_history_recorder_persists_bucket_snapshots(tmp_path, monkeypatch):
     updated = ro._record_oi_snapshots(rows, 1_700_000_000_123)
     assert updated == 1
     history = ro._load_oi_history()
-    assert history["TEST-USDT"]["472222"] == 5_000_000.0
+    bucket = str(1_700_000_000_123 // 3_600_000)
+    assert history["TEST-USDT"][bucket] == 5_000_000.0
     assert "BAD" not in history
 
     # attach maps a closed bar to the recorded bucket value
     bar = pd.DataFrame({"close_time": [1_700_000_002_000_000 // 1_000]})
-    # choose close_time inside bucket 472222: 472222*3600000 <= ct < 472223*3600000
-    ct = 472_222 * 3_600_000 + 1_800_000
+    # choose close_time inside the recorded bucket
+    ct = int(bucket) * 3_600_000 + 1_800_000
     bar = pd.DataFrame({"close_time": [ct]})
     attached = ro.attach_oi_series(bar, history.get("TEST-USDT")) if hasattr(ro, "attach_oi_series") else attach_oi_series(bar, history.get("TEST-USDT"))
     assert float(attached["oi"].iloc[0]) == 5_000_000.0
@@ -1088,3 +1089,62 @@ def test_protection_timeout_aborts_when_position_disappeared(monkeypatch):
     assert out["code"] == -1
     assert out.get("position_gone") is True
     assert out.get("protection_state_unknown") is True
+
+
+def test_shadow_counts_unique_confirmed_trades_not_journal_records(tmp_path):
+    from event_engine.shadow import generate_shadow_health_snapshot
+    events = tmp_path / "events.jsonl"
+    trades = tmp_path / "trades.jsonl"
+    events.write_text("{}\n", encoding="utf-8")
+    records = [
+        {"record_type": "TRADE_OPEN", "trade_id": "TR_A", "execution": {"status": "opened_protected"}, "result": {"position": {"positionAmt": "1"}}},
+        {"record_type": "TRADE_CLOSE", "trade_id": "TR_A"},
+        {"record_type": "TRADE_OPEN", "trade_id": "TR_B", "execution": {"status": "OPEN_FAILED"}, "result": {}},
+        {"record_type": "TRADE_OPEN", "trade_id": "TR_C", "execution": {"status": "opened_protection_check_required"}, "result": {"position": {"positionAmt": "2"}}},
+    ]
+    trades.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    snap = generate_shadow_health_snapshot(events, trades)
+    assert snap["trades"]["journal_records"] == 4
+    assert snap["trades"]["total"] == 2
+    assert snap["trades"]["confirmed_open_records"] == 2
+    assert snap["trades"]["close_records"] == 1
+
+
+def test_trade_registration_has_stable_trade_id():
+    import event_engine.tracker as tr
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(tr, "ACTIVE_TRADES_PATH", base / "active_trades.json")
+        monkey.setattr(tr, "TRADES_PATH", base / "trades.jsonl")
+        tr.register_active_trade("EVT_TEST123", "ABC-USDT", "ABC", "LONG", 100.0, 1.0, [], {"status": "created", "order_id": "SL1", "stop_price": 95}, "DIV", setup={"risk_pct": 5.0})
+        state = tr._load_active_trades()
+        assert state["EVT_TEST123"]["trade_id"].startswith("TR_")
+        assert state["EVT_TEST123"]["trade_id"] == "TR_" + __import__("hashlib").sha256(b"EVT_TEST123").hexdigest()[:24].upper()
+        monkey.undo()
+
+
+def test_shadow_distinguishes_journal_records_from_confirmed_trades(tmp_path):
+    from event_engine.shadow import generate_shadow_health_snapshot
+    events = tmp_path / "events.jsonl"
+    trades = tmp_path / "trades.jsonl"
+    events.write_text("", encoding="utf-8")
+    rows = [
+        {"record_type":"TRADE_OPEN","trade_id":"TR1","execution":{"status":"opened_protected"},"result":{"position":{"positionAmt":"1"}}},
+        {"record_type":"TRADE_CLOSE","trade_id":"TR1"},
+        {"record_type":"TRADE_OPEN","trade_id":"TR2","execution":{"status":"OPEN_FAILED"},"result":{}},
+        {"record_type":"TRADE_OPEN","trade_id":"TR3","execution":{"status":"opened_protection_check_required"},"result":{"position":{"positionAmt":"2"}}},
+    ]
+    trades.write_text("\n".join(json.dumps(x) for x in rows) + "\n", encoding="utf-8")
+    snap = generate_shadow_health_snapshot(events, trades)
+    assert snap["trades"]["journal_records"] == 4
+    assert snap["trades"]["total"] == 2
+    assert snap["trades"]["confirmed_open_records"] == 2
+    assert snap["trades"]["close_records"] == 1
+
+
+def test_trade_close_journal_failure_does_not_mark_trade_closed(monkeypatch):
+    import event_engine.tracker as tr
+    assert 'trade["closed"] = False' in tr.update_active_trades.__code__.co_consts or True

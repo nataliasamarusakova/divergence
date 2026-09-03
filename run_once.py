@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import time
@@ -239,7 +240,7 @@ def _merge_event_cache(existing: list[dict], new_events: list[dict]) -> list[dic
 
 
 OI_HISTORY = DATA / "oi_history.json"
-_OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+_OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": ""}
 _OI_HIST_CACHE_TTL = 30.0
 _OI_HIST_MAX_BUCKETS = 500
 
@@ -247,11 +248,17 @@ _OI_HIST_MAX_BUCKETS = 500
 def _load_oi_history() -> dict[str, dict[str, float]]:
     """Cached view of the accumulated OI snapshot history (audit fix B2)."""
     now = time.monotonic()
-    if now - float(_OI_HIST_CACHE.get("ts", 0.0)) < _OI_HIST_CACHE_TTL and "data" in _OI_HIST_CACHE:
+    cache_path = str(OI_HISTORY.resolve())
+    if (
+        _OI_HIST_CACHE.get("path") == cache_path
+        and now - float(_OI_HIST_CACHE.get("ts", 0.0)) < _OI_HIST_CACHE_TTL
+        and "data" in _OI_HIST_CACHE
+    ):
         return _OI_HIST_CACHE["data"]
     raw = _load_json(OI_HISTORY, {})
     data = raw if isinstance(raw, dict) else {}
     _OI_HIST_CACHE["ts"] = now
+    _OI_HIST_CACHE["path"] = cache_path
     _OI_HIST_CACHE["data"] = data
     return data
 
@@ -293,6 +300,7 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
     if updated:
         _save_json_atomic(OI_HISTORY, history)
         _OI_HIST_CACHE["ts"] = 0.0
+    _OI_HIST_CACHE["path"] = str(OI_HISTORY.resolve())
     return updated
 
 
@@ -1429,6 +1437,7 @@ def main() -> None:
     now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     current_open_positions: dict[tuple[str, str], bool] = {}
     current_positions: dict[tuple[str, str], dict] = {}
+    position_state_unknown = False
     try:
         for position in get_positions():
             bx_sym = str(position.get("symbol", "")).upper()
@@ -1444,7 +1453,8 @@ def main() -> None:
                 current_open_positions[key] = True
                 current_positions[key] = position
     except Exception as exc:
-        log.error("[BINGX] Failed to pre-fetch positions for deduplication: %s", exc)
+        position_state_unknown = True
+        log.error("[BINGX] Failed to pre-fetch positions for deduplication; NEW ENTRIES BLOCKED: %s", exc)
 
     recent_entry_ts = _load_recent_successful_entries(TRADES, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
 
@@ -1741,7 +1751,11 @@ def main() -> None:
         opposite_position_open = bool(bx_symbol and current_open_positions.get((bx_symbol, opposite_direction)))
         symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
 
-        if event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open or symbol_cooldown:
+        if position_state_unknown and EXECUTION_ENABLED:
+            stats["blocked_by_position_state_unknown"] = stats.get("blocked_by_position_state_unknown", 0) + 1
+            execution_result = {"status": "POSITION_STATE_UNKNOWN", "mode": EXECUTION_MODE, "order_id": None, "position": {}}
+            log.error("[EXECUTION] %s %s blocked: exchange position state is UNKNOWN.", direction, symbol)
+        elif event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open or symbol_cooldown:
             existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
             active_trade = None
             try:
@@ -1784,6 +1798,7 @@ def main() -> None:
             record_trade(
                 {
                     "record_type": "TRADE_OPEN",
+                    "trade_id": "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper(),
                     "event_id": event_id,
                     "symbol": symbol,
                     "direction": direction,
@@ -1899,6 +1914,8 @@ def main() -> None:
                 "score": score,
                 "event_type": ev.get("event_type"),
                 "telegram_sent": bool(sent),
+                "telegram_required": bool(is_real_execution),
+                "telegram_attempted": bool(is_real_execution and event_id not in telegram_attempted_this_cycle),
                 "execution_status": execution_result.get("status"),
                 "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
             }
