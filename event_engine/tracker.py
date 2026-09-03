@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import time
@@ -21,13 +22,118 @@ from event_engine.bingx import (
     _request,
     ORDER_PATH,
 )
-from event_engine.telegram import send as send_tg
+from event_engine.telegram import send_detailed
 
 log = logging.getLogger("event_engine.tracker")
 
 DATA = Path("data")
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
+NOTIFICATIONS_PATH = DATA / "notifications.json"
+
+
+
+
+def _load_notifications() -> dict[str, dict]:
+    if not NOTIFICATIONS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.error("[TELEGRAM] Notification state read failed: %s", exc)
+        return {}
+
+
+def _save_notifications(data: dict[str, dict]) -> None:
+    NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NOTIFICATIONS_PATH.with_name(NOTIFICATIONS_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, NOTIFICATIONS_PATH)
+
+
+def _notification_id(event_id: str, kind: str, leg: str | None = None) -> str:
+    raw = f"{event_id}|{kind}|{leg or ''}".encode("utf-8")
+    return "TG_" + hashlib.sha256(raw).hexdigest()[:24].upper()
+
+
+def _deliver_notification(notification_id: str, record: dict) -> bool:
+    notifications = _load_notifications()
+    item = notifications.get(notification_id)
+    if not isinstance(item, dict):
+        return False
+    item.setdefault("attempts", 0)
+    item.setdefault("created_ts", int(time.time() * 1000))
+    item.setdefault("chats", {})
+    chat_state = item["chats"]
+    pending = [cid for cid, state in chat_state.items() if not bool(state.get("sent"))]
+    if not pending:
+        item["resolved"] = bool(chat_state) and all(bool(state.get("sent")) for state in chat_state.values())
+        _save_notifications(notifications)
+        return bool(item["resolved"])
+
+    item["attempts"] = int(item.get("attempts", 0)) + 1
+    results = send_detailed(str(item.get("text", "")), only_chat_ids=pending)
+    now_ms = int(time.time() * 1000)
+    for cid in pending:
+        state = chat_state.setdefault(cid, {})
+        state["attempts"] = int(state.get("attempts", 0)) + 1
+        result = results.get(cid, {"sent": False, "error": "no telegram result"})
+        state["sent"] = bool(result.get("sent"))
+        state["last_attempt_ts"] = now_ms
+        state["last_error"] = result.get("error")
+        if state["sent"]:
+            state["sent_ts"] = now_ms
+            state["message_id"] = result.get("message_id")
+    item["resolved"] = all(bool(state.get("sent")) for state in chat_state.values()) and bool(chat_state)
+    notifications[notification_id] = item
+    _save_notifications(notifications)
+    return bool(item["resolved"])
+
+
+def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbol: str, direction: str, text: str, leg: str | None = None) -> bool:
+    notifications = _load_notifications()
+    item = notifications.get(notification_id)
+    raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TG_CHAT_ID") or ""
+    current_chat_ids = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    if not isinstance(item, dict):
+        chat_ids = current_chat_ids
+        item = {
+            "notification_id": notification_id,
+            "event_id": event_id,
+            "kind": kind,
+            "leg": leg,
+            "symbol": symbol,
+            "direction": direction,
+            "text": text,
+            "created_ts": int(time.time() * 1000),
+            "attempts": 0,
+            "resolved": False,
+            "chats": {cid: {"sent": False, "attempts": 0, "last_error": None} for cid in chat_ids},
+        }
+        notifications[notification_id] = item
+        _save_notifications(notifications)
+    else:
+        chats = item.setdefault("chats", {})
+        for cid in current_chat_ids:
+            chats.setdefault(cid, {"sent": False, "attempts": 0, "last_error": None})
+        item["resolved"] = False if any(not bool(v.get("sent")) for v in chats.values()) else bool(chats)
+        notifications[notification_id] = item
+        _save_notifications(notifications)
+    return _deliver_notification(notification_id, item)
+
+
+def _retry_pending_notifications() -> None:
+    notifications = _load_notifications()
+    pending = [
+        (nid, item) for nid, item in notifications.items()
+        if isinstance(item, dict) and not bool(item.get("resolved"))
+    ]
+    for nid, item in pending:
+        try:
+            _deliver_notification(nid, item)
+        except Exception as exc:
+            log.warning("[TELEGRAM] Pending notification retry failed %s: %s", nid, exc)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -57,6 +163,7 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("max_drawdown_pct", 0.0)
                 t.setdefault("be_required", False)
                 t.setdefault("be_last_error", None)
+                t.setdefault("sl_order_history", [])
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.05))
@@ -254,6 +361,7 @@ def register_active_trade(
         "be_activation_ts": None,
         "be_required": False,
         "be_last_error": None,
+        "sl_order_history": [],
         "peak_pnl_pct": 0.0,
         "mae_pct": 0.0,
         "max_drawdown_pct": 0.0,
@@ -344,8 +452,19 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
         except Exception as exc:
             resp = {"code": -1, "msg": str(exc)}
         if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-            return True, "cancelled"
-        last_error = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
+            try:
+                latest = get_open_protection_directional(symbol, direction)
+                if latest.get("status") == "ok":
+                    open_ids = {str(o.get("orderId", "")) for o in (latest.get("sl_orders", []) + latest.get("tp_orders", []))}
+                    if str(order_id) not in open_ids:
+                        return True, "cancelled_and_verified"
+                    last_error = "cancel acknowledged but order is still visible"
+                else:
+                    last_error = "cancel acknowledged but openOrders verification failed"
+            except Exception as exc:
+                last_error = f"cancel acknowledged but verification failed: {exc}"
+        else:
+            last_error = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
         if attempt + 1 < max_attempts:
             time.sleep(0.3 * (attempt + 1))
 
@@ -361,16 +480,19 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
     return False, last_error
 
 
-def _notify_be_failure(symbol: str, direction: str, detail: str) -> None:
-    """Best-effort Telegram alert when the BE swap could not be completed."""
+def _notify_be_failure(symbol: str, direction: str, detail: str, event_id: str | None = None) -> None:
+    """Queue a durable Telegram alert for BE failures."""
     try:
-        send_tg(
+        eid = str(event_id or f"{symbol}:{direction}:BE_FAILURE")
+        nid = _notification_id(eid, "BE_FAILED")
+        text = (
             f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
             f"Status: <code>{detail}</code>\n"
             f"Позиция может остаться со старым SL или без SL — требуется проверка."
         )
-    except Exception:
-        pass
+        _queue_notification(nid, event_id=eid, kind="BE_FAILED", symbol=symbol, direction=direction, text=text)
+    except Exception as exc:
+        log.error("[TELEGRAM] Could not queue BE failure notification: %s", exc)
 
 
 def _move_sl_to_break_even(
@@ -405,6 +527,15 @@ def _move_sl_to_break_even(
     if qty <= 0 or entry_price <= 0 or not bx:
         return {"status": "error", "error": "invalid BE parameters", "order_id": "", "stop_price": entry_price}
 
+    # Always reconcile the actual live quantity immediately before changing the SL.
+    live_pos = get_position_directional(symbol, direction)
+    if str(live_pos.get("status", "")).lower() != "found":
+        return {"status": "position_gone", "error": "position not found before BE", "order_id": "", "stop_price": entry_price}
+    live_qty = abs(_safe_float(live_pos.get("positionAmt"), 0.0))
+    if live_qty <= 0:
+        return {"status": "position_gone", "error": "position quantity is zero before BE", "order_id": "", "stop_price": entry_price}
+    qty = live_qty
+
     trade_token = str(trade_id) if trade_id else uuid.uuid4().hex.upper()[:16]
     be_client_id = f"EVT_BE_{trade_token}"
 
@@ -413,15 +544,17 @@ def _move_sl_to_break_even(
         for order in verified.get("sl_orders", []):
             cid = str(order.get("clientOrderId", "")).upper()
             order_price = _safe_float(order.get("stopPrice") or order.get("price"), 0.0)
+            order_qty = _safe_float(order.get("origQty") or order.get("quantity"), 0.0)
             price_matches = order_price > 0 and abs(order_price - entry_price) / max(entry_price, 1e-12) < 0.002
+            qty_matches = order_qty > 0 and abs(order_qty - qty) <= max(qty * 1e-6, 1e-12)
 
-            if be_client_id.upper() in cid or price_matches:
+            if (be_client_id.upper() in cid or price_matches) and qty_matches:
                 existing_id = str(order.get("orderId", ""))
                 old_cancelled = True
                 cancel_note = ""
                 if old_sl_id and existing_id and str(old_sl_id) != existing_id:
                     old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
-                status = "created" if old_cancelled else "created_old_sl_cancel_failed"
+                status = "created" if old_cancelled else "error"
                 if not old_cancelled:
                     log.warning(
                         "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s",
@@ -476,7 +609,7 @@ def _move_sl_to_break_even(
             "[TRACKER] BE move failed for %s %s: %s; old SL restore %s.",
             direction, symbol, error, "succeeded" if restored else "FAILED",
         )
-        _notify_be_failure(symbol, direction, f"{error}; restore={'ok' if restored else 'failed'}")
+        _notify_be_failure(symbol, direction, f"{error}; restore={'ok' if restored else 'failed'}", event_id=trade_id)
         return {
             "status": "error",
             "error": error,
@@ -513,9 +646,14 @@ def _move_sl_to_break_even(
     if verified_after.get("status") != "ok":
         return _fail("BE stop verification failed")
 
-    found = any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", []))
+    found = any(
+        str(o.get("orderId", "")) == new_order_id
+        and abs(_safe_float(o.get("stopPrice") or o.get("price"), 0.0) - entry_price) / max(entry_price, 1e-12) < 0.002
+        and abs(_safe_float(o.get("origQty") or o.get("quantity"), 0.0) - qty) <= max(qty * 1e-6, 1e-12)
+        for o in verified_after.get("sl_orders", [])
+    )
     if not found:
-        return _fail("BE stop not visible on exchange")
+        return _fail("BE stop not visible on exchange with exact price/quantity")
 
     return {
         "status": "created",
@@ -609,7 +747,36 @@ def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | Non
     return (exit_price if exit_price > 0 else None, "SL_FILLED")
 
 
+
+
+def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, str | None]:
+    candidates: list[tuple[str, str]] = []
+    current = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+    if current.get("order_id"):
+        candidates.append((str(current.get("order_id")), "current"))
+    for item in trade.get("sl_order_history", []) or []:
+        if isinstance(item, dict) and item.get("order_id"):
+            candidates.append((str(item.get("order_id")), "history"))
+    seen = set()
+    for order_id, _source in candidates:
+        if order_id in seen:
+            continue
+        seen.add(order_id)
+        try:
+            info = get_order(symbol, order_id)
+        except Exception:
+            continue
+        if str(info.get("status", "")).lower() != "ok":
+            continue
+        if str(info.get("order_status", "")).upper() == "FILLED":
+            px = _safe_float(info.get("avg_price"), 0.0)
+            if px > 0:
+                return px, order_id
+    return None, None
+
+
 def update_active_trades() -> None:
+    _retry_pending_notifications()
     trades = _load_active_trades()
     if not trades:
         return
@@ -672,7 +839,7 @@ def update_active_trades() -> None:
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
                 retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
-                if retry.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                if retry.get("status") == "created":
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
                     trade["be_required"] = False
@@ -736,8 +903,15 @@ def update_active_trades() -> None:
                     )
 
                     try:
-                        send_tg(
-                            format_tp_hit_message(
+                        nid = _notification_id(str(event_id), "TP_HIT", leg)
+                        _queue_notification(
+                            nid,
+                            event_id=str(event_id),
+                            kind="TP_HIT",
+                            leg=leg,
+                            symbol=symbol,
+                            direction=direction,
+                            text=format_tp_hit_message(
                                 name=trade.get("name", symbol),
                                 symbol=symbol,
                                 leg=leg,
@@ -746,10 +920,10 @@ def update_active_trades() -> None:
                                 closed_qty=delta_qty,
                                 remaining_qty=rem_qty,
                                 remaining_pct=rem_pct,
-                            )
+                            ),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.error("[TELEGRAM] TP notification queue error %s %s %s: %s", symbol, leg, event_id, exc)
 
                     # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (audit fix B4: cancel-first swap)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
@@ -765,10 +939,24 @@ def update_active_trades() -> None:
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
                         )
-                        if new_sl.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                        if new_sl.get("status") == "created":
+                            if old_sl_id:
+                                history = trade.setdefault("sl_order_history", [])
+                                if old_sl_id and all(str(x.get("order_id", "")) != str(old_sl_id) for x in history if isinstance(x, dict)):
+                                    history.append({"order_id": str(old_sl_id), "stop_price": old_sl_price, "replaced_ts": now_ms})
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
+                            try:
+                                nid = _notification_id(str(event_id), "BE_ACTIVATED")
+                                _queue_notification(
+                                    nid, event_id=str(event_id), kind="BE_ACTIVATED", symbol=symbol, direction=direction,
+                                    text=f"✅ <b>BE activated ({trade.get('name', symbol)} {symbol})</b>\n"
+                                         f"После {str(leg).upper()} стоп перенесён на <code>{entry_price:.8g}</code>.\n"
+                                         f"Остаток позиции: <code>{rem_qty:.8f}</code>"
+                                )
+                            except Exception as exc:
+                                log.error("[TELEGRAM] BE activation notification queue error %s: %s", event_id, exc)
                             log.info(
                                 "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
@@ -796,15 +984,15 @@ def update_active_trades() -> None:
             exit_price = _safe_float(trade.get("last_tp_exec_price"), cur_price)
             sl_order_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
 
-            sl_exit_price, _ = _get_exit_from_sl(symbol, sl_order_id)
-            if sl_exit_price is not None:
+            sl_exit_price, filled_sl_id = _get_filled_sl_from_trade(symbol, trade)
+            if closed_by_tp and rem_qty <= 1e-12:
+                exit_reason = "TAKE_PROFIT_FULL"
+            elif sl_exit_price is not None:
                 exit_price = sl_exit_price
                 if trade.get("be_activated") and abs(exit_price - entry_price) / max(entry_price, 1e-12) < 0.003:
                     exit_reason = "BREAK_EVEN"
                 else:
                     exit_reason = "STOP_LOSS"
-            elif closed_by_tp:
-                exit_reason = "TAKE_PROFIT_FULL"
             else:
                 exit_reason = "POSITION_CLOSED"
 
@@ -864,8 +1052,14 @@ def update_active_trades() -> None:
             log.info("[TRACKER_TRADE_CLOSED] %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
             try:
-                send_tg(
-                    format_trade_closed_message(
+                nid = _notification_id(str(event_id), "TRADE_CLOSE")
+                _queue_notification(
+                    nid,
+                    event_id=str(event_id),
+                    kind="TRADE_CLOSE",
+                    symbol=symbol,
+                    direction=direction,
+                    text=format_trade_closed_message(
                         name=trade.get("name", symbol),
                         symbol=symbol,
                         direction=direction,
@@ -880,10 +1074,10 @@ def update_active_trades() -> None:
                         exit_reason=exit_reason,
                         event_type=trade.get("event_type", "DIVERGENCE"),
                         timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
-                    )
+                    ),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error("[TELEGRAM] Close notification queue error %s: %s", event_id, exc)
 
             for tp in trade.get("tp_orders", []):
                 if tp.get("leg") not in hit_legs and tp.get("order_id"):

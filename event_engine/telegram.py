@@ -12,15 +12,16 @@ def _chat_ids() -> list[str]:
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
 
-def send(text: str) -> bool:
+def send_detailed(text: str, only_chat_ids: Optional[list[str]] = None) -> dict[str, dict[str, Any]]:
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    ids = _chat_ids()
+    ids = only_chat_ids if only_chat_ids is not None else _chat_ids()
+    ids = [str(x).strip() for x in ids if str(x).strip()]
     if not token or not ids:
         print("[TELEGRAM] missing TG_BOT_TOKEN or TG_CHAT_IDS")
-        return False
+        return {str(chat_id): {"sent": False, "error": "missing TG_BOT_TOKEN or TG_CHAT_IDS"} for chat_id in ids}
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    all_ok = True
+    result: dict[str, dict[str, Any]] = {}
     for chat_id in ids:
         try:
             r = requests.post(
@@ -38,16 +39,26 @@ def send(text: str) -> bool:
                 payload = r.json()
             except ValueError:
                 payload = {"ok": False, "description": r.text[:500]}
-            if not payload.get("ok"):
-                all_ok = False
-                print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {payload.get('description', 'unknown error')}")
+            if payload.get("ok"):
+                result[str(chat_id)] = {"sent": True, "message_id": ((payload.get("result") or {}).get("message_id"))}
+            else:
+                error = str(payload.get("description", "unknown Telegram API error"))
+                print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
+                result[str(chat_id)] = {"sent": False, "error": error}
         except requests.RequestException as exc:
-            all_ok = False
-            print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {exc}")
+            error = str(exc)
+            print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {error}")
+            result[str(chat_id)] = {"sent": False, "error": error}
         except Exception as exc:
-            all_ok = False
-            print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {exc}")
-    return all_ok
+            error = str(exc)
+            print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {error}")
+            result[str(chat_id)] = {"sent": False, "error": error}
+    return result
+
+
+def send(text: str) -> bool:
+    result = send_detailed(text)
+    return bool(result) and all(bool(item.get("sent")) for item in result.values())
 
 
 def format_signal(

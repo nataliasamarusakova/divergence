@@ -896,6 +896,43 @@ def _post_protection_order_verified(
                 "protection_state_unknown": True,
             }
 
+        # A missing open order after a timeout is not enough proof that the POST was lost:
+        # the order could have filled between the POST and our verification request.
+        try:
+            live_pos = get_position_directional(symbol, direction)
+            live_status = str(live_pos.get("status", "")).lower()
+            live_qty = abs(float(live_pos.get("positionAmt", 0) or 0)) if live_status == "found" else 0.0
+        except Exception as exc:
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; live position verification failed: {exc}",
+                "protection_state_unknown": True,
+            }
+        if live_status != "found" or live_qty <= 0:
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after timeout",
+                "protection_state_unknown": True,
+                "position_gone": True,
+            }
+
+        # A full-size STOP that may have partially filled must protect only the live remainder.
+        # For TP orders we do not blindly recreate after an unknown POST outcome: a filled TP
+        # is already reflected by the smaller live position and recreating the original quantity
+        # could over-close it.
+        if str(params.get("type", "")).upper() in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "MARKET"}:
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; TP outcome unknown after timeout; no blind retry",
+                "protection_state_unknown": True,
+            }
+        params = dict(params)
+        try:
+            precision = int((get_contract(symbol) or {}).get("quantityPrecision") or 0)
+            params["quantity"] = _format_qty(_round_qty(live_qty, precision), precision)
+        except Exception:
+            pass
+
         if attempt + 1 < max_attempts:
             time.sleep(retry_delay)
             continue
@@ -906,6 +943,45 @@ def _post_protection_order_verified(
 
 def _sl_price_matches(actual_price: float, expected_price: float, tolerance: float = 0.002) -> bool:
     return actual_price > 0 and expected_price > 0 and abs(actual_price - expected_price) / max(expected_price, 1e-12) <= tolerance
+
+
+
+
+def _cancel_protection_order_verified(symbol: str, direction: str, order: dict, *, max_attempts: int = 3) -> tuple[bool, str]:
+    order_id = str(order.get("orderId", ""))
+    if not order_id:
+        return False, "missing orderId"
+    last = ""
+    for attempt in range(max_attempts):
+        try:
+            resp = cancel_order(symbol, order_id)
+        except Exception as exc:
+            resp = {"code": -1, "msg": str(exc)}
+        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+            try:
+                latest = get_open_protection_directional(symbol, direction)
+                if latest.get("status") == "ok":
+                    open_ids = {str(o.get("orderId", "")) for o in (latest.get("sl_orders", []) + latest.get("tp_orders", []))}
+                    if order_id not in open_ids:
+                        return True, "cancelled_and_verified"
+                    last = "cancel acknowledged but order is still visible"
+                else:
+                    last = "cancel acknowledged but openOrders verification failed"
+            except Exception as exc:
+                last = f"cancel acknowledged but verification failed: {exc}"
+        else:
+            last = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
+        try:
+            latest = get_open_protection_directional(symbol, direction)
+            if latest.get("status") == "ok":
+                open_ids = {str(o.get("orderId", "")) for o in (latest.get("sl_orders", []) + latest.get("tp_orders", []))}
+                if order_id not in open_ids:
+                    return True, "already_gone"
+        except Exception:
+            pass
+        if attempt + 1 < max_attempts:
+            time.sleep(0.25 * (attempt + 1))
+    return False, last or "cancel failed"
 
 
 def ensure_directional_protection(
@@ -971,6 +1047,12 @@ def ensure_directional_protection(
             break
 
     if valid_existing_sl is not None:
+        # Keep exactly one current SL; remove duplicate/stale SL orders first.
+        stale_sls = [o for o in existing_sl if str(o.get("orderId", "")) != str(valid_existing_sl.get("orderId", ""))]
+        for stale in stale_sls:
+            ok, note = _cancel_protection_order_verified(symbol, direction, stale)
+            if not ok:
+                return {"status": "PROTECTION_FAILED", "error": f"stale SL cancel failed: {note}"}
         sl = valid_existing_sl
         sl_result = {
             "status": "already_exists",
@@ -980,6 +1062,11 @@ def ensure_directional_protection(
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
         }
     else:
+        # Never create a new SL while an old/wrong SL is still live.
+        for stale in existing_sl:
+            ok, note = _cancel_protection_order_verified(symbol, direction, stale)
+            if not ok:
+                return {"status": "PROTECTION_FAILED", "error": f"old SL cancel failed: {note}; refusing to create a second SL"}
         sl_price = desired_sl_price
         client_order_id = build_sl_client_order_id(trade_id)
         params = {
