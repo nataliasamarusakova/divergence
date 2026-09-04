@@ -875,8 +875,8 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
-            # Retry a failed TP1 -> BE transition while the position remains open.
-            if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0:
+            # Retry a failed TP -> BE transition while the position remains open.
+            if bool(trade.get("hit_legs")) and not trade.get("be_activated") and rem_qty > 0:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
@@ -967,8 +967,8 @@ def update_active_trades() -> None:
                     except Exception as exc:
                         log.error("[TELEGRAM] TP notification queue error %s %s %s: %s", symbol, leg, event_id, exc)
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (audit fix B4: cancel-first swap)
-                    if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
+                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ ВЗЯТИЯ ТЕЙКА (audit fix B4: cancel-first swap)
+                    if not trade.get("be_activated") and rem_qty > 0:
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
                         old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
