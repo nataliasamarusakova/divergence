@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1788534759381,
+  "updated_ts": 1788535086257,
   "events": [
     {
       "event_id": "EVT_9DBA732D095560BD",
@@ -2762,6 +2762,52 @@
         "p2_indicator": 11600000.0,
         "bars_between": 10,
         "price_delta_atr": 1.1507807984347573
+      }
+    },
+    {
+      "event_id": "EVT_5CF16D1893999E17",
+      "symbol": "FLOCK",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1788534000000,
+        "pivot_2_ts": 1788534000000,
+        "detected_at_ts": 1788534000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.04954,
+        "bb_width": 0.009464046491856046,
+        "kc_width": 0.006954927831095456,
+        "squeeze_duration_bars": 11,
+        "compression_ratio": 1.3607684682998908
+      }
+    },
+    {
+      "event_id": "EVT_C902C0F3A05D4B85",
+      "symbol": "FLOCK",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "SHORT_SQUEEZE",
+      "timestamps": {
+        "pivot_1_ts": 1788534000000,
+        "pivot_2_ts": 1788534000000,
+        "detected_at_ts": 1788534000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.04954,
+        "spike_move": 0.012160000000000004,
+        "spike_atr_mult": 4.643327167887272,
+        "liq_ratio_24h": 0.011990740740740741,
+        "liq_short24": 129500.0,
+        "liq_long24": 86600.0,
+        "open_interest": 10800000.0,
+        "oi_chg4h_pct": 101.99,
+        "fr_oiw": -0.2236,
+        "ls_accounts": 1.85,
+        "oi_surge": true,
+        "funding_extreme": true,
+        "ls_crowded": false
       }
     }
   ]
