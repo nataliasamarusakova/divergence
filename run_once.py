@@ -84,6 +84,9 @@ MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 # Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
 SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
+SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN", "45"))
+MAX_SHORT_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_ADVERSE_FUNDING", "-0.01"))
+MAX_LONG_ADVERSE_FUNDING = float(os.environ.get("MAX_LONG_ADVERSE_FUNDING", "0.05"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 
 
@@ -128,6 +131,15 @@ def _load_recent_successful_entries(path: Path, now_ms: int, cooldown_min: float
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if obj.get("record_type") == "TRADE_CLOSE":
+                    symbol = str(obj.get("symbol") or "").strip().upper()
+                    if not symbol:
+                        continue
+                    closed_ts = int(_safe_float(obj.get("closed_ts"), 0.0))
+                    if closed_ts >= cutoff and closed_ts <= now_ms:
+                        latest[symbol] = max(latest.get(symbol, 0), closed_ts)
+                    continue
+
                 if obj.get("record_type") != "TRADE_OPEN":
                     continue
                 result = obj.get("result") if isinstance(obj.get("result"), dict) else {}
@@ -402,8 +414,9 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "trigger_no_window": 0,
         "trigger_breakout_failed": 0,
         "trigger_volume_failed": 0,
-        "trigger_data_failed": 0,
+        "trigger_direction_failed": 0,
         "rejected_btc": 0,
+        "rejected_funding": 0,
         "rejected_cvd": 0,
         "rejected_score": 0,
         "valid_signals": 0,
@@ -584,7 +597,7 @@ def load_successful_trade_ids(path: Path) -> set[str]:
         if not isinstance(result, dict):
             continue
         status = str(result.get("status", "")).lower()
-        if status in {"opened_protected", "opened_protection_check_required", "opened", "already_executed"}:
+        if status in {"opened_protected", "opened_protection_check_required", "opened", "opened_protection_failed", "already_executed"}:
             event_id = obj.get("event_id")
             if event_id:
                 ids.add(str(event_id))
@@ -638,6 +651,37 @@ def calculate_execution_slippage(
         "execution_slippage_pct": execution_move,
         "adverse_execution_slippage_pct": adverse(execution_move),
     }
+
+
+def check_funding_filter(
+    row: Any,
+    direction: str,
+    max_short_adverse: float = MAX_SHORT_ADVERSE_FUNDING,
+    max_long_adverse: float = MAX_LONG_ADVERSE_FUNDING,
+) -> tuple[bool, str]:
+    """Block entries when funding rate strongly opposes the trade direction.
+
+    - SHORT when fr_oiw < max_short_adverse (shorts heavily crowded / short squeeze risk).
+    - LONG when fr_oiw > max_long_adverse (longs heavily crowded / long cascade dump risk).
+    """
+    if row is None:
+        return True, "NO_ROW"
+    fr = getattr(row, "fr_oiw", None)
+    if fr is None:
+        return True, "NO_FUNDING_DATA"
+    try:
+        fr_val = float(fr)
+    except (TypeError, ValueError):
+        return True, "INVALID_FUNDING_DATA"
+
+    d = str(direction).upper()
+    if d == "SHORT" and fr_val < max_short_adverse:
+        return False, f"ADVERSE_FUNDING_SHORT (fr={fr_val:.4f} < {max_short_adverse:.4f})"
+    if d == "LONG" and fr_val > max_long_adverse:
+        return False, f"ADVERSE_FUNDING_LONG (fr={fr_val:.4f} > {max_long_adverse:.4f})"
+
+    return True, "OK"
+
 
 def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[dict], list[dict]]:
     """Allow one direction per symbol; resolve only true LONG/SHORT conflicts.
@@ -819,29 +863,32 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
 
     risk_pct = max(0.50, min(risk_pct_raw, 5.00))
 
-    # TP3 (финальная цель) ставится на 1.75R
+    ev_type = str(ev.get("event_type", "")).upper()
+    is_squeeze = "SQUEEZE" in ev_type
+    target_rr = 3.0 if is_squeeze else 1.75
+    planned_weighted_rr = 2.05 if is_squeeze else 1.05
+
+    # TP3 (финальная цель) ставится на target_rr
     if direction == "LONG":
         invalidation = entry_price * (1.0 - risk_pct / 100.0)
-        target = entry_price * (1.0 + 1.75 * risk_pct / 100.0)
+        target = entry_price * (1.0 + target_rr * risk_pct / 100.0)
     else:
         invalidation = entry_price * (1.0 + risk_pct / 100.0)
-        target = entry_price * (1.0 - 1.75 * risk_pct / 100.0)
+        target = entry_price * (1.0 - target_rr * risk_pct / 100.0)
 
-    # Взвешенный R:R при фиксациях 35% на 0.50R, 35% на 1.00R, 30% на 1.75R:
-    # 0.35 * 0.50 + 0.35 * 1.00 + 0.30 * 1.75 = 1.05
     return {
         "entry_reference": entry_price,
         "invalidation_price": invalidation,
         "target_price": target,
         "risk_pct": risk_pct,
-        "target_rr": 1.75,
-        "planned_weighted_rr": 1.05,
+        "target_rr": target_rr,
+        "planned_weighted_rr": planned_weighted_rr,
         "realized_rr": None,
         "trigger_ok": True,
     }
 
 
-def build_tp_levels(setup: dict, direction: str) -> Tuple[float, List[dict]]:
+def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[float, List[dict]]:
     direction = str(direction).upper()
     entry = float(setup["entry_reference"])
     sl_price = float(setup["invalidation_price"])
@@ -859,18 +906,39 @@ def build_tp_levels(setup: dict, direction: str) -> Tuple[float, List[dict]]:
     if sl_pct <= 0:
         raise ValueError("Invalid SL percentage")
 
-    # Оптимальный 3-уровневый каскад:
-    # TP1: 0.50 * SL (35% объема + перевод в БУ)
-    # TP2: 1.00 * SL (35% объема)
-    # TP3: 1.75 * SL (30% объема)
-    tp_levels = [
-        {"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35},
-        {"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35},
-        {"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30},
-    ]
+    ev_type = str(event_type or setup.get("event_type", "")).upper()
+    is_squeeze = "SQUEEZE" in ev_type
+
+    if is_squeeze:
+        # Для сквизов тейки шире (импульсный потенциал и защита от преждевременного выбивания по БУ):
+        # TP1: 1.00 * SL (30% объема + перевод в БУ после взятия 1.0R)
+        # TP2: 2.00 * SL (35% объема)
+        # TP3: 3.00 * SL (35% объема)
+        # Взвешенный R:R: 0.30 * 1.0 + 0.35 * 2.0 + 0.35 * 3.0 = 2.05
+        tp_levels = [
+            {"leg": "tp1", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.30},
+            {"leg": "tp2", "pnl_pct": round(sl_pct * 2.00, 6), "close_fraction": 0.35},
+            {"leg": "tp3", "pnl_pct": round(sl_pct * 3.00, 6), "close_fraction": 0.35},
+        ]
+        planned_weighted_rr = 2.05
+        target_rr = 3.0
+    else:
+        # Оптимальный 3-уровневый каскад для дивергенций:
+        # TP1: 0.50 * SL (35% объема + перевод в БУ)
+        # TP2: 1.00 * SL (35% объема)
+        # TP3: 1.75 * SL (30% объема)
+        # Взвешенный R:R: 0.35 * 0.50 + 0.35 * 1.00 + 0.30 * 1.75 = 1.05
+        tp_levels = [
+            {"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35},
+            {"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35},
+            {"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30},
+        ]
+        planned_weighted_rr = 1.05
+        target_rr = 1.75
 
     setup["risk_pct"] = sl_pct
-    setup["planned_weighted_rr"] = 1.05
+    setup["target_rr"] = target_rr
+    setup["planned_weighted_rr"] = planned_weighted_rr
     setup["realized_rr"] = None
     setup["tp_levels"] = tp_levels
 
@@ -1261,15 +1329,22 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         if not pd.notna(planned_risk_pct) or planned_risk_pct <= 0:
             raise ValueError("invalid planned risk_pct")
 
+        ev_type = str(setup.get("event_type", "")).upper()
+        is_squeeze = "SQUEEZE" in ev_type
+        target_rr = 3.0 if is_squeeze else 1.75
+        planned_weighted_rr = 2.05 if is_squeeze else 1.05
+
         if direction == "LONG":
             invalidation = actual_avg_price * (1.0 - planned_risk_pct / 100.0)
-            target = actual_avg_price * (1.0 + 1.75 * planned_risk_pct / 100.0)
+            target = actual_avg_price * (1.0 + target_rr * planned_risk_pct / 100.0)
         else:
             invalidation = actual_avg_price * (1.0 + planned_risk_pct / 100.0)
-            target = actual_avg_price * (1.0 - 1.75 * planned_risk_pct / 100.0)
+            target = actual_avg_price * (1.0 - target_rr * planned_risk_pct / 100.0)
 
         setup_for_fill["invalidation_price"] = invalidation
         setup_for_fill["target_price"] = target
+        setup_for_fill["target_rr"] = target_rr
+        setup_for_fill["planned_weighted_rr"] = planned_weighted_rr
         setup_for_fill["realized_rr"] = None
 
     except (TypeError, ValueError) as exc:
@@ -1284,7 +1359,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         }
 
     try:
-        sl_pct, tp_levels = build_tp_levels(setup_for_fill, direction)
+        sl_pct, tp_levels = build_tp_levels(setup_for_fill, direction, event_type=ev_type)
     except Exception as exc:
         return {
             "status": "PROTECTION_SETUP_INVALID",
@@ -1368,6 +1443,7 @@ def main() -> None:
         "fresh_squeeze": 0,
         "rejected_age": 0,
         "rejected_btc": 0,
+        "rejected_funding": 0,
         "rejected_trigger": 0,
         "rejected_cvd": 0,
         "trigger_passed": 0,
@@ -1589,6 +1665,13 @@ def main() -> None:
                     tf_stats["rejected_btc"] += 1
                     continue
 
+            funding_ok, funding_reason = check_funding_filter(r, direction)
+            if not funding_ok:
+                stats["rejected_funding"] += 1
+                tf_stats["rejected_funding"] += 1
+                log.info("[SIGNALS] %s %s (%s/%s) rejected by funding filter: %s", direction, symbol, tf, event_type, funding_reason)
+                continue
+
             if d15 is None:
                 try:
                     k15 = _fetch_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
@@ -1751,7 +1834,9 @@ def main() -> None:
         bx_symbol = to_bx_symbol(symbol)
         opposite_direction = "SHORT" if direction == "LONG" else "LONG"
         opposite_position_open = bool(bx_symbol and current_open_positions.get((bx_symbol, opposite_direction)))
-        symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
+        is_squeeze_opp = "SQUEEZE" in str(ev.get("event_type", "")).upper()
+        effective_cooldown = max(SYMBOL_ENTRY_COOLDOWN_MIN, SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN) if is_squeeze_opp else SYMBOL_ENTRY_COOLDOWN_MIN
+        symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, effective_cooldown)
 
         if position_state_unknown and EXECUTION_ENABLED:
             stats["blocked_by_position_state_unknown"] = stats.get("blocked_by_position_state_unknown", 0) + 1
@@ -1780,7 +1865,7 @@ def main() -> None:
             }
             log.info("[EXECUTION] %s (%s) - Already open/executed.%s%s", symbol, direction,
                      " Position confirmed; Telegram retry eligible." if existing_position else "",
-                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else (f" Symbol cooldown active ({SYMBOL_ENTRY_COOLDOWN_MIN:g}m)." if symbol_cooldown else ""))
+                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else (f" Symbol cooldown active ({effective_cooldown:g}m)." if symbol_cooldown else ""))
         elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
             stats["execution_attempts"] += 1
             trades_this_cycle += 1
@@ -1792,6 +1877,14 @@ def main() -> None:
                 _mark_local_position_state(current_open_positions, current_positions, actual_position, symbol, direction)
                 executed_event_ids.add(event_id)
                 recent_entry_ts[str(symbol).upper()] = now_ms
+
+            err_str = str(execution_result.get("error", "")).lower()
+            if execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
+                executed_event_ids.add(event_id)
+                log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; marking event %s executed.", symbol, direction, event_id)
+            elif "min_qty" in err_str:
+                executed_event_ids.add(event_id)
+                log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; marking event %s executed to prevent slot burn.", symbol, direction, event_id)
 
             actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
             actual_qty = actual_position.get("positionAmt")
