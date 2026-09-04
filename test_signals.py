@@ -1148,3 +1148,142 @@ def test_shadow_distinguishes_journal_records_from_confirmed_trades(tmp_path):
 def test_trade_close_journal_failure_does_not_mark_trade_closed(monkeypatch):
     import event_engine.tracker as tr
     assert 'trade["closed"] = False' in tr.update_active_trades.__code__.co_consts or True
+
+
+def test_load_successful_trade_ids_includes_opened_protection_failed(tmp_path: Path):
+    from run_once import load_successful_trade_ids
+    trades_file = tmp_path / "trades.jsonl"
+    trades_file.write_text(
+        json.dumps({"event_id": "EVT_FAIL", "result": {"status": "OPEN_FAILED"}}) + "\n" +
+        json.dumps({"event_id": "EVT_PROT_FAILED", "result": {"status": "opened_protection_failed"}}) + "\n" +
+        json.dumps({"event_id": "EVT_PROTECTED", "result": {"status": "opened_protected"}}) + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_successful_trade_ids(trades_file)
+    assert "EVT_PROT_FAILED" in loaded
+    assert "EVT_PROTECTED" in loaded
+    assert "EVT_FAIL" not in loaded
+
+
+def test_check_funding_filter_blocks_adverse_funding():
+    from run_once import check_funding_filter
+    from types import SimpleNamespace
+
+    # 1. SHORT with extreme negative funding -> BLOCKED
+    row_short_bad = SimpleNamespace(fr_oiw=-0.02)
+    ok_short, reason_short = check_funding_filter(row_short_bad, "SHORT")
+    assert ok_short is False
+    assert "ADVERSE_FUNDING_SHORT" in reason_short
+
+    # 2. LONG with extreme positive funding -> BLOCKED
+    row_long_bad = SimpleNamespace(fr_oiw=0.06)
+    ok_long, reason_long = check_funding_filter(row_long_bad, "LONG")
+    assert ok_long is False
+    assert "ADVERSE_FUNDING_LONG" in reason_long
+
+    # 3. Normal funding -> PASS
+    row_normal = SimpleNamespace(fr_oiw=0.01)
+    ok_norm_long, _ = check_funding_filter(row_normal, "LONG")
+    ok_norm_short, _ = check_funding_filter(row_normal, "SHORT")
+    assert ok_norm_long is True
+    assert ok_norm_short is True
+
+    # 4. Favorable funding -> PASS
+    row_fav_short = SimpleNamespace(fr_oiw=0.03)  # positive funding is favorable for shorts
+    assert check_funding_filter(row_fav_short, "SHORT")[0] is True
+    row_fav_long = SimpleNamespace(fr_oiw=-0.005)  # negative funding is favorable for longs
+    assert check_funding_filter(row_fav_long, "LONG")[0] is True
+
+    # 5. Missing / None funding -> PASS (no blind block)
+    assert check_funding_filter(None, "LONG")[0] is True
+    assert check_funding_filter(SimpleNamespace(fr_oiw=None), "SHORT")[0] is True
+
+
+def test_squeeze_tp_levels_are_wider_than_divergence():
+    from run_once import build_event_setup, build_tp_levels
+    df = _generate_synthetic_candles(60)
+
+    # Regular divergence setup
+    div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
+    assert div_setup["target_rr"] == 1.75
+    assert div_setup["planned_weighted_rr"] == 1.05
+    sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
+    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.50)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.00)
+    assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 1.75)
+
+    # Squeeze setup
+    sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
+    assert sq_setup["target_rr"] == 3.0
+    assert sq_setup["planned_weighted_rr"] == 2.05
+    sl_pct_sq, tp_sq = build_tp_levels(sq_setup, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
+    assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.00)
+    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 2.00)
+    assert tp_sq[2]["pnl_pct"] == pytest.approx(sl_pct_sq * 3.00)
+    assert tp_sq[0]["close_fraction"] == 0.30
+    assert tp_sq[1]["close_fraction"] == 0.35
+    assert tp_sq[2]["close_fraction"] == 0.35
+
+
+def test_tracker_activates_be_if_any_tp_hit_without_tp1(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+    from pathlib import Path
+
+    active_path = tmp_path / "active_trades.json"
+    trade_record = {
+        "trade_id": "TR_TEST",
+        "event_id": "EVT_TEST",
+        "symbol": "TEST",
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "initial_qty": 10.0,
+        "remaining_qty": 7.0,
+        "entry_ts": 1000,
+        "hit_legs": ["tp2"],  # tp2 hit without tp1
+        "be_activated": False,
+        "sl_order": {"order_id": "OLD_SL", "stop_price": 95.0},
+        "tp_orders": [],
+        "closed": False,
+    }
+    active_path.write_text(json.dumps({"EVT_TEST": trade_record}), encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.0", "avgPrice": "100.0"})
+    monkeypatch.setattr(tr, "fetch_klines", lambda s, tf, limit=60: [{"close": 102.0}])
+    be_calls = []
+    monkeypatch.setattr(
+        tr, "_move_sl_to_break_even",
+        lambda symbol, direction, entry, qty, old_id, trade_id, old_sl_price: be_calls.append(old_id) or {"status": "created", "order_id": "NEW_BE"}
+    )
+    tr.update_active_trades()
+    saved = json.loads(active_path.read_text(encoding="utf-8"))
+    assert len(be_calls) == 1
+    assert saved["EVT_TEST"]["be_activated"] is True
+
+
+def test_symbol_cooldown_respects_trade_close(tmp_path):
+    from run_once import _load_recent_successful_entries, _symbol_on_cooldown
+    trades_file = tmp_path / "trades.jsonl"
+    now_ms = 1_000_000_000
+    # Trade was opened 30 minutes ago, but closed only 5 minutes ago!
+    trades_file.write_text(
+        json.dumps({
+            "record_type": "TRADE_OPEN",
+            "symbol": "TEST",
+            "ts": now_ms - 30 * 60_000,
+            "execution": {"status": "opened_protected"},
+            "result": {"position": {"positionAmt": 1.0}},
+        }) + "\n" +
+        json.dumps({
+            "record_type": "TRADE_CLOSE",
+            "symbol": "TEST",
+            "closed_ts": now_ms - 5 * 60_000,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    latest = _load_recent_successful_entries(trades_file, now_ms, cooldown_min=15)
+    # Cooldown of 15m must STILL be active because close was only 5m ago
+    assert _symbol_on_cooldown("TEST", latest, now_ms, cooldown_min=15) is True
+    # Cooldown of 4m would have expired
+    assert _symbol_on_cooldown("TEST", latest, now_ms, cooldown_min=4) is False
+
