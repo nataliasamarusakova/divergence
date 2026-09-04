@@ -13,6 +13,9 @@ import requests
 
 from event_engine.coinalyze import fetch_data
 from event_engine.bingx import (
+    API_KEY,
+    SECRET_KEY,
+    BASE_URL,
     refresh_contracts,
     get_contract,
     to_bx_symbol,
@@ -23,6 +26,8 @@ from event_engine.bingx import (
     get_open_protection_directional,
     ensure_directional_protection,
     has_open_position,
+    emergency_close_position,
+    get_position_directional,
 )
 from event_engine.signals import (
     add_cvd,
@@ -85,9 +90,28 @@ MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 # Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
 SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
 SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN", "45"))
-MAX_SHORT_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_ADVERSE_FUNDING", "-0.01"))
-MAX_LONG_ADVERSE_FUNDING = float(os.environ.get("MAX_LONG_ADVERSE_FUNDING", "0.05"))
+# Funding values are in percentage points as parsed from Coinalyze
+# (e.g. 0.05 == +0.05%, -0.05 == -0.05%).
+MAX_SHORT_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_SQUEEZE_ADVERSE_FUNDING", "-0.10"))
+MAX_LONG_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_LONG_SQUEEZE_ADVERSE_FUNDING", "0.10"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
+POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
+
+
+def _validate_execution_config() -> tuple[bool, str]:
+    if not EXECUTION_ENABLED:
+        return True, "EXECUTION_DISABLED"
+    if not API_KEY or not SECRET_KEY:
+        return False, "BINGX credentials are missing while EXECUTION_ENABLED=true"
+    mode = str(EXECUTION_MODE or "vst").strip().lower()
+    base = str(BASE_URL or "").strip().lower()
+    if mode in {"vst", "test", "demo", "simulated"} and "open-api-vst." not in base:
+        return False, f"EXECUTION_MODE={mode} requires BingX VST base URL, got {BASE_URL!r}"
+    if POSITION_MODE != "HEDGE":
+        return False, f"This engine requires BINGX_POSITION_MODE=HEDGE, got {POSITION_MODE!r}"
+    if mode in {"live", "prod", "production", "prod-live"} and os.environ.get("ALLOW_LIVE_TRADING", "false").lower() != "true":
+        return False, "Live execution requires explicit ALLOW_LIVE_TRADING=true"
+    return True, "OK"
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -445,9 +469,6 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
             # Audit fix B3: forced-liquidation squeeze from Coinalyze factors.
             liqs = detect_liquidation_squeeze(r, d, symbol, timeframe)
-            # Advance watermark ONLY after the full response was structurally
-            # usable and the detector completed without exception.
-            _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
             tf_stats["scanned"] += 1
             stats["divergence_events"] += len(divs)
             stats["squeeze_events"] += len(sqs) + len(liqs)
@@ -462,6 +483,14 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
                 if eid and eid not in seen_ids:
                     emit_event(ev)
                     seen_ids.add(eid)
+
+            # Persist the watermark only AFTER event emission succeeded. If the
+            # journal write or state write fails, this symbol remains due for a
+            # later run instead of being silently skipped forever. Persisting
+            # after every successfully scanned symbol also preserves progress
+            # across workflow timeout/interruption.
+            _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
+            _save_timeframe_scan_state(scan_state)
         except Exception as exc:
             stats["scan_errors"] += 1
             tf_stats["scan_errors"] += 1
@@ -593,6 +622,12 @@ def load_successful_trade_ids(path: Path) -> set[str]:
             continue
         if not isinstance(obj, dict):
             continue
+        if str(obj.get("record_type", "")) == "EVENT_TERMINAL":
+            event_id = obj.get("event_id")
+            if event_id:
+                ids.add(str(event_id))
+            continue
+
         result = obj.get("result", {})
         if not isinstance(result, dict):
             continue
@@ -656,13 +691,16 @@ def calculate_execution_slippage(
 def check_funding_filter(
     row: Any,
     direction: str,
-    max_short_adverse: float = MAX_SHORT_ADVERSE_FUNDING,
-    max_long_adverse: float = MAX_LONG_ADVERSE_FUNDING,
+    event_type: str | None = None,
+    max_short_adverse: float | None = None,
+    max_long_adverse: float | None = None,
 ) -> tuple[bool, str]:
-    """Block entries when funding rate strongly opposes the trade direction.
+    """Block adverse funding only for squeeze events.
 
-    - SHORT when fr_oiw < max_short_adverse (shorts heavily crowded / short squeeze risk).
-    - LONG when fr_oiw > max_long_adverse (longs heavily crowded / long cascade dump risk).
+    Funding is stored in percentage-point units (0.10 == +0.10%).
+    Normal/divergence signals are intentionally not hard-blocked by funding.
+    Active squeeze events use +/-0.10% hard limits. Explicit threshold
+    arguments remain supported for tests/backward compatibility.
     """
     if row is None:
         return True, "NO_ROW"
@@ -675,10 +713,27 @@ def check_funding_filter(
         return True, "INVALID_FUNDING_DATA"
 
     d = str(direction).upper()
-    if d == "SHORT" and fr_val < max_short_adverse:
-        return False, f"ADVERSE_FUNDING_SHORT (fr={fr_val:.4f} < {max_short_adverse:.4f})"
-    if d == "LONG" and fr_val > max_long_adverse:
-        return False, f"ADVERSE_FUNDING_LONG (fr={fr_val:.4f} > {max_long_adverse:.4f})"
+    is_squeeze = "SQUEEZE" in str(event_type or "").upper()
+
+    # Funding is a hard entry gate only for squeeze events. For ordinary
+    # divergence signals, funding remains a research/context field and must
+    # not block an otherwise valid setup.
+    if not is_squeeze and max_short_adverse is None and max_long_adverse is None:
+        return True, "OK_NORMAL_FUNDING_NOT_FILTERED"
+
+    short_limit = MAX_SHORT_SQUEEZE_ADVERSE_FUNDING if is_squeeze else float("-inf")
+    long_limit = MAX_LONG_SQUEEZE_ADVERSE_FUNDING if is_squeeze else float("inf")
+    if max_short_adverse is not None:
+        short_limit = float(max_short_adverse)
+    if max_long_adverse is not None:
+        long_limit = float(max_long_adverse)
+
+    if d == "SHORT" and fr_val < short_limit:
+        scope = "SQUEEZE" if is_squeeze else "OVERRIDE"
+        return False, f"ADVERSE_FUNDING_SHORT_{scope} (fr={fr_val:.4f} < {short_limit:.4f})"
+    if d == "LONG" and fr_val > long_limit:
+        scope = "SQUEEZE" if is_squeeze else "OVERRIDE"
+        return False, f"ADVERSE_FUNDING_LONG_{scope} (fr={fr_val:.4f} > {long_limit:.4f})"
 
     return True, "OK"
 
@@ -977,22 +1032,79 @@ def install_protection(
         return {"status": "PROTECTION_EXCEPTION", "error": str(exc)}
 
 
-def _tp_orders_to_tracker(tp_orders: list[dict]) -> list[dict]:
+def _tp_orders_to_tracker(
+    tp_orders: list[dict],
+    *,
+    direction: str | None = None,
+    avg_price: float | None = None,
+    effective_levels: list[dict] | None = None,
+) -> list[dict]:
+    """Convert live TP orders into tracker records without relying on clientOrderId.
+
+    BingX conditional TP orders do not support clientOrderId. For current orders,
+    the trigger price is therefore the authoritative leg identity when the original
+    TP profile is known. For an orphan position with no stored profile, retain the
+    live protection rather than forcing a repair loop; deterministic ordering gives
+    stable fallback labels for tracker state.
+    """
     out: list[dict] = []
+    pending: list[tuple[dict, float]] = []
+    expected = [x for x in (effective_levels or []) if isinstance(x, dict)]
+
     for order in tp_orders:
         cid = str(order.get("clientOrderId", "")).upper()
         leg = next((x for x in ("tp1", "tp2", "tp3") if x.upper() in cid), None)
-        if not leg:
+        try:
+            price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
+            qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
             continue
-        out.append(
-            {
-                "leg": leg,
-                "status": "already_exists",
-                "order_id": str(order.get("orderId", "")),
-                "price": float(order.get("stopPrice", 0) or order.get("price", 0) or 0),
-                "qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
-            }
-        )
+        if price <= 0 or qty <= 0:
+            continue
+
+        if not leg and avg_price and avg_price > 0 and direction in {"LONG", "SHORT"} and expected:
+            best = None
+            used_expected_legs = {str(x.get("leg", "")).lower() for x in out if x.get("leg")}
+            for level in expected:
+                candidate_leg = str(level.get("leg", "")).lower()
+                try:
+                    pnl_pct = float(level.get("pnl_pct", 0))
+                except (TypeError, ValueError):
+                    continue
+                if candidate_leg not in {"tp1", "tp2", "tp3"} or candidate_leg in used_expected_legs or pnl_pct <= 0:
+                    continue
+                expected_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
+                rel = abs(price - expected_price) / max(abs(expected_price), 1e-12)
+                if best is None or rel < best[0]:
+                    best = (rel, candidate_leg)
+            if best is not None and best[0] <= 0.0025:
+                leg = best[1]
+
+        row = {
+            "leg": leg,
+            "status": "already_exists",
+            "order_id": str(order.get("orderId", "")),
+            "price": price,
+            "qty": qty,
+        }
+        if leg:
+            out.append(row)
+        else:
+            pending.append((row, price))
+
+    if pending:
+        # No stored profile exists. Preserve the live orders and assign labels from
+        # their favorable distance. A single current TP is the exchange-safe
+        # micro-position fallback used by ensure_directional_protection: tp3.
+        if avg_price and avg_price > 0:
+            pending.sort(key=lambda item: abs(item[1] - avg_price))
+        else:
+            pending.sort(key=lambda item: item[1])
+        fallback_legs = ["tp3"] if len(pending) == 1 else ["tp1", "tp2", "tp3"]
+        for (row, _), leg in zip(pending, fallback_legs):
+            row["leg"] = leg
+            out.append(row)
+
     return out
 
 
@@ -1095,19 +1207,20 @@ def reconcile_all_open_positions() -> None:
         tp_orders = list(prot.get("tp_orders", []))
 
         matched_trade = _find_active_trade_for_position(bx_symbol, direction, active_trades)
-        hit_legs = set(matched_trade.get("hit_legs", [])) if matched_trade else set()
+        hit_legs = {str(x).lower() for x in (matched_trade.get("hit_legs", []) if matched_trade else set())}
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
 
         effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
-        configured_legs = {str(x.get("leg")) for x in effective_levels} if isinstance(effective_levels, list) and effective_levels else {"tp1", "tp2", "tp3"}
+        configured_legs = {str(x.get("leg")).lower() for x in effective_levels if isinstance(x, dict) and x.get("leg")} if isinstance(effective_levels, list) and effective_levels else {"tp1", "tp2", "tp3"}
         remaining_expected_legs = configured_legs - hit_legs
 
-        known_tp_legs = {
-            leg
-            for order in tp_orders
-            for leg in ("tp1", "tp2", "tp3")
-            if leg.upper() in str(order.get("clientOrderId", "")).upper()
-        }
+        tracker_tp_probe = _tp_orders_to_tracker(
+            tp_orders,
+            direction=direction,
+            avg_price=avg_price,
+            effective_levels=effective_levels if isinstance(effective_levels, list) else None,
+        )
+        known_tp_legs = {str(x.get("leg", "")).lower() for x in tracker_tp_probe if x.get("leg")}
 
         sl_valid = False
         if sl_orders:
@@ -1116,20 +1229,37 @@ def reconcile_all_open_positions() -> None:
                 sl_amt = float(sl_orders[0].get("origQty", 0) or sl_orders[0].get("quantity", 0) or 0)
 
                 if sl_price > 0 and sl_amt > 0:
+                    qty_matches = abs(sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
-                        sl_valid = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
+                        price_matches = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
                     elif direction == "SHORT":
-                        sl_valid = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
+                        price_matches = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
+                    else:
+                        price_matches = False
+                    sl_valid = bool(price_matches and qty_matches and len(sl_orders) == 1)
             except (TypeError, ValueError):
                 sl_valid = False
 
-        protection_complete = sl_valid and remaining_expected_legs.issubset(known_tp_legs)
+        # A position without local tracker state is an orphan. There is no safe
+        # original TP profile to compare against, so preserve any currently open
+        # TP orders together with a valid SL instead of endlessly creating
+        # duplicate/rewritten protection on every cycle. Once registered, the
+        # inferred live profile becomes authoritative for future reconciliation.
+        if matched_trade is None:
+            protection_complete = sl_valid and bool(tracker_tp_probe)
+        else:
+            protection_complete = sl_valid and remaining_expected_legs.issubset(known_tp_legs)
 
         if protection_complete:
-            tracker_tp = _tp_orders_to_tracker(tp_orders)
+            tracker_tp = _tp_orders_to_tracker(
+                tp_orders,
+                direction=direction,
+                avg_price=avg_price,
+                effective_levels=effective_levels if isinstance(effective_levels, list) else None,
+            )
             tracker_sl = _sl_order_to_tracker(sl_orders)
             if tracker_tp and tracker_sl:
-                update_active_trade_protection(
+                tracked = update_active_trade_protection(
                     symbol=bx_symbol,
                     direction=direction,
                     tp_orders=tracker_tp,
@@ -1138,6 +1268,64 @@ def reconcile_all_open_positions() -> None:
                     tp_mode=matched_trade.get("tp_mode") if matched_trade else None,
                     effective_weighted_rr=matched_trade.get("effective_weighted_rr") if matched_trade else None,
                 )
+                if not tracked and not matched_trade:
+                    try:
+                        sl_price = _safe_float(sl_orders[0].get("stopPrice") or sl_orders[0].get("price"), 0.0)
+                        inferred_risk = abs(avg_price - sl_price) / avg_price * 100.0 if sl_price > 0 else 2.0
+                        inferred_risk = max(0.05, min(inferred_risk, 25.0))
+                        inferred_levels = []
+                        for tp in tracker_tp:
+                            tp_price = _safe_float(tp.get("price"), 0.0)
+                            if tp_price <= 0:
+                                continue
+                            pnl_pct = ((tp_price - avg_price) / avg_price * 100.0) if direction == "LONG" else ((avg_price - tp_price) / avg_price * 100.0)
+                            if pnl_pct <= 0:
+                                continue
+                            inferred_levels.append({
+                                "leg": str(tp.get("leg", "tp1")),
+                                "pnl_pct": pnl_pct,
+                                "close_fraction": _safe_float(tp.get("qty"), 0.0) / max(qty, 1e-12),
+                            })
+                        if not inferred_levels:
+                            inferred_levels = [{"leg": "tp1", "pnl_pct": inferred_risk * 1.75, "close_fraction": 1.0}]
+                        total_fraction = sum(max(_safe_float(x.get("close_fraction"), 0.0), 0.0) for x in inferred_levels)
+                        if total_fraction <= 0:
+                            inferred_levels = [{"leg": "tp1", "pnl_pct": inferred_risk * 1.75, "close_fraction": 1.0}]
+                        else:
+                            for level in inferred_levels:
+                                level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
+                        max_rr = max(abs(_safe_float(tp.get("pnl_pct"), 0.0)) / inferred_risk for tp in inferred_levels)
+                        inferred_setup = {
+                            "risk_pct": inferred_risk,
+                            "target_rr": max_rr,
+                            "planned_weighted_rr": max_rr,
+                            "effective_weighted_rr": max_rr,
+                            "tp_mode": "single_tp" if len(inferred_levels) == 1 else "multi_tp",
+                            "effective_tp_levels": inferred_levels,
+                            "tp_levels": inferred_levels,
+                            "entry_reference": avg_price,
+                            "invalidation_price": sl_price,
+                            "target_price": avg_price,
+                            "event_type": "RECONCILED_POSITION",
+                        }
+                        register_active_trade(
+                            event_id=f"RECON_{bx_symbol}_{direction}",
+                            symbol=bx_symbol.replace("-USDT", ""),
+                            name=bx_symbol.replace("-USDT", ""),
+                            direction=direction,
+                            entry_price=avg_price,
+                            qty=qty,
+                            tp_orders=tracker_tp,
+                            sl_result=tracker_sl,
+                            event_type="RECONCILED_POSITION",
+                            timeframe="1h",
+                            score=50.0,
+                            setup=inferred_setup,
+                            requested_entry_price=avg_price,
+                        )
+                        log.warning("[RECONCILIATION] Registered orphan protected position %s (%s) into tracker.", bx_symbol, direction)
+                    except Exception as exc:
+                        log.error("[RECONCILIATION] Failed to register protected orphan %s (%s): %s", bx_symbol, direction, exc)
             continue
 
         log.warning(
@@ -1158,22 +1346,26 @@ def reconcile_all_open_positions() -> None:
         if recheck.get("status") == "ok":
             recheck_tp = list(recheck.get("tp_orders", []))
             recheck_sl = list(recheck.get("sl_orders", []))
-            recheck_known_legs = {
-                leg
-                for order in recheck_tp
-                for leg in ("tp1", "tp2", "tp3")
-                if leg.upper() in str(order.get("clientOrderId", "")).upper()
-            }
+            recheck_tracker_probe = _tp_orders_to_tracker(
+                recheck_tp,
+                direction=direction,
+                avg_price=avg_price,
+                effective_levels=effective_levels if isinstance(effective_levels, list) else None,
+            )
+            recheck_known_legs = {str(x.get("leg", "")).lower() for x in recheck_tracker_probe if x.get("leg")}
             recheck_sl_valid = False
             if recheck_sl:
                 try:
                     r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
                     r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
-                    if r_sl_price > 0 and r_sl_amt > 0:
-                        if direction == "LONG":
-                            recheck_sl_valid = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
-                        elif direction == "SHORT":
-                            recheck_sl_valid = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
+                    r_qty_matches = abs(r_sl_amt - qty) <= max(qty * 1e-6, 1e-12)
+                    if direction == "LONG":
+                        r_price_matches = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
+                    elif direction == "SHORT":
+                        r_price_matches = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
+                    else:
+                        r_price_matches = False
+                    recheck_sl_valid = bool(r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
                 except (TypeError, ValueError):
                     recheck_sl_valid = False
             if recheck_sl_valid and remaining_expected_legs.issubset(recheck_known_legs):
@@ -1208,12 +1400,31 @@ def reconcile_all_open_positions() -> None:
             log.error("[RECONCILIATION] ATR error for %s: %s", bx_symbol, exc)
 
         tp_levels = []
-        if "tp1" not in hit_legs:
-            tp_levels.append({"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35})
-        if "tp2" not in hit_legs:
-            tp_levels.append({"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35})
-        if "tp3" not in hit_legs:
-            tp_levels.append({"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30})
+        if matched_trade and isinstance(matched_trade.get("effective_tp_levels"), list) and matched_trade.get("effective_tp_levels"):
+            # Preserve the exact original protection profile, including squeeze TP1/TP2/TP3
+            # distances and micro-position single-TP mode. Never silently replace a squeeze
+            # with the ordinary divergence 0.5R/1R/1.75R profile during restart repair.
+            for level in matched_trade.get("effective_tp_levels", []):
+                if not isinstance(level, dict):
+                    continue
+                leg = str(level.get("leg", ""))
+                if not leg or leg in hit_legs:
+                    continue
+                try:
+                    pnl_pct = float(level.get("pnl_pct", 0))
+                    fraction = float(level.get("close_fraction", 0))
+                except (TypeError, ValueError):
+                    continue
+                if pnl_pct > 0 and fraction > 0:
+                    tp_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
+
+        if not tp_levels:
+            if "tp1" not in hit_legs:
+                tp_levels.append({"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35})
+            if "tp2" not in hit_legs:
+                tp_levels.append({"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35})
+            if "tp3" not in hit_legs:
+                tp_levels.append({"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30})
 
         if not tp_levels:
             tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 1.0}]
@@ -1228,6 +1439,7 @@ def reconcile_all_open_positions() -> None:
             stop_loss_pct=sl_pct,
             tp_levels=tp_levels,
             trade_id=str(trade_event_id).replace("EVT_", ""),
+            stop_loss_price=avg_price if be_activated else None,
         )
 
         status = str(res.get("status", "")).upper()
@@ -1279,24 +1491,54 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     open_status = str(opened.get("status", "")).lower()
     if open_status not in {"opened", "success", "ok"}:
+        nested_response = opened.get("response") if isinstance(opened.get("response"), dict) else {}
+        exchange_code = opened.get("code")
+        if exchange_code is None:
+            exchange_code = nested_response.get("code")
+        error_text = opened.get("error") or opened.get("msg") or nested_response.get("msg") or open_status
         return {
             "status": "EXISTING_POSITION" if open_status == "existing_position" else "OPEN_FAILED",
             "mode": EXECUTION_MODE,
             "order_id": opened.get("order_id"),
             "open_result": opened,
-            "error": opened.get("error") or opened.get("msg") or open_status,
-            "bingx_code": opened.get("code"),
+            "error": error_text,
+            "bingx_code": exchange_code,
         }
 
     order_id = opened.get("order_id")
 
+    def _rollback_unprotected_entry(status: str, *, position: dict | None = None, error: str | None = None) -> dict:
+        """Fail-safe: after an accepted market entry, never abandon an unknown/unprotected position."""
+        rollback = emergency_close_position(
+            symbol, direction,
+            qty=_safe_float((position or {}).get("positionAmt"), 0.0) if isinstance(position, dict) else None,
+            reason_token=f"ENTRYFAIL:{trade_id}:{status}",
+        )
+        result = {
+            "status": status,
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "open_result": opened,
+            "position": position or {},
+            "error": error,
+            "emergency_close": rollback,
+            "rolled_back": rollback.get("status") == "closed",
+        }
+        if result["rolled_back"]:
+            result["position"] = {**(position or {}), "positionAmt": 0.0}
+        return result
+
     try:
         position = wait_for_position_fill_directional(symbol=symbol, direction=direction, timeout_sec=15, poll_interval=0.5)
     except Exception as exc:
-        return {"status": "POSITION_WAIT_FAILED", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "error": str(exc)}
+        return _rollback_unprotected_entry("POSITION_WAIT_FAILED", error=str(exc))
 
     if not isinstance(position, dict) or str(position.get("status", "")).lower() != "found":
-        return {"status": "POSITION_NOT_CONFIRMED", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "position": position}
+        return _rollback_unprotected_entry(
+            "POSITION_NOT_CONFIRMED",
+            position=position if isinstance(position, dict) else {},
+            error=str((position or {}).get("error") or (position or {}).get("status") or "position not confirmed"),
+        )
 
     try:
         actual_qty = abs(float(position.get("positionAmt", 0) or 0))
@@ -1306,7 +1548,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         actual_avg_price = 0.0
 
     if actual_qty <= 0 or actual_avg_price <= 0:
-        return {"status": "POSITION_INVALID", "mode": EXECUTION_MODE, "order_id": order_id, "open_result": opened, "position": position}
+        return _rollback_unprotected_entry(
+            "POSITION_INVALID",
+            position=position,
+            error=f"invalid confirmed position qty={actual_qty} avgPrice={actual_avg_price}",
+        )
 
     pre_order_price = _safe_float(opened.get("order_reference_price"), 0.0)
     execution_quality = calculate_execution_slippage(
@@ -1348,27 +1594,33 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         setup_for_fill["realized_rr"] = None
 
     except (TypeError, ValueError) as exc:
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"SETUPFAIL:{trade_id}")
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
-            "position": position,
+            "position": {**position, "positionAmt": actual_qty},
             "open_result": opened,
             "execution_quality": execution_quality,
             "error": str(exc),
+            "emergency_close": rollback,
+            "rolled_back": rollback.get("status") == "closed",
         }
 
     try:
         sl_pct, tp_levels = build_tp_levels(setup_for_fill, direction, event_type=ev_type)
     except Exception as exc:
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}")
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
-            "position": position,
+            "position": {**position, "positionAmt": actual_qty},
             "open_result": opened,
             "execution_quality": execution_quality,
             "error": str(exc),
+            "emergency_close": rollback,
+            "rolled_back": rollback.get("status") == "closed",
         }
 
     protection = install_protection(
@@ -1388,7 +1640,15 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         setup_for_fill["effective_weighted_rr"] = protection["effective_weighted_rr"]
 
     protection_status = str(protection.get("status", "")).upper()
-    if protection_status == "PROTECTED":
+    if protection.get("rolled_back"):
+        final_status = "opened_rolled_back"
+        try:
+            post_close = get_position_directional(symbol, direction)
+            if str(post_close.get("status", "")).lower() != "found":
+                position = {**position, "positionAmt": 0.0}
+        except Exception:
+            pass
+    elif protection_status == "PROTECTED":
         final_status = "opened_protected"
     elif protection_status == "SL_ONLY":
         final_status = "opened_protection_check_required"
@@ -1414,6 +1674,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
 def main() -> None:
     log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
+
+    config_ok, config_reason = _validate_execution_config()
+    if not config_ok:
+        log.critical("[ENGINE] EXECUTION PREFLIGHT FAILED: %s", config_reason)
+        return
 
     if EXECUTION_ENABLED:
         try:
@@ -1532,7 +1797,9 @@ def main() -> None:
         position_state_unknown = True
         log.error("[BINGX] Failed to pre-fetch positions for deduplication; NEW ENTRIES BLOCKED: %s", exc)
 
-    recent_entry_ts = _load_recent_successful_entries(TRADES, now_ms, SYMBOL_ENTRY_COOLDOWN_MIN)
+    recent_entry_ts = _load_recent_successful_entries(
+        TRADES, now_ms, max(SYMBOL_ENTRY_COOLDOWN_MIN, SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN)
+    )
 
     telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
     telegram_attempted_this_cycle = send_pending_open_trade_notifications(
@@ -1665,7 +1932,9 @@ def main() -> None:
                     tf_stats["rejected_btc"] += 1
                     continue
 
-            funding_ok, funding_reason = check_funding_filter(r, direction)
+            funding_ok, funding_reason = check_funding_filter(
+                r, direction, event_type=event_type
+            )
             if not funding_ok:
                 stats["rejected_funding"] += 1
                 tf_stats["rejected_funding"] += 1
@@ -1879,20 +2148,42 @@ def main() -> None:
                 recent_entry_ts[str(symbol).upper()] = now_ms
 
             err_str = str(execution_result.get("error", "")).lower()
+            terminal_reason = None
             if execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
-                executed_event_ids.add(event_id)
-                log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; marking event %s executed.", symbol, direction, event_id)
+                terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
+                log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
             elif "min_qty" in err_str:
+                terminal_reason = "MIN_QTY_NOT_REACHABLE"
+                log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)
+            elif "min_notional" in err_str or "min_usdt" in err_str or "min_size_usd" in err_str:
+                terminal_reason = "MIN_NOTIONAL_NOT_REACHABLE"
+                log.warning("[EXECUTION] %s (%s) exchange minimum notional not reachable at configured margin/leverage; terminalizing event %s.", symbol, direction, event_id)
+
+            if terminal_reason:
                 executed_event_ids.add(event_id)
-                log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; marking event %s executed to prevent slot burn.", symbol, direction, event_id)
+                record_trade({
+                    "record_type": "EVENT_TERMINAL",
+                    "event_id": event_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "event_type": ev.get("event_type"),
+                    "reason": terminal_reason,
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
 
             actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
             actual_qty = actual_position.get("positionAmt")
             execution_quality = execution_result.get("execution_quality", {}) if isinstance(execution_result, dict) else {}
 
+            execution_status = str(execution_result.get("status", ""))
+            confirmed_trade = execution_status in {
+                "opened_protected",
+                "opened_protection_check_required",
+                "opened_protection_failed",
+            } and actual_qty_for_state > 0
             record_trade(
                 {
-                    "record_type": "TRADE_OPEN",
+                    "record_type": "TRADE_OPEN" if confirmed_trade else "EXECUTION_ATTEMPT",
                     "trade_id": "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper(),
                     "event_id": event_id,
                     "symbol": symbol,

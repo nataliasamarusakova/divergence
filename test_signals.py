@@ -33,6 +33,8 @@ from run_once import (
     calculate_setup_score,
     execute_new_position,
     load_successful_telegram_ids,
+    check_funding_filter,
+    _load_recent_successful_entries,
 )
 
 
@@ -465,6 +467,32 @@ def test_scheduler_uses_rate_limited_scan_wrapper():
     import inspect
     src = inspect.getsource(ro._refresh_timeframe_events)
     assert "_fetch_klines_scan" in src
+
+
+def test_successful_scan_persists_watermark_after_event_emission(monkeypatch, tmp_path):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "_fetch_klines_scan", lambda *args, **kwargs: [
+        {"open": 100, "high": 101, "low": 99, "close": 100, "close_time": 1_000_000 + i * 3_600_000, "volume": 10}
+        for i in range(80)
+    ])
+    monkeypatch.setattr(ro, "add_cvd", lambda df: df)
+    monkeypatch.setattr(ro, "attach_oi_series", lambda df, hist: df)
+    monkeypatch.setattr(ro, "detect_divergences", lambda *args: [])
+    monkeypatch.setattr(ro, "detect_squeeze_release", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ro, "detect_liquidation_squeeze", lambda *args, **kwargs: [])
+    saved = []
+    monkeypatch.setattr(ro, "_save_timeframe_scan_state", lambda state: saved.append(state.copy()))
+
+    stats = {"divergence_events": 0, "squeeze_events": 0, "events_total": 0, "scan_errors": 0}
+    state = {"version": 2, "symbols": {}}
+    ro._refresh_timeframe_events(
+        [SimpleNamespace(symbol="TEST-USDT")], "1h", 250, 2_000_000_000, set(), stats, state, 123
+    )
+
+    assert state["symbols"]["TEST-USDT"]["1h"] == 123
+    assert saved and saved[-1]["symbols"]["TEST-USDT"]["1h"] == 123
 
 
 def test_incomplete_kline_response_defers_watermark(monkeypatch):
@@ -977,33 +1005,33 @@ def test_protection_transport_error_verifies_existing_order_before_retry(monkeyp
     from event_engine import bingx as bx
     calls = []
     monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or {"code": -1, "msg": "read timed out"})
-    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: (
+    monkeypatch.setattr(bx, "_find_open_order_for_post", lambda *a, **k: (
         "found", {"orderId": "SL1", "clientOrderId": "CID", "type": "STOP_MARKET"}
     ))
     out = bx._post_protection_order_verified(
-        "TEST", "LONG", {"clientOrderId": "CID"}, "CID"
+        "TEST", "LONG", {"type": "STOP_MARKET", "positionSide": "LONG", "side": "SELL", "quantity": "1", "stopPrice": "95"}, None
     )
     assert out["code"] == 0
     assert out["recovered"] is True
     assert len(calls) == 1
 
 
-def test_protection_transport_error_retries_only_after_confirmed_absence(monkeypatch):
+def test_protection_transport_error_does_not_blind_retry_conditional_order(monkeypatch):
     from event_engine import bingx as bx
     responses = iter([
         {"code": -1, "msg": "read timed out"},
-        {"code": 0, "data": {"order": {"orderId": "SL2", "clientOrderId": "CID"}}},
     ])
     calls = []
     monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or next(responses))
-    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("absent", None))
+    monkeypatch.setattr(bx, "_find_open_order_for_post", lambda *a, **k: ("absent", None))
     monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": "1"})
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
     out = bx._post_protection_order_verified(
-        "TEST", "LONG", {"clientOrderId": "CID", "type": "STOP_MARKET", "quantity": "1"}, "CID"
+        "TEST", "LONG", {"type": "STOP_MARKET", "positionSide": "LONG", "side": "SELL", "quantity": "1", "stopPrice": "95"}, None
     )
-    assert out["code"] == 0
-    assert len(calls) == 2
+    assert out["code"] == -1
+    assert out["protection_state_unknown"] is True
+    assert len(calls) == 1
 
 
 def test_in_cycle_position_state_is_updated_immediately():
@@ -1023,8 +1051,8 @@ def test_protection_transport_error_does_not_retry_when_verification_is_unknown(
     from event_engine import bingx as bx
     calls = []
     monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append(1) or {"code": -1, "msg": "read timed out"})
-    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("unknown", None))
-    out = bx._post_protection_order_verified("TEST", "LONG", {"clientOrderId": "CID"}, "CID")
+    monkeypatch.setattr(bx, "_find_open_order_for_post", lambda *a, **k: ("unknown", None))
+    out = bx._post_protection_order_verified("TEST", "LONG", {"type": "STOP_MARKET", "positionSide": "LONG", "side": "SELL", "quantity": "1", "stopPrice": "95"}, None)
     assert out["code"] == -1
     assert out["protection_state_unknown"] is True
     assert len(calls) == 1
@@ -1057,6 +1085,13 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     assert attempts[-1] == ("B",)
 
 
+def test_tp_leg_identity_works_without_client_order_id():
+    from event_engine import bingx as bx
+    order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.00", "origQty": "1"}
+    assert bx._tp_leg_from_order(order, "tp1", 105.0, 2, None) is True
+    assert bx._tp_leg_from_order(order, "tp1", 106.0, 2, None) is False
+
+
 def test_ensure_protection_refuses_second_sl_and_cleans_stale(monkeypatch):
     from event_engine import bingx as bx
     calls = []
@@ -1081,10 +1116,10 @@ def test_ensure_protection_refuses_second_sl_and_cleans_stale(monkeypatch):
 def test_protection_timeout_aborts_when_position_disappeared(monkeypatch):
     from event_engine import bingx as bx
     monkeypatch.setattr(bx, "_request", lambda *a, **k: {"code": -1, "msg": "read timed out"})
-    monkeypatch.setattr(bx, "_find_open_order_by_client_id", lambda *a, **k: ("absent", None))
+    monkeypatch.setattr(bx, "_find_open_order_for_post", lambda *a, **k: ("absent", None))
     monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: {"status": "not_found"})
     out = bx._post_protection_order_verified(
-        "ABC", "LONG", {"clientOrderId": "CID", "type": "STOP_MARKET", "quantity": "1"}, "CID"
+        "ABC", "LONG", {"type": "STOP_MARKET", "positionSide": "LONG", "side": "SELL", "quantity": "1", "stopPrice": "95"}, None
     )
     assert out["code"] == -1
     assert out.get("position_gone") is True
@@ -1165,38 +1200,29 @@ def test_load_successful_trade_ids_includes_opened_protection_failed(tmp_path: P
     assert "EVT_FAIL" not in loaded
 
 
-def test_check_funding_filter_blocks_adverse_funding():
+def test_check_funding_filter_only_blocks_aggressive_squeeze_funding():
     from run_once import check_funding_filter
     from types import SimpleNamespace
 
-    # 1. SHORT with extreme negative funding -> BLOCKED
-    row_short_bad = SimpleNamespace(fr_oiw=-0.02)
-    ok_short, reason_short = check_funding_filter(row_short_bad, "SHORT")
-    assert ok_short is False
-    assert "ADVERSE_FUNDING_SHORT" in reason_short
+    # Ordinary divergence signals are NOT hard-blocked by funding.
+    assert check_funding_filter(SimpleNamespace(fr_oiw=0.50), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+    assert check_funding_filter(SimpleNamespace(fr_oiw=-0.50), "SHORT", event_type="REGULAR_BEARISH_RSI")[0] is True
 
-    # 2. LONG with extreme positive funding -> BLOCKED
-    row_long_bad = SimpleNamespace(fr_oiw=0.06)
-    ok_long, reason_long = check_funding_filter(row_long_bad, "LONG")
-    assert ok_long is False
-    assert "ADVERSE_FUNDING_LONG" in reason_long
+    # Squeezes tolerate funding up to +/-0.10%, then are blocked.
+    assert check_funding_filter(SimpleNamespace(fr_oiw=0.10), "LONG", event_type="SHORT_SQUEEZE")[0] is True
+    assert check_funding_filter(SimpleNamespace(fr_oiw=-0.10), "SHORT", event_type="LONG_SQUEEZE")[0] is True
 
-    # 3. Normal funding -> PASS
-    row_normal = SimpleNamespace(fr_oiw=0.01)
-    ok_norm_long, _ = check_funding_filter(row_normal, "LONG")
-    ok_norm_short, _ = check_funding_filter(row_normal, "SHORT")
-    assert ok_norm_long is True
-    assert ok_norm_short is True
+    blocked_long, reason_long = check_funding_filter(SimpleNamespace(fr_oiw=0.1001), "LONG", event_type="SHORT_SQUEEZE")
+    blocked_short, reason_short = check_funding_filter(SimpleNamespace(fr_oiw=-0.1001), "SHORT", event_type="LONG_SQUEEZE")
+    assert blocked_long is False
+    assert blocked_short is False
+    assert "ADVERSE_FUNDING_LONG_SQUEEZE" in reason_long
+    assert "ADVERSE_FUNDING_SHORT_SQUEEZE" in reason_short
 
-    # 4. Favorable funding -> PASS
-    row_fav_short = SimpleNamespace(fr_oiw=0.03)  # positive funding is favorable for shorts
-    assert check_funding_filter(row_fav_short, "SHORT")[0] is True
-    row_fav_long = SimpleNamespace(fr_oiw=-0.005)  # negative funding is favorable for longs
-    assert check_funding_filter(row_fav_long, "LONG")[0] is True
-
-    # 5. Missing / None funding -> PASS (no blind block)
-    assert check_funding_filter(None, "LONG")[0] is True
-    assert check_funding_filter(SimpleNamespace(fr_oiw=None), "SHORT")[0] is True
+    # Missing / invalid funding never causes a blind hard block.
+    assert check_funding_filter(None, "LONG", event_type="SHORT_SQUEEZE")[0] is True
+    assert check_funding_filter(SimpleNamespace(fr_oiw=None), "SHORT", event_type="LONG_SQUEEZE")[0] is True
+    assert check_funding_filter(SimpleNamespace(fr_oiw="bad"), "SHORT", event_type="LONG_SQUEEZE")[0] is True
 
 
 def test_squeeze_tp_levels_are_wider_than_divergence():
@@ -1287,3 +1313,263 @@ def test_symbol_cooldown_respects_trade_close(tmp_path):
     # Cooldown of 4m would have expired
     assert _symbol_on_cooldown("TEST", latest, now_ms, cooldown_min=4) is False
 
+
+
+def test_funding_filter_does_not_block_normal_event_at_previous_threshold():
+    row = CoinalyzeRow("X", "X", 100.0, 0.0, 30_000_000.0, 12_000_000.0, 0.0, 0.0, 0.0, 0.0, 0.0648, None, 100_000.0, 100_000.0, 1.0, 0.0, 0.0, 0.0, {})
+    ok_normal, reason_normal = check_funding_filter(row, "LONG", event_type="REGULAR_BULLISH_RSI")
+    ok_squeeze, reason_squeeze = check_funding_filter(row, "LONG", event_type="SHORT_SQUEEZE")
+    assert ok_normal
+    assert reason_normal == "OK_NORMAL_FUNDING_NOT_FILTERED"
+    assert ok_squeeze
+    assert reason_squeeze == "OK"
+
+
+def test_squeeze_short_can_tolerate_negative_funding_to_minus_0_10():
+    row = CoinalyzeRow("X", "X", 100.0, 0.0, 30_000_000.0, 12_000_000.0, 0.0, 0.0, 0.0, 0.0, -0.0672, None, 100_000.0, 100_000.0, 1.0, 0.0, 0.0, 0.0, {})
+    ok, reason = check_funding_filter(row, "SHORT", event_type="LONG_SQUEEZE")
+    assert ok
+    assert reason == "OK"
+
+
+def test_recent_entries_uses_supplied_full_cooldown_window(tmp_path: Path):
+    trades_file = tmp_path / "trades.jsonl"
+    now = 10_000_000
+    close_ts = now - 30 * 60_000
+    trades_file.write_text(
+        json.dumps({"record_type": "TRADE_CLOSE", "symbol": "ABC-USDT", "closed_ts": close_ts}) + "\n",
+        encoding="utf-8",
+    )
+    recent = _load_recent_successful_entries(trades_file, now, 45)
+    assert recent["ABC-USDT"] == close_ts
+
+
+
+
+def test_load_successful_trade_ids_includes_persisted_terminal_event(tmp_path: Path):
+    from run_once import load_successful_trade_ids
+    trades_file = tmp_path / "trades.jsonl"
+    trades_file.write_text(
+        json.dumps({
+            "record_type": "EVENT_TERMINAL",
+            "event_id": "EVT_TERMINAL",
+            "reason": "CLIENT_ORDER_ID_ALREADY_USED",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_successful_trade_ids(trades_file)
+    assert "EVT_TERMINAL" in loaded
+
+
+def test_liquidation_squeeze_family_id_is_stable_across_consecutive_spikes():
+    df = _generate_synthetic_candles(60, base_price=100.0)
+    # Two consecutive upward breakout bars. The detector should keep one episode
+    # family identity instead of creating a new family on the second bar.
+    df.loc[58, ["close", "high", "low"]] = [106.0, 106.5, 105.0]
+    df.loc[59, ["close", "high", "low"]] = [111.0, 111.5, 110.0]
+    base = CoinalyzeRow("X", "X", 109.0, 0.0, 30_000_000.0, 12_000_000.0, 0.0, 2.0, 0.0, 0.0, 0.08, None, 500_000.0, 100_000.0, 0.5, 0.0, 0.0, 0.0, {})
+    ev1 = detect_liquidation_squeeze(base, df.iloc[:59].copy(), "X-USDT", "1h")
+    ev2 = detect_liquidation_squeeze(base, df.copy(), "X-USDT", "1h")
+    assert ev1 and ev2
+    assert ev1[0]["squeeze_family_id"] == ev2[0]["squeeze_family_id"]
+
+
+def test_execute_new_position_extracts_nested_bingx_101400(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: {
+        "status": "error",
+        "error": "clientOrderID unique check failed",
+        "response": {"code": 101400, "msg": "clientOrderID unique check failed"},
+    })
+    out = ro.execute_new_position("TEST", "LONG", 100.0, {"risk_pct": 1.0}, "EVT_TEST")
+    assert out["status"] == "OPEN_FAILED"
+    assert out["bingx_code"] == 101400
+
+
+def test_bingx_entry_rejects_below_exchange_min_notional(monkeypatch):
+    from event_engine import bingx as bx
+
+    bx.CACHE["data"] = {
+        "TEST-USDT": {
+            "symbol": "TEST-USDT", "displayName": "TEST-USDT", "status": 1,
+            "apiStateOpen": "true", "quantityPrecision": 3,
+            "tradeMinQuantity": 0.001, "tradeMinUSDT": 20.0,
+            "maxLongLeverage": 10, "maxShortLeverage": 10,
+        }
+    }
+    bx.CACHE["by_display_name"] = {"TEST-USDT": bx.CACHE["data"]["TEST-USDT"]}
+    bx.CACHE["ts"] = 9_999_999_999
+    monkeypatch.setattr(bx, "has_open_position", lambda s, d: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD_MIN_NOTIONAL")
+    assert out["status"] == "error"
+    assert "min_notional" in out["error"]
+    assert out["min_notional"] == 20.0
+
+
+def test_bingx_client_order_ids_are_alphanumeric():
+    from event_engine.bingx import _new_open_client_order_id, build_tp_client_order_id, build_sl_client_order_id
+    import re
+
+    ids = [
+        _new_open_client_order_id("TEST-USDT", "TRD1"),
+        build_tp_client_order_id("tp1", "TRD1"),
+        build_tp_client_order_id("tp2", "TRD1"),
+        build_tp_client_order_id("tp3", "TRD1"),
+        build_sl_client_order_id("TRD1"),
+    ]
+    assert all(1 <= len(x) <= 40 for x in ids)
+    assert all(re.fullmatch(r"[A-Za-z0-9]+", x) for x in ids)
+
+
+def test_reconciliation_registers_orphan_position_with_complete_protection(monkeypatch):
+    import run_once as ro
+
+    registrations = []
+    position = {"symbol": "TEST-USDT", "positionSide": "LONG", "positionAmt": "1.0", "avgPrice": "100.0", "entryPrice": "100.0"}
+    sl = {"orderId": "SL1", "clientOrderId": "EVTSLABC", "type": "STOP_MARKET", "stopPrice": "95.0", "origQty": "1.0"}
+    tps = [
+        {"orderId": "TP1", "clientOrderId": "EVTTP1ABC", "type": "TAKE_PROFIT_MARKET", "stopPrice": "101.0", "origQty": "0.3"},
+        {"orderId": "TP2", "clientOrderId": "EVTTP2ABC", "type": "TAKE_PROFIT_MARKET", "stopPrice": "102.0", "origQty": "0.35"},
+        {"orderId": "TP3", "clientOrderId": "EVTTP3ABC", "type": "TAKE_PROFIT_MARKET", "stopPrice": "103.0", "origQty": "0.35"},
+    ]
+
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [position])
+    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *args, **kwargs: {
+        "status": "ok", "tp_orders": tps, "sl_orders": [sl]
+    })
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
+    monkeypatch.setattr(ro, "update_active_trade_protection", lambda **kwargs: False)
+    monkeypatch.setattr(ro, "register_active_trade", lambda **kwargs: registrations.append(kwargs))
+
+    ro.reconcile_all_open_positions()
+    assert len(registrations) == 1
+    assert registrations[0]["event_id"] == "RECON_TEST-USDT_LONG"
+    assert registrations[0]["direction"] == "LONG"
+    assert registrations[0]["qty"] == 1.0
+    assert registrations[0]["setup"]["event_type"] == "RECONCILED_POSITION"
+
+
+def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
+    import event_engine.bingx as bx
+
+    state = {"qty": 1.25}
+    calls = []
+    contract = {"quantityPrecision": 3}
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: contract)
+    monkeypatch.setattr(
+        bx,
+        "get_position_directional",
+        lambda symbol, direction: (
+            {"status": "found", "positionAmt": str(state["qty"]), "avgPrice": "100"}
+            if state["qty"] > 0
+            else {"status": "not_found"}
+        ),
+    )
+
+    def fake_request(method, path, params):
+        calls.append(dict(params))
+        state["qty"] = 0.0
+        return {"code": 0, "msg": "OK", "data": {"order": {"orderId": "CLOSE1", "clientOrderId": params["clientOrderId"]}}}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
+
+    out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="UNIT")
+    assert out["status"] == "closed"
+    assert len(calls) == 1
+    assert calls[0]["side"] == "SELL"
+    assert calls[0]["positionSide"] == "LONG"
+    assert calls[0]["type"] == "MARKET"
+    assert calls[0]["quantity"] == "1.250"
+    assert calls[0]["clientOrderId"].isalnum()
+
+
+def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch):
+    from event_engine import bingx as bx
+    captured = []
+    monkeypatch.setattr(bx, "_request", lambda method, path, params: captured.append(dict(params)) or {"code": 0, "data": {"order": {"orderId": f"O{len(captured)}"}}})
+    monkeypatch.setattr(bx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "_set_leverage", lambda *a, **k: True)
+    def fake_protection(*args, **kwargs):
+        sl = [captured[0]] if captured and captured[0].get("type") == "STOP_MARKET" else []
+        tps = [captured[-1]] if captured and captured[-1].get("type") == "TAKE_PROFIT_MARKET" else []
+        return {"status": "ok", "sl_orders": [dict(x, orderId="O1") for x in sl], "tp_orders": [dict(x, orderId="O2") for x in tps]}
+    monkeypatch.setattr(bx, "get_open_protection_directional", fake_protection)
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 5.0,
+        [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0}],
+        trade_id="TRD1",
+    )
+    assert out["status"] in {"PROTECTED", "SL_ONLY"}
+    conditional = [p for p in captured if p.get("type") in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}]
+    assert conditional
+    assert all("clientOrderId" not in p for p in conditional)
+
+
+def test_reconciliation_uses_tp_price_when_current_conditional_orders_have_no_client_id(monkeypatch):
+    import run_once as ro
+    position = {"symbol": "TEST-USDT", "positionSide": "LONG", "positionAmt": "1.0", "avgPrice": "100.0"}
+    active = {
+        "T": {
+            "symbol": "TEST", "direction": "LONG", "closed": False,
+            "hit_legs": [], "be_activated": False,
+            "effective_tp_levels": [
+                {"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0, "qty": 1.0},
+            ],
+            "tp_mode": "single_tp", "effective_weighted_rr": 1.0,
+            "planned_risk_pct": 1.0,
+        }
+    }
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "99.0", "origQty": "1.0"}
+    tp = {"orderId": "TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "101.0", "origQty": "1.0"}
+    calls = {"repair": 0, "update": 0}
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [position])
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: active)
+    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [sl], "tp_orders": [tp]})
+    monkeypatch.setattr(ro, "update_active_trade_protection", lambda **kwargs: calls.__setitem__("update", calls["update"] + 1) or True)
+    monkeypatch.setattr(ro, "ensure_directional_protection", lambda **kwargs: calls.__setitem__("repair", calls["repair"] + 1) or {"status": "PROTECTED"})
+    ro.reconcile_all_open_positions()
+    assert calls["update"] == 1
+    assert calls["repair"] == 0
+
+
+def test_closed_trade_requires_verified_protection_cleanup(monkeypatch):
+    import event_engine.tracker as tr
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found", "positionAmt": "0"})
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok",
+        "sl_orders": [{"orderId": "SL1"}],
+        "tp_orders": [{"orderId": "TP1"}],
+    })
+    monkeypatch.setattr(tr, "_cancel_protection_order_verified", lambda *a, **k: (True, "cancelled"))
+    ok, note = tr._cleanup_closed_trade_protection({"symbol": "TEST", "direction": "LONG"})
+    assert ok is False
+    assert "still visible" in note
+
+
+def test_closed_trade_cleanup_refuses_unknown_position_state(monkeypatch):
+    import event_engine.tracker as tr
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "error", "error": "timeout"})
+    ok, note = tr._cleanup_closed_trade_protection({"symbol": "TEST", "direction": "LONG"})
+    assert ok is False
+    assert "not proven closed" in note
+
+
+def test_execution_config_rejects_unsupported_position_mode(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "EXECUTION_ENABLED", True)
+    monkeypatch.setattr(ro, "API_KEY", "KEY")
+    monkeypatch.setattr(ro, "SECRET_KEY", "SECRET")
+    monkeypatch.setattr(ro, "BASE_URL", "https://open-api-vst.bingx.com")
+    monkeypatch.setattr(ro, "EXECUTION_MODE", "vst")
+    monkeypatch.setattr(ro, "POSITION_MODE", "ONE_WAY")
+    ok, reason = ro._validate_execution_config()
+    assert ok is False
+    assert "BINGX_POSITION_MODE=HEDGE" in reason
