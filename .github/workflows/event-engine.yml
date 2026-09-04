@@ -51,6 +51,10 @@ jobs:
       LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
       LIQ_SQUEEZE_FUNDING_EXTREME: "0.03"
       LIQ_SQUEEZE_PRICE_SPIKE_ATR: "1.0"
+      SYMBOL_ENTRY_COOLDOWN_MIN: "15"
+      SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN: "45"
+      MAX_SHORT_SQUEEZE_ADVERSE_FUNDING: "-0.10"
+      MAX_LONG_SQUEEZE_ADVERSE_FUNDING: "0.10"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
 
@@ -58,7 +62,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           ref: main
           persist-credentials: true
 
