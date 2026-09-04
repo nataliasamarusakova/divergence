@@ -161,7 +161,7 @@ def _request(
 
 def refresh_contracts() -> dict[str, Any]:
     resp = _request("GET", CONTRACTS_PATH, signed=False)
-    if resp.get("code") != 0:
+    if resp.get("code") not in (0, "0"):
         raise RuntimeError(f"[BINGX] Contracts error: {resp.get('msg')}")
 
     data = {}
@@ -229,7 +229,9 @@ def to_bx_symbol(symbol: str) -> str | None:
 
 def contract_exists(symbol: str) -> bool:
     c = get_contract(symbol)
-    return bool(c and c.get("status") == 1 and str(c.get("apiStateOpen", "")).lower() == "true")
+    status_ok = c and str(c.get("status", "")).strip() in {"1", "1.0"}
+    api_open = str(c.get("apiStateOpen", "")).strip().lower() == "true"
+    return bool(status_ok and api_open)
 
 
 def fetch_klines(
@@ -361,7 +363,7 @@ def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> boo
 
     for side in sides:
         resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
-        if resp.get("code") == 0:
+        if resp.get("code") in (0, "0"):
             return True
     return False
 
@@ -389,7 +391,7 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") != 0:
+    if resp.get("code") not in (0, "0"):
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
     return _normalize_orders_list(resp)
 
@@ -400,7 +402,7 @@ def get_order(symbol: str, order_id: str | int) -> dict:
         return {"status": "error", "error": "contract_not_found"}
 
     resp = _request("GET", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
-    if resp.get("code") != 0:
+    if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": resp.get("msg"), "code": resp.get("code")}
 
     data = resp.get("data") or {}
@@ -463,8 +465,9 @@ def _trade_digest(trade_id: str) -> str:
 
 
 def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
+    # BingX clientOrderId is constrained to alphanumeric identifiers.
     digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:24]
-    return f"EVT_OPEN_{digest}"
+    return f"EVTOPEN{digest}"
 
 
 def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
@@ -489,7 +492,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     try:
         prec = int(c.get("quantityPrecision") or 0)
         min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
-        mult = float(c.get("multiplier") or 1)
+        min_usdt = float(c.get("tradeMinUSDT") or c.get("minNotional") or c.get("minSizeUsd") or 0)
         max_lev = int(c.get("maxShortLeverage" if direction == "SHORT" else "maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
@@ -499,7 +502,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         return {"status": "error", "error": "invalid sizing price", "symbol": bx}
 
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
-    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
+    # Swap order quantity is expressed in the base coin. Contract ``size`` is
+    # informational here; do not multiply quantity by undocumented legacy fields.
+    target_notional_usdt = MARGIN_USDT * leverage
+    qty = target_notional_usdt / max(sizing_price, 1e-12)
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
@@ -510,6 +516,16 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "status": "error",
             "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "leverage": leverage, "sizing_price": sizing_price,
+        }
+
+    notional_usdt = qty * sizing_price
+    if min_usdt > 0 and notional_usdt + 1e-12 < min_usdt:
+        return {
+            "status": "error",
+            "error": f"notional={notional_usdt:.8g} < min_notional={min_usdt:.8g} at configured leverage={leverage}",
+            "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "min_notional": min_usdt, "notional_usdt": notional_usdt,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
@@ -530,7 +546,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
 
     response = _request("POST", ORDER_PATH, params)
 
-    if isinstance(response, dict) and response.get("code") != 0:
+    if isinstance(response, dict) and response.get("code") not in (0, "0"):
         # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
         # the outcome unknown -- the order may have been created even though we
         # did not receive an ack. Never blindly retry a POST; verify the result
@@ -581,6 +597,72 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     }
 
 
+def emergency_close_position(symbol: str, direction: str, qty: float | None = None, reason_token: str | None = None) -> dict:
+    """Fail-safe close used when a freshly opened position cannot be protected.
+
+    It never blindly retries the same MARKET request. After each POST we query
+    the live directional position and, when necessary, close only the remaining
+    quantity with a fresh clientOrderId. This keeps the emergency path idempotent
+    even when the exchange acknowledgement is lost.
+    """
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction}"}
+    bx_symbol = to_bx_symbol(symbol)
+    contract = get_contract(symbol)
+    if not bx_symbol or not contract:
+        return {"status": "error", "error": "contract_not_found"}
+    try:
+        precision = int(contract.get("quantityPrecision") or 0)
+        requested_qty = abs(float(qty)) if qty is not None else 0.0
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": f"invalid close parameters: {exc}"}
+
+    for attempt in range(2):
+        try:
+            live = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "error", "error": f"position verification failed before emergency close: {exc}"}
+        if str(live.get("status", "")).lower() != "found":
+            return {"status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": attempt}
+
+        live_qty = abs(float(live.get("positionAmt", 0) or 0))
+        close_qty = live_qty if live_qty > 0 else requested_qty
+        close_qty = _round_qty(close_qty, precision)
+        if close_qty <= 0:
+            return {"status": "error", "error": "emergency close quantity is zero", "symbol": bx_symbol}
+
+        side = "SELL" if direction == "LONG" else "BUY"
+        token = f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:{attempt}"
+        digest = hashlib.sha256(token.upper().encode()).hexdigest().upper()[:24]
+        client_order_id = f"EVTCLOSE{digest}"
+        params = {
+            "symbol": bx_symbol,
+            "side": side,
+            "positionSide": direction,
+            "type": "MARKET",
+            "quantity": _format_qty(close_qty, precision),
+            "clientOrderId": client_order_id,
+        }
+        response = _request("POST", ORDER_PATH, params)
+        code = response.get("code") if isinstance(response, dict) else None
+        if code not in (0, "0", -1, "-1"):
+            last_error = str(response.get("msg", "emergency close failed")) if isinstance(response, dict) else str(response)
+            if attempt == 1:
+                return {"status": "error", "error": last_error, "symbol": bx_symbol, "client_order_id": client_order_id}
+            continue
+
+        time.sleep(0.25)
+        try:
+            after = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "unknown", "error": f"emergency close submitted but verification failed: {exc}", "symbol": bx_symbol, "client_order_id": client_order_id}
+        if str(after.get("status", "")).lower() != "found" or abs(float(after.get("positionAmt", 0) or 0)) <= 0:
+            return {"status": "closed", "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id}
+
+    return {"status": "error", "error": "emergency close did not flatten position", "symbol": bx_symbol, "direction": direction}
+
+
 def get_position_directional(symbol: str, direction: str) -> dict:
     bx_symbol = to_bx_symbol(symbol)
     direction = str(direction).upper()
@@ -588,7 +670,7 @@ def get_position_directional(symbol: str, direction: str) -> dict:
         return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
 
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if resp.get("code") != 0:
+    if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
 
     for p in _normalize_orders_list(resp):
@@ -657,7 +739,7 @@ def get_open_protection_directional(
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") != 0:
+    if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
 
     tp_orders = []
@@ -692,16 +774,18 @@ def _format_price(price: float, precision: int) -> str:
 
 
 def build_tp_client_order_id(leg: str, trade_id: str | None = None) -> str:
-    leg_u = str(leg).upper()
+    leg_u = str(leg).upper().replace("_", "")
+    if leg_u not in {"TP1", "TP2", "TP3"}:
+        leg_u = "TP" + "".join(ch for ch in leg_u if ch.isdigit())[:1] or "1"
     if trade_id:
-        return f"EVT_{_trade_digest(trade_id)}_{leg_u}"
-    return f"EVT_{leg_u}"
+        return f"EVTTP{leg_u[-1]}{_trade_digest(trade_id)}"
+    return f"EVT{leg_u}"
 
 
 def build_sl_client_order_id(trade_id: str | None = None) -> str:
     if trade_id:
-        return f"EVT_{_trade_digest(trade_id)}_SL"
-    return "EVT_SL"
+        return f"EVTSL{_trade_digest(trade_id)}"
+    return "EVTSL"
 
 
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
@@ -788,13 +872,28 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     expected_formatted = _format_price(expected_price, price_precision)
     actual_formatted = _format_price(actual_price, price_precision)
 
-    if trade_id:
-        if client_id == f"EVT_{_trade_digest(trade_id)}_{expected_leg}":
+    # Prefer the legacy/deterministic client id when it is present. New
+    # conditional BingX protection orders do not support clientOrderId, so for
+    # those orders the trigger price becomes the stable leg identity.
+    if trade_id and client_id:
+        digest = _trade_digest(trade_id)
+        expected_leg_num = "".join(ch for ch in expected_leg if ch.isdigit())[:1]
+        if client_id == f"EVTTP{expected_leg_num}{digest}":
+            return actual_formatted == expected_formatted
+        # Backward compatibility for protection orders created before the
+        # alphanumeric clientOrderId hardening.
+        if client_id == f"EVT_{digest}_{expected_leg}":
             return actual_formatted == expected_formatted
 
-    if f"_{expected_leg}_" in f"_{client_id}_":
-        return actual_formatted == expected_formatted
-    return False
+    if client_id:
+        if f"_{expected_leg}_" in f"_{client_id}_":
+            return actual_formatted == expected_formatted
+        if client_id.startswith(f"EVTTP{''.join(ch for ch in expected_leg if ch.isdigit())[:1]}"):
+            return actual_formatted == expected_formatted
+
+    # Current BingX conditional protection orders: identify the leg by the
+    # expected trigger price when no clientOrderId is available.
+    return actual_formatted == expected_formatted
 
 
 def _current_close_price(symbol: str) -> float | None:
@@ -838,10 +937,56 @@ def _effective_weighted_rr(levels: list[dict], stop_loss_pct: float) -> float | 
     return weighted / total if total > 0 else None
 
 
+def _protection_order_matches_params(order: dict, params: dict) -> bool:
+    """Match an uncertain conditional-order POST against an open order by shape.
+
+    Conditional BingX orders do not support clientOrderId according to the current
+    swap-trade API contract, so transport recovery must rely on immutable order
+    attributes instead of a client id.
+    """
+    if not isinstance(order, dict) or not isinstance(params, dict):
+        return False
+    if str(order.get("type", "")).upper() != str(params.get("type", "")).upper():
+        return False
+    if str(order.get("positionSide", "")).upper() != str(params.get("positionSide", "")).upper():
+        return False
+    if str(order.get("side", "")).upper() != str(params.get("side", "")).upper():
+        return False
+
+    def _num(value):
+        try:
+            x = float(value)
+            return x if math.isfinite(x) else None
+        except (TypeError, ValueError):
+            return None
+
+    expected_qty = _num(params.get("quantity"))
+    actual_qty = _num(order.get("origQty", order.get("quantity")))
+    if expected_qty is not None and actual_qty is not None:
+        if not _qty_matches_position(actual_qty, expected_qty):
+            return False
+    elif expected_qty is not None:
+        return False
+
+    order_type = str(params.get("type", "")).upper()
+    if order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+        expected_stop = _num(params.get("stopPrice"))
+        actual_stop = _num(order.get("stopPrice", order.get("price")))
+        if expected_stop is None or actual_stop is None:
+            return False
+        if order_type in {"STOP", "STOP_MARKET"}:
+            price_matches = _sl_price_matches(actual_stop, expected_stop)
+        else:
+            price_matches = abs(actual_stop - expected_stop) / max(expected_stop, 1e-12) <= 0.002
+        if not price_matches:
+            return False
+    return True
+
+
 def _find_open_order_by_client_id(symbol: str, direction: str, client_order_id: str) -> tuple[str, dict | None]:
-    """Return (found/absent/unknown, order) for a deterministic client id."""
+    """Legacy-compatible client-id lookup; MARKET/LIMIT orders may use this."""
     if not client_order_id:
-        return "unknown", None
+        return "absent", None
     try:
         prot = get_open_protection_directional(symbol, direction, retryable=False)
     except Exception as exc:
@@ -856,24 +1001,49 @@ def _find_open_order_by_client_id(symbol: str, direction: str, client_order_id: 
     return "absent", None
 
 
+def _find_open_order_for_post(symbol: str, direction: str, params: dict, client_order_id: str | None = None) -> tuple[str, dict | None]:
+    """Return (found/absent/unknown, order) for an uncertain POST outcome."""
+    try:
+        prot = get_open_protection_directional(symbol, direction, retryable=False)
+    except Exception as exc:
+        log.warning("[BINGX] Protection verification failed for %s %s: %s", symbol, direction, exc)
+        return "unknown", None
+    if prot.get("status") != "ok":
+        return "unknown", None
+
+    orders = list(prot.get("sl_orders", [])) + list(prot.get("tp_orders", []))
+    if client_order_id:
+        wanted = str(client_order_id).upper()
+        for order in orders:
+            if str(order.get("clientOrderId", "")).upper() == wanted:
+                return "found", order
+
+    for order in orders:
+        if _protection_order_matches_params(order, params):
+            return "found", order
+    return "absent", None
+
+
 def _post_protection_order_verified(
-    symbol: str, direction: str, params: dict, client_order_id: str,
+    symbol: str, direction: str, params: dict, client_order_id: str | None = None,
     *, max_attempts: int = 2, retry_delay: float = 0.25,
 ) -> dict:
-    """POST protection order with idempotent recovery for transport failures.
+    """POST protection order with safe recovery when the POST outcome is unknown.
 
-    A transport timeout makes the POST outcome unknown. We first query open orders
-    for the deterministic clientOrderId. We retry only after the exchange confirms
-    that the order is absent; an unavailable verification leaves the outcome unknown
-    and does not issue a potentially duplicating POST.
+    For conditional protection orders, current BingX docs do not support
+    clientOrderId, so recovery matches the open order by order shape. When state
+    cannot be proven, never issue a blind duplicate; reconciliation repairs it later.
     """
     last_resp: dict = {"code": -1, "msg": "protection request not attempted"}
+    order_type = str(params.get("type", "")).upper()
+    conditional = order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
+
     for attempt in range(max_attempts):
         try:
             resp = _request("POST", ORDER_PATH, params)
         except Exception as exc:
             resp = {"code": -1, "msg": str(exc)}
-        if isinstance(resp, dict) and resp.get("code") == 0:
+        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
             return resp
 
         last_resp = resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
@@ -881,7 +1051,7 @@ def _post_protection_order_verified(
         if not is_transport:
             return last_resp
 
-        state, found = _find_open_order_by_client_id(symbol, direction, client_order_id)
+        state, found = _find_open_order_for_post(symbol, direction, params, client_order_id)
         if state == "found" and found is not None:
             return {
                 "code": 0,
@@ -896,8 +1066,37 @@ def _post_protection_order_verified(
                 "protection_state_unknown": True,
             }
 
-        # A missing open order after a timeout is not enough proof that the POST was lost:
-        # the order could have filled between the POST and our verification request.
+        # For a conditional order we cannot prove that the POST was lost if the
+        # order is not open anymore: it may have immediately triggered/filled.
+        # Never send a duplicate in that state; the next reconciliation cycle
+        # will inspect the live position and repair what is actually missing.
+        if conditional:
+            # Distinguish a genuinely disappeared position from a still-open
+            # position, but never infer that the conditional POST was lost. It
+            # may already have triggered/filled between the POST and verification.
+            try:
+                live_pos = get_position_directional(symbol, direction)
+                live_status = str(live_pos.get("status", "")).lower()
+                live_qty = abs(float(live_pos.get("positionAmt", 0) or 0)) if live_status == "found" else 0.0
+            except Exception as exc:
+                return {
+                    "code": -1,
+                    "msg": f"{last_resp.get('msg', 'transport error')}; conditional protection verification failed: {exc}",
+                    "protection_state_unknown": True,
+                }
+            if live_status != "found" or live_qty <= 0:
+                return {
+                    "code": -1,
+                    "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after conditional-order timeout",
+                    "protection_state_unknown": True,
+                    "position_gone": True,
+                }
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; conditional protection outcome unknown; no blind retry",
+                "protection_state_unknown": True,
+            }
+
         try:
             live_pos = get_position_directional(symbol, direction)
             live_status = str(live_pos.get("status", "")).lower()
@@ -916,16 +1115,15 @@ def _post_protection_order_verified(
                 "position_gone": True,
             }
 
-        # A full-size STOP that may have partially filled must protect only the live remainder.
-        # For TP orders we do not blindly recreate after an unknown POST outcome: a filled TP
-        # is already reflected by the smaller live position and recreating the original quantity
-        # could over-close it.
-        if str(params.get("type", "")).upper() in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "MARKET"}:
+        # MARKET TP/close can fill between POST and verification. Never recreate.
+        if order_type == "MARKET":
             return {
                 "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; TP outcome unknown after timeout; no blind retry",
+                "msg": f"{last_resp.get('msg', 'transport error')}; MARKET outcome unknown after timeout; no blind retry",
                 "protection_state_unknown": True,
             }
+
+        # Kept for any future non-conditional, non-MARKET order type.
         params = dict(params)
         try:
             precision = int((get_contract(symbol) or {}).get("quantityPrecision") or 0)
@@ -939,7 +1137,6 @@ def _post_protection_order_verified(
         return last_resp
 
     return last_resp
-
 
 def _sl_price_matches(actual_price: float, expected_price: float, tolerance: float = 0.002) -> bool:
     return actual_price > 0 and expected_price > 0 and abs(actual_price - expected_price) / max(expected_price, 1e-12) <= tolerance
@@ -987,6 +1184,7 @@ def _cancel_protection_order_verified(symbol: str, direction: str, order: dict, 
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
+    stop_loss_price: float | None = None,
 ) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1026,7 +1224,20 @@ def ensure_directional_protection(
     existing_sl = list(existing.get("sl_orders", []))
     tp_levels_norm = _normalize_tp_levels(tp_levels)
 
-    desired_sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
+    if stop_loss_price is not None:
+        try:
+            explicit_sl_price = float(stop_loss_price)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "invalid explicit stop_loss_price"}
+        if not math.isfinite(explicit_sl_price) or explicit_sl_price <= 0:
+            return {"status": "error", "error": "invalid explicit stop_loss_price"}
+        if direction == "LONG" and explicit_sl_price > avg_price:
+            return {"status": "error", "error": "LONG stop_loss_price is above avg_price"}
+        if direction == "SHORT" and explicit_sl_price < avg_price:
+            return {"status": "error", "error": "SHORT stop_loss_price is below avg_price"}
+        desired_sl_price = explicit_sl_price
+    else:
+        desired_sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
     valid_existing_sl = None
     for sl in existing_sl:
         order_type = str(sl.get("type", "")).upper()
@@ -1076,24 +1287,26 @@ def ensure_directional_protection(
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
-            "clientOrderId": client_order_id,
         }
 
         resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
-        if resp.get("code") != 0:
+        if resp.get("code") not in (0, "0"):
             log.error("[BINGX] SL failed: code=%s msg=%s", resp.get("code"), resp.get("msg"))
+            rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLFAIL:{trade_id or bx_symbol}")
             return {
                 "status": "PROTECTION_FAILED",
-                "error": f"SL failed: {resp.get('msg')}",
+                "error": f"SL failed: {resp.get('msg')}; emergency_close={rollback.get('status')}",
                 "sl_result": {"status": "error", "error": resp.get("msg")},
                 "tp_orders": [],
+                "rolled_back": rollback.get("status") == "closed",
+                "emergency_close": rollback,
             }
 
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
         sl_result = {
             "status": "created",
             "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "client_order_id": order.get("clientOrderId") or None,
             "stop_price": sl_price,
             "qty": position_qty,
         }
@@ -1106,6 +1319,7 @@ def ensure_directional_protection(
     )
 
     if not verified_sl_valid:
+        rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLVERIFY:{trade_id or bx_symbol}")
         return {
             "status": "SL_UNVERIFIED",
             "symbol": symbol,
@@ -1116,6 +1330,8 @@ def ensure_directional_protection(
             "sl_result": sl_result,
             "tp_orders": [],
             "error": "SL created but not visible on exchange",
+            "rolled_back": rollback.get("status") == "closed",
+            "emergency_close": rollback,
         }
 
     tp_mode = "multi_tp"
@@ -1212,11 +1428,10 @@ def ensure_directional_protection(
                 "positionSide": direction,
                 "type": "MARKET",
                 "quantity": _format_qty(tp_qty, precision),
-                "clientOrderId": client_order_id,
             }
 
             resp = _post_protection_order_verified(symbol, direction, market_params, client_order_id, max_attempts=2, retry_delay=0.25)
-            if resp.get("code") != 0:
+            if resp.get("code") not in (0, "0"):
                 log.error("[BINGX] TP market close failed: %s msg=%s", leg, resp.get("msg"))
                 tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
             else:
@@ -1225,7 +1440,7 @@ def ensure_directional_protection(
                     "leg": leg,
                     "status": "created",
                     "order_id": str(order.get("orderId", "")),
-                    "client_order_id": order.get("clientOrderId") or client_order_id,
+                    "client_order_id": order.get("clientOrderId") or None,
                     "price": current_price,
                     "qty": tp_qty,
                     "pnl_pct": pnl_pct,
@@ -1240,11 +1455,10 @@ def ensure_directional_protection(
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
-            "clientOrderId": client_order_id,
         }
 
         resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
-        if resp.get("code") != 0:
+        if resp.get("code") not in (0, "0"):
             log.error("[BINGX] TP order failed: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
             tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
             continue
@@ -1254,7 +1468,7 @@ def ensure_directional_protection(
             "leg": leg,
             "status": "created",
             "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "client_order_id": order.get("clientOrderId") or None,
             "price": tp_price,
             "qty": tp_qty,
             "pnl_pct": pnl_pct,

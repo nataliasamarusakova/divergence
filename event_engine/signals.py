@@ -605,19 +605,47 @@ def detect_liquidation_squeeze(
             "ls_crowded": bool(ls_crowded),
         }
 
-    candidates: list[tuple[str, str, float]] = []
+    candidates: list[tuple[str, str, float, int]] = []
+
+    # A liquidation cascade can span several consecutive bars. Keep one stable
+    # episode/family identity across that run so the event is updated rather
+    # than emitted as a new opportunity on every bar.
+    def _family_start_index(last_idx: int, direction: str) -> int:
+        start = last_idx
+        for idx in range(last_idx, 0, -1):
+            cur = b.iloc[idx]
+            prv = b.iloc[idx - 1]
+            cur_close = float(cur["close"])
+            prv_close = float(prv["close"])
+            cur_move = cur_close - prv_close
+            cur_atr = float(atr_series.iloc[idx]) if pd.notna(atr_series.iloc[idx]) else 0.0
+            if not math.isfinite(cur_atr) or cur_atr <= 0:
+                break
+            if direction == "LONG":
+                qualifies = cur_move > 0 and cur_close > float(prv["high"]) and cur_move >= th["price_spike_atr"] * cur_atr
+            else:
+                qualifies = cur_move < 0 and cur_close < float(prv["low"]) and abs(cur_move) >= th["price_spike_atr"] * cur_atr
+            if not qualifies:
+                break
+            start = idx - 1
+        return start + 1 if start < last_idx else last_idx
+
     if move > 0 and close_val > prev_high and move >= th["price_spike_atr"] * atr_value:
         ratio = liq_short / oi
         if ratio >= th["liq_oi_ratio"]:
-            candidates.append(("SHORT_SQUEEZE", "LONG", ratio))
+            family_start = _family_start_index(len(b) - 1, "LONG")
+            candidates.append(("SHORT_SQUEEZE", "LONG", ratio, family_start))
 
     if move < 0 and close_val < prev_low and abs(move) >= th["price_spike_atr"] * atr_value:
         ratio = liq_long / oi
         if ratio >= th["liq_oi_ratio"]:
-            candidates.append(("LONG_SQUEEZE", "SHORT", ratio))
+            family_start = _family_start_index(len(b) - 1, "SHORT")
+            candidates.append(("LONG_SQUEEZE", "SHORT", ratio, family_start))
 
     events: list[dict[str, Any]] = []
-    for typ, direction, liq_ratio in candidates:
+    for typ, direction, liq_ratio, family_start_index in candidates:
+        family_start_ts = int(b["close_time"].iloc[family_start_index])
+        family_id = _event_id(symbol, timeframe, typ + "_FAMILY", family_start_ts, family_start_ts)
         soft = _soft_factors(direction)
         soft_hits = sum(1 for k in ("oi_surge", "funding_extreme", "ls_crowded") if soft[k])
         if soft_hits < 1:
@@ -625,7 +653,8 @@ def detect_liquidation_squeeze(
 
         events.append(
             {
-                "event_id": _event_id(symbol, timeframe, typ, detected_ts, detected_ts),
+                "event_id": family_id,
+                "squeeze_family_id": family_id,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "direction": direction,
@@ -634,6 +663,8 @@ def detect_liquidation_squeeze(
                     "pivot_1_ts": detected_ts,
                     "pivot_2_ts": detected_ts,
                     "detected_at_ts": detected_ts,
+                    "squeeze_family_start_ts": family_start_ts,
+                    "squeeze_family_end_ts": detected_ts,
                 },
                 "event_fact": {
                     "detection_close_price": close_val,

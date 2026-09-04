@@ -22,6 +22,7 @@ from event_engine.bingx import (
     _request,
     ORDER_PATH,
     _post_protection_order_verified,
+    _cancel_protection_order_verified,
 )
 from event_engine.telegram import send_detailed
 
@@ -170,6 +171,8 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.05))
                 t.setdefault("close_journal_pending", False)
                 t.setdefault("close_notification_pending", False)
+                t.setdefault("close_cleanup_pending", False)
+                t.setdefault("close_cleanup_last_error", None)
                 normalized[str(event_id)] = t
             return normalized
         log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
@@ -542,7 +545,7 @@ def _move_sl_to_break_even(
     qty = live_qty
 
     trade_token = str(trade_id) if trade_id else uuid.uuid4().hex.upper()[:16]
-    be_client_id = f"EVT_BE_{trade_token}"
+    be_client_id = "EVTBE" + hashlib.sha256(str(trade_token).upper().encode()).hexdigest().upper()[:24]
 
     verified = get_open_protection_directional(symbol, direction)
     if verified.get("status") == "ok":
@@ -602,6 +605,7 @@ def _move_sl_to_break_even(
         if not old_sl_price or old_sl_price <= 0 or abs(old_sl_price - entry_price) / max(entry_price, 1e-12) < 1e-9:
             return False
         restore_side = "SELL" if direction == "LONG" else "BUY"
+        restore_client_id = "EVTBERST" + hashlib.sha256(str(trade_token).upper().encode()).hexdigest().upper()[:16]
         restore_params = {
             "symbol": bx,
             "side": restore_side,
@@ -609,11 +613,10 @@ def _move_sl_to_break_even(
             "type": "STOP_MARKET",
             "stopPrice": _format_price(old_sl_price, price_precision),
             "quantity": _format_qty(qty, precision),
-            "clientOrderId": f"EVT_BE_RST_{trade_token}",
         }
         try:
             restore_resp = _post_protection_order_verified(
-                symbol, direction, restore_params, restore_params["clientOrderId"], max_attempts=3, retry_delay=0.25
+                symbol, direction, restore_params, None, max_attempts=3, retry_delay=0.25
             )
         except Exception as exc:
             log.error("[TRACKER] Old SL restore exception for %s %s: %s", symbol, direction, exc)
@@ -660,12 +663,11 @@ def _move_sl_to_break_even(
         "type": "STOP_MARKET",
         "stopPrice": _format_price(entry_price, price_precision),
         "quantity": _format_qty(qty, precision),
-        "clientOrderId": be_client_id,
     }
 
     try:
         resp = _post_protection_order_verified(
-            symbol, direction, params, be_client_id, max_attempts=3, retry_delay=0.25
+            symbol, direction, params, None, max_attempts=3, retry_delay=0.25
         )
     except Exception as exc:
         return _fail(f"BE stop request exception: {exc}")
@@ -694,7 +696,7 @@ def _move_sl_to_break_even(
     return {
         "status": "created",
         "order_id": new_order_id,
-        "client_order_id": order.get("clientOrderId") or be_client_id,
+        "client_order_id": order.get("clientOrderId") or None,
         "stop_price": entry_price,
     }
 
@@ -811,6 +813,62 @@ def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, s
     return None, None
 
 
+def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
+    """Cancel and verify all remaining protection for a position that has closed.
+
+    Stale conditional orders are dangerous in hedge mode because they can affect a
+    later position in the same symbol/direction. Cleanup therefore must be verified
+    before the lifecycle is finalized.
+    """
+    symbol = str(trade.get("symbol", ""))
+    direction = str(trade.get("direction", "")).upper()
+    if not symbol or direction not in {"LONG", "SHORT"}:
+        return False, "invalid trade identity for protection cleanup"
+    try:
+        live = get_position_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"position state read failed: {exc}"
+    live_status = str(live.get("status", "")).lower()
+    if live_status == "found" and abs(_safe_float(live.get("positionAmt"), 0.0)) > 0:
+        return False, "refusing cleanup because a new live position exists for the same symbol/direction"
+    if live_status != "not_found":
+        return False, f"refusing cleanup because position state is not proven closed: {live_status or 'unknown'}"
+    try:
+        prot = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"open protection read failed: {exc}"
+    if prot.get("status") != "ok":
+        return False, str(prot.get("error", "open protection read failed"))
+
+    orders = list(prot.get("sl_orders", [])) + list(prot.get("tp_orders", []))
+    if not orders:
+        return True, "no_open_protection"
+
+    failures = []
+    for order in orders:
+        order_id = str(order.get("orderId", ""))
+        if not order_id:
+            failures.append("open protection missing orderId")
+            continue
+        try:
+            ok, note = _cancel_protection_order_verified(symbol, direction, order, max_attempts=3)
+        except Exception as exc:
+            ok, note = False, str(exc)
+        if not ok:
+            failures.append(f"{order_id}: {note}")
+
+    try:
+        final = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"final protection verification failed: {exc}"
+    if final.get("status") != "ok":
+        return False, str(final.get("error", "final protection verification failed"))
+    remaining = list(final.get("sl_orders", [])) + list(final.get("tp_orders", []))
+    if remaining:
+        failures.append("protection still visible after cancellation")
+    return (not failures), ("; ".join(failures) if failures else "cleanup_verified")
+
+
 def update_active_trades() -> None:
     _retry_pending_notifications()
     trades = _load_active_trades()
@@ -821,6 +879,20 @@ def update_active_trades() -> None:
     updated_trades: dict[str, dict] = {}
 
     for event_id, trade in trades.items():
+        if trade.get("close_cleanup_pending"):
+            cleanup_ok, cleanup_note = _cleanup_closed_trade_protection(trade)
+            if cleanup_ok:
+                trade["close_cleanup_pending"] = False
+                trade["closed"] = True
+                log.info("[TRACKER] Closed trade %s protection cleanup verified.", event_id)
+            else:
+                trade["closed"] = False
+                trade["close_cleanup_pending"] = True
+                trade["close_cleanup_last_error"] = cleanup_note
+                log.error("[TRACKER] Closed trade %s still has protection cleanup pending: %s", event_id, cleanup_note)
+            updated_trades[event_id] = trade
+            continue
+
         if trade.get("closed", False):
             if trade.get("close_notification_pending"):
                 try:
@@ -1156,19 +1228,19 @@ def update_active_trades() -> None:
 
             trade["close_notification_pending"] = False
             trade["close_journal_pending"] = False
-            trade["closed"] = True
-            for tp in trade.get("tp_orders", []):
-                if tp.get("leg") not in hit_legs and tp.get("order_id"):
-                    try:
-                        cancel_order(symbol, tp["order_id"])
-                    except Exception:
-                        pass
-
-            if sl_order_id:
-                try:
-                    cancel_order(symbol, sl_order_id)
-                except Exception:
-                    pass
+            cleanup_ok, cleanup_note = _cleanup_closed_trade_protection(trade)
+            if cleanup_ok:
+                trade["close_cleanup_pending"] = False
+                trade["closed"] = True
+                trade.pop("close_cleanup_last_error", None)
+            else:
+                # The position is already closed, but stale protection must not be
+                # allowed to survive into a future position on the same instrument.
+                # Keep the lifecycle state retryable until openOrders confirms cleanup.
+                trade["close_cleanup_pending"] = True
+                trade["close_cleanup_last_error"] = cleanup_note
+                trade["closed"] = False
+                log.error("[TRACKER] Trade %s closed but protection cleanup is pending: %s", event_id, cleanup_note)
 
         except Exception as exc:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
