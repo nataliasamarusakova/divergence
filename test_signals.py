@@ -310,6 +310,7 @@ def test_rsi_matches_wilder_sma_seed_reference():
 
 def test_execute_new_position_defines_pre_order_price(monkeypatch):
     import run_once as ro
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 3.0)
 
     monkeypatch.setattr(ro, "open_market", lambda symbol, direction, price, trade_id: {
         "status": "opened", "order_id": "O1", "order_reference_price": 100.0,
@@ -1573,3 +1574,95 @@ def test_execution_config_rejects_unsupported_position_mode(monkeypatch):
     ok, reason = ro._validate_execution_config()
     assert ok is False
     assert "BINGX_POSITION_MODE=HEDGE" in reason
+
+
+def test_entry_drift_is_adverse_by_direction():
+    import run_once as ro
+    assert ro._entry_drift_pct(100.0, 102.0, "LONG") == pytest.approx(2.0)
+    assert ro._entry_drift_pct(100.0, 98.0, "SHORT") == pytest.approx(2.0)
+    assert ro._entry_drift_pct(100.0, 98.0, "LONG") == pytest.approx(2.0)
+    assert ro._entry_drift_pct(100.0, 102.0, "SHORT") == pytest.approx(2.0)
+
+
+def test_symbol_quarantine_after_three_consecutive_losses(tmp_path: Path):
+    import run_once as ro
+    trades = tmp_path / "trades.jsonl"
+    rows = [
+        {"record_type": "TRADE_CLOSE", "symbol": "ABC", "closed_ts": 1000, "realized_pnl_pct": -1.0},
+        {"record_type": "TRADE_CLOSE", "symbol": "ABC", "closed_ts": 2000, "realized_pnl_pct": -2.0},
+        {"record_type": "TRADE_CLOSE", "symbol": "ABC", "closed_ts": 3000, "realized_pnl_pct": -3.0},
+        {"record_type": "TRADE_CLOSE", "symbol": "DEF", "closed_ts": 3000, "realized_pnl_pct": 2.0},
+    ]
+    trades.write_text("\n".join(json.dumps(x) for x in rows) + "\n", encoding="utf-8")
+    out = ro._load_symbol_quarantines(trades, now_ms=60_000, max_consecutive_losses=3, quarantine_min=10)
+    assert out["ABC"] == 603_000
+    assert ro._symbol_on_quarantine("ABC", out, 60_001) is True
+    assert ro._symbol_on_quarantine("DEF", out, 60_001) is False
+
+
+def test_load_recent_successful_entries_reads_full_cooldown_window(tmp_path: Path):
+    import run_once as ro
+    trades = tmp_path / "trades.jsonl"
+    now = 3_600_000
+    rows = [
+        {"record_type": "TRADE_CLOSE", "symbol": "SQUEEZE", "closed_ts": now - 35 * 60_000},
+        {"record_type": "TRADE_OPEN", "symbol": "SQUEEZE", "execution": {"status": "opened_protected"}, "result": {"position": {"positionAmt": "1"}}, "ts": now - 50 * 60_000},
+    ]
+    trades.write_text("\n".join(json.dumps(x) for x in rows) + "\n", encoding="utf-8")
+    out = ro._load_recent_successful_entries(trades, now, cooldown_min=45)
+    assert out["SQUEEZE"] == now - 35 * 60_000
+
+
+def test_short_defensive_score_is_stricter():
+    import run_once as ro
+    ev = {"direction": "SHORT", "event_type": "REGULAR_BEARISH_MACD", "event_fact": {"price_delta_atr": 1.0}}
+    score = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
+    assert score > 0
+    assert ro.MIN_SHORT_SCORE == 85.0
+
+
+def test_hot_oi_penalty_applies_to_score():
+    import run_once as ro
+    from types import SimpleNamespace
+    row = SimpleNamespace(oi_chg24_pct=55.0, fr_oiw=0.0)
+    ev = {"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI", "event_fact": {}}
+    base = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
+    hot = ro.calculate_setup_score(ev, row, pd.DataFrame({"close": [1]}))
+    assert hot == pytest.approx(base - ro.HOT_OI_SCORE_PENALTY)
+
+
+def test_market_protection_close_uses_client_order_id(monkeypatch):
+    import event_engine.bingx as bx
+    captured = []
+    monkeypatch.setattr(
+        bx, "_request",
+        lambda method, path, params: captured.append(dict(params)) or {"code": 0, "data": {"order": {"orderId": "M1", "clientOrderId": params.get("clientOrderId")}}},
+    )
+    monkeypatch.setattr(bx, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    out = bx._post_protection_order_verified(
+        "TEST", "LONG",
+        {"type": "MARKET", "symbol": "TEST-USDT", "side": "SELL", "positionSide": "LONG", "quantity": "1"},
+        "EVTCLOSEUNIT", max_attempts=1,
+    )
+    assert out["code"] == 0
+    assert captured[0]["clientOrderId"] == "EVTCLOSEUNIT"
+
+
+def test_execute_new_position_rolls_back_excessive_entry_drift(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 2.0)
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: {
+        "status": "opened", "order_id": "O1", "leverage": 10, "order_reference_price": 100.0,
+    })
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **k: {
+        "status": "found", "positionAmt": "1", "avgPrice": "104", "entryPrice": "104",
+    })
+    monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: {"status": "closed"})
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        "EVT_DRIFT",
+    )
+    assert out["status"] == "ENTRY_DRIFT_EXCEEDED"
+    assert out["rolled_back"] is True
+    assert out["execution_quality"]["signal_to_fill_distance_pct"] == pytest.approx(4.0)

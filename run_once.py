@@ -84,8 +84,16 @@ REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "tr
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
-MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "60"))
+MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "30"))
+MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
+MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "3.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
+MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "85"))
+MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
+HARD_HOT_OI_CHG24_PCT = float(os.environ.get("HARD_HOT_OI_CHG24_PCT", "75"))
+HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
+SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
+SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
 # Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
 SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
@@ -375,8 +383,8 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
 
     This protects the runner from burst traffic and BingX application-level
     errors while never marking a symbol/timeframe processed until the caller
-    validates the returned dataset. Pacing is cross-process when the file lock
-    is available (audit fix B5).
+    validates the returned dataset. Pacing is process-local because GitHub-hosted
+    runners are ephemeral and cross-run monotonic timestamps are not comparable.
     """
     min_interval = float(os.environ.get("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "1.05"))
     max_attempts = int(os.environ.get("BINGX_KLINE_RETRY_ATTEMPTS", "3"))
@@ -443,6 +451,9 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "rejected_funding": 0,
         "rejected_cvd": 0,
         "rejected_score": 0,
+        "rejected_entry_drift": 0,
+        "rejected_hot_oi": 0,
+        "rejected_symbol_quarantine": 0,
         "valid_signals": 0,
     })
     return rec
@@ -607,6 +618,73 @@ def send_pending_open_trade_notifications(
         else:
             log.error("[TELEGRAM] Pending open notification failed for %s %s (%s); will retry.", direction, symbol, event_id)
     return attempted
+
+
+def _load_symbol_quarantines(path: Path, now_ms: int, max_consecutive_losses: int, quarantine_min: float) -> dict[str, int]:
+    """Return symbols temporarily quarantined after repeated confirmed losses.
+
+    State is derived from the append-only trade journal, so a clean start needs no
+    separate legacy file. Only confirmed TRADE_CLOSE records participate.
+    """
+    if max_consecutive_losses <= 0 or quarantine_min <= 0 or not path.exists():
+        return {}
+    closes: dict[str, list[dict]] = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("record_type") != "TRADE_CLOSE":
+                    continue
+                symbol = str(obj.get("symbol") or "").strip().upper()
+                closed_ts = int(_safe_float(obj.get("closed_ts"), 0.0))
+                pnl = _safe_float(obj.get("realized_pnl_pct"), 0.0)
+                if not symbol or closed_ts <= 0 or closed_ts > now_ms:
+                    continue
+                closes.setdefault(symbol, []).append({"ts": closed_ts, "pnl": pnl})
+    except OSError:
+        return {}
+
+    out: dict[str, int] = {}
+    window_ms = int(quarantine_min * 60_000)
+    for symbol, rows in closes.items():
+        rows.sort(key=lambda x: x["ts"])
+        streak = 0
+        for row in reversed(rows):
+            if row["pnl"] < 0:
+                streak += 1
+                if streak >= max_consecutive_losses:
+                    most_recent_loss_ts = int(rows[-1]["ts"])
+                    if now_ms - most_recent_loss_ts < window_ms:
+                        out[symbol] = most_recent_loss_ts + window_ms
+                    break
+            else:
+                break
+    return out
+
+
+def _symbol_on_quarantine(symbol: str, quarantines: dict[str, int], now_ms: int) -> bool:
+    until = int(quarantines.get(str(symbol).strip().upper(), 0) or 0)
+    return until > now_ms
+
+
+def _entry_drift_pct(signal_price: float, trigger_price: float, direction: str) -> float | None:
+    """Absolute percentage distance from signal price to trigger price.
+
+    This is a signal-decay metric, not trade PnL slippage: a SHORT trigger below
+    the signal is still a late entry and therefore carries positive drift.
+    Direction is accepted for API clarity and future policy expansion.
+    """
+    _ = direction
+    signal_price = _safe_float(signal_price, 0.0)
+    trigger_price = _safe_float(trigger_price, 0.0)
+    if signal_price <= 0 or trigger_price <= 0:
+        return None
+    return abs(trigger_price - signal_price) / signal_price * 100.0
 
 
 def load_successful_trade_ids(path: Path) -> set[str]:
@@ -839,6 +917,14 @@ def calculate_setup_score(
             score += 10.0
 
     if coinalyze_row is not None:
+        try:
+            oi_chg24 = getattr(coinalyze_row, "oi_chg24_pct", None)
+            if oi_chg24 is not None:
+                oi_chg24 = float(oi_chg24)
+                if oi_chg24 >= MAX_HOT_OI_CHG24_PCT:
+                    score -= HOT_OI_SCORE_PENALTY
+        except (TypeError, ValueError):
+            pass
         try:
             fr = getattr(coinalyze_row, "fr_oiw", None)
             if fr is not None:
@@ -1565,6 +1651,34 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         direction, symbol, actual_avg_price, actual_qty, execution_quality.get("slippage_pct") or 0.0
     )
 
+    event_type_for_risk = str(setup.get("event_type", "")).upper()
+    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type_for_risk else MAX_ENTRY_DRIFT_PCT
+    signal_price_for_risk = _safe_float(setup.get("signal_price", price), 0.0)
+    fill_drift_pct = _entry_drift_pct(signal_price_for_risk, actual_avg_price, direction)
+    execution_quality["signal_to_fill_distance_pct"] = fill_drift_pct
+    if drift_limit > 0 and fill_drift_pct is not None and fill_drift_pct > drift_limit:
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"DRIFTFAIL:{trade_id}")
+        flattened = rollback.get("status") == "closed"
+        log.error(
+            "[EXECUTION] Entry drift exceeded for %s %s: %.2f%% > %.2f%%; emergency_close=%s",
+            direction, symbol, fill_drift_pct, drift_limit, rollback.get("status"),
+        )
+        result_position = {**position, "positionAmt": 0.0} if flattened else {**position, "positionAmt": actual_qty}
+        return {
+            "status": "ENTRY_DRIFT_EXCEEDED",
+            "mode": EXECUTION_MODE,
+            "order_id": order_id,
+            "position": result_position,
+            "open_result": opened,
+            "execution_quality": execution_quality,
+            "error": f"signal_to_fill_distance_pct={fill_drift_pct:.6f} > limit={drift_limit:.6f}",
+            "emergency_close": rollback,
+            "rolled_back": flattened,
+            "fill_ts_ms": fill_ts_ms,
+            "notional_usdt": actual_avg_price * actual_qty,
+            "leverage": opened.get("leverage"),
+        }
+
     try:
         setup_for_fill = dict(setup)
         setup_for_fill["entry_reference"] = actual_avg_price
@@ -1669,6 +1783,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         "execution_quality": execution_quality,
         "setup_used_for_protection": setup_for_fill,
         "fill_ts_ms": fill_ts_ms,
+        "notional_usdt": actual_avg_price * actual_qty,
+        "leverage": opened.get("leverage"),
+        "planned_risk_usdt": (actual_avg_price * actual_qty) * planned_risk_pct / 100.0,
     }
 
 
@@ -1718,6 +1835,10 @@ def main() -> None:
         "trigger_data_failed": 0,
         "trigger_direction_failed": 0,
         "rejected_score": 0,
+        "rejected_short_score": 0,
+        "rejected_entry_drift": 0,
+        "rejected_hot_oi": 0,
+        "rejected_symbol_quarantine": 0,
         "conflict_rejected": 0,
         "valid_signals": 0,
         "execution_attempts": 0,
@@ -1799,6 +1920,9 @@ def main() -> None:
 
     recent_entry_ts = _load_recent_successful_entries(
         TRADES, now_ms, max(SYMBOL_ENTRY_COOLDOWN_MIN, SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN)
+    )
+    symbol_quarantines = _load_symbol_quarantines(
+        TRADES, now_ms, SYMBOL_MAX_CONSECUTIVE_LOSSES, SYMBOL_QUARANTINE_MIN
     )
 
     telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
@@ -1958,6 +2082,11 @@ def main() -> None:
                 stats["trigger_data_failed"] += 1
                 continue
 
+            signal_price = _safe_float(ev.get("event_fact", {}).get("detection_close_price") or r.price, 0.0)
+            if signal_price <= 0:
+                stats["scan_errors"] += 1
+                continue
+
             if REQUIRE_TRIGGER:
                 trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
                 if not trigger_diag.get("ok"):
@@ -1973,6 +2102,23 @@ def main() -> None:
                         stats["trigger_data_failed"] += 1; tf_stats["trigger_data_failed"] += 1
                     log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
                     continue
+                trigger_price = _safe_float(trigger_diag.get("current_close"), 0.0)
+                if trigger_price <= 0:
+                    stats["trigger_data_failed"] += 1
+                    tf_stats["trigger_data_failed"] += 1
+                    continue
+                drift_pct = _entry_drift_pct(signal_price, trigger_price, direction)
+                drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type else MAX_ENTRY_DRIFT_PCT
+                if drift_pct is None:
+                    stats["trigger_data_failed"] += 1
+                    tf_stats["trigger_data_failed"] += 1
+                    continue
+                if drift_pct > max(0.0, drift_limit):
+                    stats["rejected_entry_drift"] += 1
+                    tf_stats["rejected_entry_drift"] = tf_stats.get("rejected_entry_drift", 0) + 1
+                    log.info("[SIGNALS] %s %s (%s/%s) rejected: entry drift %.2f%% > %.2f%%", direction, symbol, tf, event_type, drift_pct, drift_limit)
+                    continue
+                trigger_diag["signal_to_trigger_drift_pct"] = round(drift_pct, 6)
                 stats["trigger_passed"] += 1
                 tf_stats["trigger_passed"] += 1
             else:
@@ -1988,13 +2134,32 @@ def main() -> None:
                     tf_stats["rejected_cvd"] += 1
                     continue
 
-            signal_price = _safe_float(ev.get("event_fact", {}).get("detection_close_price") or r.price, 0.0)
-            if signal_price <= 0:
-                stats["scan_errors"] += 1
+            if REQUIRE_TRIGGER and trigger_diag.get("signal_to_trigger_drift_pct") is not None:
+                setup_drift = float(trigger_diag["signal_to_trigger_drift_pct"])
+            else:
+                setup_drift = 0.0
+
+            if _symbol_on_quarantine(symbol, symbol_quarantines, now_ms):
+                stats["rejected_symbol_quarantine"] += 1
+                tf_stats["rejected_symbol_quarantine"] = tf_stats.get("rejected_symbol_quarantine", 0) + 1
+                log.info("[RISK] %s %s rejected: symbol quarantine active until %s", direction, symbol, pd.to_datetime(symbol_quarantines.get(symbol.upper()), unit="ms", utc=True).isoformat())
+                continue
+
+            oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", 0.0), 0.0)
+            if oi_chg24 >= HARD_HOT_OI_CHG24_PCT and "SQUEEZE" not in event_type:
+                stats["rejected_hot_oi"] += 1
+                tf_stats["rejected_hot_oi"] = tf_stats.get("rejected_hot_oi", 0) + 1
+                log.info("[RISK] %s %s rejected: OI24h %.2f%% >= hard hot-OI %.2f%%", direction, symbol, oi_chg24, HARD_HOT_OI_CHG24_PCT)
                 continue
 
             score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
-            if MIN_SCORE > 0 and score < MIN_SCORE:
+            min_score_for_direction = MIN_SHORT_SCORE if direction == "SHORT" else MIN_SCORE
+            if min_score_for_direction > 0 and score < min_score_for_direction:
+                stats["rejected_score"] += 1
+                stats["rejected_short_score"] += int(direction == "SHORT")
+                tf_stats["rejected_score"] += 1
+                log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < required %.1f", direction, symbol, tf, event_type, score, min_score_for_direction)
+                continue
                 stats["rejected_score"] += 1
                 tf_stats["rejected_score"] += 1
                 log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, tf, event_type, score, MIN_SCORE)
@@ -2027,9 +2192,17 @@ def main() -> None:
                 "trigger_bar_close_ts": trigger_diag.get("trigger_bar_close_ts"),
                 "trigger_price": _safe_float(trigger_diag.get("current_close"), 0.0) or None,
                 "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
+                "signal_to_trigger_drift_pct": trigger_diag.get("signal_to_trigger_drift_pct"),
                 "volume_ratio": trigger_diag.get("volume_ratio"),
             }
             setup["signal_price"] = signal_price
+            setup["entry_risk"] = {
+                "signal_to_trigger_drift_pct": trigger_diag.get("signal_to_trigger_drift_pct"),
+                "oi_chg24_pct": oi_chg24,
+                "hot_oi_warning": oi_chg24 >= MAX_HOT_OI_CHG24_PCT,
+                "short_defensive_mode": direction == "SHORT",
+                "symbol_quarantine_until_ts": symbol_quarantines.get(symbol.upper()),
+            }
             setup["event_timeframe"] = tf
             setup["event_type"] = event_type
             setup["trigger_ok"] = True
@@ -2149,7 +2322,10 @@ def main() -> None:
 
             err_str = str(execution_result.get("error", "")).lower()
             terminal_reason = None
-            if execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
+            if execution_result.get("status") == "ENTRY_DRIFT_EXCEEDED":
+                terminal_reason = "ENTRY_DRIFT_EXCEEDED"
+                log.warning("[EXECUTION] %s (%s) entry drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+            elif execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
                 terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
                 log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
             elif "min_qty" in err_str:
@@ -2209,6 +2385,12 @@ def main() -> None:
                         "adverse_slippage_pct": execution_quality.get("adverse_slippage_pct"),
                         "signal_to_order_drift_pct": execution_quality.get("signal_to_order_drift_pct"),
                         "execution_slippage_pct": execution_quality.get("execution_slippage_pct"),
+                        "adverse_execution_slippage_pct": execution_quality.get("adverse_execution_slippage_pct"),
+                        "entry_notional_usdt": execution_result.get("notional_usdt"),
+                        "leverage": execution_result.get("leverage"),
+                        "planned_risk_usdt": execution_result.get("planned_risk_usdt"),
+                        "trigger_delay_min": ((setup.get("trigger") or {}).get("trigger_delay_min")),
+                        "signal_to_trigger_drift_pct": ((setup.get("trigger") or {}).get("signal_to_trigger_drift_pct")),
                     },
                     "score": score,
                     "event_type": ev.get("event_type"),
