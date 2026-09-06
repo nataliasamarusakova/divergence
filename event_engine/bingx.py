@@ -1038,9 +1038,13 @@ def _post_protection_order_verified(
     order_type = str(params.get("type", "")).upper()
     conditional = order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
 
+    request_params = dict(params)
+    if not conditional and client_order_id and not request_params.get("clientOrderId"):
+        request_params["clientOrderId"] = str(client_order_id)
+
     for attempt in range(max_attempts):
         try:
-            resp = _request("POST", ORDER_PATH, params)
+            resp = _request("POST", ORDER_PATH, request_params)
         except Exception as exc:
             resp = {"code": -1, "msg": str(exc)}
         if isinstance(resp, dict) and resp.get("code") in (0, "0"):

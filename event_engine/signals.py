@@ -686,7 +686,7 @@ def diagnose_15m_trigger(
     df15: pd.DataFrame,
     direction: str,
     event_detected_at_ts: int | None = None,
-    max_trigger_delay_min: float = 60.0,
+    max_trigger_delay_min: float = 30.0,
     min_vol_mult: float = 1.05,
     require_event_ts: bool = False,
 ) -> dict[str, Any]:
@@ -952,7 +952,7 @@ def build_15m_trigger(
     direction: str,
     min_vol_mult: float = 1.0,
     event_detected_at_ts: int | None = None,
-    max_trigger_delay_min: float = 60.0,
+    max_trigger_delay_min: float = 30.0,
     require_event_ts: bool = False,
 ) -> bool:
     diagnostic = diagnose_15m_trigger(

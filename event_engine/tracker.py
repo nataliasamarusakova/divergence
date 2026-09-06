@@ -360,6 +360,7 @@ def register_active_trade(
         "entry_slippage_pct": entry_slippage_pct,
         "adverse_entry_slippage_pct": adverse_entry_slippage_pct,
         "initial_qty": actual_qty,
+        "initial_notional_usdt": actual_entry_price * actual_qty,
         "remaining_qty": actual_qty,
         "entry_ts": actual_entry_ts,
         "tp_orders": tp_orders if isinstance(tp_orders, list) else [],
@@ -1126,8 +1127,24 @@ def update_active_trades() -> None:
                 exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct)
+            initial_notional_usdt = _safe_float(trade.get("initial_notional_usdt"), entry_price * init_qty)
+            realized_pnl_usdt = (realized_weighted / 100.0) * entry_price if entry_price > 0 else None
+            planned_risk_usdt = (initial_notional_usdt * planned_risk_pct / 100.0) if planned_risk_pct else None
             stored_sl_price = _safe_float((trade.get("sl_order") or {}).get("stop_price"), 0.0) if isinstance(trade.get("sl_order"), dict) else 0.0
             actual_initial_sl_price = _safe_float(trade.get("planned_invalidation_price"), 0.0)
+            stop_slippage_pct = None
+            if sl_exit_price is not None and actual_initial_sl_price > 0:
+                if direction == "LONG":
+                    stop_slippage_pct = max(0.0, (actual_initial_sl_price - sl_exit_price) / actual_initial_sl_price * 100.0)
+                else:
+                    stop_slippage_pct = max(0.0, (sl_exit_price - actual_initial_sl_price) / actual_initial_sl_price * 100.0)
+            loss_pct = max(0.0, -final_pnl)
+            tail_loss_multiple = (loss_pct / planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else None
+            execution_anomaly = bool(
+                exit_reason in {"STOP_LOSS", "BREAK_EVEN"}
+                and tail_loss_multiple is not None
+                and tail_loss_multiple >= 1.50
+            )
             actual_initial_sl_risk_pct = None
             if actual_initial_sl_price > 0 and entry_price > 0:
                 actual_initial_sl_risk_pct = abs(entry_price - actual_initial_sl_price) / entry_price * 100.0
@@ -1164,6 +1181,14 @@ def update_active_trades() -> None:
                         "realized_pnl_pct": final_pnl,
                         "realized_rr": realized_rr,
                         "effective_weighted_rr": planned_rr,
+                        "planned_risk_pct": planned_risk_pct,
+                        "planned_risk_usdt": planned_risk_usdt,
+                        "initial_notional_usdt": initial_notional_usdt,
+                        "realized_pnl_usdt": realized_pnl_usdt,
+                        "actual_loss_pct": loss_pct,
+                        "tail_loss_multiple": tail_loss_multiple,
+                        "stop_slippage_pct": stop_slippage_pct,
+                        "execution_anomaly": execution_anomaly,
                         "tp_mode": trade.get("tp_mode", "multi_tp"),
                         "effective_tp_levels": trade.get("effective_tp_levels", []),
                         "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),

@@ -17,7 +17,7 @@ COINALYZE_URL = os.environ.get("COINALYZE_URL", "https://coinalyze.net/").strip(
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "").strip()
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "").strip()
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
-DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "debug_page.html")
+DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "").strip()
 
 
 @dataclass(frozen=True)
@@ -455,11 +455,12 @@ def fetch_data() -> list[CoinalyzeRow]:
         browser, page = _setup_browser_context(p)
         try:
             html = _load_page(page, COINALYZE_URL)
-            try:
-                with open(DEBUG_HTML_FILE, "w", encoding="utf-8") as f:
-                    f.write(html)
-            except OSError as exc:
-                log.warning("[COINALYZE] Cannot write debug HTML %s: %s", DEBUG_HTML_FILE, exc)
+            if DEBUG_HTML_FILE:
+                try:
+                    with open(DEBUG_HTML_FILE, "w", encoding="utf-8") as f:
+                        f.write(html)
+                except OSError as exc:
+                    log.warning("[COINALYZE] Cannot write debug HTML %s: %s", DEBUG_HTML_FILE, exc)
 
             rows = parse_table(html)
             for row in rows:
