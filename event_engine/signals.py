@@ -135,30 +135,46 @@ def _event_id(
 def add_cvd(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Build a continuous CVD state without fabricating zero flow.
+
+    A missing/invalid taker-flow bar does not reset the cumulative CVD. The last
+    known CVD value is carried forward, while ``taker_flow_valid`` stays False so
+    callers can apply a coverage/validity policy. This preserves continuity
+    without asserting that missing flow was actually zero.
+    """
     work = df.copy()
 
     if "bar_delta_usdt" not in work.columns:
         work["bingx_cvd"] = float("nan")
+        work["taker_flow_valid"] = False
         work["cvd_segment_id"] = 0
+        work["cvd_valid_coverage"] = 0.0
         return work
 
     if "taker_flow_valid" not in work.columns:
         work["taker_flow_valid"] = False
 
     work["taker_flow_valid"] = work["taker_flow_valid"].fillna(False).astype(bool)
-    work["cvd_segment_id"] = (~work["taker_flow_valid"]).cumsum()
-    work["bingx_cvd"] = float("nan")
+    work["bar_delta_usdt"] = pd.to_numeric(work["bar_delta_usdt"], errors="coerce")
 
-    for _, idx in work.groupby("cvd_segment_id", sort=False).groups.items():
-        valid_idx = [
-            i for i in idx
-            if bool(work.at[i, "taker_flow_valid"]) and pd.notna(work.at[i, "bar_delta_usdt"])
-        ]
-        if not valid_idx:
-            continue
+    cvd = []
+    coverage = []
+    current = float("nan")
+    valid_count = 0
+    for i in work.index:
+        valid = bool(work.at[i, "taker_flow_valid"]) and pd.notna(work.at[i, "bar_delta_usdt"])
+        if valid:
+            delta = float(work.at[i, "bar_delta_usdt"])
+            current = delta if pd.isna(current) else current + delta
+            valid_count += 1
+        cvd.append(current)
+        coverage.append(valid_count / max(1, len(cvd)))
 
-        work.loc[valid_idx, "bingx_cvd"] = work.loc[valid_idx, "bar_delta_usdt"].cumsum()
-
+    work["bingx_cvd"] = cvd
+    work["cvd_valid_coverage"] = coverage
+    # Kept as a stable column for existing event metadata/tests; there are no
+    # artificial segments anymore, so every row belongs to the same sequence.
+    work["cvd_segment_id"] = 0
     return work
 
 
@@ -300,12 +316,13 @@ def detect_divergences(
             return
 
         if indicator == "bingx_cvd":
-            if "bar_delta_usdt" not in work.columns:
+            # CVD is continuous across missing bars, but a divergence must still
+            # have enough valid taker-flow observations to be trustworthy.
+            if "taker_flow_valid" not in work.columns:
                 return
             span = work.iloc[p1i:detected + 1]
-            if not span["bar_delta_usdt"].notna().all():
-                return
-            if work["cvd_segment_id"].iloc[p1i] != work["cvd_segment_id"].iloc[detected]:
+            valid = span["taker_flow_valid"].astype(bool) & span["bar_delta_usdt"].notna()
+            if valid.mean() < 0.80:
                 return
 
         price_column = "low" if is_low else "high"

@@ -168,7 +168,7 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("sl_order_history", [])
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
-                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.05))
+                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.6625))
                 t.setdefault("close_journal_pending", False)
                 t.setdefault("close_notification_pending", False)
                 t.setdefault("close_cleanup_pending", False)
@@ -253,7 +253,7 @@ def update_active_trade_protection(
             if tp_mode:
                 trade["tp_mode"] = tp_mode
             if effective_weighted_rr is not None:
-                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 1.05)
+                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 1.6625)
             trade["protection_last_updated_ts"] = int(time.time() * 1000)
             _save_active_trades(trades)
             return True
@@ -266,22 +266,22 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         return {
             "planned_risk_pct": None,
             "planned_target_rr": None,
-            "planned_weighted_rr": 1.05,
+            "planned_weighted_rr": 1.6625,
             "entry_reference": None,
             "invalidation_price": None,
             "target_price": None,
             "tp_levels": [],
             "effective_tp_levels": [],
-            "effective_weighted_rr": 1.05,
+            "effective_weighted_rr": 1.6625,
             "tp_mode": "multi_tp",
         }
 
     return {
         "planned_risk_pct": _safe_float(setup.get("risk_pct"), 0.0) if setup.get("risk_pct") is not None else None,
         "planned_target_rr": _safe_float(setup.get("target_rr"), 0.0) if setup.get("target_rr") is not None else None,
-        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.05), 1.05),
+        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.6625), 1.6625),
         "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
-        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.05)), 1.05),
+        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.6625)), 1.6625),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "entry_reference": _safe_float(setup.get("entry_reference"), 0.0) if setup.get("entry_reference") is not None else None,
         "invalidation_price": _safe_float(setup.get("invalidation_price"), 0.0) if setup.get("invalidation_price") is not None else None,
@@ -948,8 +948,13 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
-            # Retry a failed TP -> BE transition while the position remains open.
-            if bool(trade.get("hit_legs")) and not trade.get("be_activated") and rem_qty > 0:
+            # Retry a failed TP -> BE transition only after the BE milestone.
+            # Normal/squeeze 3-leg profiles activate BE at TP2; a true single-TP
+            # profile can activate it only at its terminal TP3 milestone.
+            hit_legs = {str(x).lower() for x in trade.get("hit_legs", []) if x}
+            is_single_tp = trade.get("tp_mode") == "single_tp"
+            should_move_to_be = ("tp2" in hit_legs) or (is_single_tp and "tp3" in hit_legs)
+            if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
@@ -1040,8 +1045,11 @@ def update_active_trades() -> None:
                     except Exception as exc:
                         log.error("[TELEGRAM] TP notification queue error %s %s %s: %s", symbol, leg, event_id, exc)
 
-                    # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ ВЗЯТИЯ ТЕЙКА (audit fix B4: cancel-first swap)
-                    if not trade.get("be_activated") and rem_qty > 0:
+                    # Move to BE only at the TP2 milestone (or terminal TP3 for
+                    # an explicitly single-TP trade). TP1 alone never arms BE.
+                    is_single_tp = trade.get("tp_mode") == "single_tp"
+                    should_move_to_be = (leg == "tp2") or (is_single_tp and leg == "tp3")
+                    if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
                         old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
@@ -1073,8 +1081,8 @@ def update_active_trades() -> None:
                             except Exception as exc:
                                 log.error("[TELEGRAM] BE activation notification queue error %s: %s", event_id, exc)
                             log.info(
-                                "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
-                                trade.get("name", symbol), symbol, entry_price
+                                "[TRACKER_BE_ACTIVATED] %s (%s) %s milestone reached. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                trade.get("name", symbol), symbol, leg.upper(), entry_price
                             )                             
                         else:
                             trade["be_required"] = True
@@ -1151,7 +1159,7 @@ def update_active_trades() -> None:
             elif stored_sl_price > 0 and entry_price > 0:
                 actual_initial_sl_risk_pct = abs(entry_price - stored_sl_price) / entry_price * 100.0
             exit_reason_confidence = "confirmed" if exit_reason in {"TAKE_PROFIT_FULL", "STOP_LOSS", "BREAK_EVEN"} and (closed_by_tp or sl_exit_price is not None) else "unknown"
-            planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
+            planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.6625)), 1.6625)
 
             trade["remaining_qty"] = 0.0
             trade["realized_pnl_pct"] = final_pnl

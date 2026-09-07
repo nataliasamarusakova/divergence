@@ -158,7 +158,7 @@ def format_signal(
         ])
 
     if setup:
-        rr = setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.05))))
+        rr = setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.6625))))
         tp_mode = setup.get("tp_mode")
         trigger = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
         lines.extend([
