@@ -54,7 +54,7 @@
     "peak_pnl_pct": 0.667259786476869,
     "mae_pct": -1.1565836298932346,
     "max_drawdown_pct": -1.8238434163701036,
-    "current_pnl_pct": -0.9786476868327435,
+    "current_pnl_pct": -1.1120996441281148,
     "score": 90.0,
     "event_type": "HIDDEN_BULLISH_MACD",
     "timeframe": "4h",
@@ -201,13 +201,204 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788743469894,
+    "last_observation_ts": 1788743756408,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
     "close_cleanup_last_error": null,
     "last_exchange_avg_price": 0.2248,
     "current_position_qty": 44.0,
-    "protection_last_updated_ts": 1788743478051
+    "protection_last_updated_ts": 1788743759109
+  },
+  "EVT_3E5AD072A32126C5": {
+    "trade_id": "TR_CF9ECE20B71FA7F03EDD1D16",
+    "event_id": "EVT_3E5AD072A32126C5",
+    "symbol": "INJ",
+    "name": "Injective Protocol",
+    "direction": "LONG",
+    "entry_price": 5.422,
+    "actual_entry_price": 5.422,
+    "requested_entry_price": 5.405,
+    "signal_reference_price": 5.405,
+    "pre_order_reference_price": 5.405,
+    "entry_slippage_pct": 0.3145235892691852,
+    "adverse_entry_slippage_pct": 0.3145235892691852,
+    "initial_qty": 1.0,
+    "initial_notional_usdt": 5.422,
+    "remaining_qty": 1.0,
+    "entry_ts": 1788743840821,
+    "tp_orders": [
+      {
+        "leg": "tp3",
+        "status": "created",
+        "order_id": "2096769763455361024",
+        "client_order_id": null,
+        "price": 5.847554724739999,
+        "qty": 1.0,
+        "pnl_pct": 7.848667
+      }
+    ],
+    "sl_order": {
+      "status": "created",
+      "order_id": "2096769759160393728",
+      "client_order_id": null,
+      "stop_price": 5.280148422130593,
+      "qty": 1.0
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "sl_order_history": [],
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": 0.0,
+    "score": 95.0,
+    "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+    "timeframe": "1h",
+    "research": {
+      "fr_oiw": 0.014,
+      "pfr_oiw": 0.0075,
+      "liq_short24": 62400.0,
+      "liq_long24": 35000.0,
+      "ls_accounts": 1.38,
+      "oi": 50200000.0,
+      "oi_chg24_pct": 30.51,
+      "oi_chg4h_pct": 23.08,
+      "oi_vol_ratio": 0.496,
+      "oi_mktcap_ratio": 0.092,
+      "volume24": 101100000.0,
+      "btc_corr7d": 0.45,
+      "cvd24": 100.0,
+      "lls24": 36.6878
+    },
+    "setup": {
+      "entry_reference": 5.422,
+      "invalidation_price": 5.280148422130593,
+      "target_price": 5.84755473360822,
+      "risk_pct": 2.6162223878533104,
+      "target_rr": 3.0,
+      "planned_weighted_rr": 2.05,
+      "realized_rr": null,
+      "trigger_ok": true,
+      "trigger": {
+        "event_detected_at_ts": 1788742800000,
+        "trigger_bar_close_ts": 1788743700000,
+        "trigger_price": 5.437,
+        "trigger_delay_min": 15.0,
+        "signal_to_trigger_drift_pct": 0.592044,
+        "volume_ratio": 1.5824835136914317
+      },
+      "signal_price": 5.405,
+      "entry_risk": {
+        "signal_to_trigger_drift_pct": 0.592044,
+        "oi_chg24_pct": 30.51,
+        "hot_oi_warning": false,
+        "short_defensive_mode": false,
+        "symbol_quarantine_until_ts": null
+      },
+      "event_timeframe": "1h",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "confluence_events": [
+        {
+          "event_id": "EVT_409F6C9D8B32488D",
+          "event_type": "HIDDEN_BULLISH_MACD",
+          "timeframe": "1h",
+          "score": 85.0,
+          "detected_at_ts": 1788742800000
+        },
+        {
+          "event_id": "EVT_5FF6C9A2AD766F20",
+          "event_type": "HIDDEN_BULLISH_OBV",
+          "timeframe": "1h",
+          "score": 85.0,
+          "detected_at_ts": 1788742800000
+        },
+        {
+          "event_id": "EVT_CAC0C7EB779A1AA5",
+          "event_type": "HIDDEN_BULLISH_RSI",
+          "timeframe": "1h",
+          "score": 70.0,
+          "detected_at_ts": 1788742800000
+        }
+      ],
+      "conflict_events": [],
+      "pre_order_reference_price": 5.405,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 2.616222,
+          "close_fraction": 0.3
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 5.232445,
+          "close_fraction": 0.35
+        },
+        {
+          "leg": "tp3",
+          "pnl_pct": 7.848667,
+          "close_fraction": 0.35
+        }
+      ],
+      "effective_tp_levels": [
+        {
+          "leg": "tp3",
+          "pnl_pct": 7.848667,
+          "close_fraction": 1.0,
+          "qty": 1.0
+        }
+      ],
+      "tp_mode": "single_tp",
+      "effective_weighted_rr": 2.999999937482405
+    },
+    "planned_risk_pct": 2.6162223878533104,
+    "planned_target_rr": 3.0,
+    "planned_weighted_rr": 2.05,
+    "planned_entry_reference": 5.422,
+    "planned_invalidation_price": 5.280148422130593,
+    "planned_target_price": 5.84755473360822,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 2.616222,
+        "close_fraction": 0.3
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 5.232445,
+        "close_fraction": 0.35
+      },
+      {
+        "leg": "tp3",
+        "pnl_pct": 7.848667,
+        "close_fraction": 0.35
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp3",
+        "pnl_pct": 7.848667,
+        "close_fraction": 1.0,
+        "qty": 1.0
+      }
+    ],
+    "tp_mode": "single_tp",
+    "effective_weighted_rr": 2.999999937482405,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1788743842476
   }
 }
