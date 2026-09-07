@@ -14,7 +14,7 @@
     "adverse_entry_slippage_pct": 0.03836807775930571,
     "initial_qty": 1.27,
     "initial_notional_usdt": 9.93394,
-    "remaining_qty": 1.27,
+    "remaining_qty": 0.8200000000000001,
     "entry_ts": 1788737508687,
     "tp_orders": [
       {
@@ -30,31 +30,32 @@
         "order_id": "2096743206267478016",
         "price": 7.933,
         "qty": 0.44
-      },
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096743205076295680",
-        "price": 7.877,
-        "qty": 0.45
       }
     ],
     "sl_order": {
       "status": "already_exists",
-      "order_id": "2096743199871164416",
-      "stop_price": 7.711,
-      "qty": 1.27
+      "order_id": "2096753196596289536",
+      "stop_price": 7.822,
+      "qty": 0.82
     },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
+    "hit_legs": [
+      "tp1"
+    ],
+    "be_activated": true,
+    "be_activation_ts": 1788739888574,
     "be_required": false,
     "be_last_error": null,
-    "sl_order_history": [],
-    "peak_pnl_pct": 0.5880848887752527,
+    "sl_order_history": [
+      {
+        "order_id": "2096743199871164416",
+        "stop_price": 7.711,
+        "replaced_ts": 1788739888574
+      }
+    ],
+    "peak_pnl_pct": 0.9460496036819208,
     "mae_pct": -0.29404244438762067,
     "max_drawdown_pct": -0.8821273331628734,
-    "current_pnl_pct": 0.39631807721809886,
+    "current_pnl_pct": 0.8949117872666874,
     "score": 80.0,
     "event_type": "HIDDEN_BULLISH_MACD",
     "timeframe": "1h",
@@ -189,10 +190,12 @@
     ],
     "tp_mode": "multi_tp",
     "effective_weighted_rr": 1.0472441958373204,
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null,
+    "tp_filled_qty": {
+      "tp1": 0.45
+    },
+    "realized_pnl_qty": 0.45,
+    "realized_pnl_weighted_sum": 0.3049092303758626,
+    "last_tp_exec_price": 7.875,
     "last_close_exec_price": null,
     "realized_pnl_pct": null,
     "realized_rr": null,
@@ -201,13 +204,13 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788739550954,
+    "last_observation_ts": 1788739888574,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
     "close_cleanup_last_error": null,
     "last_exchange_avg_price": 7.822,
-    "current_position_qty": 1.27,
-    "protection_last_updated_ts": 1788739553480
+    "current_position_qty": 0.82,
+    "protection_last_updated_ts": 1788739894093
   }
 }
