@@ -247,7 +247,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == 1.05
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 3
@@ -257,7 +257,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == 1.05
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 3
@@ -326,7 +326,7 @@ def test_execute_new_position_defines_pre_order_price(monkeypatch):
         "effective_tp_levels": [{"leg": "tp3", "pnl_pct": 1.75, "close_fraction": 1.0, "qty": 0.1}],
         "effective_weighted_rr": 1.75,
     })
-    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.05, "entry_reference": 99.0, "target_rr": 1.75}
+    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.6625, "entry_reference": 99.0, "target_rr": 2.50}
     out = execute_new_position("TEST", "LONG", 99.0, setup, "EVT_TEST")
     assert out["status"] == "opened_protected"
     assert out["open_result"]["order_reference_price"] == 100.0
@@ -350,8 +350,8 @@ def test_failed_telegram_delivery_is_retryable(tmp_path: Path):
 
 def test_default_setup_rr_is_v2_1_05():
     metrics = _extract_setup_metrics(None)
-    assert metrics["planned_weighted_rr"] == pytest.approx(1.05)
-    assert metrics["effective_weighted_rr"] == pytest.approx(1.05)
+    assert metrics["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert metrics["effective_weighted_rr"] == pytest.approx(1.6625)
 
 
 def test_telegram_message_uses_effective_rr_and_tp_mode():
@@ -1232,12 +1232,13 @@ def test_squeeze_tp_levels_are_wider_than_divergence():
 
     # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
-    assert div_setup["target_rr"] == 1.75
-    assert div_setup["planned_weighted_rr"] == 1.05
+    assert div_setup["target_rr"] == 2.50
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
-    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.50)
-    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.00)
-    assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 1.75)
+    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.75)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.50)
+    assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 2.50)
+    assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.40, 0.35])
 
     # Squeeze setup
     sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
@@ -1252,7 +1253,7 @@ def test_squeeze_tp_levels_are_wider_than_divergence():
     assert tp_sq[2]["close_fraction"] == 0.35
 
 
-def test_tracker_activates_be_if_any_tp_hit_without_tp1(monkeypatch, tmp_path):
+def test_tracker_activates_be_after_tp2(monkeypatch, tmp_path):
     import event_engine.tracker as tr
     from pathlib import Path
 
@@ -1286,6 +1287,28 @@ def test_tracker_activates_be_if_any_tp_hit_without_tp1(monkeypatch, tmp_path):
     saved = json.loads(active_path.read_text(encoding="utf-8"))
     assert len(be_calls) == 1
     assert saved["EVT_TEST"]["be_activated"] is True
+
+
+def test_tracker_does_not_activate_be_after_tp1(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+    active_path = tmp_path / "active_trades.json"
+    trade_record = {
+        "trade_id": "TR_TEST_TP1", "event_id": "EVT_TP1", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 10.0, "remaining_qty": 7.5, "entry_ts": 1000,
+        "hit_legs": ["tp1"], "be_activated": False,
+        "sl_order": {"order_id": "OLD_SL", "stop_price": 95.0}, "tp_orders": [], "closed": False,
+    }
+    active_path.write_text(json.dumps({"EVT_TP1": trade_record}), encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.5", "avgPrice": "100.0"})
+    monkeypatch.setattr(tr, "fetch_klines", lambda s, tf, limit=60: [{"close": 101.0}])
+    be_calls = []
+    monkeypatch.setattr(tr, "_move_sl_to_break_even", lambda *a, **k: be_calls.append(True) or {"status": "created", "order_id": "NEW_BE"})
+    tr.update_active_trades()
+    saved = json.loads(active_path.read_text(encoding="utf-8"))
+    assert be_calls == []
+    assert saved["EVT_TP1"]["be_activated"] is False
 
 
 def test_symbol_cooldown_respects_trade_close(tmp_path):
@@ -1618,7 +1641,7 @@ def test_short_defensive_score_is_stricter():
     ev = {"direction": "SHORT", "event_type": "REGULAR_BEARISH_MACD", "event_fact": {"price_delta_atr": 1.0}}
     score = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
     assert score > 0
-    assert ro.MIN_SHORT_SCORE == 85.0
+    assert ro.MIN_SHORT_SCORE == 75.0
 
 
 def test_hot_oi_penalty_applies_to_score():
@@ -1666,3 +1689,21 @@ def test_execute_new_position_rolls_back_excessive_entry_drift(monkeypatch):
     assert out["status"] == "ENTRY_DRIFT_EXCEEDED"
     assert out["rolled_back"] is True
     assert out["execution_quality"]["signal_to_fill_distance_pct"] == pytest.approx(4.0)
+
+
+def test_hot_oi_is_score_only():
+    import run_once as ro
+    assert not hasattr(ro, "HARD_HOT_OI_CHG24_PCT")
+    assert ro.HOT_OI_SCORE_PENALTY > 0
+
+
+def test_add_cvd_carries_value_across_missing_bar_without_zero_fill():
+    from event_engine.signals import add_cvd
+    df = pd.DataFrame({
+        "bar_delta_usdt": [10.0, np.nan, -3.0],
+        "taker_flow_valid": [True, False, True],
+    })
+    out = add_cvd(df)
+    assert out["bingx_cvd"].tolist() == pytest.approx([10.0, 10.0, 7.0])
+    assert out["taker_flow_valid"].tolist() == [True, False, True]
+    assert out["cvd_valid_coverage"].iloc[1] == pytest.approx(0.5)

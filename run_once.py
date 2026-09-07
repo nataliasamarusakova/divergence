@@ -84,13 +84,12 @@ REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "tr
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
-MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "30"))
+MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "45"))
 MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
 MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "3.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
-MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "85"))
+MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "75"))
 MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
-HARD_HOT_OI_CHG24_PCT = float(os.environ.get("HARD_HOT_OI_CHG24_PCT", "75"))
 HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
@@ -1006,8 +1005,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
 
     ev_type = str(ev.get("event_type", "")).upper()
     is_squeeze = "SQUEEZE" in ev_type
-    target_rr = 3.0 if is_squeeze else 1.75
-    planned_weighted_rr = 2.05 if is_squeeze else 1.05
+    target_rr = 3.0 if is_squeeze else 2.50
+    planned_weighted_rr = 2.05 if is_squeeze else 1.6625
 
     # TP3 (финальная цель) ставится на target_rr
     if direction == "LONG":
@@ -1064,18 +1063,19 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         planned_weighted_rr = 2.05
         target_rr = 3.0
     else:
-        # Оптимальный 3-уровневый каскад для дивергенций:
-        # TP1: 0.50 * SL (35% объема + перевод в БУ)
-        # TP2: 1.00 * SL (35% объема)
-        # TP3: 1.75 * SL (30% объема)
-        # Взвешенный R:R: 0.35 * 0.50 + 0.35 * 1.00 + 0.30 * 1.75 = 1.05
+        # Normal divergence cascade: take a small early partial, protect only
+        # after TP2, and keep enough size for the higher-R move.
+        # TP1: 0.75R -> 25% (no BE)
+        # TP2: 1.50R -> 40% (move SL to BE)
+        # TP3: 2.50R -> 35%
+        # Weighted RR = 0.25*0.75 + 0.40*1.50 + 0.35*2.50 = 1.6625R
         tp_levels = [
-            {"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35},
-            {"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35},
-            {"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30},
+            {"leg": "tp1", "pnl_pct": round(sl_pct * 0.75, 6), "close_fraction": 0.25},
+            {"leg": "tp2", "pnl_pct": round(sl_pct * 1.50, 6), "close_fraction": 0.40},
+            {"leg": "tp3", "pnl_pct": round(sl_pct * 2.50, 6), "close_fraction": 0.35},
         ]
-        planned_weighted_rr = 1.05
-        target_rr = 1.75
+        planned_weighted_rr = 1.6625
+        target_rr = 2.50
 
     setup["risk_pct"] = sl_pct
     setup["target_rr"] = target_rr
@@ -1373,10 +1373,10 @@ def reconcile_all_open_positions() -> None:
                                 "close_fraction": _safe_float(tp.get("qty"), 0.0) / max(qty, 1e-12),
                             })
                         if not inferred_levels:
-                            inferred_levels = [{"leg": "tp1", "pnl_pct": inferred_risk * 1.75, "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * 2.50, "close_fraction": 1.0}]
                         total_fraction = sum(max(_safe_float(x.get("close_fraction"), 0.0), 0.0) for x in inferred_levels)
                         if total_fraction <= 0:
-                            inferred_levels = [{"leg": "tp1", "pnl_pct": inferred_risk * 1.75, "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * 2.50, "close_fraction": 1.0}]
                         else:
                             for level in inferred_levels:
                                 level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
@@ -1487,9 +1487,9 @@ def reconcile_all_open_positions() -> None:
 
         tp_levels = []
         if matched_trade and isinstance(matched_trade.get("effective_tp_levels"), list) and matched_trade.get("effective_tp_levels"):
-            # Preserve the exact original protection profile, including squeeze TP1/TP2/TP3
-            # distances and micro-position single-TP mode. Never silently replace a squeeze
-            # with the ordinary divergence 0.5R/1R/1.75R profile during restart repair.
+            # Preserve the exact original protection profile, including squeeze and normal
+            # TP distances and micro-position single-TP mode. Never silently rewrite a
+            # matched trade during restart repair.
             for level in matched_trade.get("effective_tp_levels", []):
                 if not isinstance(level, dict):
                     continue
@@ -1505,15 +1505,22 @@ def reconcile_all_open_positions() -> None:
                     tp_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
         if not tp_levels:
-            if "tp1" not in hit_legs:
-                tp_levels.append({"leg": "tp1", "pnl_pct": round(sl_pct * 0.50, 6), "close_fraction": 0.35})
-            if "tp2" not in hit_legs:
-                tp_levels.append({"leg": "tp2", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.35})
-            if "tp3" not in hit_legs:
-                tp_levels.append({"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 0.30})
+            if "SQUEEZE" in str((matched_trade or {}).get("event_type", "")).upper():
+                default_levels = [
+                    {"leg": "tp1", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.30},
+                    {"leg": "tp2", "pnl_pct": round(sl_pct * 2.00, 6), "close_fraction": 0.35},
+                    {"leg": "tp3", "pnl_pct": round(sl_pct * 3.00, 6), "close_fraction": 0.35},
+                ]
+            else:
+                default_levels = [
+                    {"leg": "tp1", "pnl_pct": round(sl_pct * 0.75, 6), "close_fraction": 0.25},
+                    {"leg": "tp2", "pnl_pct": round(sl_pct * 1.50, 6), "close_fraction": 0.40},
+                    {"leg": "tp3", "pnl_pct": round(sl_pct * 2.50, 6), "close_fraction": 0.35},
+                ]
+            tp_levels.extend([x for x in default_levels if x["leg"] not in hit_legs])
 
         if not tp_levels:
-            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * 1.75, 6), "close_fraction": 1.0}]
+            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * (3.00 if "SQUEEZE" in str((matched_trade or {}).get("event_type", "")).upper() else 2.50), 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
@@ -1691,8 +1698,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
         ev_type = str(setup.get("event_type", "")).upper()
         is_squeeze = "SQUEEZE" in ev_type
-        target_rr = 3.0 if is_squeeze else 1.75
-        planned_weighted_rr = 2.05 if is_squeeze else 1.05
+        target_rr = 3.0 if is_squeeze else 2.50
+        planned_weighted_rr = 2.05 if is_squeeze else 1.6625
 
         if direction == "LONG":
             invalidation = actual_avg_price * (1.0 - planned_risk_pct / 100.0)
@@ -2146,12 +2153,10 @@ def main() -> None:
                 continue
 
             oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", 0.0), 0.0)
-            if oi_chg24 >= HARD_HOT_OI_CHG24_PCT and "SQUEEZE" not in event_type:
-                stats["rejected_hot_oi"] += 1
-                tf_stats["rejected_hot_oi"] = tf_stats.get("rejected_hot_oi", 0) + 1
-                log.info("[RISK] %s %s rejected: OI24h %.2f%% >= hard hot-OI %.2f%%", direction, symbol, oi_chg24, HARD_HOT_OI_CHG24_PCT)
-                continue
 
+            # High OI growth is treated as a score/risk-quality signal, not as a
+            # blanket hard reject. The prior 75% hard gate removed exactly the
+            # momentum instruments we still want to evaluate.
             score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
             min_score_for_direction = MIN_SHORT_SCORE if direction == "SHORT" else MIN_SCORE
             if min_score_for_direction > 0 and score < min_score_for_direction:
@@ -2159,10 +2164,6 @@ def main() -> None:
                 stats["rejected_short_score"] += int(direction == "SHORT")
                 tf_stats["rejected_score"] += 1
                 log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < required %.1f", direction, symbol, tf, event_type, score, min_score_for_direction)
-                continue
-                stats["rejected_score"] += 1
-                tf_stats["rejected_score"] += 1
-                log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < MIN_SCORE %.1f", direction, symbol, tf, event_type, score, MIN_SCORE)
                 continue
 
             if symbol not in risk_1h_cache:
