@@ -510,6 +510,7 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "trigger_no_window": 0,
         "trigger_breakout_failed": 0,
         "trigger_volume_failed": 0,
+        "trigger_data_failed": 0,
         "trigger_direction_failed": 0,
         "rejected_btc": 0,
         "rejected_funding": 0,
