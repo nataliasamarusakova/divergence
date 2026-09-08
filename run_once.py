@@ -244,6 +244,14 @@ def _is_liquidation_squeeze_event(event_type: str) -> bool:
     return str(event_type or "").upper() in {"SHORT_SQUEEZE", "LONG_SQUEEZE"}
 
 
+def _is_volatility_squeeze_event(event_type: str) -> bool:
+    return str(event_type or "").upper() == "VOLATILITY_SQUEEZE_RELEASE"
+
+
+def _is_squeeze_event(event_type: str) -> bool:
+    return _is_liquidation_squeeze_event(event_type) or _is_volatility_squeeze_event(event_type)
+
+
 def _event_trigger_max_delay_min(ev: dict) -> float:
     fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
     engine = str(fact.get("engine") or "").upper()
@@ -980,7 +988,7 @@ def calculate_setup_score(
 
     # Squeeze families retain a bonus, but volatility compression and liquidation
     # squeeze are separate event types and can be analysed independently.
-    if "SQUEEZE" in event_type:
+    if _is_squeeze_event(event_type):
         score += 25.0
 
         try:
@@ -1078,7 +1086,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
     risk_pct = max(0.50, min(risk_pct_raw, 5.00))
 
     ev_type = str(ev.get("event_type", "")).upper()
-    is_squeeze = "SQUEEZE" in ev_type
+    is_squeeze = _is_squeeze_event(ev_type)
     target_rr = 3.0 if is_squeeze else 2.50
     planned_weighted_rr = 2.05 if is_squeeze else 1.6625
 
@@ -1121,7 +1129,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         raise ValueError("Invalid SL percentage")
 
     ev_type = str(event_type or setup.get("event_type", "")).upper()
-    is_squeeze = "SQUEEZE" in ev_type
+    is_squeeze = _is_squeeze_event(ev_type)
 
     if is_squeeze:
         # Для сквизов тейки шире (импульсный потенциал и защита от преждевременного выбивания по БУ):
@@ -1569,7 +1577,7 @@ def reconcile_all_open_positions() -> None:
                     tp_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
         if not tp_levels:
-            if "SQUEEZE" in str((matched_trade or {}).get("event_type", "")).upper():
+            if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))):
                 default_levels = [
                     {"leg": "tp1", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.30},
                     {"leg": "tp2", "pnl_pct": round(sl_pct * 2.00, 6), "close_fraction": 0.35},
@@ -1584,7 +1592,7 @@ def reconcile_all_open_positions() -> None:
             tp_levels.extend([x for x in default_levels if x["leg"] not in hit_legs])
 
         if not tp_levels:
-            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * (3.00 if "SQUEEZE" in str((matched_trade or {}).get("event_type", "")).upper() else 2.50), 6), "close_fraction": 1.0}]
+            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * (3.00 if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else 2.50), 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
@@ -1643,7 +1651,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     # prices and then discovered excessive drift after the fill, which could
     # force an expensive emergency close.
     event_type_for_risk = str(setup.get("event_type", "")).upper()
-    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type_for_risk else MAX_ENTRY_DRIFT_PCT
+    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type_for_risk) else MAX_ENTRY_DRIFT_PCT
     try:
         live_reference = _current_close_price(symbol)
     except Exception as exc:
@@ -1748,7 +1756,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     )
 
     event_type_for_risk = str(setup.get("event_type", "")).upper()
-    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type_for_risk else MAX_ENTRY_DRIFT_PCT
+    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type_for_risk) else MAX_ENTRY_DRIFT_PCT
     signal_price_for_risk = _safe_float(setup.get("signal_price", price), 0.0)
     fill_drift_pct = _entry_drift_pct(signal_price_for_risk, actual_avg_price, direction)
     execution_quality["signal_to_fill_distance_pct"] = fill_drift_pct
@@ -1786,7 +1794,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             raise ValueError("invalid planned risk_pct")
 
         ev_type = str(setup.get("event_type", "")).upper()
-        is_squeeze = "SQUEEZE" in ev_type
+        is_squeeze = _is_squeeze_event(ev_type)
         target_rr = 3.0 if is_squeeze else 2.50
         planned_weighted_rr = 2.05 if is_squeeze else 1.6625
 
@@ -2432,7 +2440,7 @@ def main() -> None:
         bx_symbol = to_bx_symbol(symbol)
         opposite_direction = "SHORT" if direction == "LONG" else "LONG"
         opposite_position_open = bool(bx_symbol and current_open_positions.get((bx_symbol, opposite_direction)))
-        is_squeeze_opp = "SQUEEZE" in str(ev.get("event_type", "")).upper()
+        is_squeeze_opp = _is_squeeze_event(str(ev.get("event_type", "")))
         effective_cooldown = max(SYMBOL_ENTRY_COOLDOWN_MIN, SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN) if is_squeeze_opp else SYMBOL_ENTRY_COOLDOWN_MIN
         symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, effective_cooldown)
 
@@ -2445,7 +2453,7 @@ def main() -> None:
         trigger_age_min = ((now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
             ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
         )
-        if EXECUTION_ENABLED and trigger_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
+        if EXECUTION_ENABLED and trigger_observed_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
             stats["rejected_trigger_stale"] += 1
             execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
                                 "error": f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"}
