@@ -28,6 +28,7 @@ from event_engine.bingx import (
     has_open_position,
     emergency_close_position,
     get_position_directional,
+    _current_close_price,
 )
 from event_engine.signals import (
     add_cvd,
@@ -38,6 +39,12 @@ from event_engine.signals import (
     build_15m_trigger,
     diagnose_15m_trigger,
     check_btc_regime,
+    detect_macd_4h,
+    detect_ma_compression_breakout,
+    detect_breakout_momentum,
+    diagnose_15m_retest_trigger,
+    validate_divergence_context,
+    _atr as canonical_atr,
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health
@@ -83,12 +90,12 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "tru
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
-MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "90"))
-MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "45"))
+MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "60"))
+MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "30"))
 MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
-MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "3.00"))
+MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "2.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
-MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "75"))
+MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "85"))
 MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
 HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
@@ -101,6 +108,21 @@ SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_C
 # (e.g. 0.05 == +0.05%, -0.05 == -0.05%).
 MAX_SHORT_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_SQUEEZE_ADVERSE_FUNDING", "-0.10"))
 MAX_LONG_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_LONG_SQUEEZE_ADVERSE_FUNDING", "0.10"))
+EXTREME_SHORT_FUNDING = float(os.environ.get("EXTREME_SHORT_FUNDING", "-0.50"))
+EXTREME_LONG_FUNDING = float(os.environ.get("EXTREME_LONG_FUNDING", "0.50"))
+MAX_TRIGGER_TO_ORDER_DELAY_MIN = float(os.environ.get("MAX_TRIGGER_TO_ORDER_DELAY_MIN", "8"))
+DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN = float(os.environ.get("MAX_DIVERGENCE_POST_CONFIRM_AGE_MIN", os.environ.get("MAX_DIVERGENCE_FORMATION_AGE_MIN", "45")))
+MA_COMPRESSION_RETEST_MAX_DELAY_MIN = float(os.environ.get("MA_COMPRESSION_RETEST_MAX_DELAY_MIN", "120"))
+BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN = float(os.environ.get("BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN", "90"))
+VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN = float(os.environ.get("VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN", "60"))
+REQUIRE_4H_CONTEXT_FOR_1H = os.environ.get("REQUIRE_4H_CONTEXT_FOR_1H", "true").lower() == "true"
+ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
+ENABLE_MA_COMPRESSION_ENGINE = os.environ.get("ENABLE_MA_COMPRESSION_ENGINE", "true").lower() == "true"
+ENABLE_BREAKOUT_MOMENTUM_ENGINE = os.environ.get("ENABLE_BREAKOUT_MOMENTUM_ENGINE", "true").lower() == "true"
+ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED", "false").lower() == "true"
+MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
+MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
+MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
@@ -218,6 +240,33 @@ def _mark_local_position_state(
             current_positions[key] = dict(position)
 
 
+def _is_liquidation_squeeze_event(event_type: str) -> bool:
+    return str(event_type or "").upper() in {"SHORT_SQUEEZE", "LONG_SQUEEZE"}
+
+
+def _event_trigger_max_delay_min(ev: dict) -> float:
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    engine = str(fact.get("engine") or "").upper()
+    event_type = str(ev.get("event_type") or "").upper()
+    if engine == "MA_COMPRESSION":
+        return MA_COMPRESSION_RETEST_MAX_DELAY_MIN
+    if engine == "BREAKOUT_MOMENTUM":
+        return BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN
+    if event_type == "VOLATILITY_SQUEEZE_RELEASE":
+        return VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN
+    return MAX_TRIGGER_DELAY
+
+
+def _event_max_age_min(ev: dict) -> float:
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    if fact.get("requires_retest"):
+        return max(float(MAX_AGE), _event_trigger_max_delay_min(ev))
+    event_type = str(ev.get("event_type") or "").upper()
+    if "REGULAR_" in event_type or "HIDDEN_" in event_type:
+        return max(float(MAX_AGE), DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN)
+    return float(MAX_AGE)
+
+
 def _event_is_fresh(ev: dict, now_ms: int, max_age_min: int) -> bool:
     try:
         ts = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
@@ -225,6 +274,22 @@ def _event_is_fresh(ev: dict, now_ms: int, max_age_min: int) -> bool:
         return False
     age_min = (now_ms - ts) / 60_000.0
     return 0 <= age_min <= max_age_min
+
+
+def _divergence_post_confirmation_age(ev: dict, now_ms: int) -> tuple[bool, float, float, float]:
+    """Return timing validity plus confirmation lag, formation age and post-confirm age."""
+    try:
+        pivot2_ts = int(ev.get("timestamps", {}).get("pivot_2_ts", 0) or 0)
+        confirm_ts = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+    except (TypeError, ValueError):
+        return False, float("inf"), float("inf"), float("inf")
+    if pivot2_ts <= 0 or confirm_ts <= 0:
+        return False, float("inf"), float("inf"), float("inf")
+    confirmation_lag = (confirm_ts - pivot2_ts) / 60_000.0
+    formation_age = (now_ms - pivot2_ts) / 60_000.0
+    post_confirmation_age = (now_ms - confirm_ts) / 60_000.0
+    valid = confirmation_lag >= 0 and post_confirmation_age >= 0
+    return valid, formation_age, post_confirmation_age, confirmation_lag
 
 
 def _load_cached_events() -> list[dict]:
@@ -451,6 +516,8 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "rejected_cvd": 0,
         "rejected_score": 0,
         "rejected_entry_drift": 0,
+        "rejected_trigger_stale": 0,
+        "rejected_portfolio_cap": 0,
         "rejected_hot_oi": 0,
         "rejected_symbol_quarantine": 0,
         "valid_signals": 0,
@@ -477,15 +544,23 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             d = attach_oi_series(d, _load_oi_history().get(symbol))
             divs = detect_divergences(d, symbol, timeframe)
             sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
-            # Audit fix B3: forced-liquidation squeeze from Coinalyze factors.
-            liqs = detect_liquidation_squeeze(r, d, symbol, timeframe)
+            # Forced-liquidation squeeze is an opt-in research engine until local
+            # liquidation time-series coverage is available; the code remains intact.
+            liqs = detect_liquidation_squeeze(r, d, symbol, timeframe) if ENABLE_LIQUIDATION_SQUEEZE_ENGINE else []
+            strategy_events: list[dict] = []
+            if timeframe.lower() == "4h" and ENABLE_MACD_4H_ENGINE:
+                strategy_events.extend(detect_macd_4h(d, symbol, timeframe))
+            if timeframe.lower() == "1h" and ENABLE_MA_COMPRESSION_ENGINE:
+                strategy_events.extend(detect_ma_compression_breakout(d, symbol, timeframe))
+            if ENABLE_BREAKOUT_MOMENTUM_ENGINE:
+                strategy_events.extend(detect_breakout_momentum(d, symbol, timeframe))
             tf_stats["scanned"] += 1
             stats["divergence_events"] += len(divs)
             stats["squeeze_events"] += len(sqs) + len(liqs)
             tf_stats["divergence_events"] += len(divs)
             tf_stats["squeeze_events"] += len(sqs) + len(liqs)
-            stats["events_total"] += len(divs) + len(sqs) + len(liqs)
-            for ev in divs + sqs + liqs:
+            stats["events_total"] += len(divs) + len(sqs) + len(liqs) + len(strategy_events)
+            for ev in divs + sqs + liqs + strategy_events:
                 if not _event_is_fresh(ev, now_ms, MAX_AGE):
                     continue
                 fresh.append(ev)
@@ -772,12 +847,12 @@ def check_funding_filter(
     max_short_adverse: float | None = None,
     max_long_adverse: float | None = None,
 ) -> tuple[bool, str]:
-    """Block adverse funding only for squeeze events.
+    """Apply directional funding safety vetoes.
 
     Funding is stored in percentage-point units (0.10 == +0.10%).
-    Normal/divergence signals are intentionally not hard-blocked by funding.
-    Active squeeze events use +/-0.10% hard limits. Explicit threshold
-    arguments remain supported for tests/backward compatibility.
+    Extreme funding is a safety veto for every engine; liquidation squeezes
+    additionally use tighter directional limits. Explicit thresholds remain
+    supported for tests/backward compatibility.
     """
     if row is None:
         return True, "NO_ROW"
@@ -790,28 +865,28 @@ def check_funding_filter(
         return True, "INVALID_FUNDING_DATA"
 
     d = str(direction).upper()
-    is_squeeze = "SQUEEZE" in str(event_type or "").upper()
+    event_upper = str(event_type or "").upper()
+    is_liq_squeeze = _is_liquidation_squeeze_event(event_upper)
 
-    # Funding is a hard entry gate only for squeeze events. For ordinary
-    # divergence signals, funding remains a research/context field and must
-    # not block an otherwise valid setup.
-    if not is_squeeze and max_short_adverse is None and max_long_adverse is None:
-        return True, "OK_NORMAL_FUNDING_NOT_FILTERED"
-
-    short_limit = MAX_SHORT_SQUEEZE_ADVERSE_FUNDING if is_squeeze else float("-inf")
-    long_limit = MAX_LONG_SQUEEZE_ADVERSE_FUNDING if is_squeeze else float("inf")
+    # Extreme funding is a universal safety veto. Only actual liquidation-squeeze
+    # events get the tighter directional crowding limits; volatility squeeze release
+    # is a different mechanism and must not inherit liquidation-funding semantics.
+    short_limit = MAX_SHORT_SQUEEZE_ADVERSE_FUNDING if is_liq_squeeze else EXTREME_SHORT_FUNDING
+    long_limit = MAX_LONG_SQUEEZE_ADVERSE_FUNDING if is_liq_squeeze else EXTREME_LONG_FUNDING
     if max_short_adverse is not None:
         short_limit = float(max_short_adverse)
     if max_long_adverse is not None:
         long_limit = float(max_long_adverse)
 
     if d == "SHORT" and fr_val < short_limit:
-        scope = "SQUEEZE" if is_squeeze else "OVERRIDE"
+        scope = "SQUEEZE" if is_liq_squeeze else "OVERRIDE"
         return False, f"ADVERSE_FUNDING_SHORT_{scope} (fr={fr_val:.4f} < {short_limit:.4f})"
     if d == "LONG" and fr_val > long_limit:
-        scope = "SQUEEZE" if is_squeeze else "OVERRIDE"
+        scope = "SQUEEZE" if is_liq_squeeze else "OVERRIDE"
         return False, f"ADVERSE_FUNDING_LONG_{scope} (fr={fr_val:.4f} > {long_limit:.4f})"
 
+    if not is_liq_squeeze:
+        return True, "OK_NORMAL_FUNDING_NOT_FILTERED"
     return True, "OK"
 
 
@@ -888,14 +963,22 @@ def calculate_setup_score(
         score += 10.0
 
     if event_type.endswith(("_MACD", "_STOCH", "_OBV", "_OI")):
-        # Audit P1-1/P2-1/P2-2: new divergence families score like CVD.
         score += 15.0
 
     if "CVD" in event_type:
         score += 15.0
 
-    # Бонус за Сквиз: +25 баллов (лидер по прибыли).
-    # Audit P1-2: applies to volatility and forced-liquidation squeezes alike.
+    # Standalone engines get an explicit identity bonus instead of being hidden
+    # inside the generic divergence score. These remain capped at 100.
+    if event_type == "MACD_4H_BULLISH_CROSS" or event_type == "MACD_4H_BEARISH_CROSS":
+        score += 25.0
+    elif event_type == "MA_COMPRESSION_BREAKOUT":
+        score += 25.0
+    elif event_type == "BREAKOUT_MOMENTUM":
+        score += 30.0
+
+    # Squeeze families retain a bonus, but volatility compression and liquidation
+    # squeeze are separate event types and can be analysed independently.
     if "SQUEEZE" in event_type:
         score += 25.0
 
@@ -980,17 +1063,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
     if df[["high", "low", "close"]].isna().any().any():
         raise ValueError("invalid OHLC data")
 
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
+    atr = canonical_atr(df, 14).iloc[-1]
     if pd.isna(atr) or float(atr) <= 0:
         raise ValueError("ATR unavailable")
 
@@ -1468,17 +1541,7 @@ def reconcile_all_open_positions() -> None:
                 for col in ("high", "low", "close"):
                     df1[col] = pd.to_numeric(df1[col], errors="coerce")
 
-                prev_close = df1["close"].shift(1)
-                tr = pd.concat(
-                    [
-                        df1["high"] - df1["low"],
-                        (df1["high"] - prev_close).abs(),
-                        (df1["low"] - prev_close).abs(),
-                    ],
-                    axis=1,
-                ).max(axis=1)
-
-                atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
+                atr = canonical_atr(df1, 14).iloc[-1]
                 if pd.notna(atr) and float(atr) > 0:
                     risk_pct = max(0.50, min(float(atr) * 1.5 / avg_price * 100.0, 5.00))
                     sl_pct = risk_pct
@@ -1574,6 +1637,28 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     log.info("[EXECUTION] Opening market position: %s %s at ref price %.8g...", direction, symbol, price)
 
+    # Hard pre-order drift guard against price movement while the opportunity
+    # was being evaluated. The old implementation only compared trigger/event
+    # prices and then discovered excessive drift after the fill, which could
+    # force an expensive emergency close.
+    event_type_for_risk = str(setup.get("event_type", "")).upper()
+    drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type_for_risk else MAX_ENTRY_DRIFT_PCT
+    try:
+        live_reference = _current_close_price(symbol)
+    except Exception as exc:
+        return {"status": "PRE_ORDER_PRICE_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "error": str(exc)}
+    pre_order_drift = _entry_drift_pct(_safe_float(setup.get("signal_price", price), price), live_reference, direction) if live_reference else None
+    trigger_price = _safe_float((setup.get("trigger") or {}).get("trigger_price"), 0.0)
+    trigger_live_drift = _entry_drift_pct(trigger_price, live_reference, direction) if trigger_price > 0 and live_reference else None
+    effective_pre_drift = max(x for x in (pre_order_drift, trigger_live_drift) if x is not None) if (pre_order_drift is not None or trigger_live_drift is not None) else None
+    if drift_limit > 0 and effective_pre_drift is not None and effective_pre_drift > drift_limit:
+        return {
+            "status": "PRE_ORDER_DRIFT_EXCEEDED",
+            "mode": EXECUTION_MODE, "order_id": None,
+            "error": f"pre_order_drift={effective_pre_drift:.6f} > limit={drift_limit:.6f}",
+            "execution_quality": {"signal_to_pre_order_drift_pct": pre_order_drift, "trigger_to_pre_order_drift_pct": trigger_live_drift, "pre_order_price": live_reference, "drift_limit_pct": drift_limit},
+        }
+
     try:
         opened = open_market(symbol, direction, price, trade_id)
     except Exception as exc:
@@ -1652,6 +1737,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         signal_price=price, actual_entry_price=actual_avg_price, direction=direction,
         pre_order_price=pre_order_price if pre_order_price > 0 else None,
     )
+    execution_quality["signal_to_pre_order_drift_pct"] = pre_order_drift
+    execution_quality["trigger_to_pre_order_drift_pct"] = trigger_live_drift
+    execution_quality["pre_order_price"] = live_reference
     fill_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     log.info(
         "[EXECUTION] Fill confirmed: %s %s at avgPrice=%.8g (Qty: %.8g, Slippage: %+.2f%%)",
@@ -1844,6 +1932,8 @@ def main() -> None:
         "rejected_score": 0,
         "rejected_short_score": 0,
         "rejected_entry_drift": 0,
+        "rejected_trigger_stale": 0,
+        "rejected_portfolio_cap": 0,
         "rejected_hot_oi": 0,
         "rejected_symbol_quarantine": 0,
         "conflict_rejected": 0,
@@ -1991,7 +2081,7 @@ def main() -> None:
         now_ms, seen_events, stats, scan_state, completed_4h,
     )
     event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
-    event_cache = [ev for ev in event_cache if _event_is_fresh(ev, now_ms, MAX_AGE)]
+    event_cache = [ev for ev in event_cache if _event_is_fresh(ev, now_ms, _event_max_age_min(ev))]
     _save_json_atomic(EVENT_CACHE, {"updated_ts": now_ms, "events": event_cache})
     _save_timeframe_scan_state(scan_state)
 
@@ -2012,6 +2102,7 @@ def main() -> None:
 
     # Fresh 1H ATR is fetched only after an event passes the cheap 15M trigger + score gate.
     risk_1h_cache: dict[str, pd.DataFrame] = {}
+    htf_context_cache: dict[str, dict[str, Any]] = {}
     for r in candidates:
         symbol = str(r.symbol)
         all_events = events_by_symbol.get(symbol, [])
@@ -2030,6 +2121,8 @@ def main() -> None:
             bx_symbol = to_bx_symbol(symbol)
             if bx_symbol and current_open_positions.get((bx_symbol, direction)):
                 continue
+            tf = str(ev.get("timeframe", "1h")).lower()
+            tf_stats = _tf_stats(stats, tf)
             try:
                 detected_at = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
             except (TypeError, ValueError):
@@ -2039,11 +2132,24 @@ def main() -> None:
                 stats["trigger_data_failed"] += 1
                 continue
             age = (now_ms - detected_at) / 60_000.0
-            if age < 0 or age > MAX_AGE:
+            event_max_age = _event_max_age_min(ev)
+            if age < 0 or age > event_max_age:
                 continue
-
-            tf = str(ev.get("timeframe", "1h")).lower()
-            tf_stats = _tf_stats(stats, tf)
+            # Divergence pivots are inherently confirmed only after `right` bars.
+            # Freshness therefore applies to the post-confirmation lifetime, not
+            # to pivot_2 itself. A 1H divergence with right=2 is about 120 minutes
+            # old when confirmed; using a raw 45-minute pivot age would reject it.
+            if ("REGULAR_" in str(ev.get("event_type", "")).upper() or "HIDDEN_" in str(ev.get("event_type", "")).upper()):
+                valid_timing, formation_age, post_confirmation_age, confirmation_lag_min = _divergence_post_confirmation_age(ev, now_ms)
+                max_post_confirm_age = DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN
+                if not valid_timing or post_confirmation_age > max_post_confirm_age:
+                    stats["rejected_stale_formation"] = stats.get("rejected_stale_formation", 0) + 1
+                    tf_stats = _tf_stats(stats, str(ev.get("timeframe", "1h")))
+                    tf_stats["rejected_stale_formation"] = tf_stats.get("rejected_stale_formation", 0) + 1
+                    continue
+                ev.setdefault("event_fact", {})["confirmation_lag_min"] = round(confirmation_lag_min, 3)
+                ev["event_fact"]["formation_age_min"] = round(formation_age, 3)
+                ev["event_fact"]["post_confirmation_age_min"] = round(post_confirmation_age, 3)
 
             stats["fresh_events"] += 1
             tf_stats["fresh_events"] += 1
@@ -2094,8 +2200,54 @@ def main() -> None:
                 stats["scan_errors"] += 1
                 continue
 
+            # 1H divergences require a 4H directional context; hidden divergences
+            # are especially strict because they are continuation setups.
+            htf_context: dict[str, Any] = {}
+            if ("REGULAR_" in event_type or "HIDDEN_" in event_type) and (tf == "4h" or REQUIRE_4H_CONTEXT_FOR_1H):
+                context_tf = "1d" if tf == "4h" else "4h"
+                context_limit = int(os.environ.get("KLINE_LIMIT_1D", "250")) if context_tf == "1d" else int(os.environ.get("KLINE_LIMIT_4H", "250"))
+                cache_key = f"{symbol}:{context_tf}"
+                htf_context = htf_context_cache.get(cache_key)
+                if htf_context is None or htf_context.get("error"):
+                    try:
+                        kctx = _fetch_klines_scan(symbol, context_tf, context_limit)
+                        cdf = pd.DataFrame(kctx)
+                        htf_context = {"df": cdf} if len(kctx) >= 60 else {"df": None}
+                        htf_context_cache[cache_key] = htf_context
+                    except Exception as exc:
+                        htf_context = {"df": None, "error": str(exc)}
+                        # Do not cache transient errors; a later event/cycle may succeed.
+                        htf_context_cache.pop(cache_key, None)
+                valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(
+                    ev,
+                    (htf_context or {}).get("df") if isinstance(htf_context, dict) else None,
+                    context_timeframe=context_tf,
+                )
+                if not valid_ctx:
+                    # If 1H context is explicitly optional, do not silently turn the
+                    # flag into an unconditional rejection. Otherwise a missing HTF
+                    # dataset is a fail-closed condition for hidden divergence.
+                    if tf == "1h" and not REQUIRE_4H_CONTEXT_FOR_1H:
+                        pass
+                    else:
+                        stats["rejected_context"] = stats.get("rejected_context", 0) + 1
+                        tf_stats["rejected_context"] = tf_stats.get("rejected_context", 0) + 1
+                        log.info("[SIGNALS] %s %s (%s/%s) rejected by divergence context: %s", direction, symbol, tf, event_type, ctx_reason)
+                        continue
+                ev.setdefault("event_fact", {}).update(ctx_meta)
+
             if REQUIRE_TRIGGER:
-                trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
+                if bool(ev.get("event_fact", {}).get("requires_retest")):
+                    ref_level = _safe_float(ev.get("event_fact", {}).get("trigger_level"), 0.0)
+                    if ref_level <= 0:
+                        stats["trigger_data_failed"] += 1
+                        continue
+                    trigger_diag = diagnose_15m_retest_trigger(
+                        d15, direction, ref_level, detected_at,
+                        max_delay_min=_event_trigger_max_delay_min(ev), volume_mult=1.10
+                    )
+                else:
+                    trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
                 if not trigger_diag.get("ok"):
                     reason = trigger_diag.get("reason") or "failed"
                     stats["rejected_trigger"] += 1
@@ -2109,13 +2261,13 @@ def main() -> None:
                         stats["trigger_data_failed"] += 1; tf_stats["trigger_data_failed"] += 1
                     log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
                     continue
-                trigger_price = _safe_float(trigger_diag.get("current_close"), 0.0)
+                trigger_price = _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0)
                 if trigger_price <= 0:
                     stats["trigger_data_failed"] += 1
                     tf_stats["trigger_data_failed"] += 1
                     continue
                 drift_pct = _entry_drift_pct(signal_price, trigger_price, direction)
-                drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if "SQUEEZE" in event_type else MAX_ENTRY_DRIFT_PCT
+                drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type) else MAX_ENTRY_DRIFT_PCT
                 if drift_pct is None:
                     stats["trigger_data_failed"] += 1
                     tf_stats["trigger_data_failed"] += 1
@@ -2158,13 +2310,14 @@ def main() -> None:
             # blanket hard reject. The prior 75% hard gate removed exactly the
             # momentum instruments we still want to evaluate.
             score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
+            # Score is diagnostic/ranking metadata, not a universal entry veto.
+            # Each engine's structural validation is the actual admission criterion.
+            # Keep the configured directional thresholds for observability/analytics.
             min_score_for_direction = MIN_SHORT_SCORE if direction == "SHORT" else MIN_SCORE
-            if min_score_for_direction > 0 and score < min_score_for_direction:
-                stats["rejected_score"] += 1
-                stats["rejected_short_score"] += int(direction == "SHORT")
-                tf_stats["rejected_score"] += 1
-                log.info("[SIGNALS] %s %s (%s/%s) rejected: score %.1f < required %.1f", direction, symbol, tf, event_type, score, min_score_for_direction)
-                continue
+            score_gate_passed = (min_score_for_direction <= 0) or score >= min_score_for_direction
+            ev.setdefault("event_fact", {})["score"] = score
+            ev["event_fact"]["score_gate_threshold"] = min_score_for_direction
+            ev["event_fact"]["score_gate_passed"] = bool(score_gate_passed)
 
             if symbol not in risk_1h_cache:
                 try:
@@ -2190,8 +2343,9 @@ def main() -> None:
                 continue
             setup["trigger"] = {
                 "event_detected_at_ts": detected_at,
+                "trigger_observed_at_ts": int(now_ms),
                 "trigger_bar_close_ts": trigger_diag.get("trigger_bar_close_ts"),
-                "trigger_price": _safe_float(trigger_diag.get("current_close"), 0.0) or None,
+                "trigger_price": _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0) or None,
                 "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
                 "signal_to_trigger_drift_pct": trigger_diag.get("signal_to_trigger_drift_pct"),
                 "volume_ratio": trigger_diag.get("volume_ratio"),
@@ -2281,166 +2435,188 @@ def main() -> None:
         effective_cooldown = max(SYMBOL_ENTRY_COOLDOWN_MIN, SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN) if is_squeeze_opp else SYMBOL_ENTRY_COOLDOWN_MIN
         symbol_cooldown = _symbol_on_cooldown(symbol, recent_entry_ts, now_ms, effective_cooldown)
 
-        if position_state_unknown and EXECUTION_ENABLED:
-            stats["blocked_by_position_state_unknown"] = stats.get("blocked_by_position_state_unknown", 0) + 1
-            execution_result = {"status": "POSITION_STATE_UNKNOWN", "mode": EXECUTION_MODE, "order_id": None, "position": {}}
-            log.error("[EXECUTION] %s %s blocked: exchange position state is UNKNOWN.", direction, symbol)
-        elif event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open or symbol_cooldown:
-            existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
-            active_trade = None
-            try:
-                active_trade = next(
-                    (x for x in _load_active_trades().values()
-                     if not x.get("closed", False) and str(x.get("event_id", "")) == event_id),
-                    None,
-                )
-            except Exception:
+        # A valid setup can become stale while the opportunity list is being
+        # built or while higher-ranked trades are executed. Do not submit a
+        # market order from an old trigger.
+        trigger_meta = setup.get("trigger") or {}
+        trigger_observed_ts = _safe_float(trigger_meta.get("trigger_observed_at_ts"), 0.0)
+        trigger_bar_ts = _safe_float(trigger_meta.get("trigger_bar_close_ts"), 0.0)
+        trigger_age_min = ((now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
+            ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
+        )
+        if EXECUTION_ENABLED and trigger_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
+            stats["rejected_trigger_stale"] += 1
+            execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
+                                "error": f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"}
+            # A stale trigger is a cycle-local skip, not a terminal event. The parent
+            # setup may still be valid for a subsequent freshly-detected trigger.
+            record_action({"event_id": event_id, "symbol": symbol, "direction": direction,
+                           "score": score, "event_type": ev.get("event_type"),
+                           "execution_status": "TRIGGER_STALE",
+                           "ts": int(pd.Timestamp.utcnow().timestamp() * 1000)})
+        elif EXECUTION_ENABLED:
+            active_total = sum(1 for p in current_open_positions.values() if p)
+            active_longs = sum(1 for (sym, d), p in current_open_positions.items() if p and d == "LONG")
+            active_shorts = sum(1 for (sym, d), p in current_open_positions.items() if p and d == "SHORT")
+            portfolio_cap_hit = (active_total >= MAX_ACTIVE_TRADES or
+                                  (direction == "LONG" and active_longs >= MAX_ACTIVE_LONGS) or
+                                  (direction == "SHORT" and active_shorts >= MAX_ACTIVE_SHORTS))
+            if portfolio_cap_hit:
+                stats["rejected_portfolio_cap"] += 1
+                execution_result = {"status": "PORTFOLIO_CAP_REACHED", "mode": EXECUTION_MODE, "order_id": None,
+                                    "error": f"active={active_total}/{MAX_ACTIVE_TRADES}, longs={active_longs}/{MAX_ACTIVE_LONGS}, shorts={active_shorts}/{MAX_ACTIVE_SHORTS}"}
+                log.info("[RISK] %s %s rejected by portfolio cap: %s", direction, symbol, execution_result["error"])
+            elif position_state_unknown:
+                stats["blocked_by_position_state_unknown"] = stats.get("blocked_by_position_state_unknown", 0) + 1
+                execution_result = {"status": "POSITION_STATE_UNKNOWN", "mode": EXECUTION_MODE, "order_id": None, "position": {}}
+                log.error("[EXECUTION] %s %s blocked: exchange position state is UNKNOWN.", direction, symbol)
+            elif event_id in executed_event_ids or (bx_symbol and current_open_positions.get((bx_symbol, direction))) or opposite_position_open or symbol_cooldown:
+                existing_position = current_positions.get((bx_symbol, direction), {}) if bx_symbol else {}
                 active_trade = None
-            execution_result = {
-                "status": (
-                    "SYMBOL_COOLDOWN" if symbol_cooldown and not existing_position and not opposite_position_open and event_id not in executed_event_ids
-                    else ("CONFLICTING_DIRECTION_POSITION" if opposite_position_open and not existing_position else ("ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED"))
-                ),
-                "mode": EXECUTION_MODE,
-                "order_id": None,
-                "position": existing_position,
-                "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
-            }
-            log.info("[EXECUTION] %s (%s) - Already open/executed.%s%s", symbol, direction,
-                     " Position confirmed; Telegram retry eligible." if existing_position else "",
-                     f" Opposite {opposite_direction} position is already open; new direction blocked." if opposite_position_open else (f" Symbol cooldown active ({effective_cooldown:g}m)." if symbol_cooldown else ""))
-        elif EXECUTION_ENABLED and trades_this_cycle < MAX_TRADES:
-            stats["execution_attempts"] += 1
-            trades_this_cycle += 1
-            log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, MAX_TRADES, direction, symbol, score, price)
-            execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
-            actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
-            actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
-            if actual_qty_for_state > 0:
-                _mark_local_position_state(current_open_positions, current_positions, actual_position, symbol, direction)
-                executed_event_ids.add(event_id)
-                recent_entry_ts[str(symbol).upper()] = now_ms
-
-            err_str = str(execution_result.get("error", "")).lower()
-            terminal_reason = None
-            if execution_result.get("status") == "ENTRY_DRIFT_EXCEEDED":
-                terminal_reason = "ENTRY_DRIFT_EXCEEDED"
-                log.warning("[EXECUTION] %s (%s) entry drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
-            elif execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
-                terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
-                log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
-            elif "min_qty" in err_str:
-                terminal_reason = "MIN_QTY_NOT_REACHABLE"
-                log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)
-            elif "min_notional" in err_str or "min_usdt" in err_str or "min_size_usd" in err_str:
-                terminal_reason = "MIN_NOTIONAL_NOT_REACHABLE"
-                log.warning("[EXECUTION] %s (%s) exchange minimum notional not reachable at configured margin/leverage; terminalizing event %s.", symbol, direction, event_id)
-
-            if terminal_reason:
-                executed_event_ids.add(event_id)
-                record_trade({
-                    "record_type": "EVENT_TERMINAL",
-                    "event_id": event_id,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "event_type": ev.get("event_type"),
-                    "reason": terminal_reason,
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                })
-
-            actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
-            actual_qty = actual_position.get("positionAmt")
-            execution_quality = execution_result.get("execution_quality", {}) if isinstance(execution_result, dict) else {}
-
-            execution_status = str(execution_result.get("status", ""))
-            confirmed_trade = execution_status in {
-                "opened_protected",
-                "opened_protection_check_required",
-                "opened_protection_failed",
-            } and actual_qty_for_state > 0
-            record_trade(
-                {
-                    "record_type": "TRADE_OPEN" if confirmed_trade else "EXECUTION_ATTEMPT",
-                    "trade_id": "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper(),
-                    "event_id": event_id,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "signal": {
-                        "event_type": ev.get("event_type"),
-                        "timeframe": ev.get("timeframe"),
-                        "signal_price": price,
-                        "score": score,
-                        "detected_at_ts": ev.get("timestamps", {}).get("detected_at_ts"),
-                        "event_fact": ev.get("event_fact", {}),
-                    },
-                    "execution": {
-                        "requested_price": price,
-                        "signal_price": price,
-                        "pre_order_reference_price": ((execution_result.get("open_result") or {}).get("order_reference_price") if isinstance(execution_result.get("open_result"), dict) else None),
-                        "actual_entry_price": actual_entry,
-                        "actual_qty": actual_qty,
-                        "order_id": execution_result.get("order_id"),
-                        "status": execution_result.get("status"),
-                        "slippage_pct": execution_quality.get("slippage_pct"),
-                        "signal_to_fill_drift_pct": execution_quality.get("slippage_pct"),
-                        "adverse_slippage_pct": execution_quality.get("adverse_slippage_pct"),
-                        "signal_to_order_drift_pct": execution_quality.get("signal_to_order_drift_pct"),
-                        "execution_slippage_pct": execution_quality.get("execution_slippage_pct"),
-                        "adverse_execution_slippage_pct": execution_quality.get("adverse_execution_slippage_pct"),
-                        "entry_notional_usdt": execution_result.get("notional_usdt"),
-                        "leverage": execution_result.get("leverage"),
-                        "planned_risk_usdt": execution_result.get("planned_risk_usdt"),
-                        "trigger_delay_min": ((setup.get("trigger") or {}).get("trigger_delay_min")),
-                        "signal_to_trigger_drift_pct": ((setup.get("trigger") or {}).get("signal_to_trigger_drift_pct")),
-                    },
-                    "score": score,
-                    "event_type": ev.get("event_type"),
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                    "result": execution_result,
-                    "setup": setup,
-                    "planned_metrics": {
-                        "target_rr": (execution_result.get("setup_used_for_protection") or setup).get("target_rr"),
-                        "planned_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("planned_weighted_rr"),
-                        "effective_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("effective_weighted_rr"),
-                        "tp_mode": (execution_result.get("setup_used_for_protection") or setup).get("tp_mode"),
-                        "realized_rr": None,
-                    },
-                }
-            )
-
-            status = str(execution_result.get("status", ""))
-            if status in {"opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
-                if status in {"opened_protected", "opened_protection_check_required"} or actual_qty_for_state > 0:
-                    stats["trades"] += 1
-
                 try:
-                    protection = execution_result.get("protection", {})
-                    register_active_trade(
-                        event_id=event_id,
-                        symbol=symbol,
-                        name=getattr(r, "name", None) or symbol,
-                        direction=direction,
-                        entry_price=float(execution_result.get("position", {}).get("avgPrice", price) or price),
-                        qty=float(execution_result.get("position", {}).get("positionAmt", 0) or 0),
-                        tp_orders=protection.get("tp_orders", []),
-                        sl_result=protection.get("sl_result", {}),
-                        event_type=ev.get("event_type", ""),
-                        timeframe=ev.get("timeframe") or setup.get("event_timeframe") or setup.get("timeframe") or "1h",
-                        coinalyze_row=r,
-                        score=score,
-                        setup=execution_result.get("setup_used_for_protection", setup),
-                        requested_entry_price=_safe_float((execution_result.get("open_result") or {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
-                        entry_ts_ms=execution_result.get("fill_ts_ms"),
-                    )
-                except Exception as exc:
-                    log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
-
+                    active_trade = next((x for x in _load_active_trades().values() if not x.get("closed", False) and str(x.get("event_id", "")) == event_id), None)
+                except Exception:
+                    active_trade = None
+                execution_result = {
+                    "status": ("SYMBOL_COOLDOWN" if symbol_cooldown and not existing_position and not opposite_position_open and event_id not in executed_event_ids
+                                else ("CONFLICTING_DIRECTION_POSITION" if opposite_position_open and not existing_position
+                                      else ("ALREADY_EXECUTED_WITH_POSITION" if existing_position else "ALREADY_EXECUTED"))),
+                    "mode": EXECUTION_MODE, "order_id": None, "position": existing_position,
+                    "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
+                }
+                log.info("[EXECUTION] %s (%s) - Already open/executed or blocked by cooldown.", symbol, direction)
+            elif trades_this_cycle < MAX_TRADES:
+                stats["execution_attempts"] += 1
+                trades_this_cycle += 1
+                log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, MAX_TRADES, direction, symbol, score, price)
+                execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
+                actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
+                actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
+                if actual_qty_for_state > 0:
+                    _mark_local_position_state(current_open_positions, current_positions, actual_position, symbol, direction)
+                    executed_event_ids.add(event_id)
+                    recent_entry_ts[str(symbol).upper()] = now_ms
+    
+                err_str = str(execution_result.get("error", "")).lower()
+                terminal_reason = None
+                if execution_result.get("status") == "ENTRY_DRIFT_EXCEEDED":
+                    terminal_reason = "ENTRY_DRIFT_EXCEEDED"
+                    log.warning("[EXECUTION] %s (%s) entry drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
+                    terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
+                    log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
+                elif "min_qty" in err_str:
+                    terminal_reason = "MIN_QTY_NOT_REACHABLE"
+                    log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)
+                elif "min_notional" in err_str or "min_usdt" in err_str or "min_size_usd" in err_str:
+                    terminal_reason = "MIN_NOTIONAL_NOT_REACHABLE"
+                    log.warning("[EXECUTION] %s (%s) exchange minimum notional not reachable at configured margin/leverage; terminalizing event %s.", symbol, direction, event_id)
+    
+                if terminal_reason:
+                    executed_event_ids.add(event_id)
+                    record_trade({
+                        "record_type": "EVENT_TERMINAL",
+                        "event_id": event_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "event_type": ev.get("event_type"),
+                        "reason": terminal_reason,
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+    
+                actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
+                actual_qty = actual_position.get("positionAmt")
+                execution_quality = execution_result.get("execution_quality", {}) if isinstance(execution_result, dict) else {}
+    
+                execution_status = str(execution_result.get("status", ""))
+                confirmed_trade = execution_status in {
+                    "opened_protected",
+                    "opened_protection_check_required",
+                    "opened_protection_failed",
+                } and actual_qty_for_state > 0
+                record_trade(
+                    {
+                        "record_type": "TRADE_OPEN" if confirmed_trade else "EXECUTION_ATTEMPT",
+                        "trade_id": "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper(),
+                        "event_id": event_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "signal": {
+                            "event_type": ev.get("event_type"),
+                            "timeframe": ev.get("timeframe"),
+                            "signal_price": price,
+                            "score": score,
+                            "detected_at_ts": ev.get("timestamps", {}).get("detected_at_ts"),
+                            "event_fact": ev.get("event_fact", {}),
+                        },
+                        "execution": {
+                            "requested_price": price,
+                            "signal_price": price,
+                            "pre_order_reference_price": ((execution_result.get("open_result") or {}).get("order_reference_price") if isinstance(execution_result.get("open_result"), dict) else None),
+                            "actual_entry_price": actual_entry,
+                            "actual_qty": actual_qty,
+                            "order_id": execution_result.get("order_id"),
+                            "status": execution_result.get("status"),
+                            "slippage_pct": execution_quality.get("slippage_pct"),
+                            "signal_to_fill_drift_pct": execution_quality.get("slippage_pct"),
+                            "adverse_slippage_pct": execution_quality.get("adverse_slippage_pct"),
+                            "signal_to_order_drift_pct": execution_quality.get("signal_to_order_drift_pct"),
+                            "execution_slippage_pct": execution_quality.get("execution_slippage_pct"),
+                            "adverse_execution_slippage_pct": execution_quality.get("adverse_execution_slippage_pct"),
+                            "entry_notional_usdt": execution_result.get("notional_usdt"),
+                            "leverage": execution_result.get("leverage"),
+                            "planned_risk_usdt": execution_result.get("planned_risk_usdt"),
+                            "trigger_delay_min": ((setup.get("trigger") or {}).get("trigger_delay_min")),
+                            "signal_to_trigger_drift_pct": ((setup.get("trigger") or {}).get("signal_to_trigger_drift_pct")),
+                        },
+                        "score": score,
+                        "event_type": ev.get("event_type"),
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                        "result": execution_result,
+                        "setup": setup,
+                        "planned_metrics": {
+                            "target_rr": (execution_result.get("setup_used_for_protection") or setup).get("target_rr"),
+                            "planned_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("planned_weighted_rr"),
+                            "effective_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("effective_weighted_rr"),
+                            "tp_mode": (execution_result.get("setup_used_for_protection") or setup).get("tp_mode"),
+                            "realized_rr": None,
+                        },
+                    }
+                )
+    
+                status = str(execution_result.get("status", ""))
+                if status in {"opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
+                    if status in {"opened_protected", "opened_protection_check_required"} or actual_qty_for_state > 0:
+                        stats["trades"] += 1
+    
+                    try:
+                        protection = execution_result.get("protection", {})
+                        register_active_trade(
+                            event_id=event_id,
+                            symbol=symbol,
+                            name=getattr(r, "name", None) or symbol,
+                            direction=direction,
+                            entry_price=float(execution_result.get("position", {}).get("avgPrice", price) or price),
+                            qty=float(execution_result.get("position", {}).get("positionAmt", 0) or 0),
+                            tp_orders=protection.get("tp_orders", []),
+                            sl_result=protection.get("sl_result", {}),
+                            event_type=ev.get("event_type", ""),
+                            timeframe=ev.get("timeframe") or setup.get("event_timeframe") or setup.get("timeframe") or "1h",
+                            coinalyze_row=r,
+                            score=score,
+                            setup=execution_result.get("setup_used_for_protection", setup),
+                            requested_entry_price=_safe_float((execution_result.get("open_result") or {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
+                            entry_ts_ms=execution_result.get("fill_ts_ms"),
+                        )
+                    except Exception as exc:
+                        log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
+            else:
+                execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
+                log.info("[EXECUTION] %s %s skipped: cycle limit reached (%d/%d).", direction, symbol, trades_this_cycle, MAX_TRADES)
+    
         elif not EXECUTION_ENABLED:
             execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
             log.info("[EXECUTION] %s %s skipped: EXECUTION_ENABLED is false.", direction, symbol)
-        else:
-            execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
-            log.info("[EXECUTION] %s %s skipped: cycle limit reached (%d/%d).", direction, symbol, trades_this_cycle, MAX_TRADES)
 
         telegram_setup = execution_result.get("setup_used_for_protection") if isinstance(execution_result, dict) else None
         if not isinstance(telegram_setup, dict):

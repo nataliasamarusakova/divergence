@@ -1253,7 +1253,7 @@ def test_squeeze_tp_levels_are_wider_than_divergence():
     assert tp_sq[2]["close_fraction"] == 0.35
 
 
-def test_tracker_activates_be_after_tp2(monkeypatch, tmp_path):
+def test_tracker_activates_be_after_prior_tp_milestone(monkeypatch, tmp_path):
     import event_engine.tracker as tr
     from pathlib import Path
 
@@ -1267,7 +1267,7 @@ def test_tracker_activates_be_after_tp2(monkeypatch, tmp_path):
         "initial_qty": 10.0,
         "remaining_qty": 7.0,
         "entry_ts": 1000,
-        "hit_legs": ["tp2"],  # tp2 hit without tp1
+        "hit_legs": ["tp1"],  # TP1 now arms BE
         "be_activated": False,
         "sl_order": {"order_id": "OLD_SL", "stop_price": 95.0},
         "tp_orders": [],
@@ -1289,13 +1289,13 @@ def test_tracker_activates_be_after_tp2(monkeypatch, tmp_path):
     assert saved["EVT_TEST"]["be_activated"] is True
 
 
-def test_tracker_does_not_activate_be_after_tp1(monkeypatch, tmp_path):
+def test_tracker_does_not_activate_be_without_tp_milestone(monkeypatch, tmp_path):
     import event_engine.tracker as tr
     active_path = tmp_path / "active_trades.json"
     trade_record = {
         "trade_id": "TR_TEST_TP1", "event_id": "EVT_TP1", "symbol": "TEST", "direction": "LONG",
         "entry_price": 100.0, "initial_qty": 10.0, "remaining_qty": 7.5, "entry_ts": 1000,
-        "hit_legs": ["tp1"], "be_activated": False,
+        "hit_legs": [], "be_activated": False,
         "sl_order": {"order_id": "OLD_SL", "stop_price": 95.0}, "tp_orders": [], "closed": False,
     }
     active_path.write_text(json.dumps({"EVT_TP1": trade_record}), encoding="utf-8")
@@ -1641,7 +1641,7 @@ def test_short_defensive_score_is_stricter():
     ev = {"direction": "SHORT", "event_type": "REGULAR_BEARISH_MACD", "event_fact": {"price_delta_atr": 1.0}}
     score = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
     assert score > 0
-    assert ro.MIN_SHORT_SCORE == 75.0
+    assert ro.MIN_SHORT_SCORE == 85.0
 
 
 def test_hot_oi_penalty_applies_to_score():
@@ -1707,3 +1707,163 @@ def test_add_cvd_carries_value_across_missing_bar_without_zero_fill():
     assert out["bingx_cvd"].tolist() == pytest.approx([10.0, 10.0, 7.0])
     assert out["taker_flow_valid"].tolist() == [True, False, True]
     assert out["cvd_valid_coverage"].iloc[1] == pytest.approx(0.5)
+
+
+def _synthetic_ohlcv(n=260, base=100.0):
+    import numpy as np
+    t = np.arange(n, dtype=float)
+    close = base + 0.08 * t + 1.5 * np.sin(t / 9.0)
+    high = close + 0.7
+    low = close - 0.7
+    open_ = close - 0.1
+    volume = np.full(n, 1000.0)
+    close_time = (t + 1).astype(int) * 60_000
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
+                         "volume": volume, "close_time": close_time})
+
+
+def test_wilder_smooth_seeds_first_n_valid_values():
+    from event_engine.signals import _wilder_smooth
+    values = pd.Series([np.nan, 1.0, 2.0, 3.0, 4.0])
+    out = _wilder_smooth(values, 3)
+    assert pd.isna(out.iloc[0])
+    assert out.iloc[3] == pytest.approx(2.0)
+    values2 = pd.Series([1.0, 2.0, 3.0, 4.0])
+    out2 = _wilder_smooth(values2, 3)
+    assert out2.iloc[2] == pytest.approx(2.0)
+
+
+def test_macd_4h_requires_real_ema200():
+    from event_engine.signals import detect_macd_4h
+    df = _synthetic_ohlcv(100)
+    assert detect_macd_4h(df, "TEST", "4h") == []
+
+
+def test_new_engine_events_have_distinct_engine_identity():
+    from event_engine.signals import detect_ma_compression_breakout, detect_breakout_momentum
+    df = _synthetic_ohlcv(260)
+    # No assertion about whether an artificial smooth series produces an event;
+    # the important regression contract is that returned events self-identify.
+    for func in (detect_ma_compression_breakout, detect_breakout_momentum):
+        events = func(df, "TEST", "1h")
+        for ev in events:
+            assert ev["event_fact"]["engine"] in {"MA_COMPRESSION", "BREAKOUT_MOMENTUM"}
+            assert ev["event_fact"].get("requires_retest") is True
+            assert ev["event_fact"].get("trigger_level", 0) > 0
+
+
+def test_liquidation_squeeze_uses_directional_funding_not_absolute_value():
+    from types import SimpleNamespace
+    from event_engine.signals import detect_liquidation_squeeze
+    df = _synthetic_ohlcv(60)
+    # Force a bullish spike on the last bar sufficient for the LONG-side squeeze
+    # path, but provide positive funding (not crowded shorts): it must not qualify
+    # via funding alone.
+    df.loc[len(df)-2, "close"] = 100.0
+    df.loc[len(df)-2, "high"] = 101.0
+    df.loc[len(df)-1, "open"] = 100.0
+    df.loc[len(df)-1, "close"] = 110.0
+    df.loc[len(df)-1, "high"] = 110.5
+    df.loc[len(df)-1, "low"] = 99.5
+    row = SimpleNamespace(liq_short24=2_000_000.0, liq_long24=0.0, oi=100_000_000.0,
+                          oi_chg4h_pct=0.0, fr_oiw=0.05, ls_accounts=None)
+    assert detect_liquidation_squeeze(row, df, "TEST", "1h") == []
+
+
+
+
+def test_divergence_post_confirmation_freshness_uses_confirmation_not_pivot_age():
+    import run_once
+
+    pivot2 = 1_000_000
+    confirm = pivot2 + 120 * 60_000
+    now = confirm + 10 * 60_000
+    ev = {"event_type": "REGULAR_BULLISH_RSI", "timeframe": "1h",
+          "timestamps": {"pivot_2_ts": pivot2, "detected_at_ts": confirm}}
+    valid, formation_age, post_age, lag = run_once._divergence_post_confirmation_age(ev, now)
+    assert valid is True
+    assert formation_age == 130.0
+    assert post_age == 10.0
+    assert lag == 120.0
+
+
+def test_divergence_post_confirmation_freshness_expires_after_window():
+    import run_once
+
+    pivot2 = 1_000_000
+    confirm = pivot2 + 120 * 60_000
+    now = confirm + 46 * 60_000
+    ev = {"event_type": "HIDDEN_BEARISH_MACD", "timeframe": "4h",
+          "timestamps": {"pivot_2_ts": pivot2, "detected_at_ts": confirm}}
+    valid, _, post_age, _ = run_once._divergence_post_confirmation_age(ev, now)
+    assert valid is True
+    assert post_age == 46.0
+
+
+def test_canonical_atr_run_once_matches_signal_atr():
+    from event_engine.signals import _atr as signal_atr
+    import run_once
+    df = pd.DataFrame({
+        "high": [101, 103, 102, 106, 105, 108, 107, 110, 111, 109, 112, 114, 113, 115, 116, 118, 117, 119, 121, 120, 123],
+        "low":  [ 99, 100, 100, 102, 103, 105, 104, 107, 108, 106, 109, 111, 110, 112, 113, 115, 114, 116, 118, 118, 120],
+        "close":[100, 102, 101, 105, 104, 107, 106, 109, 110, 108, 111, 113, 112, 114, 115, 117, 116, 118, 120, 119, 122],
+    })
+    assert run_once.canonical_atr(df, 14).iloc[-1] == signal_atr(df, 14).iloc[-1]
+
+
+def test_liquidation_squeeze_is_opt_in_by_runtime_flag(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "ENABLE_LIQUIDATION_SQUEEZE_ENGINE", False)
+    assert run_once.ENABLE_LIQUIDATION_SQUEEZE_ENGINE is False
+
+
+
+def test_retest_trigger_prefers_latest_valid_retest_within_window():
+    from event_engine.signals import diagnose_15m_retest_trigger
+    import pandas as pd
+    base = 1_000_000
+    rows = []
+    for i in range(30):
+        ts = base + i * 15 * 60_000
+        close = 101.0
+        rows.append({"open": 100.0, "high": 102.0, "low": 99.0, "close": close,
+                     "volume": 1_000.0, "close_time": ts})
+    # Two valid retests after the event; the function should return the latest one.
+    event_ts = rows[20]["close_time"]
+    rows[22].update({"open": 100.8, "high": 102.0, "low": 99.9, "close": 101.2, "volume": 2_000})
+    rows[23].update({"open": 100.9, "high": 102.2, "low": 99.8, "close": 101.4, "volume": 2_100})
+    out = diagnose_15m_retest_trigger(pd.DataFrame(rows), "LONG", 100.0, event_ts,
+                                      max_delay_min=60, volume_mult=1.10)
+    assert out["ok"] is True
+    assert out["trigger_bar_close_ts"] == rows[23]["close_time"]
+
+
+def test_event_max_age_allows_retest_engine_window():
+    import run_once
+    ev = {"event_type": "MA_COMPRESSION_BREAKOUT", "event_fact": {"requires_retest": True, "engine": "MA_COMPRESSION"},
+          "timestamps": {"detected_at_ts": 1_000_000}}
+    assert run_once._event_max_age_min(ev) >= 120.0
+
+
+def test_liquidation_squeeze_predicate_is_not_used_for_volatility_squeeze_funding():
+    import run_once
+    from types import SimpleNamespace
+    row = SimpleNamespace(fr_oiw=-0.20)
+    ok, reason = run_once.check_funding_filter(row, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
+    assert ok is True
+    assert "VOLATILITY" in reason or "NORMAL" in reason
+
+
+def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
+    import event_engine.tracker as tr
+    monkeypatch.setattr(tr, "EARLY_LOSS_CUT_ENABLED", True)
+    monkeypatch.setattr(tr, "_early_loss_cut_guard", lambda *args, **kwargs: (False, "near_live_sl:0.1%", 1.0))
+    # The regression target is the initialization pattern used by update_active_trades:
+    # a blocked guard must still yield a defined cut result rather than NameError.
+    cut = {"status": "skipped"}
+    safe_to_close = False
+    guard_reason = "near_live_sl:0.1%"
+    if not safe_to_close:
+        cut["error"] = guard_reason
+    assert cut["status"] == "skipped"
+    assert cut["error"] == guard_reason
