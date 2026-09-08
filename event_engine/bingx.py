@@ -869,6 +869,11 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     expected_leg = str(expected_leg).upper()
     client_id = str(order.get("clientOrderId", "")).upper()
 
+    unit = 10 ** (-max(0, int(price_precision)))
+    price_tolerance = max(unit * 0.51, 1e-12)
+    def _price_matches() -> bool:
+        return abs(actual_price - expected_price) <= price_tolerance
+
     expected_formatted = _format_price(expected_price, price_precision)
     actual_formatted = _format_price(actual_price, price_precision)
 
@@ -879,21 +884,21 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
         digest = _trade_digest(trade_id)
         expected_leg_num = "".join(ch for ch in expected_leg if ch.isdigit())[:1]
         if client_id == f"EVTTP{expected_leg_num}{digest}":
-            return actual_formatted == expected_formatted
+            return _price_matches()
         # Backward compatibility for protection orders created before the
         # alphanumeric clientOrderId hardening.
         if client_id == f"EVT_{digest}_{expected_leg}":
-            return actual_formatted == expected_formatted
+            return _price_matches()
 
     if client_id:
         if f"_{expected_leg}_" in f"_{client_id}_":
-            return actual_formatted == expected_formatted
+            return _price_matches()
         if client_id.startswith(f"EVTTP{''.join(ch for ch in expected_leg if ch.isdigit())[:1]}"):
-            return actual_formatted == expected_formatted
+            return _price_matches()
 
     # Current BingX conditional protection orders: identify the leg by the
     # expected trigger price when no clientOrderId is available.
-    return actual_formatted == expected_formatted
+    return _price_matches()
 
 
 def _current_close_price(symbol: str) -> float | None:

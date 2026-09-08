@@ -23,6 +23,7 @@ from event_engine.bingx import (
     ORDER_PATH,
     _post_protection_order_verified,
     _cancel_protection_order_verified,
+    emergency_close_position,
 )
 from event_engine.telegram import send_detailed
 
@@ -33,6 +34,11 @@ ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 NOTIFICATIONS_PATH = DATA / "notifications.json"
 
+EARLY_LOSS_CUT_ENABLED = os.environ.get("EARLY_LOSS_CUT_ENABLED", "false").lower() == "true"
+EARLY_LOSS_CUT_2H_MIN = float(os.environ.get("EARLY_LOSS_CUT_2H_MIN", "120"))
+EARLY_LOSS_CUT_2H_PNL = float(os.environ.get("EARLY_LOSS_CUT_2H_PNL", "-1.50"))
+EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
+EARLY_LOSS_CUT_4H_PNL = float(os.environ.get("EARLY_LOSS_CUT_4H_PNL", "-2.50"))
 
 
 
@@ -710,6 +716,47 @@ def _calc_trade_pnl_pct(entry_price: float, exit_price: float, direction: str) -
     return (entry_price - exit_price) / entry_price * 100.0
 
 
+def _early_loss_cut_guard(symbol: str, direction: str, current_price: float, qty: float, sl_distance_pct: float = 0.50) -> tuple[bool, str, float]:
+    """Re-check live position + live SL immediately before an Early Loss Cut MARKET close.
+
+    Returns (safe_to_close, reason, live_qty). A stale/missing exchange state blocks the
+    local close rather than risking a second order. If no live SL is present, we do not
+    infer safety; the caller should let reconciliation repair protection on the next cycle.
+    """
+    try:
+        pos = get_position_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"position_recheck_error:{exc}", qty
+    if str(pos.get("status", "")).lower() != "found":
+        return False, "position_not_found_on_recheck", 0.0
+    live_qty = abs(_safe_float(pos.get("positionAmt"), 0.0))
+    if live_qty <= 0:
+        return False, "position_zero_on_recheck", 0.0
+
+    try:
+        protection = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"protection_recheck_error:{exc}", live_qty
+    if str(protection.get("status", "")).lower() != "ok":
+        return False, "protection_state_unknown", live_qty
+
+    sl_orders = [o for o in protection.get("sl_orders", []) if isinstance(o, dict)]
+    if len(sl_orders) != 1:
+        return False, f"expected_one_live_sl_got_{len(sl_orders)}", live_qty
+    try:
+        sl_price = _safe_float(sl_orders[0].get("stopPrice") or sl_orders[0].get("price"), 0.0)
+    except Exception:
+        sl_price = 0.0
+    if sl_price <= 0 or current_price <= 0:
+        return False, "invalid_live_price_or_sl", live_qty
+
+    distance_pct = abs(current_price - sl_price) / max(abs(sl_price), 1e-12) * 100.0
+    if distance_pct <= max(0.0, sl_distance_pct):
+        return False, f"near_live_sl:{distance_pct:.4f}%", live_qty
+
+    return True, "safe_to_close", live_qty
+
+
 def _derive_planned_risk_pct(trade: dict) -> float | None:
     direct = trade.get("planned_risk_pct")
     if direct is not None:
@@ -948,12 +995,48 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
-            # Retry a failed TP -> BE transition only after the BE milestone.
-            # Normal/squeeze 3-leg profiles activate BE at TP2; a true single-TP
-            # profile can activate it only at its terminal TP3 milestone.
+            # Experimental early-loss cut: a setup that fails to develop for
+            # a sustained period should not be allowed to drift all the way to
+            # the full structural stop. The thresholds are configurable and the
+            # exit is recorded as a distinct research outcome.
+            duration_min = max(0.0, (now_ms - entry_ts) / 60000.0)
+            early_loss_reason = None
+            if EARLY_LOSS_CUT_ENABLED and pos_status == "found" and pos_amt > 0:
+                if duration_min >= EARLY_LOSS_CUT_4H_MIN and current_pnl <= EARLY_LOSS_CUT_4H_PNL:
+                    early_loss_reason = "EARLY_LOSS_CUT_4H"
+                elif duration_min >= EARLY_LOSS_CUT_2H_MIN and current_pnl <= EARLY_LOSS_CUT_2H_PNL:
+                    early_loss_reason = "EARLY_LOSS_CUT_2H"
+                if early_loss_reason:
+                    cut = {"status": "skipped"}
+                    safe_to_close, guard_reason, live_qty = _early_loss_cut_guard(symbol, direction, cur_price, pos_amt)
+                    if not safe_to_close:
+                        cut["error"] = guard_reason
+                        trade["early_loss_cut_last_error"] = guard_reason
+                        log.warning("[TRACKER_EARLY_LOSS_CUT] %s %s blocked by live-state guard: %s", symbol, direction, guard_reason)
+                    else:
+                        log.warning("[TRACKER_EARLY_LOSS_CUT] %s %s pnl=%+.2f%% age=%.1fm reason=%s", symbol, direction, current_pnl, duration_min, early_loss_reason)
+                        try:
+                            cut = emergency_close_position(symbol, direction, qty=live_qty, reason_token=early_loss_reason)
+                        except Exception as exc:
+                            cut = {"status": "error", "error": str(exc)}
+                    if safe_to_close and str(cut.get("status", "")).lower() == "closed":
+                        trade["manual_exit_reason"] = early_loss_reason
+                        try:
+                            pos = get_position_directional(symbol, direction)
+                            pos_status = str(pos.get("status", "")).lower()
+                            pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
+                            trade["current_position_qty"] = pos_amt
+                        except Exception as exc:
+                            log.warning("[TRACKER_EARLY_LOSS_CUT] post-close verification failed for %s: %s", event_id, exc)
+                    else:
+                        trade["early_loss_cut_last_error"] = cut.get("error") or cut
+
+            # Retry a failed TP -> BE transition after the first realised partial.
+            # This removes risk earlier; a single-TP profile can activate only at
+            # its terminal TP3 milestone.
             hit_legs = {str(x).lower() for x in trade.get("hit_legs", []) if x}
             is_single_tp = trade.get("tp_mode") == "single_tp"
-            should_move_to_be = ("tp2" in hit_legs) or (is_single_tp and "tp3" in hit_legs)
+            should_move_to_be = ("tp1" in hit_legs) or (is_single_tp and "tp3" in hit_legs)
             if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
@@ -1045,10 +1128,10 @@ def update_active_trades() -> None:
                     except Exception as exc:
                         log.error("[TELEGRAM] TP notification queue error %s %s %s: %s", symbol, leg, event_id, exc)
 
-                    # Move to BE only at the TP2 milestone (or terminal TP3 for
-                    # an explicitly single-TP trade). TP1 alone never arms BE.
+                    # Move to BE after TP1 (or terminal TP3 for an explicitly
+                    # single-TP trade). This is the first realised-risk-removal point.
                     is_single_tp = trade.get("tp_mode") == "single_tp"
-                    should_move_to_be = (leg == "tp2") or (is_single_tp and leg == "tp3")
+                    should_move_to_be = (leg == "tp1") or (is_single_tp and leg == "tp3")
                     if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
@@ -1119,6 +1202,9 @@ def update_active_trades() -> None:
             else:
                 exit_reason = "POSITION_CLOSED"
 
+            if trade.get("manual_exit_reason"):
+                exit_reason = str(trade.get("manual_exit_reason"))
+
             if exit_price <= 0:
                 exit_price = cur_price
 
@@ -1158,7 +1244,7 @@ def update_active_trades() -> None:
                 actual_initial_sl_risk_pct = abs(entry_price - actual_initial_sl_price) / entry_price * 100.0
             elif stored_sl_price > 0 and entry_price > 0:
                 actual_initial_sl_risk_pct = abs(entry_price - stored_sl_price) / entry_price * 100.0
-            exit_reason_confidence = "confirmed" if exit_reason in {"TAKE_PROFIT_FULL", "STOP_LOSS", "BREAK_EVEN"} and (closed_by_tp or sl_exit_price is not None) else "unknown"
+            exit_reason_confidence = "confirmed" if (exit_reason in {"TAKE_PROFIT_FULL", "STOP_LOSS", "BREAK_EVEN"} and (closed_by_tp or sl_exit_price is not None)) or exit_reason.startswith("EARLY_LOSS_CUT") else "unknown"
             planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.6625)), 1.6625)
 
             trade["remaining_qty"] = 0.0
