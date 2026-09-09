@@ -18,6 +18,12 @@ from event_engine.signals import (
     detect_divergences,
     detect_squeeze_release,
     detect_liquidation_squeeze,
+    detect_order_block,
+    detect_breaker_block,
+    detect_mitigation_block,
+    detect_sfp,
+    detect_liquidation_cascade_fvg,
+    detect_crt,
     attach_oi_series,
     check_btc_regime,
 )
@@ -1867,3 +1873,164 @@ def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
         cut["error"] = guard_reason
     assert cut["status"] == "skipped"
     assert cut["error"] == guard_reason
+
+
+def _make_trend_candles(n=140, step=1.0):
+    rows=[]
+    base=100.0
+    for i in range(n):
+        o=base + i*step
+        c=o + step
+        h=c + 0.6
+        l=o - 0.6
+        rows.append({"open":o,"high":h,"low":l,"close":c,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+    return pd.DataFrame(rows)
+
+
+def test_new_strategy_engines_expose_required_event_schema():
+    from event_engine.signals import detect_donchian_retest, detect_liquidity_sweep_reclaim, detect_ema_pullback_continuation
+    df = _make_trend_candles()
+    # Baseline trend series may not trigger all engines on its own; schema checks
+    # apply only when a detector produces an event on a crafted/realistic sample.
+    for detector in (detect_donchian_retest, detect_liquidity_sweep_reclaim, detect_ema_pullback_continuation):
+        events = detector(df, "TEST", "1h")
+        for ev in events:
+            assert ev["direction"] in {"LONG", "SHORT"}
+            assert ev["event_fact"].get("requires_retest") is True
+            assert ev["event_fact"].get("requires_htf_context") is True
+
+
+def test_strategy_htf_context_requires_matching_trend():
+    from event_engine.signals import validate_strategy_htf_context
+    ev = {"direction": "LONG", "event_fact": {"requires_htf_context": True}}
+    up = _make_trend_candles(120, 1.0)
+    down = _make_trend_candles(120, -1.0)
+    ok, reason, meta = validate_strategy_htf_context(ev, up, "4h")
+    assert ok is True
+    assert reason == "STRATEGY_HTF_OK"
+    assert meta["context_timeframe"] == "4h"
+    ok2, reason2, _ = validate_strategy_htf_context(ev, down, "4h")
+    assert ok2 is False
+    assert reason2 == "STRATEGY_HTF_TREND_MISMATCH"
+
+
+def test_squeeze_family_predicates_are_separate():
+    import run_once as ro
+    assert ro._is_liquidation_squeeze_event("SHORT_SQUEEZE") is True
+    assert ro._is_liquidation_squeeze_event("VOLATILITY_SQUEEZE_RELEASE") is False
+    assert ro._is_volatility_squeeze_event("VOLATILITY_SQUEEZE_RELEASE") is True
+
+
+def test_new_engine_features_have_distinct_identity():
+    from event_engine.signals import detect_donchian_retest, detect_liquidity_sweep_reclaim, detect_ema_pullback_continuation
+    df = _make_trend_candles()
+    names = set()
+    for detector in (detect_donchian_retest, detect_liquidity_sweep_reclaim, detect_ema_pullback_continuation):
+        for ev in detector(df, "TEST", "1h"):
+            names.add(ev["event_fact"]["engine"])
+    assert names.issubset({"DONCHIAN_RETEST", "LIQUIDITY_SWEEP", "EMA_PULLBACK"})
+
+
+def test_ema_pullback_engine_can_detect_valid_long_setup():
+    from event_engine.signals import detect_ema_pullback_continuation
+    rows=[]; p=100.0
+    for i in range(240):
+        o=p; c=p+0.20; h=c+0.15; l=o-0.15
+        rows.append({"open":o,"high":h,"low":l,"close":c,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+        p=c
+    df=pd.DataFrame(rows)
+    ema21=df["close"].ewm(span=21, adjust=False).mean().iloc[-2]
+    prev_close=float(df["close"].iloc[-2])
+    df.loc[df.index[-1], ["open","low","high","close","volume"]] = [float(ema21)-0.10, float(ema21)-0.20, float(ema21)+0.70, float(ema21)+0.40, 1200.0]
+    events=detect_ema_pullback_continuation(df,"TEST","1h")
+    assert any(e["direction"]=="LONG" and e["event_type"]=="EMA_PULLBACK_CONTINUATION" for e in events)
+
+
+def test_donchian_engine_can_detect_valid_long_breakout():
+    from event_engine.signals import detect_donchian_retest
+    rows=[]; p=100.0
+    for i in range(240):
+        o=p; c=p+0.20; h=c+0.15; l=o-0.15
+        rows.append({"open":o,"high":h,"low":l,"close":c,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+        p=c
+    df=pd.DataFrame(rows)
+    dc_high=float(df["high"].iloc[-21:-1].max())
+    prev=float(df["close"].iloc[-2])
+    df.loc[df.index[-1], ["open","low","high","close","volume"]] = [prev, prev-0.15, dc_high+1.80, dc_high+1.50, 1800.0]
+    events=detect_donchian_retest(df,"TEST","1h")
+    assert any(e["direction"]=="LONG" and e["event_type"]=="DONCHIAN_RETEST_BREAKOUT" for e in events)
+
+
+def test_liquidity_sweep_engine_can_detect_long_reclaim(monkeypatch):
+    import event_engine.signals as sig
+    rows=[]; p=100.0
+    for i in range(100):
+        o=p; c=p+0.01; h=c+0.05; l=o-0.05
+        rows.append({"open":o,"high":h,"low":l,"close":c,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+        p=c
+    df=pd.DataFrame(rows)
+    # Make a clear prior pivot low at 95 with a few surrounding bars.
+    for j,v in [(94,96.0),(95,95.0),(96,96.0)]:
+        df.loc[j,["open","high","low","close"]] = [v+0.2,v+0.4,v-0.4,v]
+    prev_high=float(df["high"].iloc[-2])
+    df.loc[df.index[-1],["open","low","high","close","volume"]] = [99.0,94.0,prev_high+0.5,prev_high+0.3,1500.0]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([95], []))
+    events=sig.detect_liquidity_sweep_reclaim(df,"TEST","1h")
+    assert any(e["direction"]=="LONG" and e["event_type"]=="LIQUIDITY_SWEEP_RECLAIM" for e in events)
+
+
+def test_expected_engine_registry_contains_v5_and_smc_engines():
+    import run_once as ro
+    assert ro.EXPECTED_EVENT_ENGINES == {
+        "DIVERGENCE", "VOLATILITY_SQUEEZE", "MACD_4H", "MA_COMPRESSION",
+        "BREAKOUT_MOMENTUM", "DONCHIAN_RETEST", "LIQUIDITY_SWEEP", "EMA_PULLBACK",
+        "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
+        "LIQUIDATION_CASCADE_FVG", "CRT",
+    }
+
+
+def test_smc_detectors_fail_closed_on_incomplete_data():
+    bad = pd.DataFrame({"close": [1.0, 2.0], "high": [2.0, 3.0], "low": [0.5, 1.5]})
+    for fn in (detect_order_block, detect_breaker_block, detect_mitigation_block, detect_sfp, detect_crt):
+        assert fn(bad, "TEST", "1h") == []
+    assert detect_liquidation_cascade_fvg(None, bad, "TEST", "1h") == []
+
+
+def test_crt_bullish_three_candle_pattern():
+    rows=[]; p=100.0
+    for i in range(50):
+        rows.append({"open":p,"high":p+0.6,"low":p-0.6,"close":p+0.2,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+        p += 0.2
+    df=pd.DataFrame(rows)
+    i=47
+    df.loc[i,["open","high","low","close"]]=[100,102,99,101]
+    df.loc[i+1,["open","high","low","close"]]=[101,101.4,97.5,98.5]
+    df.loc[i+2,["open","high","low","close"]]=[98.5,101.5,98.2,100.8]
+    events=detect_crt(df,"TEST","1h")
+    assert any(e["event_type"]=="CRT_BULLISH" and e["direction"]=="LONG" for e in events)
+
+
+def test_sfp_bearish_sweep_reclaim():
+    rows=[]; p=100.0
+    for i in range(100):
+        rows.append({"open":p,"high":p+0.2,"low":p-0.2,"close":p,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+    df=pd.DataFrame(rows)
+    # A prior swing high at index 90.
+    df.loc[89,["open","high","low","close"]]=[103.8,104.0,103.0,103.9]
+    df.loc[90,["open","high","low","close"]]=[104.0,105.0,103.7,104.8]
+    df.loc[91,["open","high","low","close"]]=[104.8,104.0,103.6,103.8]
+    df.loc[99,["open","high","low","close","volume"]]=[104.2,106.5,103.9,103.5,1500.0]
+    events=detect_sfp(df,"TEST","1h")
+    assert any(e["event_type"]=="SFP_BEARISH" and e["direction"]=="SHORT" for e in events)
+
+
+def test_oi_history_cache_updates_immediately(tmp_path, monkeypatch):
+    import run_once as ro
+    monkeypatch.chdir(tmp_path)
+    ro.DATA=Path("data"); ro.DATA.mkdir(exist_ok=True)
+    ro.OI_HISTORY=ro.DATA/"oi_history.json"
+    ro._OI_HIST_CACHE.update({"ts":0.0,"data":{},"path":""})
+    from types import SimpleNamespace
+    row=SimpleNamespace(symbol="TEST", price=100.0, oi=123.0)
+    assert ro._record_oi_snapshots([row],1_700_000_000_000)==1
+    assert "TEST" in ro._load_oi_history()

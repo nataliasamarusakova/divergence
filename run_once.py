@@ -42,8 +42,18 @@ from event_engine.signals import (
     detect_macd_4h,
     detect_ma_compression_breakout,
     detect_breakout_momentum,
+    detect_donchian_retest,
+    detect_liquidity_sweep_reclaim,
+    detect_ema_pullback_continuation,
+    detect_order_block,
+    detect_breaker_block,
+    detect_mitigation_block,
+    detect_sfp,
+    detect_liquidation_cascade_fvg,
+    detect_crt,
     diagnose_15m_retest_trigger,
     validate_divergence_context,
+    validate_strategy_htf_context,
     _atr as canonical_atr,
 )
 from event_engine.telegram import send as send_tg, format_signal
@@ -115,16 +125,38 @@ DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN = float(os.environ.get("MAX_DIVERGENCE_POST_
 MA_COMPRESSION_RETEST_MAX_DELAY_MIN = float(os.environ.get("MA_COMPRESSION_RETEST_MAX_DELAY_MIN", "120"))
 BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN = float(os.environ.get("BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN", "90"))
 VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN = float(os.environ.get("VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN", "60"))
+ORDER_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("ORDER_BLOCK_RETEST_MAX_DELAY_MIN", "120"))
+BREAKER_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("BREAKER_BLOCK_RETEST_MAX_DELAY_MIN", "120"))
+MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN", "120"))
+SFP_RETEST_MAX_DELAY_MIN = float(os.environ.get("SFP_RETEST_MAX_DELAY_MIN", "60"))
+LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN = float(os.environ.get("LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN", "90"))
+CRT_RETEST_MAX_DELAY_MIN = float(os.environ.get("CRT_RETEST_MAX_DELAY_MIN", "60"))
 REQUIRE_4H_CONTEXT_FOR_1H = os.environ.get("REQUIRE_4H_CONTEXT_FOR_1H", "true").lower() == "true"
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
 ENABLE_MA_COMPRESSION_ENGINE = os.environ.get("ENABLE_MA_COMPRESSION_ENGINE", "true").lower() == "true"
 ENABLE_BREAKOUT_MOMENTUM_ENGINE = os.environ.get("ENABLE_BREAKOUT_MOMENTUM_ENGINE", "true").lower() == "true"
+ENABLE_DONCHIAN_RETEST_ENGINE = os.environ.get("ENABLE_DONCHIAN_RETEST_ENGINE", "true").lower() == "true"
+ENABLE_LIQUIDITY_SWEEP_ENGINE = os.environ.get("ENABLE_LIQUIDITY_SWEEP_ENGINE", "true").lower() == "true"
+ENABLE_EMA_PULLBACK_ENGINE = os.environ.get("ENABLE_EMA_PULLBACK_ENGINE", "true").lower() == "true"
+ENABLE_ORDER_BLOCK_ENGINE = os.environ.get("ENABLE_ORDER_BLOCK_ENGINE", "true").lower() == "true"
+ENABLE_BREAKER_BLOCK_ENGINE = os.environ.get("ENABLE_BREAKER_BLOCK_ENGINE", "true").lower() == "true"
+ENABLE_MITIGATION_BLOCK_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_ENGINE", "true").lower() == "true"
+ENABLE_SFP_ENGINE = os.environ.get("ENABLE_SFP_ENGINE", "true").lower() == "true"
+ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE = os.environ.get("ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "false").lower() == "true"
+ENABLE_CRT_ENGINE = os.environ.get("ENABLE_CRT_ENGINE", "true").lower() == "true"
 ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED", "false").lower() == "true"
 MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
 MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
 MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
+
+EXPECTED_EVENT_ENGINES = {
+    "DIVERGENCE", "VOLATILITY_SQUEEZE", "MACD_4H", "MA_COMPRESSION",
+    "BREAKOUT_MOMENTUM", "DONCHIAN_RETEST", "LIQUIDITY_SWEEP", "EMA_PULLBACK",
+    "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
+    "LIQUIDATION_CASCADE_FVG", "CRT",
+}
 
 
 def _validate_execution_config() -> tuple[bool, str]:
@@ -260,6 +292,22 @@ def _event_trigger_max_delay_min(ev: dict) -> float:
         return MA_COMPRESSION_RETEST_MAX_DELAY_MIN
     if engine == "BREAKOUT_MOMENTUM":
         return BREAKOUT_MOMENTUM_RETEST_MAX_DELAY_MIN
+    if engine == "DONCHIAN_RETEST":
+        return float(os.environ.get("DONCHIAN_RETEST_MAX_DELAY_MIN", "120"))
+    if engine == "EMA_PULLBACK":
+        return float(os.environ.get("EMA_PULLBACK_RETEST_MAX_DELAY_MIN", "120"))
+    if engine == "ORDER_BLOCK":
+        return ORDER_BLOCK_RETEST_MAX_DELAY_MIN
+    if engine == "BREAKER_BLOCK":
+        return BREAKER_BLOCK_RETEST_MAX_DELAY_MIN
+    if engine == "MITIGATION_BLOCK":
+        return MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN
+    if engine == "SFP":
+        return SFP_RETEST_MAX_DELAY_MIN
+    if engine == "LIQUIDATION_CASCADE_FVG":
+        return LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN
+    if engine == "CRT":
+        return CRT_RETEST_MAX_DELAY_MIN
     if event_type == "VOLATILITY_SQUEEZE_RELEASE":
         return VOLATILITY_SQUEEZE_RETEST_MAX_DELAY_MIN
     return MAX_TRIGGER_DELAY
@@ -415,7 +463,11 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
 
     if updated:
         _save_json_atomic(OI_HISTORY, history)
-        _OI_HIST_CACHE["ts"] = 0.0
+        # Keep the in-memory cache coherent with the just-persisted snapshot.
+        # Invalidating the timestamp alone can still leave callers with stale
+        # data during the same monotonic tick if they read immediately.
+        _OI_HIST_CACHE["data"] = history
+        _OI_HIST_CACHE["ts"] = time.monotonic()
     _OI_HIST_CACHE["path"] = str(OI_HISTORY.resolve())
     return updated
 
@@ -563,6 +615,24 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
                 strategy_events.extend(detect_ma_compression_breakout(d, symbol, timeframe))
             if ENABLE_BREAKOUT_MOMENTUM_ENGINE:
                 strategy_events.extend(detect_breakout_momentum(d, symbol, timeframe))
+            if ENABLE_DONCHIAN_RETEST_ENGINE:
+                strategy_events.extend(detect_donchian_retest(d, symbol, timeframe))
+            if ENABLE_LIQUIDITY_SWEEP_ENGINE:
+                strategy_events.extend(detect_liquidity_sweep_reclaim(d, symbol, timeframe))
+            if ENABLE_EMA_PULLBACK_ENGINE:
+                strategy_events.extend(detect_ema_pullback_continuation(d, symbol, timeframe))
+            if ENABLE_ORDER_BLOCK_ENGINE:
+                strategy_events.extend(detect_order_block(d, symbol, timeframe))
+            if ENABLE_BREAKER_BLOCK_ENGINE:
+                strategy_events.extend(detect_breaker_block(d, symbol, timeframe))
+            if ENABLE_MITIGATION_BLOCK_ENGINE:
+                strategy_events.extend(detect_mitigation_block(d, symbol, timeframe))
+            if ENABLE_SFP_ENGINE:
+                strategy_events.extend(detect_sfp(d, symbol, timeframe))
+            if ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE:
+                strategy_events.extend(detect_liquidation_cascade_fvg(r, d, symbol, timeframe))
+            if ENABLE_CRT_ENGINE:
+                strategy_events.extend(detect_crt(d, symbol, timeframe))
             tf_stats["scanned"] += 1
             stats["divergence_events"] += len(divs)
             stats["squeeze_events"] += len(sqs) + len(liqs)
@@ -985,6 +1055,24 @@ def calculate_setup_score(
         score += 25.0
     elif event_type == "BREAKOUT_MOMENTUM":
         score += 30.0
+    elif event_type == "DONCHIAN_RETEST_BREAKOUT":
+        score += 25.0
+    elif event_type == "LIQUIDITY_SWEEP_RECLAIM":
+        score += 25.0
+    elif event_type == "EMA_PULLBACK_CONTINUATION":
+        score += 20.0
+    elif event_type.startswith("ORDER_BLOCK_"):
+        score += 20.0
+    elif event_type.startswith("BREAKER_BLOCK_"):
+        score += 20.0
+    elif event_type.startswith("MITIGATION_BLOCK_"):
+        score += 20.0
+    elif event_type.startswith("SFP_"):
+        score += 20.0
+    elif event_type.startswith("LIQUIDATION_CASCADE_FVG_"):
+        score += 25.0
+    elif event_type.startswith("CRT_"):
+        score += 20.0
 
     # Squeeze families retain a bonus, but volatility compression and liquidation
     # squeeze are separate event types and can be analysed independently.
@@ -2165,10 +2253,11 @@ def main() -> None:
             stats["fresh_long"] += int(direction == "LONG")
             stats["fresh_short"] += int(direction == "SHORT")
             event_type = str(ev.get("event_type", "")).upper()
-            stats["fresh_squeeze"] += int("SQUEEZE" in event_type)
-            stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
-            tf_stats["fresh_squeeze"] += int("SQUEEZE" in event_type)
-            tf_stats["fresh_divergence"] += int("SQUEEZE" not in event_type)
+            is_squeeze = _is_squeeze_event(event_type)
+            stats["fresh_squeeze"] += int(is_squeeze)
+            stats["fresh_divergence"] += int(not is_squeeze)
+            tf_stats["fresh_squeeze"] += int(is_squeeze)
+            tf_stats["fresh_divergence"] += int(not is_squeeze)
             log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
             if btc_regime_df is not None and symbol != "BTC-USDT":
@@ -2212,7 +2301,9 @@ def main() -> None:
             # 1H divergences require a 4H directional context; hidden divergences
             # are especially strict because they are continuation setups.
             htf_context: dict[str, Any] = {}
-            if ("REGULAR_" in event_type or "HIDDEN_" in event_type) and (tf == "4h" or REQUIRE_4H_CONTEXT_FOR_1H):
+            requires_div_context = ("REGULAR_" in event_type or "HIDDEN_" in event_type) and (tf == "4h" or REQUIRE_4H_CONTEXT_FOR_1H)
+            requires_strategy_context = bool(ev.get("event_fact", {}).get("requires_htf_context")) and not requires_div_context
+            if requires_div_context or requires_strategy_context:
                 context_tf = "1d" if tf == "4h" else "4h"
                 context_limit = int(os.environ.get("KLINE_LIMIT_1D", "250")) if context_tf == "1d" else int(os.environ.get("KLINE_LIMIT_4H", "250"))
                 cache_key = f"{symbol}:{context_tf}"
@@ -2227,21 +2318,19 @@ def main() -> None:
                         htf_context = {"df": None, "error": str(exc)}
                         # Do not cache transient errors; a later event/cycle may succeed.
                         htf_context_cache.pop(cache_key, None)
-                valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(
-                    ev,
-                    (htf_context or {}).get("df") if isinstance(htf_context, dict) else None,
-                    context_timeframe=context_tf,
-                )
+
+                ctx_df = (htf_context or {}).get("df") if isinstance(htf_context, dict) else None
+                if requires_div_context:
+                    valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(ev, ctx_df, context_timeframe=context_tf)
+                else:
+                    valid_ctx, ctx_reason, ctx_meta = validate_strategy_htf_context(ev, ctx_df, context_timeframe=context_tf)
                 if not valid_ctx:
-                    # If 1H context is explicitly optional, do not silently turn the
-                    # flag into an unconditional rejection. Otherwise a missing HTF
-                    # dataset is a fail-closed condition for hidden divergence.
-                    if tf == "1h" and not REQUIRE_4H_CONTEXT_FOR_1H:
+                    if requires_div_context and tf == "1h" and not REQUIRE_4H_CONTEXT_FOR_1H:
                         pass
                     else:
                         stats["rejected_context"] = stats.get("rejected_context", 0) + 1
                         tf_stats["rejected_context"] = tf_stats.get("rejected_context", 0) + 1
-                        log.info("[SIGNALS] %s %s (%s/%s) rejected by divergence context: %s", direction, symbol, tf, event_type, ctx_reason)
+                        log.info("[SIGNALS] %s %s (%s/%s) rejected by HTF context: %s", direction, symbol, tf, event_type, ctx_reason)
                         continue
                 ev.setdefault("event_fact", {}).update(ctx_meta)
 
@@ -2402,7 +2491,11 @@ def main() -> None:
     opportunities, conflict_rejected = resolve_symbol_direction_conflicts(opportunities)
     stats["conflict_rejected"] = len(conflict_rejected)
     stats["valid_signals"] = len(opportunities)
-    opportunities.sort(key=lambda x: x["score"], reverse=True)
+    def _opportunity_rank_key(item: dict[str, Any]) -> tuple[float, str, str, float]:
+        event = item.get("event") if isinstance(item.get("event"), dict) else {}
+        ts = _safe_float((event.get("timestamps") or {}).get("detected_at_ts"), 0.0)
+        return (-ts, str(item.get("symbol", "")), str(item.get("direction", "")), -_safe_float(item.get("score"), 0.0))
+    opportunities.sort(key=_opportunity_rank_key)
 
     for rejected in conflict_rejected:
         loser = rejected.get("direction")
