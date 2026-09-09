@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1788969746418,
+  "updated_ts": 1788970443287,
   "events": [
     {
       "event_id": "EVT_8D0902A9A2D4AEAE",
@@ -8821,6 +8821,50 @@
         "range_high": 0.09183,
         "range_low": 0.08197,
         "manipulation_depth_atr": 0.17460726891255726
+      }
+    },
+    {
+      "event_id": "EVT_283F4C069B0497C8",
+      "symbol": "COTI",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1788696000000,
+        "pivot_2_ts": 1788969600000,
+        "detected_at_ts": 1788969600000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.018779,
+        "zone_high": 0.019215,
+        "zone_low": 0.017479,
+        "origin_ts": 1788696000000,
+        "displacement_atr": 1.2258476971561048,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_C41CE4DE1261BA79",
+      "symbol": "COTI",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "MACD_4H_BULLISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1788969600000,
+        "pivot_2_ts": 1788969600000,
+        "detected_at_ts": 1788969600000
+      },
+      "event_fact": {
+        "detection_close_price": 0.019007,
+        "macd": 0.0007754425665705729,
+        "macd_signal": 0.0007488347773648796,
+        "macd_hist": 2.6607789205693308e-05,
+        "ema200": 0.013706535054700108,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H"
       }
     }
   ]
