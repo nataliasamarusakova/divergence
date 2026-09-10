@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789070563799,
+  "updated_ts": 1789071192324,
   "events": [
     {
       "event_id": "EVT_20FC597C07A7319F",
@@ -5173,6 +5173,77 @@
         "bars_between": 7,
         "price_delta_atr": 0.9009486122887801,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_9DCD8E84E83E9F12",
+      "symbol": "SAGA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789063200000,
+        "pivot_2_ts": 1789070400000,
+        "detected_at_ts": 1789070400000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.01782,
+        "zone_high": 0.01859,
+        "zone_low": 0.01687,
+        "origin_ts": 1789063200000,
+        "displacement_atr": 1.2108072818993183,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_A59D7F337CC1CBE5",
+      "symbol": "SAGA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789063200000,
+        "pivot_2_ts": 1789070400000,
+        "detected_at_ts": 1789070400000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.01687,
+        "range_high": 0.01859,
+        "range_low": 0.01687,
+        "manipulation_depth_atr": 0.9553087634903948
+      }
+    },
+    {
+      "event_id": "EVT_6A653C9ADB3C764C",
+      "symbol": "SAGA",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789070400000,
+        "pivot_2_ts": 1789070400000,
+        "detected_at_ts": 1789070400000
+      },
+      "event_fact": {
+        "detection_close_price": 0.01767,
+        "donchian_high": 0.01654,
+        "donchian_low": 0.01287,
+        "breakout_atr": 1.5124793675533967,
+        "volume_ratio": 1.3335301369130836,
+        "adx": 28.122211806971105,
+        "ema200": 0.014537653116354736,
+        "compressed_recent": false,
+        "bb_width": 0.21452062683901266,
+        "trigger_level": 0.01654,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true
       }
     }
   ]
