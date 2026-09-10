@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789006812405,
+  "updated_ts": 1789007062058,
   "events": [
     {
       "event_id": "EVT_1B51D48E7C1E81B6",
@@ -3218,6 +3218,29 @@
         "requires_retest": true,
         "trigger_level": 0.09816,
         "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_F9E18077D5BF19C1",
+      "symbol": "SAHARA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1789005600000,
+        "pivot_2_ts": 1789005600000,
+        "detected_at_ts": 1789005600000
+      },
+      "event_fact": {
+        "ema_fast": 0.009981395202884403,
+        "ema_slow": 0.009700204103694023,
+        "ema200": 0.00925488840952284,
+        "body_atr": 0.9590929446436413,
+        "volume_ratio": 1.0248223253833895,
+        "trigger_level": 0.009981395202884403,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
         "requires_htf_context": true
       }
     }
