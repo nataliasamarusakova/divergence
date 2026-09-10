@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789014019091,
+  "updated_ts": 1789014338720,
   "events": [
     {
       "event_id": "EVT_7405FAE8103AA5D7",
@@ -5984,6 +5984,50 @@
         "engine": "VOLATILITY_SQUEEZE",
         "requires_retest": true,
         "trigger_level": 35.54596326659241
+      }
+    },
+    {
+      "event_id": "EVT_578A21E6F177A837",
+      "symbol": "RAY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MITIGATION_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788933600000,
+        "pivot_2_ts": 1789012800000,
+        "detected_at_ts": 1789012800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 1.2514,
+        "zone_high": 1.3241,
+        "zone_low": 1.2379,
+        "origin_ts": 1788933600000,
+        "displacement_atr": 1.576340584191606,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_025F56B400E6AAE5",
+      "symbol": "RAY",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788984000000,
+        "pivot_2_ts": 1789012800000,
+        "detected_at_ts": 1789012800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.2282,
+        "range_high": 1.4304,
+        "range_low": 1.2282,
+        "manipulation_depth_atr": 0.21756344751947468
       }
     }
   ]
