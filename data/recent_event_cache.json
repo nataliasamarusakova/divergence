@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789027972912,
+  "updated_ts": 1789028297332,
   "events": [
     {
       "event_id": "EVT_DBD0776CD806B291",
@@ -5661,6 +5661,51 @@
         "bars_between": 9,
         "price_delta_atr": 2.9728829365671987,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_F46A84E4B0318605",
+      "symbol": "EGLD",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1788994800000,
+        "pivot_2_ts": 1789020000000,
+        "detected_at_ts": 1789027200000
+      },
+      "event_fact": {
+        "detection_close_price": 5.273,
+        "p1_price": 5.033,
+        "p2_price": 4.997,
+        "p1_indicator": 57.14150386225884,
+        "p2_indicator": 57.855423337252674,
+        "bars_between": 7,
+        "price_delta_atr": 0.3588403443046148,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_0D4DDC8C9C14DC15",
+      "symbol": "EGLD",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1788436800000,
+        "pivot_2_ts": 1789027200000,
+        "detected_at_ts": 1789027200000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 5.283,
+        "zone_high": 5.348,
+        "zone_low": 4.8,
+        "origin_ts": 1788436800000,
+        "displacement_atr": 1.7874804560448865,
+        "return_tolerance_pct": 0.2
       }
     }
   ]
