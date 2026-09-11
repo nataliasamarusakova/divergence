@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789110539980,
+  "updated_ts": 1789110776968,
   "events": [
     {
       "event_id": "EVT_F950970D6733C382",
@@ -3619,6 +3619,53 @@
         "trigger_level": 0.3725,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_535CED7CB2072C9D",
+      "symbol": "BTR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789110000000,
+        "pivot_2_ts": 1789110000000,
+        "detected_at_ts": 1789110000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.05205,
+        "compression_ratio": 0.5101717967162152,
+        "ma_spread_atr": 0.5676842811168354,
+        "compression_threshold": 1.11273160290476,
+        "breakout_atr": 0.6611986652173704,
+        "volume_ratio": 0.7995341641998687,
+        "requires_retest": true,
+        "trigger_level": 0.05098,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_3721B509909DDC14",
+      "symbol": "BTR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MITIGATION_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788937200000,
+        "pivot_2_ts": 1789110000000,
+        "detected_at_ts": 1789110000000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.05128,
+        "zone_high": 0.05445,
+        "zone_low": 0.05118,
+        "origin_ts": 1788937200000,
+        "displacement_atr": 1.6941261295576264,
+        "return_tolerance_pct": 0.2
       }
     }
   ]
