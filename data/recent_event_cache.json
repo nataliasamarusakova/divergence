@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789159781710,
+  "updated_ts": 1789160171031,
   "events": [
     {
       "event_id": "EVT_A5C5191ADEC5BD85",
@@ -6662,6 +6662,50 @@
         "origin_ts": 1788537600000,
         "displacement_atr": 3.632214983515152,
         "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_663A10ACE490B45F",
+      "symbol": "ORDI",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "MITIGATION_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788451200000,
+        "pivot_2_ts": 1789156800000,
+        "detected_at_ts": 1789156800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 4.019,
+        "zone_high": 4.21,
+        "zone_low": 3.971,
+        "origin_ts": 1788451200000,
+        "displacement_atr": 1.6850055065124865,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_8A2F9CB4BD4D110D",
+      "symbol": "ORDI",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789128000000,
+        "pivot_2_ts": 1789156800000,
+        "detected_at_ts": 1789156800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 4.014,
+        "range_high": 4.014,
+        "range_low": 3.904,
+        "manipulation_depth_atr": 0.28456021910416546
       }
     }
   ]
