@@ -1549,5 +1549,3 @@ def _validate_sl_order_for_position(
     if expected_qty is not None and not _qty_matches_position(qty, float(expected_qty)):
         return False
     return True
-
-    return False

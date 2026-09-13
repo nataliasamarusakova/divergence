@@ -729,8 +729,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) < zlo]
                 if breaks:
-                    break_i=breaks[-1]
-                    # The breaker must be retested AFTER the decisive break;
+                    break_i=breaks[0]
+                    # The breaker must be retested AFTER the first decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
                         continue
@@ -750,8 +750,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) > zhi]
                 if breaks:
-                    break_i=breaks[-1]
-                    # The breaker must be retested AFTER the decisive break;
+                    break_i=breaks[0]
+                    # The breaker must be retested AFTER the first decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
                         continue
