@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789270911162,
+  "updated_ts": 1789271218766,
   "events": [
     {
       "event_id": "EVT_3F540E6A96A1B902",
@@ -2787,6 +2787,30 @@
         "engine": "VOLATILITY_SQUEEZE",
         "requires_retest": true,
         "trigger_level": 217.97994394542704
+      }
+    },
+    {
+      "event_id": "EVT_905551F75D0046EC",
+      "symbol": "TIA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789268400000,
+        "pivot_2_ts": 1789268400000,
+        "detected_at_ts": 1789268400000
+      },
+      "event_fact": {
+        "detection_close_price": 0.3499,
+        "compression_ratio": 0.6291936295240896,
+        "ma_spread_atr": 0.40556301930327693,
+        "compression_threshold": 0.6445758511732506,
+        "breakout_atr": 0.13088887820221745,
+        "volume_ratio": 0.6899667822224148,
+        "requires_retest": true,
+        "trigger_level": 0.3503,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
       }
     }
   ]
