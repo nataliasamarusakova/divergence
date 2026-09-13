@@ -57,7 +57,7 @@ from event_engine.signals import (
     _atr as canonical_atr,
 )
 from event_engine.telegram import send as send_tg, format_signal
-from event_engine.shadow import append_shadow_health
+from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
 from event_engine.tracker import (
     update_active_trades,
     register_active_trade,
@@ -134,6 +134,7 @@ CRT_RETEST_MAX_DELAY_MIN = float(os.environ.get("CRT_RETEST_MAX_DELAY_MIN", "60"
 REQUIRE_4H_CONTEXT_FOR_1H = os.environ.get("REQUIRE_4H_CONTEXT_FOR_1H", "true").lower() == "true"
 ENABLE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_DIVERGENCE_ENGINE", "true").lower() == "true"
 DIVERGENCE_SHADOW_ONLY = os.environ.get("DIVERGENCE_SHADOW_ONLY", "false").lower() == "true"
+DIVERGENCE_SHADOW_STATE = DATA / "divergence_shadow_trades.json"
 MAX_PRE_ORDER_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_PRE_ORDER_DRIFT_REJECTIONS", "3")))
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
 ENABLE_MA_COMPRESSION_ENGINE = os.environ.get("ENABLE_MA_COMPRESSION_ENGINE", "true").lower() == "true"
@@ -2168,6 +2169,19 @@ def main() -> None:
 
     stats["coinalyze_rows"] = len(rows)
 
+    # Maintain persistent paper-trade lifecycle for divergence shadow setups.
+    # This never opens exchange positions and is intentionally independent of
+    # real active-trade state. Market-price snapshots are used between cycles.
+    if DIVERGENCE_SHADOW_ONLY:
+        try:
+            shadow_prices = {str(r.symbol).upper(): float(r.price) for r in rows if getattr(r, "price", None) and float(r.price) > 0}
+            shadow_updates = update_divergence_shadow_state(DIVERGENCE_SHADOW_STATE, shadow_prices, now_ms=int(pd.Timestamp.utcnow().timestamp() * 1000))
+            stats["divergence_shadow_active"] = shadow_updates.get("active", 0)
+            stats["divergence_shadow_closed"] = shadow_updates.get("closed", 0)
+        except Exception as exc:
+            stats["scan_errors"] += 1
+            log.warning("[SHADOW] Divergence shadow state update failed: %s", exc)
+
     # Audit fix B2: persist OI snapshots per 1h bucket so Price-vs-OI swing
     # divergence becomes computable once enough history has accumulated.
     try:
@@ -2353,9 +2367,10 @@ def main() -> None:
             event_type = str(ev.get("event_type", "")).upper()
             is_squeeze = _is_squeeze_event(event_type)
             stats["fresh_squeeze"] += int(is_squeeze)
-            stats["fresh_divergence"] += int(not is_squeeze)
+            is_divergence = event_type == "DIVERGENCE"
+            stats["fresh_divergence"] += int(is_divergence)
             tf_stats["fresh_squeeze"] += int(is_squeeze)
-            tf_stats["fresh_divergence"] += int(not is_squeeze)
+            tf_stats["fresh_divergence"] += int(is_divergence)
             log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
             if btc_regime_df is not None and symbol != "BTC-USDT":
@@ -2627,6 +2642,7 @@ def main() -> None:
         score = opp["score"]
         r = opp["coinalyze_row"]
         ev = opp["event"]
+        event_type_name = str(ev.get("event_type", "")).upper()
 
         bx_symbol = to_bx_symbol(symbol)
         opposite_direction = "SHORT" if direction == "LONG" else "LONG"
@@ -2645,30 +2661,55 @@ def main() -> None:
             ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
         )
         if EXECUTION_ENABLED and event_type_name == "DIVERGENCE" and DIVERGENCE_SHADOW_ONLY:
-            execution_result = {
-                "status": "DIVERGENCE_SHADOW",
-                "mode": EXECUTION_MODE,
-                "order_id": None,
-                "position": {},
-                "error": "DIVERGENCE_SHADOW_ONLY=true",
-            }
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
-            record_action({
-                "event_id": event_id, "symbol": symbol, "direction": direction,
-                "score": score, "event_type": ev.get("event_type"),
-                "execution_status": "DIVERGENCE_SHADOW",
-                "ts": shadow_ts,
-            })
-            record_trade({
-                "record_type": "EVENT_TERMINAL",
-                "event_id": event_id,
-                "reason": "DIVERGENCE_SHADOW_EVALUATED",
-                "symbol": symbol,
-                "direction": direction,
-                "event_type": ev.get("event_type"),
-                "ts": shadow_ts,
-            })
-            terminal_event_ids.add(event_id)
+            trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)
+            try:
+                shadow_result = record_divergence_shadow_open(
+                    DIVERGENCE_SHADOW_STATE,
+                    event_id=event_id,
+                    symbol=symbol,
+                    direction=direction,
+                    event_type=event_type_name,
+                    timeframe=str(ev.get("timeframe", "1h")),
+                    entry_price=trigger_entry,
+                    setup=setup,
+                    score=float(score),
+                    opened_ts=shadow_ts,
+                )
+                execution_result = {
+                    "status": "DIVERGENCE_SHADOW",
+                    "mode": EXECUTION_MODE,
+                    "order_id": None,
+                    "position": {},
+                    "error": "DIVERGENCE_SHADOW_ONLY=true",
+                    "shadow": shadow_result,
+                }
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "score": score, "event_type": ev.get("event_type"),
+                    "execution_status": "DIVERGENCE_SHADOW",
+                    "shadow_entry_price": trigger_entry,
+                    "ts": shadow_ts,
+                })
+                record_trade({
+                    "record_type": "EVENT_TERMINAL",
+                    "event_id": event_id,
+                    "reason": "DIVERGENCE_SHADOW_OPENED",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "event_type": ev.get("event_type"),
+                    "ts": shadow_ts,
+                })
+                terminal_event_ids.add(event_id)
+            except Exception as exc:
+                execution_result = {
+                    "status": "DIVERGENCE_SHADOW_ERROR",
+                    "mode": EXECUTION_MODE,
+                    "order_id": None,
+                    "position": {},
+                    "error": str(exc),
+                }
+                log.exception("[SHADOW] Failed to record divergence paper trade for %s %s (%s)", direction, symbol, event_id)
         elif EXECUTION_ENABLED and trigger_observed_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
             stats["rejected_trigger_stale"] += 1
             execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
@@ -2908,7 +2949,7 @@ def main() -> None:
         )
 
     try:
-        append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES)
+        append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES, divergence_shadow_path=DIVERGENCE_SHADOW_STATE)
     except Exception as exc:
         log.error("[SHADOW] Health snapshot error: %s", exc)
 
