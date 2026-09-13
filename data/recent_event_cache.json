@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789307519996,
+  "updated_ts": 1789307804369,
   "events": [
     {
       "event_id": "EVT_3F8143B7190E3C4B",
@@ -2556,6 +2556,72 @@
         "bars_between": 7,
         "price_delta_atr": 0.9074672737091092,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_B812943F0C14461A",
+      "symbol": "ATOM",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_MACD",
+      "timestamps": {
+        "pivot_1_ts": 1789257600000,
+        "pivot_2_ts": 1789297200000,
+        "detected_at_ts": 1789304400000
+      },
+      "event_fact": {
+        "detection_close_price": 1.599,
+        "p1_price": 1.591,
+        "p2_price": 1.569,
+        "p1_indicator": -0.01914599933508776,
+        "p2_indicator": -0.018066749739691357,
+        "bars_between": 11,
+        "price_delta_atr": 1.4953827362069625,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_9050E19A1EF71AA3",
+      "symbol": "ATOM",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1789275600000,
+        "pivot_2_ts": 1789304400000,
+        "detected_at_ts": 1789304400000
+      },
+      "event_fact": {
+        "swept_level": 1.592,
+        "sweep_depth_atr": 0.13336417961226563,
+        "reclaim_displacement_atr": 0.4667746286429223,
+        "volume_ratio": 1.4288923386671775,
+        "trigger_level": 1.592,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_1AC55A26B64DCB12",
+      "symbol": "ATOM",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "SFP_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789275600000,
+        "pivot_2_ts": 1789304400000,
+        "detected_at_ts": 1789304400000
+      },
+      "event_fact": {
+        "engine": "SFP",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.592,
+        "swept_level": 1.592,
+        "sweep_depth_atr": 0.13336417961226563,
+        "volume_ratio": 1.4288923386671775,
+        "body_fraction": 0.8181818181818163
       }
     }
   ]
