@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789308404523,
+  "updated_ts": 1789308718437,
   "events": [
     {
       "event_id": "EVT_2CDE9475C3270CBC",
@@ -1655,6 +1655,29 @@
         "trigger_level": 0.3543,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_B1DCC6D70C5DCEF7",
+      "symbol": "ETC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MITIGATION_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789131600000,
+        "pivot_2_ts": 1789308000000,
+        "detected_at_ts": 1789308000000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 7.51,
+        "zone_high": 7.707,
+        "zone_low": 7.396,
+        "origin_ts": 1789131600000,
+        "displacement_atr": 1.5663653855496649,
+        "return_tolerance_pct": 0.2
       }
     }
   ]
