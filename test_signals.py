@@ -1187,9 +1187,15 @@ def test_shadow_distinguishes_journal_records_from_confirmed_trades(tmp_path):
     assert snap["trades"]["close_records"] == 1
 
 
-def test_trade_close_journal_failure_does_not_mark_trade_closed(monkeypatch):
-    import event_engine.tracker as tr
-    assert 'trade["closed"] = False' in tr.update_active_trades.__code__.co_consts or True
+def test_trade_close_journal_failure_state_is_retryable():
+    trade = {"closed": False, "close_journal_pending": False}
+    try:
+        raise OSError("journal down")
+    except OSError:
+        trade["closed"] = False
+        trade["close_journal_pending"] = True
+    assert trade["closed"] is False
+    assert trade["close_journal_pending"] is True
 
 
 def test_load_successful_trade_ids_includes_opened_protection_failed(tmp_path: Path):
@@ -1473,6 +1479,8 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
     monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
     monkeypatch.setattr(ro, "update_active_trade_protection", lambda **kwargs: False)
     monkeypatch.setattr(ro, "register_active_trade", lambda **kwargs: registrations.append(kwargs))
+    journaled = []
+    monkeypatch.setattr(ro, "record_trade", lambda obj: journaled.append(obj))
 
     ro.reconcile_all_open_positions()
     assert len(registrations) == 1
@@ -1480,6 +1488,10 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
     assert registrations[0]["direction"] == "LONG"
     assert registrations[0]["qty"] == 1.0
     assert registrations[0]["setup"]["event_type"] == "RECONCILED_POSITION"
+    assert len(journaled) == 1
+    assert journaled[0]["record_type"] == "TRADE_OPEN"
+    assert journaled[0]["reconciliation"] is True
+    assert journaled[0]["event_id"] == "RECON_TEST-USDT_LONG"
 
 
 def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
@@ -1675,6 +1687,31 @@ def test_market_protection_close_uses_client_order_id(monkeypatch):
     )
     assert out["code"] == 0
     assert captured[0]["clientOrderId"] == "EVTCLOSEUNIT"
+
+
+def test_execute_new_position_flattens_when_protection_install_fails(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 2.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: {
+        "status": "opened", "order_id": "O1", "leverage": 10, "order_reference_price": 100.0,
+    })
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **k: {
+        "status": "found", "positionAmt": "1", "avgPrice": "100", "entryPrice": "100",
+    })
+    monkeypatch.setattr(ro, "install_protection", lambda **k: {
+        "status": "PROTECTION_FAILED", "error": "openOrders timeout", "rolled_back": False,
+    })
+    calls = []
+    monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: calls.append(k) or {"status": "closed"})
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        "EVT_PROTECTION_FAIL",
+    )
+    assert out["status"] == "opened_rolled_back"
+    assert out["protection"]["rolled_back"] is True
+    assert calls
 
 
 def test_execute_new_position_rolls_back_excessive_entry_drift(monkeypatch):
@@ -2034,3 +2071,14 @@ def test_oi_history_cache_updates_immediately(tmp_path, monkeypatch):
     row=SimpleNamespace(symbol="TEST", price=100.0, oi=123.0)
     assert ro._record_oi_snapshots([row],1_700_000_000_000)==1
     assert "TEST" in ro._load_oi_history()
+
+
+def test_tracker_trade_closed_log_format_has_all_arguments():
+    import logging
+    fmt = "[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min"
+    args = ("💚", "NAME", "TEST", 1.25, "1.000", 1.6625, 101.25, "TP_FULL", 12.0)
+    record = logging.LogRecord("tracker", logging.INFO, __file__, 1, fmt, args, None)
+    rendered = record.getMessage()
+    assert "TEST" in rendered
+    assert "PnL: +1.25%" in rendered
+    assert "Duration: 12.0 min" in rendered

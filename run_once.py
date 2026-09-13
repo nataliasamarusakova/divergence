@@ -132,6 +132,9 @@ SFP_RETEST_MAX_DELAY_MIN = float(os.environ.get("SFP_RETEST_MAX_DELAY_MIN", "60"
 LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN = float(os.environ.get("LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN", "90"))
 CRT_RETEST_MAX_DELAY_MIN = float(os.environ.get("CRT_RETEST_MAX_DELAY_MIN", "60"))
 REQUIRE_4H_CONTEXT_FOR_1H = os.environ.get("REQUIRE_4H_CONTEXT_FOR_1H", "true").lower() == "true"
+ENABLE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_DIVERGENCE_ENGINE", "true").lower() == "true"
+DIVERGENCE_SHADOW_ONLY = os.environ.get("DIVERGENCE_SHADOW_ONLY", "false").lower() == "true"
+MAX_PRE_ORDER_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_PRE_ORDER_DRIFT_REJECTIONS", "3")))
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
 ENABLE_MA_COMPRESSION_ENGINE = os.environ.get("ENABLE_MA_COMPRESSION_ENGINE", "true").lower() == "true"
 ENABLE_BREAKOUT_MOMENTUM_ENGINE = os.environ.get("ENABLE_BREAKOUT_MOMENTUM_ENGINE", "true").lower() == "true"
@@ -141,6 +144,7 @@ ENABLE_EMA_PULLBACK_ENGINE = os.environ.get("ENABLE_EMA_PULLBACK_ENGINE", "true"
 ENABLE_ORDER_BLOCK_ENGINE = os.environ.get("ENABLE_ORDER_BLOCK_ENGINE", "true").lower() == "true"
 ENABLE_BREAKER_BLOCK_ENGINE = os.environ.get("ENABLE_BREAKER_BLOCK_ENGINE", "true").lower() == "true"
 ENABLE_MITIGATION_BLOCK_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_ENGINE", "true").lower() == "true"
+ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE", "false").lower() == "true"
 ENABLE_SFP_ENGINE = os.environ.get("ENABLE_SFP_ENGINE", "true").lower() == "true"
 ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE = os.environ.get("ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "false").lower() == "true"
 ENABLE_CRT_ENGINE = os.environ.get("ENABLE_CRT_ENGINE", "true").lower() == "true"
@@ -626,7 +630,10 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             if ENABLE_BREAKER_BLOCK_ENGINE:
                 strategy_events.extend(detect_breaker_block(d, symbol, timeframe))
             if ENABLE_MITIGATION_BLOCK_ENGINE:
-                strategy_events.extend(detect_mitigation_block(d, symbol, timeframe))
+                mitigation_events = detect_mitigation_block(d, symbol, timeframe)
+                if not ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE:
+                    mitigation_events = [ev for ev in mitigation_events if str(ev.get("event_type", "")).upper() != "MITIGATION_BLOCK_BULLISH"]
+                strategy_events.extend(mitigation_events)
             if ENABLE_SFP_ENGINE:
                 strategy_events.extend(detect_sfp(d, symbol, timeframe))
             if ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE:
@@ -678,6 +685,52 @@ def load_ids(path: Path) -> set[str]:
             if val:
                 ids.add(str(val))
     return ids
+
+
+def load_terminal_event_ids(path: Path) -> set[str]:
+    """Return event IDs explicitly retired by EVENT_TERMINAL records."""
+    if not path.exists():
+        return set()
+    ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("record_type") == "EVENT_TERMINAL" and obj.get("event_id"):
+            ids.add(str(obj["event_id"]))
+    return ids
+
+
+def load_pre_order_drift_failure_counts(path: Path, terminal_ids: set[str] | None = None) -> dict[str, int]:
+    """Count repeated PRE_ORDER_DRIFT_EXCEEDED outcomes per event.
+
+    Counts are persisted in trades.jsonl through EXECUTION_ATTEMPT records, so the
+    retry budget survives workflow runs without another state file. Terminal events
+    are excluded because their retry budget has already been exhausted.
+    """
+    if not path.exists():
+        return {}
+    terminal_ids = terminal_ids or set()
+    counts: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("record_type") != "EXECUTION_ATTEMPT":
+            continue
+        event_id = str(obj.get("event_id") or "")
+        if not event_id or event_id in terminal_ids:
+            continue
+        result = obj.get("result") or {}
+        if isinstance(result, dict) and str(result.get("status", "")) == "PRE_ORDER_DRIFT_EXCEEDED":
+            counts[event_id] = counts.get(event_id, 0) + 1
+    return counts
 
 
 def load_successful_telegram_ids(path: Path) -> set[str]:
@@ -882,6 +935,29 @@ def emit_event(ev: dict) -> None:
 
 def record_trade(obj: dict) -> None:
     append_jsonl(TRADES, obj)
+
+
+def _record_reconciled_trade_open(symbol: str, direction: str, avg_price: float, qty: float,
+                                  *, event_id: str, tp_orders: list[dict], sl_result: dict,
+                                  setup: dict | None = None) -> None:
+    """Journal an exchange position adopted by reconciliation."""
+    trade_id = "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper()
+    record_trade({
+        "record_type": "TRADE_OPEN",
+        "trade_id": trade_id,
+        "event_id": event_id,
+        "symbol": symbol,
+        "direction": direction,
+        "signal": {"event_type": "RECONCILED_POSITION", "timeframe": "1h", "signal_price": avg_price,
+                   "score": None, "detected_at_ts": None, "event_fact": {"reconciliation": True}},
+        "execution": {"requested_price": avg_price, "signal_price": avg_price,
+                       "actual_entry_price": avg_price, "actual_qty": qty, "order_id": None,
+                       "status": "reconciled_adopted", "slippage_pct": None, "adverse_slippage_pct": None},
+        "protection": {"tp_orders": tp_orders, "sl_result": sl_result},
+        "setup": setup or {"event_type": "RECONCILED_POSITION", "risk_pct": None},
+        "reconciliation": True, "status": "reconciled_adopted",
+        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+    })
 
 
 def record_action(obj: dict) -> None:
@@ -1579,7 +1655,12 @@ def reconcile_all_open_positions() -> None:
                             setup=inferred_setup,
                             requested_entry_price=avg_price,
                         )
-                        log.warning("[RECONCILIATION] Registered orphan protected position %s (%s) into tracker.", bx_symbol, direction)
+                        _record_reconciled_trade_open(
+                            bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
+                            event_id=f"RECON_{bx_symbol}_{direction}",
+                            tp_orders=tracker_tp, sl_result=tracker_sl, setup=inferred_setup,
+                        )
+                        log.warning("[RECONCILIATION] Registered orphan protected position %s (%s) into tracker and journal.", bx_symbol, direction)
                     except Exception as exc:
                         log.error("[RECONCILIATION] Failed to register protected orphan %s (%s): %s", bx_symbol, direction, exc)
             continue
@@ -1720,6 +1801,11 @@ def reconcile_all_open_positions() -> None:
                     tp_orders=repaired_tp,
                     sl_result=repaired_sl,
                     event_type="RECONCILED_POSITION",
+                )
+                _record_reconciled_trade_open(
+                    bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
+                    event_id=f"RECON_{bx_symbol}_{direction}",
+                    tp_orders=repaired_tp, sl_result=repaired_sl,
                 )
 
             first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)
@@ -1946,6 +2032,12 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         setup_for_fill["effective_weighted_rr"] = protection["effective_weighted_rr"]
 
     protection_status = str(protection.get("status", "")).upper()
+    if protection_status not in {"PROTECTED", "SL_ONLY"} and not protection.get("rolled_back"):
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"PROTECTIONFAIL:{trade_id}")
+        protection["emergency_close"] = rollback
+        protection["rolled_back"] = rollback.get("status") == "closed"
+        protection["rollback_reason"] = "post_entry_protection_not_verified"
+
     if protection.get("rolled_back"):
         final_status = "opened_rolled_back"
         try:
@@ -2158,6 +2250,8 @@ def main() -> None:
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
+    terminal_event_ids = load_terminal_event_ids(TRADES)
+    pre_order_drift_fail_counts = load_pre_order_drift_failure_counts(TRADES, terminal_event_ids)
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     scan_state = _load_timeframe_scan_state()
@@ -2209,7 +2303,11 @@ def main() -> None:
         d15 = None
         for ev in sorted(all_events, key=lambda x: int(x.get("timestamps", {}).get("detected_at_ts", 0) or 0), reverse=True):
             event_id = ev.get("event_id")
-            if not event_id or event_id in executed_event_ids:
+            if not event_id or event_id in executed_event_ids or event_id in terminal_event_ids:
+                continue
+
+            event_type_name = str(ev.get("event_type", "")).upper()
+            if event_type_name == "DIVERGENCE" and not ENABLE_DIVERGENCE_ENGINE:
                 continue
             direction = str(ev.get("direction", "")).upper()
             if direction not in {"LONG", "SHORT"}:
@@ -2546,7 +2644,32 @@ def main() -> None:
         trigger_age_min = ((now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
             ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
         )
-        if EXECUTION_ENABLED and trigger_observed_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
+        if EXECUTION_ENABLED and event_type_name == "DIVERGENCE" and DIVERGENCE_SHADOW_ONLY:
+            execution_result = {
+                "status": "DIVERGENCE_SHADOW",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "position": {},
+                "error": "DIVERGENCE_SHADOW_ONLY=true",
+            }
+            shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
+            record_action({
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "score": score, "event_type": ev.get("event_type"),
+                "execution_status": "DIVERGENCE_SHADOW",
+                "ts": shadow_ts,
+            })
+            record_trade({
+                "record_type": "EVENT_TERMINAL",
+                "event_id": event_id,
+                "reason": "DIVERGENCE_SHADOW_EVALUATED",
+                "symbol": symbol,
+                "direction": direction,
+                "event_type": ev.get("event_type"),
+                "ts": shadow_ts,
+            })
+            terminal_event_ids.add(event_id)
+        elif EXECUTION_ENABLED and trigger_observed_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
             stats["rejected_trigger_stale"] += 1
             execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
                                 "error": f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"}
@@ -2601,9 +2724,24 @@ def main() -> None:
     
                 err_str = str(execution_result.get("error", "")).lower()
                 terminal_reason = None
-                if execution_result.get("status") == "ENTRY_DRIFT_EXCEEDED":
+                status_now = str(execution_result.get("status", ""))
+                if status_now == "PRE_ORDER_DRIFT_EXCEEDED":
+                    current_fail_count = pre_order_drift_fail_counts.get(event_id, 0) + 1
+                    pre_order_drift_fail_counts[event_id] = current_fail_count
+                    if current_fail_count >= MAX_PRE_ORDER_DRIFT_REJECTIONS:
+                        terminal_reason = "ENTRY_DRIFT_EXHAUSTED"
+                        log.warning(
+                            "[EXECUTION] %s (%s) pre-order drift rejected %d times; terminalizing event %s.",
+                            symbol, direction, current_fail_count, event_id,
+                        )
+                    else:
+                        log.info(
+                            "[EXECUTION] %s (%s) pre-order drift rejection %d/%d for event %s; keeping event retryable.",
+                            symbol, direction, current_fail_count, MAX_PRE_ORDER_DRIFT_REJECTIONS, event_id,
+                        )
+                elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
-                    log.warning("[EXECUTION] %s (%s) entry drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                    log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
                 elif execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
                     terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
                     log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
@@ -2616,6 +2754,7 @@ def main() -> None:
     
                 if terminal_reason:
                     executed_event_ids.add(event_id)
+                    terminal_event_ids.add(event_id)
                     record_trade({
                         "record_type": "EVENT_TERMINAL",
                         "event_id": event_id,
