@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789426021505,
+  "updated_ts": 1789426328209,
   "events": [
     {
       "event_id": "EVT_CC929EF4345AC674",
@@ -3664,6 +3664,50 @@
         "trigger_level": 0.0834,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_1A9EE6BC5CD2E4EC",
+      "symbol": "ZRO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789347600000,
+        "pivot_2_ts": 1789423200000,
+        "detected_at_ts": 1789423200000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.9995,
+        "zone_high": 1.0196,
+        "zone_low": 0.9995,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789416000000,
+        "bos_ts": 1789372800000
+      }
+    },
+    {
+      "event_id": "EVT_C73BF919C90794CC",
+      "symbol": "ZRO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789416000000,
+        "pivot_2_ts": 1789423200000,
+        "detected_at_ts": 1789423200000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.0146,
+        "range_high": 1.0146,
+        "range_low": 0.9993,
+        "manipulation_depth_atr": 0.6274548362669073
       }
     }
   ]
