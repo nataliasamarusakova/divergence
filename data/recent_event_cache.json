@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789482835797,
+  "updated_ts": 1789483164677,
   "events": [
     {
       "event_id": "EVT_931A6D5B5BCD68AE",
@@ -4869,6 +4869,74 @@
         "range_high": 183.52,
         "range_low": 182.22,
         "manipulation_depth_atr": 0.8788955977964136
+      }
+    },
+    {
+      "event_id": "EVT_B578DA1A1ADB5EBE",
+      "symbol": "AMZN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789480800000,
+        "pivot_2_ts": 1789480800000,
+        "detected_at_ts": 1789480800000
+      },
+      "event_fact": {
+        "detection_close_price": 252.49,
+        "compression_ratio": 0.40206376336542465,
+        "ma_spread_atr": 0.26839077590581023,
+        "compression_threshold": 0.6675328650840818,
+        "breakout_atr": 0.6075512085480628,
+        "volume_ratio": 0.836094556684161,
+        "requires_retest": true,
+        "trigger_level": 252.98,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_27475BA1780F5425",
+      "symbol": "AMZN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789380000000,
+        "pivot_2_ts": 1789480800000,
+        "detected_at_ts": 1789480800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 253.05,
+        "zone_high": 253.73,
+        "zone_low": 253.05,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789398000000,
+        "bos_ts": 1789387200000
+      }
+    },
+    {
+      "event_id": "EVT_7294E5FD37A1C94B",
+      "symbol": "AMZN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789473600000,
+        "pivot_2_ts": 1789480800000,
+        "detected_at_ts": 1789480800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 253.43,
+        "range_high": 253.43,
+        "range_low": 252.74,
+        "manipulation_depth_atr": 0.22654451844164805
       }
     }
   ]
