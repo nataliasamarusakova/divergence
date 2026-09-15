@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789467270940,
+  "updated_ts": 1789467538875,
   "events": [
     {
       "event_id": "EVT_55DBC2F9FB6D64C7",
@@ -4280,6 +4280,29 @@
         "engine": "VOLATILITY_SQUEEZE",
         "requires_retest": true,
         "trigger_level": 1.2697850020025543
+      }
+    },
+    {
+      "event_id": "EVT_00A13B7C23E8C787",
+      "symbol": "SAGA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789448400000,
+        "pivot_2_ts": 1789466400000,
+        "detected_at_ts": 1789466400000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.01918,
+        "zone_high": 0.01918,
+        "zone_low": 0.01848,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789462800000,
+        "bos_ts": 1789455600000
       }
     }
   ]
