@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789577328754,
+  "updated_ts": 1789577625793,
   "events": [
     {
       "event_id": "EVT_307A25CE29DCE2DE",
@@ -6294,6 +6294,51 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1788595200000,
         "bos_ts": 1787932800000
+      }
+    },
+    {
+      "event_id": "EVT_B99D54C4EEB6A496",
+      "symbol": "4",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1789574400000,
+        "pivot_2_ts": 1789574400000,
+        "detected_at_ts": 1789574400000
+      },
+      "event_fact": {
+        "detection_close_price": 0.02395,
+        "bb_width": 0.005032489864868012,
+        "kc_width": 0.004910827815556948,
+        "squeeze_duration_bars": 15,
+        "compression_ratio": 1.0247742445633405,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.02361901390777847
+      }
+    },
+    {
+      "event_id": "EVT_94336375AFDA8138",
+      "symbol": "4",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1788609600000,
+        "pivot_2_ts": 1789574400000,
+        "detected_at_ts": 1789574400000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.024073,
+        "zone_high": 0.028628,
+        "zone_low": 0.024073,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1788696000000,
+        "bos_ts": 1788638400000
       }
     }
   ]
