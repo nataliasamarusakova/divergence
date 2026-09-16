@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789586504770,
+  "updated_ts": 1789586788722,
   "events": [
     {
       "event_id": "EVT_4B426F4A72263AA8",
@@ -4087,6 +4087,74 @@
         "engine": "VOLATILITY_SQUEEZE",
         "requires_retest": true,
         "trigger_level": 247.39244714181993
+      }
+    },
+    {
+      "event_id": "EVT_EAFED026CEDB14BF",
+      "symbol": "BOME",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789585200000,
+        "pivot_2_ts": 1789585200000,
+        "detected_at_ts": 1789585200000
+      },
+      "event_fact": {
+        "detection_close_price": 0.0008901,
+        "compression_ratio": 0.9651219548853787,
+        "ma_spread_atr": 0.21456909239291183,
+        "compression_threshold": 0.2223232942808713,
+        "breakout_atr": 2.004251023943679,
+        "volume_ratio": 0.9952459075834955,
+        "requires_retest": true,
+        "trigger_level": 0.000864,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_AB798A8B48AA1C12",
+      "symbol": "BOME",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789495200000,
+        "pivot_2_ts": 1789585200000,
+        "detected_at_ts": 1789585200000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.000873,
+        "zone_high": 0.000873,
+        "zone_low": 0.0008521,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789556400000,
+        "bos_ts": 1789498800000
+      }
+    },
+    {
+      "event_id": "EVT_5754C0C244195920",
+      "symbol": "BOME",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789578000000,
+        "pivot_2_ts": 1789585200000,
+        "detected_at_ts": 1789585200000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.0008575,
+        "range_high": 0.0008782,
+        "range_low": 0.0008575,
+        "manipulation_depth_atr": 0.635067911656573
       }
     }
   ]
