@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789584407828,
+  "updated_ts": 1789584706590,
   "events": [
     {
       "event_id": "EVT_1D009E7900FF8F97",
@@ -3328,6 +3328,81 @@
         "origin_ts": 1789340400000,
         "displacement_atr": 1.5632902202459578,
         "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_E32B3D6E5D98D652",
+      "symbol": "COTI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789581600000,
+        "pivot_2_ts": 1789581600000,
+        "detected_at_ts": 1789581600000
+      },
+      "event_fact": {
+        "detection_close_price": 0.018516,
+        "donchian_high": 0.017399,
+        "donchian_low": 0.015859,
+        "breakout_atr": 2.8126976195362676,
+        "volume_ratio": 1.3608526873731333,
+        "adx": 24.849826791517952,
+        "ema200": 0.017006874544792553,
+        "compressed_recent": true,
+        "bb_width": 0.13941234709203565,
+        "trigger_level": 0.017399,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_46AC9D6B19C9B57E",
+      "symbol": "COTI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789563600000,
+        "pivot_2_ts": 1789581600000,
+        "detected_at_ts": 1789581600000
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.016815,
+        "zone_high": 0.016815,
+        "zone_low": 0.016627,
+        "bos_level": 0.017051,
+        "ob_ts": 1789567200000,
+        "displacement_atr": 3.338976762314318,
+        "volume_ratio": 1.3608526873731333,
+        "body_fraction": 0.9512195121951229
+      }
+    },
+    {
+      "event_id": "EVT_443326F9CD6657E2",
+      "symbol": "COTI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789279200000,
+        "pivot_2_ts": 1789581600000,
+        "detected_at_ts": 1789581600000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.017133,
+        "zone_high": 0.017133,
+        "zone_low": 0.016855,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789455600000,
+        "bos_ts": 1789282800000
       }
     }
   ]
