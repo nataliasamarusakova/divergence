@@ -1,1266 +1,6 @@
 {
-  "updated_ts": 1789678592143,
+  "updated_ts": 1789678943453,
   "events": [
-    {
-      "event_id": "EVT_5DC6BC41AB12412C",
-      "symbol": "XRP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 1.2969,
-        "compression_ratio": 0.2517995784462704,
-        "ma_spread_atr": 0.07194529452738041,
-        "compression_threshold": 0.28572444390621676,
-        "breakout_atr": 0.2914859784399595,
-        "volume_ratio": 1.2394652802516908,
-        "requires_retest": true,
-        "trigger_level": 1.3001,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_76B6DA46199397EC",
-      "symbol": "XRP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "EMA_PULLBACK_CONTINUATION",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "ema_fast": 1.2999442221103732,
-        "ema_slow": 1.3123661879492174,
-        "ema200": 1.3506238226081173,
-        "body_atr": 0.2914859784399595,
-        "volume_ratio": 1.2394652802516908,
-        "trigger_level": 1.2999442221103732,
-        "requires_retest": true,
-        "engine": "EMA_PULLBACK",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_D94CD8EC2187CDF2",
-      "symbol": "UNI",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "ORDER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "ORDER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 6.914,
-        "zone_high": 6.914,
-        "zone_low": 6.904,
-        "bos_level": 6.932,
-        "ob_ts": 1789660800000,
-        "displacement_atr": 0.8029112118725229,
-        "volume_ratio": 1.3169614966939065,
-        "body_fraction": 0.5846153846153831
-      }
-    },
-    {
-      "event_id": "EVT_E4C9820B0F3474B3",
-      "symbol": "BR",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789603200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.65148,
-        "zone_high": 0.65148,
-        "zone_low": 0.6275,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789657200000,
-        "bos_ts": 1789610400000
-      }
-    },
-    {
-      "event_id": "EVT_7F71DEE0999C3FAD",
-      "symbol": "CRCL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789567200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 85.93,
-        "zone_high": 86.22,
-        "zone_low": 81.37,
-        "origin_ts": 1789567200000,
-        "displacement_atr": 3.2215539248532776,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_5F3A9238A53CBDE2",
-      "symbol": "SNXX",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789293600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 14.39,
-        "zone_high": 14.39,
-        "zone_low": 14.14,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789653600000,
-        "bos_ts": 1789304400000
-      }
-    },
-    {
-      "event_id": "EVT_A30AF4E6781F8C15",
-      "symbol": "LIT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789624800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 4.7316,
-        "zone_high": 4.8405,
-        "zone_low": 4.7316,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789664400000,
-        "bos_ts": 1789635600000
-      }
-    },
-    {
-      "event_id": "EVT_0B42F654F2AA75DF",
-      "symbol": "PONS",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "DONCHIAN_RETEST_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.6912,
-        "donchian_high": 0.6668,
-        "donchian_low": 0.48,
-        "breakout_atr": 0.5972159700709253,
-        "volume_ratio": 2.2456513624433545,
-        "adx": 30.08475591127949,
-        "ema200": 0.6300092282472971,
-        "compressed_recent": false,
-        "bb_width": 0.15752796551980042,
-        "trigger_level": 0.6668,
-        "requires_retest": true,
-        "engine": "DONCHIAN_RETEST",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_D10553FF50F2D955",
-      "symbol": "PONS",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789513200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.6359,
-        "zone_high": 0.6958,
-        "zone_low": 0.5572,
-        "origin_ts": 1789513200000,
-        "displacement_atr": 1.3506040102110655,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_5E333F0345525727",
-      "symbol": "WLD",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789621200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.3823,
-        "zone_high": 0.3828,
-        "zone_low": 0.352,
-        "origin_ts": 1789621200000,
-        "displacement_atr": 3.1361635051848102,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_4E94CA7ADD1B2A0A",
-      "symbol": "LINK",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789498800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 11.317,
-        "zone_high": 11.347,
-        "zone_low": 10.787,
-        "origin_ts": 1789498800000,
-        "displacement_atr": 1.3943342193497508,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_57B133B513C00841",
-      "symbol": "AAVE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 127.5,
-        "zone_high": 127.68,
-        "zone_low": 123.12,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 2.0481761242087817,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_339A2BFD032D5AA8",
-      "symbol": "TAO",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789459200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 230.22,
-        "zone_high": 231.22,
-        "zone_low": 226.1,
-        "origin_ts": 1789459200000,
-        "displacement_atr": 1.3010166737430968,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_EB40EA23A1FB8243",
-      "symbol": "AKE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.020775,
-        "compression_ratio": 0.3782909828385958,
-        "ma_spread_atr": 0.5203162190484792,
-        "compression_threshold": 1.375439126632529,
-        "breakout_atr": 0.21073495503901915,
-        "volume_ratio": 0.8211441679441276,
-        "requires_retest": true,
-        "trigger_level": 0.020819,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_40B706A4C318FE97",
-      "symbol": "FIL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.8116,
-        "compression_ratio": 0.12442439253255476,
-        "ma_spread_atr": 0.46030344357894076,
-        "compression_threshold": 3.6994630571212603,
-        "breakout_atr": 0.8008471462101252,
-        "volume_ratio": 0.8003256723504792,
-        "requires_retest": true,
-        "trigger_level": 0.8137,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_79E98332F8CD4BA2",
-      "symbol": "PAXG",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789585200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 4363.73,
-        "zone_high": 4363.73,
-        "zone_low": 4266.55,
-        "origin_ts": 1789585200000,
-        "displacement_atr": 4.401003042939458,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_37A89EB54816D1E5",
-      "symbol": "LTC",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789272000000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 53.48,
-        "zone_high": 53.72,
-        "zone_low": 53.48,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789423200000,
-        "bos_ts": 1789279200000
-      }
-    },
-    {
-      "event_id": "EVT_656C2F0B8B21750A",
-      "symbol": "LTC",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789423200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 53.95,
-        "zone_high": 53.95,
-        "zone_low": 53.2,
-        "origin_ts": 1789423200000,
-        "displacement_atr": 1.3765631809607164,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_039819974833F309",
-      "symbol": "HOOD",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789570800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 107.98,
-        "zone_high": 107.98,
-        "zone_low": 105.27,
-        "origin_ts": 1789570800000,
-        "displacement_atr": 1.8807652056776811,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_AEEB3564C414906E",
-      "symbol": "GOOGL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 346.44,
-        "zone_high": 347.55,
-        "zone_low": 346.44,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789653600000,
-        "bos_ts": 1789650000000
-      }
-    },
-    {
-      "event_id": "EVT_A4AFC5911176177E",
-      "symbol": "GOOGL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789585200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 345.46,
-        "zone_high": 347.08,
-        "zone_low": 342.97,
-        "origin_ts": 1789585200000,
-        "displacement_atr": 1.4965610701847303,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_C8B8806D572FF497",
-      "symbol": "XPL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789639200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.08523,
-        "zone_high": 0.08605,
-        "zone_low": 0.08523,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789657200000,
-        "bos_ts": 1789642800000
-      }
-    },
-    {
-      "event_id": "EVT_EB1D1FD47DC7884C",
-      "symbol": "牛来",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789592400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.10603,
-        "zone_high": 0.10654,
-        "zone_low": 0.10051,
-        "origin_ts": 1789592400000,
-        "displacement_atr": 1.3947763277752365,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_F952C3923B18CE71",
-      "symbol": "CRV",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789290000000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.3296,
-        "zone_high": 0.3371,
-        "zone_low": 0.3296,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789506000000,
-        "bos_ts": 1789297200000
-      }
-    },
-    {
-      "event_id": "EVT_576E0F1D0990932C",
-      "symbol": "LITE",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789351200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 901.81,
-        "zone_high": 901.81,
-        "zone_low": 890.05,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789574400000,
-        "bos_ts": 1789372800000
-      }
-    },
-    {
-      "event_id": "EVT_53499745B550C20C",
-      "symbol": "IOST",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789498800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.0007907,
-        "zone_high": 0.0007916,
-        "zone_low": 0.0007333,
-        "origin_ts": 1789498800000,
-        "displacement_atr": 1.9112546830293704,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_7E49DC1C75AC3792",
-      "symbol": "META",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 676.67,
-        "compression_ratio": 0.09010518930321923,
-        "ma_spread_atr": 0.10086140373168093,
-        "compression_threshold": 1.1193739729269667,
-        "breakout_atr": 0.3504220346704108,
-        "volume_ratio": 1.0750364512286321,
-        "requires_retest": true,
-        "trigger_level": 677.55,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_61523F375DD78D27",
-      "symbol": "1000SHIB",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.005165,
-        "zone_high": 0.005175,
-        "zone_low": 0.005031,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 1.5102197673004853,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_F69363428B2FF74C",
-      "symbol": "COIN",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789567200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 173.85,
-        "zone_high": 174.05,
-        "zone_low": 170.0,
-        "origin_ts": 1789567200000,
-        "displacement_atr": 1.8551199074890259,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_247B32C3AD220742",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789473600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.5804,
-        "zone_high": 0.5819,
-        "zone_low": 0.5654,
-        "origin_ts": 1789473600000,
-        "displacement_atr": 1.3953552456012939,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_B2F1D979EB9D5BF0",
-      "symbol": "OP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789498800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.1008,
-        "zone_high": 0.10108,
-        "zone_low": 0.09433,
-        "origin_ts": 1789498800000,
-        "displacement_atr": 1.6127464817601684,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_50130CC569362D5D",
-      "symbol": "AAOI",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789624800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 98.59,
-        "zone_high": 99.49,
-        "zone_low": 98.59,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789657200000,
-        "bos_ts": 1789635600000
-      }
-    },
-    {
-      "event_id": "EVT_DB883711B409CB2E",
-      "symbol": "POL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789556400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.09917,
-        "zone_high": 0.09917,
-        "zone_low": 0.09369,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789668000000,
-        "bos_ts": 1789567200000
-      }
-    },
-    {
-      "event_id": "EVT_45F7792DED090413",
-      "symbol": "AVGO",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789398000000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 347.89,
-        "zone_high": 349.01,
-        "zone_low": 344.33,
-        "origin_ts": 1789398000000,
-        "displacement_atr": 1.6276523343219198,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_061B7EB9C9699DAB",
-      "symbol": "SAGA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.02127,
-        "compression_ratio": 0.4786911528466213,
-        "ma_spread_atr": 0.2167974325647066,
-        "compression_threshold": 0.4528962594680985,
-        "breakout_atr": 0.813783328556404,
-        "volume_ratio": 0.9181621870012321,
-        "requires_retest": true,
-        "trigger_level": 0.0208,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_887E39053123F8F2",
-      "symbol": "SAGA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789545600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.02037,
-        "zone_high": 0.02037,
-        "zone_low": 0.01953,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789567200000,
-        "bos_ts": 1789549200000
-      }
-    },
-    {
-      "event_id": "EVT_8F10B4C7EE06E0D6",
-      "symbol": "LAB",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.05112,
-        "compression_ratio": 0.40794459430886837,
-        "ma_spread_atr": 0.34039930686527203,
-        "compression_threshold": 0.8344253401420106,
-        "breakout_atr": 0.2379879872001913,
-        "volume_ratio": 0.9574466988668994,
-        "requires_retest": true,
-        "trigger_level": 0.0511,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_0FE007C1807833A4",
-      "symbol": "BTW",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789642800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.7075,
-        "zone_high": 0.7075,
-        "zone_low": 0.6991,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789660800000,
-        "bos_ts": 1789657200000
-      }
-    },
-    {
-      "event_id": "EVT_F52ABF6D1E620DEE",
-      "symbol": "AMZN",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 252.49,
-        "zone_high": 252.5,
-        "zone_low": 248.78,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 3.1692706404125945,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_526B55AD3FCEAAFF",
-      "symbol": "FET",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789430400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.1668,
-        "zone_high": 0.1673,
-        "zone_low": 0.1626,
-        "origin_ts": 1789430400000,
-        "displacement_atr": 1.5333153275788611,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_97885148E426BA20",
-      "symbol": "PENDLE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789416000000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 2.3351,
-        "zone_high": 2.376,
-        "zone_low": 2.3351,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789444800000,
-        "bos_ts": 1789419600000
-      }
-    },
-    {
-      "event_id": "EVT_A8C58D6CE9B7C92E",
-      "symbol": "ETC",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 7.406,
-        "zone_high": 7.421,
-        "zone_low": 7.235,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 1.5873092770435888,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_EB0D08E246E0ADCC",
-      "symbol": "MSFT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "EMA_PULLBACK_CONTINUATION",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "ema_fast": 495.793291107359,
-        "ema_slow": 496.4684428693339,
-        "ema200": 496.6884143328618,
-        "body_atr": 0.36264878760682784,
-        "volume_ratio": 1.0281259892083767,
-        "trigger_level": 495.793291107359,
-        "requires_retest": true,
-        "engine": "EMA_PULLBACK",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_C026F7CCC5FAE889",
-      "symbol": "MSFT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789570800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 496.16,
-        "zone_high": 496.28,
-        "zone_low": 492.74,
-        "origin_ts": 1789570800000,
-        "displacement_atr": 1.5752269466078381,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_8D27A536AB3296E8",
-      "symbol": "ORCL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789358400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 148.94,
-        "zone_high": 148.94,
-        "zone_low": 148.07,
-        "breaker_from": "BEARISH_OB",
-        "broken_ts": 1789653600000,
-        "bos_ts": 1789376400000
-      }
-    },
-    {
-      "event_id": "EVT_B03890D5FA26E9EF",
-      "symbol": "CHIP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.03737,
-        "compression_ratio": 0.7914866669864858,
-        "ma_spread_atr": 0.8375571521492414,
-        "compression_threshold": 1.058207531578725,
-        "breakout_atr": 1.2226116993816303,
-        "volume_ratio": 0.9707475404684143,
-        "requires_retest": true,
-        "trigger_level": 0.03799,
-        "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_1B9C8A0C378AE36D",
-      "symbol": "CHIP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.03876,
-        "zone_high": 0.03893,
-        "zone_low": 0.03744,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 1.2105822217330853,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_15A5B34B0E085A2D",
-      "symbol": "GALA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "ORDER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "ORDER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.00189,
-        "zone_high": 0.00189,
-        "zone_low": 0.001805,
-        "bos_level": 0.001744,
-        "ob_ts": 1789668000000,
-        "displacement_atr": 0.8906225095893666,
-        "volume_ratio": 2.7817399474671265,
-        "body_fraction": 0.6862745098039257
-      }
-    },
-    {
-      "event_id": "EVT_48A04C7B13B81C0A",
-      "symbol": "VIRTUAL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "MITIGATION_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789484400000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "MITIGATION_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.6082,
-        "zone_high": 0.6097,
-        "zone_low": 0.5912,
-        "origin_ts": 1789484400000,
-        "displacement_atr": 1.5403971598194308,
-        "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_CD2DC8D4EC68D5E5",
-      "symbol": "PLTR",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789624800000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 175.34,
-        "zone_high": 176.18,
-        "zone_low": 175.34,
-        "breaker_from": "BULLISH_OB",
-        "broken_ts": 1789650000000,
-        "bos_ts": 1789628400000
-      }
-    },
-    {
-      "event_id": "EVT_89A1529C7BACE337",
-      "symbol": "ZRO",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "DONCHIAN_RETEST_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1789671600000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "detection_close_price": 1.1308,
-        "donchian_high": 1.0422,
-        "donchian_low": 0.9702,
-        "breakout_atr": 3.8114397601646157,
-        "volume_ratio": 1.3520233605296978,
-        "adx": 37.449304439593575,
-        "ema200": 1.0233457854188353,
-        "compressed_recent": true,
-        "bb_width": 0.10922002332901207,
-        "trigger_level": 1.0422,
-        "requires_retest": true,
-        "engine": "DONCHIAN_RETEST",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_E56F2AB47C1F9F6B",
-      "symbol": "ZRO",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "ORDER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789657200000,
-        "pivot_2_ts": 1789671600000,
-        "detected_at_ts": 1789671600000
-      },
-      "event_fact": {
-        "engine": "ORDER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 1.0366,
-        "zone_high": 1.0366,
-        "zone_low": 1.0155,
-        "bos_level": 1.0405,
-        "ob_ts": 1789664400000,
-        "displacement_atr": 3.9835137899688875,
-        "volume_ratio": 1.3520233605296978,
-        "body_fraction": 0.9034146341463413
-      }
-    },
-    {
-      "event_id": "EVT_7232C5FE5E205F8D",
-      "symbol": "ZEC",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 1466.57,
-        "range_high": 1495.47,
-        "range_low": 1466.57,
-        "manipulation_depth_atr": 0.2729067959991418
-      }
-    },
-    {
-      "event_id": "EVT_C67D1ECAB17EDFC1",
-      "symbol": "SOL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789639200000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 100.873,
-        "p1_price": 100.9,
-        "p2_price": 102.011,
-        "p1_indicator": 90.85088899139208,
-        "p2_indicator": 83.90285858196616,
-        "bars_between": 8,
-        "price_delta_atr": 1.165686726374414,
-        "engine": "DIVERGENCE"
-      }
-    },
     {
       "event_id": "EVT_F9B6C7365BF91BAB",
       "symbol": "XRP",
@@ -1283,92 +23,6 @@
         "trigger_level": 1.2968,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_274054E4C2CCCD26",
-      "symbol": "HYPE",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 82.087,
-        "range_high": 82.778,
-        "range_low": 82.087,
-        "manipulation_depth_atr": 0.1683885659567696
-      }
-    },
-    {
-      "event_id": "EVT_6175DA4049F8B717",
-      "symbol": "SPCX",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789617600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 154.83,
-        "p1_price": 148.55,
-        "p2_price": 153.39,
-        "p1_indicator": 1.7151008147610867,
-        "p2_indicator": 1.429215395076568,
-        "bars_between": 14,
-        "price_delta_atr": 3.119334462848585,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_61252941DFB258AF",
-      "symbol": "SPCX",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789617600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 154.83,
-        "p1_price": 148.55,
-        "p2_price": 153.39,
-        "p1_indicator": 81.91033138401566,
-        "p2_indicator": 67.81167588508471,
-        "bars_between": 14,
-        "price_delta_atr": 3.119334462848585,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_973E061BABA8DB30",
-      "symbol": "ONE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.0016565,
-        "range_high": 0.0016565,
-        "range_low": 0.001465,
-        "manipulation_depth_atr": 0.18831195731472286
       }
     },
     {
@@ -1395,50 +49,6 @@
       }
     },
     {
-      "event_id": "EVT_A85A68A856E7E70D",
-      "symbol": "MU",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 978.58,
-        "p1_price": 932.88,
-        "p2_price": 974.26,
-        "p1_indicator": -2276.04737,
-        "p2_indicator": -4204.13156,
-        "bars_between": 11,
-        "price_delta_atr": 6.0081872687034314,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_AB60E51EB25E88E5",
-      "symbol": "MU",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 978.58,
-        "p1_price": 932.88,
-        "p2_price": 974.26,
-        "p1_indicator": 182300000.0,
-        "p2_indicator": 182000000.0,
-        "bars_between": 11,
-        "price_delta_atr": 6.0081872687034314,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_0443CA82420EDAAC",
       "symbol": "BNB",
       "timeframe": "1h",
@@ -1462,138 +72,6 @@
       }
     },
     {
-      "event_id": "EVT_A4DEAF011B34F24B",
-      "symbol": "CRCL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 85.12,
-        "p1_price": 84.36,
-        "p2_price": 86.0,
-        "p1_indicator": 89.7915059806832,
-        "p2_indicator": 78.69976950320508,
-        "bars_between": 9,
-        "price_delta_atr": 1.1802690984861612,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_3018FBCC4465F219",
-      "symbol": "ENA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789639200000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.15353,
-        "p1_price": 0.15333,
-        "p2_price": 0.15904,
-        "p1_indicator": 0.00244519447023292,
-        "p2_indicator": 0.0024258068645742203,
-        "bars_between": 8,
-        "price_delta_atr": 2.150366414368232,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_1BB70D99F44FB9BB",
-      "symbol": "SUI",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789610400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7316,
-        "p1_price": 0.722,
-        "p2_price": 0.7386,
-        "p1_indicator": 86.30751902420265,
-        "p2_indicator": 83.35902451747513,
-        "bars_between": 16,
-        "price_delta_atr": 1.9896544902773248,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_A2155F6DF0E94005",
-      "symbol": "SUI",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789610400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7316,
-        "p1_price": 0.722,
-        "p2_price": 0.7386,
-        "p1_indicator": -22716007.0,
-        "p2_indicator": -24365586.0,
-        "bars_between": 16,
-        "price_delta_atr": 1.9896544902773248,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_0AFC088A27ABE890",
-      "symbol": "SUI",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789632000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7316,
-        "p1_price": 0.7269,
-        "p2_price": 0.7386,
-        "p1_indicator": 89.8309178743961,
-        "p2_indicator": 83.35902451747513,
-        "bars_between": 10,
-        "price_delta_atr": 1.4023468395328134,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_F49B23DBF8C7ABCF",
-      "symbol": "SUI",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789632000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7316,
-        "p1_price": 0.7269,
-        "p2_price": 0.7386,
-        "p1_indicator": -24359908.0,
-        "p2_indicator": -24365586.0,
-        "bars_between": 10,
-        "price_delta_atr": 1.4023468395328134,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_BA6684899F8FF00C",
       "symbol": "PONS",
       "timeframe": "1h",
@@ -1614,49 +92,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789401600000,
         "bos_ts": 1789254000000
-      }
-    },
-    {
-      "event_id": "EVT_790D48B2B41FA4E4",
-      "symbol": "ONDO",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.3782,
-        "range_high": 0.3782,
-        "range_low": 0.3702,
-        "manipulation_depth_atr": 0.12288884308329523
-      }
-    },
-    {
-      "event_id": "EVT_EB0B1EF39D02F29B",
-      "symbol": "MSTR",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 132.4,
-        "p1_price": 130.2,
-        "p2_price": 133.59,
-        "p1_indicator": 83.97082744161786,
-        "p2_indicator": 79.70382181737286,
-        "bars_between": 9,
-        "price_delta_atr": 1.7159819427194953,
-        "engine": "DIVERGENCE"
       }
     },
     {
@@ -1706,28 +141,6 @@
       }
     },
     {
-      "event_id": "EVT_488EA8B118A353B7",
-      "symbol": "LINK",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789617600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 11.317,
-        "p1_price": 11.191,
-        "p2_price": 11.41,
-        "p1_indicator": 92.94458204322287,
-        "p2_indicator": 88.08888888888885,
-        "bars_between": 14,
-        "price_delta_atr": 1.8645862590951179,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_D205AF99A54B3EE0",
       "symbol": "LINK",
       "timeframe": "1h",
@@ -1751,28 +164,6 @@
       }
     },
     {
-      "event_id": "EVT_2383498857D75F16",
-      "symbol": "AAVE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 127.9,
-        "p1_price": 123.98,
-        "p2_price": 129.52,
-        "p1_indicator": 95.67276600347607,
-        "p2_indicator": 90.92686986222624,
-        "bars_between": 9,
-        "price_delta_atr": 3.2363991374501393,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_FEDDE9E09A44792B",
       "symbol": "AAVE",
       "timeframe": "1h",
@@ -1793,70 +184,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789664400000,
         "bos_ts": 1789509600000
-      }
-    },
-    {
-      "event_id": "EVT_09A03704AD24469B",
-      "symbol": "AAVE",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 127.24,
-        "range_high": 129.52,
-        "range_low": 127.24,
-        "manipulation_depth_atr": 0.5517386642755028
-      }
-    },
-    {
-      "event_id": "EVT_05DF4A22B8DAFEB9",
-      "symbol": "NVDA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 219.67,
-        "p1_price": 213.04,
-        "p2_price": 218.83,
-        "p1_indicator": 181500000.0,
-        "p2_indicator": 181200000.0,
-        "bars_between": 11,
-        "price_delta_atr": 4.576578907531874,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_F8905A87E01A1BA3",
-      "symbol": "TRUMP",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 1.95,
-        "range_high": 1.964,
-        "range_low": 1.95,
-        "manipulation_depth_atr": 0.2687157351792199
       }
     },
     {
@@ -1906,70 +233,6 @@
       }
     },
     {
-      "event_id": "EVT_AF4A81272807C254",
-      "symbol": "TAO",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 230.51,
-        "range_high": 230.51,
-        "range_low": 228.47,
-        "manipulation_depth_atr": 0.27570280010713855
-      }
-    },
-    {
-      "event_id": "EVT_4619FF314C1088D0",
-      "symbol": "AKE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "HIDDEN_BEARISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789632000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.020925,
-        "p1_price": 0.022443,
-        "p2_price": 0.021889,
-        "p1_indicator": -0.0010644613954048712,
-        "p2_indicator": -0.00046535322030073767,
-        "bars_between": 10,
-        "price_delta_atr": 0.4620329503452569,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_EA8B5A79D64AA717",
-      "symbol": "MARSCOIN",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.11937,
-        "range_high": 0.11937,
-        "range_low": 0.11304,
-        "manipulation_depth_atr": 0.6969213396297818
-      }
-    },
-    {
       "event_id": "EVT_08D2DF0661442CA3",
       "symbol": "FIL",
       "timeframe": "1h",
@@ -1990,71 +253,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789653600000,
         "bos_ts": 1789596000000
-      }
-    },
-    {
-      "event_id": "EVT_694098AE6C0C77F5",
-      "symbol": "FIL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.8137,
-        "range_high": 0.8229,
-        "range_low": 0.8137,
-        "manipulation_depth_atr": 0.8088001499142297
-      }
-    },
-    {
-      "event_id": "EVT_6F0C6A5378A8FC94",
-      "symbol": "NBIS",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "HIDDEN_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789621200000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 218.13,
-        "p1_price": 225.37,
-        "p2_price": 218.72,
-        "p1_indicator": 20900000.0,
-        "p2_indicator": 30300000.0,
-        "bars_between": 13,
-        "price_delta_atr": 1.4031665240727156,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_BE15D87DFA1DB435",
-      "symbol": "NBIS",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "HIDDEN_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 218.13,
-        "p1_price": 232.91,
-        "p2_price": 218.72,
-        "p1_indicator": 21100000.0,
-        "p2_indicator": 30300000.0,
-        "bars_between": 6,
-        "price_delta_atr": 2.9941252596378667,
-        "engine": "DIVERGENCE"
       }
     },
     {
@@ -2127,27 +325,6 @@
       }
     },
     {
-      "event_id": "EVT_4E93A3EB4545D8D7",
-      "symbol": "LTC",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 53.63,
-        "range_high": 53.95,
-        "range_low": 53.63,
-        "manipulation_depth_atr": 0.5319833137710267
-      }
-    },
-    {
       "event_id": "EVT_FEBE3724D438E5AB",
       "symbol": "PAXG",
       "timeframe": "1h",
@@ -2168,28 +345,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789585200000,
         "bos_ts": 1789581600000
-      }
-    },
-    {
-      "event_id": "EVT_207479C28FEF3FA3",
-      "symbol": "XLM",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.18615,
-        "p1_price": 0.1836,
-        "p2_price": 0.18732,
-        "p1_indicator": 18972028.0,
-        "p2_indicator": 17796491.0,
-        "bars_between": 9,
-        "price_delta_atr": 1.643448184086102,
-        "engine": "DIVERGENCE"
       }
     },
     {
@@ -2307,269 +462,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789632000000,
         "bos_ts": 1789459200000
-      }
-    },
-    {
-      "event_id": "EVT_E640D879010A50C2",
-      "symbol": "XMR",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 510.22,
-        "range_high": 516.03,
-        "range_low": 510.22,
-        "manipulation_depth_atr": 0.13530699598026394
-      }
-    },
-    {
-      "event_id": "EVT_631FE51528C671A5",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_RSI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.7411,
-        "p2_price": 0.7437,
-        "p1_indicator": 86.8673812438961,
-        "p2_indicator": 79.1150380305,
-        "bars_between": 9,
-        "price_delta_atr": 0.4196340266450704,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_3477BA31E601674D",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.7411,
-        "p2_price": 0.7437,
-        "p1_indicator": 0.013503691377119265,
-        "p2_indicator": 0.013215816826054883,
-        "bars_between": 9,
-        "price_delta_atr": 0.4196340266450704,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_95B5A72A687B4A5E",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.7411,
-        "p2_price": 0.7437,
-        "p1_indicator": 92.29148563754852,
-        "p2_indicator": 91.44221083519479,
-        "bars_between": 9,
-        "price_delta_atr": 0.4196340266450704,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_CC0D6A5A7584A7FA",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.7411,
-        "p2_price": 0.7437,
-        "p1_indicator": 179400000.0,
-        "p2_indicator": 177000000.0,
-        "bars_between": 9,
-        "price_delta_atr": 0.4196340266450704,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_B2EA824B08F0DF41",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.74,
-        "p2_price": 0.7437,
-        "p1_indicator": 0.013802174039523996,
-        "p2_indicator": 0.013215816826054883,
-        "bars_between": 5,
-        "price_delta_atr": 0.5971714994564415,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_D92FF00EA27A735D",
-      "symbol": "ASTER",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.7401,
-        "p1_price": 0.74,
-        "p2_price": 0.7437,
-        "p1_indicator": 177200000.0,
-        "p2_indicator": 177000000.0,
-        "bars_between": 5,
-        "price_delta_atr": 0.5971714994564415,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_41D7FC2DA3076481",
-      "symbol": "AAPL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "REGULAR_BULLISH_RSI",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 339.91,
-        "p1_price": 333.49,
-        "p2_price": 329.81,
-        "p1_indicator": 59.89357808913879,
-        "p2_indicator": 68.90461153612958,
-        "bars_between": 11,
-        "price_delta_atr": 1.4285474640187235,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_5B62421FB1659AF7",
-      "symbol": "AAPL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "REGULAR_BULLISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 339.91,
-        "p1_price": 333.49,
-        "p2_price": 329.81,
-        "p1_indicator": 0.47612292021705116,
-        "p2_indicator": 1.0524156946759717,
-        "bars_between": 11,
-        "price_delta_atr": 1.4285474640187235,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_0538B98F7BCDBE00",
-      "symbol": "AAPL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "REGULAR_BULLISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 339.91,
-        "p1_price": 333.49,
-        "p2_price": 329.81,
-        "p1_indicator": 64.8780487804885,
-        "p2_indicator": 88.52338600144243,
-        "bars_between": 11,
-        "price_delta_atr": 1.4285474640187235,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_F1D96E9392187D9D",
-      "symbol": "AAPL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "REGULAR_BULLISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 339.91,
-        "p1_price": 333.49,
-        "p2_price": 329.81,
-        "p1_indicator": -20642.824,
-        "p2_indicator": -17783.353000000003,
-        "bars_between": 11,
-        "price_delta_atr": 1.4285474640187235,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_C11B84CA0E2AF283",
-      "symbol": "AAPL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "REGULAR_BULLISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789628400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 339.91,
-        "p1_price": 333.49,
-        "p2_price": 329.81,
-        "p1_indicator": 38100000.0,
-        "p2_indicator": 38800000.0,
-        "bars_between": 11,
-        "price_delta_atr": 1.4285474640187235,
-        "engine": "DIVERGENCE"
       }
     },
     {
@@ -2768,71 +660,6 @@
       }
     },
     {
-      "event_id": "EVT_E2FA98492E31F0B8",
-      "symbol": "CRWV",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 79.08,
-        "range_high": 80.63,
-        "range_low": 79.08,
-        "manipulation_depth_atr": 0.26738650348611964
-      }
-    },
-    {
-      "event_id": "EVT_643D740D41FC1F1A",
-      "symbol": "1000SHIB",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789610400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.005135,
-        "p1_price": 0.005032,
-        "p2_price": 0.005286,
-        "p1_indicator": 86.79712503991583,
-        "p2_indicator": 85.63247863247857,
-        "bars_between": 16,
-        "price_delta_atr": 3.9539762507843217,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_95A3D270F5E06198",
-      "symbol": "1000SHIB",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789639200000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.005135,
-        "p1_price": 0.005061,
-        "p2_price": 0.005286,
-        "p1_indicator": 93.57377212197294,
-        "p2_indicator": 85.63247863247857,
-        "bars_between": 8,
-        "price_delta_atr": 3.5025380174270504,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_7F45C032F8F016E4",
       "symbol": "1000SHIB",
       "timeframe": "1h",
@@ -2856,138 +683,6 @@
       }
     },
     {
-      "event_id": "EVT_2CC783C9921AD5D5",
-      "symbol": "OP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789617600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.10133,
-        "p1_price": 0.09701,
-        "p2_price": 0.10212,
-        "p1_indicator": 74.07401713193882,
-        "p2_indicator": 61.36799708228279,
-        "bars_between": 14,
-        "price_delta_atr": 4.372649728014012,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_6DE2C07C5EA5E4DD",
-      "symbol": "OP",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789639200000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.10133,
-        "p1_price": 0.09839,
-        "p2_price": 0.10212,
-        "p1_indicator": 86.43308051036638,
-        "p2_indicator": 61.36799708228279,
-        "bars_between": 8,
-        "price_delta_atr": 3.1917775901158985,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_6244D793C39441FC",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_RSI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.5806,
-        "p1_price": 0.5827,
-        "p2_price": 0.5885,
-        "p1_indicator": 76.14360835165616,
-        "p2_indicator": 67.15060893480009,
-        "bars_between": 9,
-        "price_delta_atr": 0.6804724871621846,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_594BE43E66424215",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.5806,
-        "p1_price": 0.5827,
-        "p2_price": 0.5885,
-        "p1_indicator": 92.99283887065566,
-        "p2_indicator": 80.10761148644161,
-        "bars_between": 9,
-        "price_delta_atr": 0.6804724871621846,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_DF51C41A01375CC1",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.5806,
-        "p1_price": 0.5827,
-        "p2_price": 0.5885,
-        "p1_indicator": -3036531.8000000007,
-        "p2_indicator": -3308018.5000000005,
-        "bars_between": 9,
-        "price_delta_atr": 0.6804724871621846,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_E55A9BB82140EB45",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.5806,
-        "p1_price": 0.5827,
-        "p2_price": 0.5885,
-        "p1_indicator": 46000000.0,
-        "p2_indicator": 45400000.0,
-        "bars_between": 9,
-        "price_delta_atr": 0.6804724871621846,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_47791D6898923DF5",
       "symbol": "APT",
       "timeframe": "1h",
@@ -3008,27 +703,6 @@
         "origin_ts": 1789473600000,
         "displacement_atr": 1.3953552438259462,
         "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_6448859EE5788990",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.579,
-        "range_high": 0.5885,
-        "range_low": 0.579,
-        "manipulation_depth_atr": 0.46256793942364705
       }
     },
     {
@@ -3102,50 +776,6 @@
       }
     },
     {
-      "event_id": "EVT_BDB3549331E45CD5",
-      "symbol": "POL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.09639,
-        "p1_price": 0.09905,
-        "p2_price": 0.10213,
-        "p1_indicator": -121123725.94999999,
-        "p2_indicator": -123737749.0,
-        "bars_between": 5,
-        "price_delta_atr": 1.6967606918685607,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_6AF6C4F425954524",
-      "symbol": "POL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "swept_level": 0.09905,
-        "sweep_depth_atr": 0.7166807717135376,
-        "reclaim_displacement_atr": 1.1914817829737512,
-        "volume_ratio": 3.925456692216109,
-        "trigger_level": 0.09905,
-        "requires_retest": true,
-        "engine": "LIQUIDITY_SWEEP",
-        "requires_htf_context": true
-      }
-    },
-    {
       "event_id": "EVT_DFBE236D7C558864",
       "symbol": "POL",
       "timeframe": "1h",
@@ -3166,28 +796,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789462800000,
         "bos_ts": 1789405200000
-      }
-    },
-    {
-      "event_id": "EVT_BEE0CF1B99A1A963",
-      "symbol": "POL",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "SFP_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789650000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "SFP",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.09905,
-        "swept_level": 0.09905,
-        "sweep_depth_atr": 0.7166807717135376,
-        "volume_ratio": 3.925456692216109,
-        "body_fraction": 0.4330827067669161
       }
     },
     {
@@ -3284,27 +892,6 @@
       }
     },
     {
-      "event_id": "EVT_A1C789D597579C37",
-      "symbol": "TRX",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.33323,
-        "range_high": 0.33409,
-        "range_low": 0.33323,
-        "manipulation_depth_atr": 0.28545935309948184
-      }
-    },
-    {
       "event_id": "EVT_F4E94C75CBE67978",
       "symbol": "UAI",
       "timeframe": "1h",
@@ -3372,27 +959,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789668000000,
         "bos_ts": 1789484400000
-      }
-    },
-    {
-      "event_id": "EVT_7BAD6F65B034F5F9",
-      "symbol": "FET",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.1671,
-        "range_high": 0.17,
-        "range_low": 0.1671,
-        "manipulation_depth_atr": 0.5820463637482787
       }
     },
     {
@@ -3466,50 +1032,6 @@
       }
     },
     {
-      "event_id": "EVT_0E0006C8B2B4388C",
-      "symbol": "MSFT",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789642800000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 498.17,
-        "p1_price": 494.1,
-        "p2_price": 495.26,
-        "p1_indicator": 68.41454191434677,
-        "p2_indicator": 39.85743277524071,
-        "bars_between": 7,
-        "price_delta_atr": 0.534947508029137,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_2D5DB5B7BFC50088",
-      "symbol": "MSFT",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789642800000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 498.17,
-        "p1_price": 494.1,
-        "p2_price": 495.26,
-        "p1_indicator": 28700000.0,
-        "p2_indicator": 27900000.0,
-        "bars_between": 7,
-        "price_delta_atr": 0.534947508029137,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_ECFB4F799D6C4725",
       "symbol": "MSFT",
       "timeframe": "1h",
@@ -3580,27 +1102,6 @@
       }
     },
     {
-      "event_id": "EVT_F2EDCC926D32F124",
-      "symbol": "PENDLE",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 2.3429,
-        "range_high": 2.3429,
-        "range_low": 2.3021,
-        "manipulation_depth_atr": 0.1038188338887785
-      }
-    },
-    {
       "event_id": "EVT_8AEA4E95C29BE1FB",
       "symbol": "0G",
       "timeframe": "1h",
@@ -3647,245 +1148,6 @@
       }
     },
     {
-      "event_id": "EVT_EC692C8346FDE3FA",
-      "symbol": "ORCL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 149.43,
-        "range_high": 150.92,
-        "range_low": 149.43,
-        "manipulation_depth_atr": 0.4006456763949018
-      }
-    },
-    {
-      "event_id": "EVT_1F7BC0945541B732",
-      "symbol": "GALA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789617600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.001846,
-        "p1_price": 0.001662,
-        "p2_price": 0.00189,
-        "p1_indicator": 89.18918918918905,
-        "p2_indicator": 88.17849462365591,
-        "bars_between": 14,
-        "price_delta_atr": 5.937773843695064,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_9FEB74778B9AC9A6",
-      "symbol": "GALA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_RSI",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.001846,
-        "p1_price": 0.001744,
-        "p2_price": 0.00189,
-        "p1_indicator": 76.45283408518246,
-        "p2_indicator": 67.27167398153956,
-        "bars_between": 6,
-        "price_delta_atr": 3.8022586893836796,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_38F2EFCC63321A7C",
-      "symbol": "GALA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.001846,
-        "p1_price": 0.001744,
-        "p2_price": 0.00189,
-        "p1_indicator": 94.88267535551002,
-        "p2_indicator": 88.17849462365591,
-        "bars_between": 6,
-        "price_delta_atr": 3.8022586893836796,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_805DB1F5488BAC39",
-      "symbol": "GALA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.001846,
-        "p1_price": 0.001744,
-        "p2_price": 0.00189,
-        "p1_indicator": 36124170.0,
-        "p2_indicator": -84240789.0,
-        "bars_between": 6,
-        "price_delta_atr": 3.8022586893836796,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_845A09175DD329CE",
-      "symbol": "VIRTUAL",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789668000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.6078,
-        "range_high": 0.6133,
-        "range_low": 0.6078,
-        "manipulation_depth_atr": 0.2195611280557442
-      }
-    },
-    {
-      "event_id": "EVT_04971301AE8F4C49",
-      "symbol": "RAY",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_RSI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 1.4547,
-        "p1_price": 1.5028,
-        "p2_price": 1.5236,
-        "p1_indicator": 64.37035385911503,
-        "p2_indicator": 60.82820262644702,
-        "bars_between": 9,
-        "price_delta_atr": 0.4642411788937789,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_0E8A13A8F68068CE",
-      "symbol": "RAY",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 1.4547,
-        "p1_price": 1.5028,
-        "p2_price": 1.5236,
-        "p1_indicator": 0.034582899736375294,
-        "p2_indicator": 0.0303014963927839,
-        "bars_between": 9,
-        "price_delta_atr": 0.4642411788937789,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_A9E48A6344FBDA47",
-      "symbol": "RAY",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 1.4547,
-        "p1_price": 1.5028,
-        "p2_price": 1.5236,
-        "p1_indicator": 81.34195759370817,
-        "p2_indicator": 64.2502033937704,
-        "bars_between": 9,
-        "price_delta_atr": 0.4642411788937789,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_FD741F3888F79326",
-      "symbol": "RAY",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789635600000,
-        "pivot_2_ts": 1789668000000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 1.4547,
-        "p1_price": 1.5028,
-        "p2_price": 1.5236,
-        "p1_indicator": 10400000.0,
-        "p2_indicator": 10300000.0,
-        "bars_between": 9,
-        "price_delta_atr": 0.4642411788937789,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_1C6B66ED91098D14",
-      "symbol": "ETH",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 2455.62,
-        "range_high": 2455.62,
-        "range_low": 2421.0,
-        "manipulation_depth_atr": 0.5813461142133908
-      }
-    },
-    {
       "event_id": "EVT_993E4E9EDD27A0E2",
       "symbol": "SOL",
       "timeframe": "4h",
@@ -3909,27 +1171,6 @@
       }
     },
     {
-      "event_id": "EVT_4ACEC623B3F8FF39",
-      "symbol": "SOL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 100.9,
-        "range_high": 100.9,
-        "range_low": 99.516,
-        "manipulation_depth_atr": 0.4226142945301348
-      }
-    },
-    {
       "event_id": "EVT_01D2729ECDBBA286",
       "symbol": "XRP",
       "timeframe": "4h",
@@ -3950,28 +1191,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789502400000,
         "bos_ts": 1788451200000
-      }
-    },
-    {
-      "event_id": "EVT_94F2DCCCF83EA53F",
-      "symbol": "HYPE",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 83.09,
-        "bb_width": 6.492872904967044,
-        "kc_width": 5.4817558872333905,
-        "squeeze_duration_bars": 25,
-        "compression_ratio": 1.1844513032928867,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 82.0155779436167
       }
     },
     {
@@ -4078,49 +1297,6 @@
       }
     },
     {
-      "event_id": "EVT_E739CFF86777D70F",
-      "symbol": "SKHYNIX",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 1310.32,
-        "bb_width": 88.16889907442737,
-        "kc_width": 77.91538315797243,
-        "squeeze_duration_bars": 6,
-        "compression_ratio": 1.1315980939946875,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 1306.2591915789862
-      }
-    },
-    {
-      "event_id": "EVT_36688E9AF4A01C08",
-      "symbol": "DOGE",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.08177,
-        "range_high": 0.08177,
-        "range_low": 0.0807,
-        "manipulation_depth_atr": 0.5906111728560164
-      }
-    },
-    {
       "event_id": "EVT_ACD17F66FF308436",
       "symbol": "ONE",
       "timeframe": "4h",
@@ -4196,50 +1372,6 @@
       }
     },
     {
-      "event_id": "EVT_DEF2EBDDB1A980F2",
-      "symbol": "BNB",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789531200000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 732.83,
-        "p1_price": 679.33,
-        "p2_price": 715.76,
-        "p1_indicator": -90320.39999999998,
-        "p2_indicator": -98644.79999999999,
-        "bars_between": 8,
-        "price_delta_atr": 2.949046687469595,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_A56313970DE19DFC",
-      "symbol": "SKHY",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 182.98,
-        "bb_width": 10.30240049696522,
-        "kc_width": 10.111869990162745,
-        "squeeze_duration_bars": 6,
-        "compression_ratio": 1.0188422623103175,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 182.90393499508139
-      }
-    },
-    {
       "event_id": "EVT_5FA0D2DD3584D797",
       "symbol": "CRCL",
       "timeframe": "4h",
@@ -4260,70 +1392,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789516800000,
         "bos_ts": 1788206400000
-      }
-    },
-    {
-      "event_id": "EVT_1A2B1E2053D22AE1",
-      "symbol": "CRCL",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 82.82,
-        "range_high": 84.36,
-        "range_low": 82.82,
-        "manipulation_depth_atr": 0.47554401299889154
-      }
-    },
-    {
-      "event_id": "EVT_6549A9C0875CD949",
-      "symbol": "ENA",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.15,
-        "range_high": 0.15333,
-        "range_low": 0.15,
-        "manipulation_depth_atr": 0.2782855420084928
-      }
-    },
-    {
-      "event_id": "EVT_EF9E762D5DDF3F8B",
-      "symbol": "SNXX",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 14.75,
-        "bb_width": 1.6620180504428923,
-        "kc_width": 1.657386177936285,
-        "squeeze_duration_bars": 8,
-        "compression_ratio": 1.0027946851302783,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 14.514693088968144
       }
     },
     {
@@ -4350,27 +1418,6 @@
       }
     },
     {
-      "event_id": "EVT_7633D4792DEC789C",
-      "symbol": "PUMP",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.003947,
-        "range_high": 0.003947,
-        "range_low": 0.003833,
-        "manipulation_depth_atr": 1.0077713102248793
-      }
-    },
-    {
       "event_id": "EVT_4F1789EC11207A59",
       "symbol": "LIT",
       "timeframe": "4h",
@@ -4391,27 +1438,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789142400000,
         "bos_ts": 1789084800000
-      }
-    },
-    {
-      "event_id": "EVT_9E59BB062D89E653",
-      "symbol": "MSTR",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 127.97,
-        "range_high": 130.2,
-        "range_low": 127.97,
-        "manipulation_depth_atr": 0.38082768199951067
       }
     },
     {
@@ -4461,27 +1487,6 @@
       }
     },
     {
-      "event_id": "EVT_D03A7691C44177E6",
-      "symbol": "WLD",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.3445,
-        "range_high": 0.3808,
-        "range_low": 0.3445,
-        "manipulation_depth_atr": 0.2760945441901033
-      }
-    },
-    {
       "event_id": "EVT_3120A111F1CF1BF6",
       "symbol": "LINK",
       "timeframe": "4h",
@@ -4505,28 +1510,6 @@
       }
     },
     {
-      "event_id": "EVT_9F884519F3CD1AF7",
-      "symbol": "SYN",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789430400000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.18809,
-        "p1_price": 0.09088,
-        "p2_price": 0.2349,
-        "p1_indicator": -64107745.37000002,
-        "p2_indicator": -179637946.17000005,
-        "bars_between": 15,
-        "price_delta_atr": 4.363657046331382,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_6D8A0247F266D7F0",
       "symbol": "AAVE",
       "timeframe": "4h",
@@ -4547,50 +1530,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789416000000,
         "bos_ts": 1789300800000
-      }
-    },
-    {
-      "event_id": "EVT_0D7F9837011E6CA0",
-      "symbol": "NVDA",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 219.67,
-        "bb_width": 10.854458807330161,
-        "kc_width": 9.226912998694672,
-        "squeeze_duration_bars": 10,
-        "compression_ratio": 1.1763911515005872,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 218.42895649934735
-      }
-    },
-    {
-      "event_id": "EVT_6222B9B398872C4F",
-      "symbol": "BCH",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 231.62,
-        "bb_width": 16.85070158777802,
-        "kc_width": 15.479349437015856,
-        "squeeze_duration_bars": 24,
-        "compression_ratio": 1.088592363415664,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 229.53567471850792
       }
     },
     {
@@ -4663,28 +1602,6 @@
       }
     },
     {
-      "event_id": "EVT_E0781750C3D89A3C",
-      "symbol": "MARSCOIN",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_MACD",
-      "timestamps": {
-        "pivot_1_ts": 1789459200000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.11579,
-        "p1_price": 0.08324,
-        "p2_price": 0.09621,
-        "p1_indicator": -0.004325627144595223,
-        "p2_indicator": -0.00451299177568075,
-        "bars_between": 13,
-        "price_delta_atr": 1.3537765142252391,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_D424F7C1FBA1CB75",
       "symbol": "FIL",
       "timeframe": "4h",
@@ -4705,28 +1622,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789214400000,
         "bos_ts": 1789084800000
-      }
-    },
-    {
-      "event_id": "EVT_4D0EFBAE9268854F",
-      "symbol": "SAMSUNG",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 190.74,
-        "bb_width": 10.884527734355856,
-        "kc_width": 9.730459048089813,
-        "squeeze_duration_bars": 4,
-        "compression_ratio": 1.118603724712515,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 189.22422952404492
       }
     },
     {
@@ -4845,27 +1740,6 @@
       }
     },
     {
-      "event_id": "EVT_9C740D69B9278365",
-      "symbol": "AVAX",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 7.611,
-        "range_high": 7.611,
-        "range_low": 7.469,
-        "manipulation_depth_atr": 0.17123582754957314
-      }
-    },
-    {
       "event_id": "EVT_FCAA2AAF42B1709C",
       "symbol": "VVV",
       "timeframe": "4h",
@@ -4886,27 +1760,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789617600000,
         "bos_ts": 1789315200000
-      }
-    },
-    {
-      "event_id": "EVT_D819B7501F3B3FB1",
-      "symbol": "VVV",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 24.776,
-        "range_high": 25.482,
-        "range_low": 24.776,
-        "manipulation_depth_atr": 0.5760811347274625
       }
     },
     {
@@ -4933,69 +1786,6 @@
       }
     },
     {
-      "event_id": "EVT_36C0E11AF9F1E3D9",
-      "symbol": "PAXG",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 4350.24,
-        "range_high": 4350.24,
-        "range_low": 4304.43,
-        "manipulation_depth_atr": 0.7818470231010695
-      }
-    },
-    {
-      "event_id": "EVT_26F892F5FF8501B1",
-      "symbol": "XAUT",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 4353.51,
-        "range_high": 4353.51,
-        "range_low": 4309.81,
-        "manipulation_depth_atr": 0.8117929568446844
-      }
-    },
-    {
-      "event_id": "EVT_D3A5A11D48C555C5",
-      "symbol": "HOOD",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "MACD_4H_BULLISH_CROSS",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 109.94,
-        "macd": -1.334600938185531,
-        "macd_signal": -1.4728472210970418,
-        "macd_hist": 0.13824628291151075,
-        "ema200": 108.98860088507354,
-        "distance_ema200_atr": null,
-        "engine": "MACD_4H"
-      }
-    },
-    {
       "event_id": "EVT_11F01F04128D8C29",
       "symbol": "HOOD",
       "timeframe": "4h",
@@ -5016,159 +1806,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1788249600000,
         "bos_ts": 1788148800000
-      }
-    },
-    {
-      "event_id": "EVT_A5044D3D22B414FF",
-      "symbol": "DRAM",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 57.32,
-        "bb_width": 2.7721875838392833,
-        "kc_width": 2.6328309162242363,
-        "squeeze_duration_bars": 6,
-        "compression_ratio": 1.0529303521757865,
-        "engine": "VOLATILITY_SQUEEZE",
-        "requires_retest": true,
-        "trigger_level": 57.180415458112115
-      }
-    },
-    {
-      "event_id": "EVT_6DE2A6AD72C06FD4",
-      "symbol": "牛来",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "HIDDEN_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789416000000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.10619,
-        "p1_price": 0.12831,
-        "p2_price": 0.11316,
-        "p1_indicator": 15.854671240862478,
-        "p2_indicator": 38.61505497869132,
-        "bars_between": 16,
-        "price_delta_atr": 1.7527614449336668,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_C1BD4FD06DC3219C",
-      "symbol": "牛来",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "HIDDEN_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789516800000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.10619,
-        "p1_price": 0.12358,
-        "p2_price": 0.11316,
-        "p1_indicator": 31.182186635747613,
-        "p2_indicator": 38.61505497869132,
-        "bars_between": 9,
-        "price_delta_atr": 1.2055296538751679,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_AA086FEBDAE33220",
-      "symbol": "XPL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_STOCH",
-      "timestamps": {
-        "pivot_1_ts": 1789430400000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.08577,
-        "p1_price": 0.08624,
-        "p2_price": 0.08845,
-        "p1_indicator": 76.93694316010077,
-        "p2_indicator": 68.3515551633497,
-        "bars_between": 15,
-        "price_delta_atr": 0.6960587657947938,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_4B175DE16758B384",
-      "symbol": "XPL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789430400000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.08577,
-        "p1_price": 0.08624,
-        "p2_price": 0.08845,
-        "p1_indicator": -54011320.589999974,
-        "p2_indicator": -58879180.70999995,
-        "bars_between": 15,
-        "price_delta_atr": 0.6960587657947938,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_39B75D3305542941",
-      "symbol": "XPL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "REGULAR_BEARISH_OI",
-      "timestamps": {
-        "pivot_1_ts": 1789430400000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.08577,
-        "p1_price": 0.08624,
-        "p2_price": 0.08845,
-        "p1_indicator": 125000000.0,
-        "p2_indicator": 120600000.0,
-        "bars_between": 15,
-        "price_delta_atr": 0.6960587657947938,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
-      "event_id": "EVT_BB89B4554BCF3DC5",
-      "symbol": "XPL",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.08495,
-        "range_high": 0.08845,
-        "range_low": 0.08495,
-        "manipulation_depth_atr": 0.27494610805156894
       }
     },
     {
@@ -5264,27 +1901,6 @@
       }
     },
     {
-      "event_id": "EVT_AFEEDFB942781753",
-      "symbol": "CRV",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.3123,
-        "range_high": 0.3238,
-        "range_low": 0.3123,
-        "manipulation_depth_atr": 0.2601097979081092
-      }
-    },
-    {
       "event_id": "EVT_197B6C9E5CC18248",
       "symbol": "AAPL",
       "timeframe": "4h",
@@ -5354,27 +1970,6 @@
       }
     },
     {
-      "event_id": "EVT_CABD781914CF08B0",
-      "symbol": "PENGU",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.007297,
-        "range_high": 0.007297,
-        "range_low": 0.007122,
-        "manipulation_depth_atr": 0.2231324694202746
-      }
-    },
-    {
       "event_id": "EVT_70BCA719960748D1",
       "symbol": "LITE",
       "timeframe": "4h",
@@ -5418,69 +2013,6 @@
         "origin_ts": 1789344000000,
         "displacement_atr": 1.2671107040549938,
         "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_6DEB244DCB58A913",
-      "symbol": "LITE",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 944.34,
-        "range_high": 944.34,
-        "range_low": 930.16,
-        "manipulation_depth_atr": 0.48130650393991237
-      }
-    },
-    {
-      "event_id": "EVT_3C0D9484337667D4",
-      "symbol": "FARTCOIN",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.1438,
-        "range_high": 0.1471,
-        "range_low": 0.1438,
-        "manipulation_depth_atr": 0.4949299415897082
-      }
-    },
-    {
-      "event_id": "EVT_2E19C97352FBF591",
-      "symbol": "CRWV",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "MACD_4H_BEARISH_CROSS",
-      "timestamps": {
-        "pivot_1_ts": 1789675200000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 80.01,
-        "macd": -0.9927768227193781,
-        "macd_signal": -0.9911195514440401,
-        "macd_hist": -0.0016572712753379903,
-        "ema200": 88.35778905554463,
-        "distance_ema200_atr": null,
-        "engine": "MACD_4H"
       }
     },
     {
@@ -5555,69 +2087,6 @@
       }
     },
     {
-      "event_id": "EVT_1DC431485227D3FE",
-      "symbol": "OP",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.09629,
-        "range_high": 0.09839,
-        "range_low": 0.09629,
-        "manipulation_depth_atr": 0.11340728724222918
-      }
-    },
-    {
-      "event_id": "EVT_FC2E6588B6629003",
-      "symbol": "APT",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.5827,
-        "range_high": 0.5827,
-        "range_low": 0.5679,
-        "manipulation_depth_atr": 0.22885073427040192
-      }
-    },
-    {
-      "event_id": "EVT_3FA135C0196022FA",
-      "symbol": "COIN",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 167.18,
-        "range_high": 170.04,
-        "range_low": 167.18,
-        "manipulation_depth_atr": 0.2653450864178562
-      }
-    },
-    {
       "event_id": "EVT_6F6D81292AED036C",
       "symbol": "AAOI",
       "timeframe": "4h",
@@ -5638,49 +2107,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789372800000,
         "bos_ts": 1788523200000
-      }
-    },
-    {
-      "event_id": "EVT_9DCE374462581B06",
-      "symbol": "AAOI",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 102.03,
-        "range_high": 102.03,
-        "range_low": 99.3,
-        "manipulation_depth_atr": 0.2677997656775352
-      }
-    },
-    {
-      "event_id": "EVT_FF0E145589CD97CF",
-      "symbol": "POL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-      "timestamps": {
-        "pivot_1_ts": 1789560000000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "swept_level": 0.09917,
-        "sweep_depth_atr": 0.557939283299092,
-        "reclaim_displacement_atr": 0.5240105430984692,
-        "volume_ratio": 1.110966364670413,
-        "trigger_level": 0.09917,
-        "requires_retest": true,
-        "engine": "LIQUIDITY_SWEEP",
-        "requires_htf_context": true
       }
     },
     {
@@ -5707,48 +2133,6 @@
       }
     },
     {
-      "event_id": "EVT_88DF27912EB87F2A",
-      "symbol": "ZEN",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 6.867,
-        "range_high": 7.179,
-        "range_low": 6.867,
-        "manipulation_depth_atr": 0.22698622348744132
-      }
-    },
-    {
-      "event_id": "EVT_8F9A5F21ADC05312",
-      "symbol": "AXTI",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 66.33,
-        "range_high": 68.36,
-        "range_low": 66.33,
-        "manipulation_depth_atr": 0.49946716279912307
-      }
-    },
-    {
       "event_id": "EVT_1CCC62F6DB0EFF58",
       "symbol": "TRX",
       "timeframe": "4h",
@@ -5769,48 +2153,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1788624000000,
         "bos_ts": 1788278400000
-      }
-    },
-    {
-      "event_id": "EVT_BD4C16718EACCA87",
-      "symbol": "TRX",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.33415,
-        "range_high": 0.33538,
-        "range_low": 0.33415,
-        "manipulation_depth_atr": 0.2573608836481664
-      }
-    },
-    {
-      "event_id": "EVT_E8DA762A99A61AFA",
-      "symbol": "BTW",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.7236,
-        "range_high": 0.7236,
-        "range_low": 0.6923,
-        "manipulation_depth_atr": 0.47904740518968625
       }
     },
     {
@@ -5860,48 +2202,6 @@
       }
     },
     {
-      "event_id": "EVT_9F474402D3D3E568",
-      "symbol": "ETC",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 7.436,
-        "range_high": 7.436,
-        "range_low": 7.285,
-        "manipulation_depth_atr": 0.28568527191882614
-      }
-    },
-    {
-      "event_id": "EVT_C8B359205AB9E2D1",
-      "symbol": "CBRS",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 196.85,
-        "range_high": 196.85,
-        "range_low": 192.82,
-        "manipulation_depth_atr": 0.4306683229032187
-      }
-    },
-    {
       "event_id": "EVT_BBC62A08665E7817",
       "symbol": "AMZN",
       "timeframe": "4h",
@@ -5925,27 +2225,6 @@
       }
     },
     {
-      "event_id": "EVT_E544438B3F080AD4",
-      "symbol": "BE",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 285.34,
-        "range_high": 285.34,
-        "range_low": 279.65,
-        "manipulation_depth_atr": 0.4864977092772686
-      }
-    },
-    {
       "event_id": "EVT_BD682D59000754F8",
       "symbol": "MSFT",
       "timeframe": "4h",
@@ -5966,27 +2245,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789387200000,
         "bos_ts": 1789300800000
-      }
-    },
-    {
-      "event_id": "EVT_E76BF889F2DF84D5",
-      "symbol": "PENDLE",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 2.3395,
-        "range_high": 2.3395,
-        "range_low": 2.2546,
-        "manipulation_depth_atr": 0.5464461873542802
       }
     },
     {
@@ -6134,49 +2392,6 @@
       }
     },
     {
-      "event_id": "EVT_921E5CC2A459B8A4",
-      "symbol": "CHIP",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.03965,
-        "range_high": 0.03965,
-        "range_low": 0.03691,
-        "manipulation_depth_atr": 0.15867758556050468
-      }
-    },
-    {
-      "event_id": "EVT_644D6DA741276FB6",
-      "symbol": "TIA",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "HIDDEN_BULLISH_OBV",
-      "timestamps": {
-        "pivot_1_ts": 1789516800000,
-        "pivot_2_ts": 1789646400000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "detection_close_price": 0.3764,
-        "p1_price": 0.3157,
-        "p2_price": 0.3252,
-        "p1_indicator": -54397263.67399999,
-        "p2_indicator": -55911142.548999995,
-        "bars_between": 9,
-        "price_delta_atr": 0.681296366784588,
-        "engine": "DIVERGENCE"
-      }
-    },
-    {
       "event_id": "EVT_D5A3598149120E62",
       "symbol": "TIA",
       "timeframe": "4h",
@@ -6225,27 +2440,6 @@
       }
     },
     {
-      "event_id": "EVT_E66EBE5EE2BA0D52",
-      "symbol": "WIF",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.1863,
-        "range_high": 0.1863,
-        "range_low": 0.1831,
-        "manipulation_depth_atr": 0.4534452484051753
-      }
-    },
-    {
       "event_id": "EVT_61BDDDA531A44D22",
       "symbol": "TQQQ",
       "timeframe": "4h",
@@ -6266,27 +2460,6 @@
         "origin_ts": 1789041600000,
         "displacement_atr": 1.3764179825100613,
         "return_tolerance_pct": 0.2
-      }
-    },
-    {
-      "event_id": "EVT_4ACDC7B5FB918C63",
-      "symbol": "VIRTUAL",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
-      },
-      "event_fact": {
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.6119,
-        "range_high": 0.6119,
-        "range_low": 0.6017,
-        "manipulation_depth_atr": 0.4381876313620776
       }
     },
     {
@@ -6336,24 +2509,2042 @@
       }
     },
     {
-      "event_id": "EVT_C3EA32B42ED4C2A9",
-      "symbol": "PLTR",
-      "timeframe": "4h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
+      "event_id": "EVT_0DC4B6AAE80FDAC7",
+      "symbol": "ETH",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
       "timestamps": {
-        "pivot_1_ts": 1789646400000,
-        "pivot_2_ts": 1789675200000,
-        "detected_at_ts": 1789675200000
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
       },
       "event_fact": {
         "engine": "CRT",
         "requires_retest": true,
         "requires_htf_context": true,
-        "trigger_level": 176.61,
-        "range_high": 176.61,
-        "range_low": 175.01,
-        "manipulation_depth_atr": 0.6041643381767831
+        "trigger_level": 2440.32,
+        "range_high": 2461.92,
+        "range_low": 2440.32,
+        "manipulation_depth_atr": 0.2378954247702058
+      }
+    },
+    {
+      "event_id": "EVT_2B11642D6A09204B",
+      "symbol": "NEAR",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789617600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 3.009,
+        "p1_price": 2.704,
+        "p2_price": 3.076,
+        "p1_indicator": 74.58832505497703,
+        "p2_indicator": 73.40470788094598,
+        "bars_between": 15,
+        "price_delta_atr": 5.19210304018116,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_9CA0DAD27C3662F8",
+      "symbol": "UNI",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "SFP_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789668000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "SFP",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 7.736,
+        "swept_level": 7.736,
+        "sweep_depth_atr": 0.5370201746634762,
+        "volume_ratio": 1.5163316145106647,
+        "body_fraction": 0.008968609865469834
+      }
+    },
+    {
+      "event_id": "EVT_8D4030342003687B",
+      "symbol": "ONE",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789632000000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.0015237,
+        "p1_price": 0.0012749,
+        "p2_price": 0.0016793,
+        "p1_indicator": 90.65731865728543,
+        "p2_indicator": 87.57393763394838,
+        "bars_between": 11,
+        "price_delta_atr": 3.4976655837035775,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_8B93DADF533FFF1C",
+      "symbol": "BR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789603200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.65148,
+        "zone_high": 0.65148,
+        "zone_low": 0.6275,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789657200000,
+        "bos_ts": 1789610400000
+      }
+    },
+    {
+      "event_id": "EVT_EB328AAAC438F6C8",
+      "symbol": "ARB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789624800000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.17874,
+        "p1_price": 0.17352,
+        "p2_price": 0.18484,
+        "p1_indicator": 10831999.900000019,
+        "p2_indicator": 1757247.5000000186,
+        "bars_between": 13,
+        "price_delta_atr": 1.7526572333681683,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_2F4ECE4E5A1355F2",
+      "symbol": "KORU",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789621200000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 20.62,
+        "p1_price": 19.42,
+        "p2_price": 20.75,
+        "p1_indicator": 82100000.0,
+        "p2_indicator": 66400000.00000001,
+        "bars_between": 14,
+        "price_delta_atr": 3.716663084113376,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_7D68D5D42534CF3E",
+      "symbol": "KORU",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 20.62,
+        "p1_price": 20.62,
+        "p2_price": 20.75,
+        "p1_indicator": 70.98610257622354,
+        "p2_indicator": 67.67745406692467,
+        "bars_between": 5,
+        "price_delta_atr": 0.363282857845666,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_3DCB2456654610D1",
+      "symbol": "KORU",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 20.62,
+        "p1_price": 20.62,
+        "p2_price": 20.75,
+        "p1_indicator": 43898.01328000001,
+        "p2_indicator": 39476.03860000001,
+        "bars_between": 5,
+        "price_delta_atr": 0.363282857845666,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_9A69C5FBB6D777FC",
+      "symbol": "KORU",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 20.62,
+        "p1_price": 20.62,
+        "p2_price": 20.75,
+        "p1_indicator": 74400000.0,
+        "p2_indicator": 66400000.00000001,
+        "bars_between": 5,
+        "price_delta_atr": 0.363282857845666,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_5000D73EFCB1543E",
+      "symbol": "KORU",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 20.54,
+        "range_high": 20.75,
+        "range_low": 20.54,
+        "manipulation_depth_atr": 0.323353316780452
+      }
+    },
+    {
+      "event_id": "EVT_8DBD6CE81A7A9CB6",
+      "symbol": "SKHY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789300800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 183.21,
+        "zone_high": 183.21,
+        "zone_low": 182.33,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789653600000,
+        "bos_ts": 1789304400000
+      }
+    },
+    {
+      "event_id": "EVT_60F42570B43C584F",
+      "symbol": "PONS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789632000000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.6141,
+        "p1_price": 0.6595,
+        "p2_price": 0.7277,
+        "p1_indicator": 150300000.0,
+        "p2_indicator": 140900000.0,
+        "bars_between": 11,
+        "price_delta_atr": 1.6692675843276763,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_E181CFCE35FBA5F9",
+      "symbol": "PONS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789650000000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.6141,
+        "p1_price": 0.6668,
+        "p2_price": 0.7277,
+        "p1_indicator": 83.61133432735527,
+        "p2_indicator": 83.50713582740394,
+        "bars_between": 6,
+        "price_delta_atr": 1.4905923150374711,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_19B5FA29F4A85B29",
+      "symbol": "PONS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789470000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.6198,
+        "zone_high": 0.6379,
+        "zone_low": 0.6198,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789513200000,
+        "bos_ts": 1789477200000
+      }
+    },
+    {
+      "event_id": "EVT_398AB96F9E249577",
+      "symbol": "PONS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789513200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.6359,
+        "zone_high": 0.6958,
+        "zone_low": 0.5572,
+        "origin_ts": 1789513200000,
+        "displacement_atr": 1.3506039487696015,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_A8E3A7D4EDA6D3BD",
+      "symbol": "PONS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "SFP_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789650000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "SFP",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.6668,
+        "swept_level": 0.6668,
+        "sweep_depth_atr": 0.9623531537831399,
+        "volume_ratio": 2.1396840782080275,
+        "body_fraction": 0.6725806451612906
+      }
+    },
+    {
+      "event_id": "EVT_6CA53F76A50E36C8",
+      "symbol": "USELESS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.25686,
+        "range_high": 0.26391,
+        "range_low": 0.25686,
+        "manipulation_depth_atr": 0.31762957612067305
+      }
+    },
+    {
+      "event_id": "EVT_93513B970EFC825C",
+      "symbol": "WLD",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789621200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.3823,
+        "zone_high": 0.3828,
+        "zone_low": 0.352,
+        "origin_ts": 1789621200000,
+        "displacement_atr": 3.136163447860355,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_66CA033FC3267E4C",
+      "symbol": "LINK",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789484400000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 11.391,
+        "zone_high": 11.415,
+        "zone_low": 11.05,
+        "origin_ts": 1789484400000,
+        "displacement_atr": 1.8808997593444579,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_AB69BEB057C91C3A",
+      "symbol": "LINK",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 11.31,
+        "range_high": 11.383,
+        "range_low": 11.31,
+        "manipulation_depth_atr": 0.22947766490870994
+      }
+    },
+    {
+      "event_id": "EVT_E215321C4BF21E76",
+      "symbol": "AAVE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789477200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 128.61,
+        "zone_high": 128.61,
+        "zone_low": 127.17,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789668000000,
+        "bos_ts": 1789484400000
+      }
+    },
+    {
+      "event_id": "EVT_641C66E373228613",
+      "symbol": "AKE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789614000000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.021485,
+        "p1_price": 0.018592,
+        "p2_price": 0.020712,
+        "p1_indicator": 263937832.0,
+        "p2_indicator": 242849439.0,
+        "bars_between": 16,
+        "price_delta_atr": 1.8537680713887672,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_22241385F3463686",
+      "symbol": "AKE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789614000000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.021485,
+        "p1_price": 0.018592,
+        "p2_price": 0.020712,
+        "p1_indicator": 46400000.0,
+        "p2_indicator": 41700000.0,
+        "bars_between": 16,
+        "price_delta_atr": 1.8537680713887672,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_FEDEC14D2A184A83",
+      "symbol": "TAO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789459200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 230.22,
+        "zone_high": 231.22,
+        "zone_low": 226.1,
+        "origin_ts": 1789459200000,
+        "displacement_atr": 1.301016762230994,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_A068841DCA433212",
+      "symbol": "TAO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 231.26,
+        "range_high": 231.26,
+        "range_low": 229.09,
+        "manipulation_depth_atr": 0.13697823145026272
+      }
+    },
+    {
+      "event_id": "EVT_ABC3115611951232",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789624800000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.1165,
+        "p1_price": 0.12028,
+        "p2_price": 0.12474,
+        "p1_indicator": 70.5985410606881,
+        "p2_indicator": 66.71364832393654,
+        "bars_between": 13,
+        "price_delta_atr": 0.628615506995604,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_CD71352A6A05E940",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789624800000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.1165,
+        "p1_price": 0.12028,
+        "p2_price": 0.12474,
+        "p1_indicator": 483640623.29999995,
+        "p2_indicator": 482710760.4,
+        "bars_between": 13,
+        "price_delta_atr": 0.628615506995604,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_1FBBD0C6EDC4536A",
+      "symbol": "FIL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.8206,
+        "p1_price": 0.8071,
+        "p2_price": 0.8094,
+        "p1_indicator": 55.92886144039874,
+        "p2_indicator": 45.6728270719179,
+        "bars_between": 5,
+        "price_delta_atr": 0.46048710625053835,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_81F1176711ACE368",
+      "symbol": "FIL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.8206,
+        "p1_price": 0.8071,
+        "p2_price": 0.8094,
+        "p1_indicator": -7462062.800000005,
+        "p2_indicator": -8122841.8000000045,
+        "bars_between": 5,
+        "price_delta_atr": 0.46048710625053835,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_612D975C2C476F5E",
+      "symbol": "FIL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.8206,
+        "p1_price": 0.8071,
+        "p2_price": 0.8094,
+        "p1_indicator": 98200000.0,
+        "p2_indicator": 98000000.0,
+        "bars_between": 5,
+        "price_delta_atr": 0.46048710625053835,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_491FCEFCF786F1AF",
+      "symbol": "AVAX",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789477200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 7.571,
+        "zone_high": 7.571,
+        "zone_low": 7.466,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789635600000,
+        "bos_ts": 1789484400000
+      }
+    },
+    {
+      "event_id": "EVT_F40EB2B6E48FA098",
+      "symbol": "DOT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.0629,
+        "range_high": 1.072,
+        "range_low": 1.0629,
+        "manipulation_depth_atr": 0.11312950954996577
+      }
+    },
+    {
+      "event_id": "EVT_F7D19FFACABDA0E1",
+      "symbol": "VVV",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 25.085,
+        "range_high": 25.085,
+        "range_low": 24.203,
+        "manipulation_depth_atr": 0.5797398747294666
+      }
+    },
+    {
+      "event_id": "EVT_43BF56A87AE60804",
+      "symbol": "LTC",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789423200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 53.95,
+        "zone_high": 53.95,
+        "zone_low": 53.2,
+        "origin_ts": 1789423200000,
+        "displacement_atr": 1.3765624928838642,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_A61E69F46464362D",
+      "symbol": "EWY",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 183.23,
+        "p1_price": 183.21,
+        "p2_price": 183.61,
+        "p1_indicator": 71.95579349292863,
+        "p2_indicator": 68.09469930842029,
+        "bars_between": 5,
+        "price_delta_atr": 0.35518456285191746,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_B2701C210FD3BFF9",
+      "symbol": "EWY",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789653600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 183.23,
+        "p1_price": 183.21,
+        "p2_price": 183.61,
+        "p1_indicator": -337.80914000000416,
+        "p2_indicator": -835.6119900000042,
+        "bars_between": 5,
+        "price_delta_atr": 0.35518456285191746,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_995FCA6D0E4A19AA",
+      "symbol": "CASHCAT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789617600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.202,
+        "p1_price": 0.1944,
+        "p2_price": 0.2101,
+        "p1_indicator": 77.16886009528177,
+        "p2_indicator": 54.35344343469747,
+        "bars_between": 15,
+        "price_delta_atr": 1.3540439799612685,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_63FF37B854C06FE7",
+      "symbol": "CASHCAT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_MACD",
+      "timestamps": {
+        "pivot_1_ts": 1789617600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.202,
+        "p1_price": 0.1944,
+        "p2_price": 0.2101,
+        "p1_indicator": 0.008100279672021399,
+        "p2_indicator": 0.00751032580581526,
+        "bars_between": 15,
+        "price_delta_atr": 1.3540439799612685,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_12A2D469B02310E2",
+      "symbol": "CASHCAT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789617600000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.202,
+        "p1_price": 0.1944,
+        "p2_price": 0.2101,
+        "p1_indicator": 90.96801140994295,
+        "p2_indicator": 59.13343180699163,
+        "bars_between": 15,
+        "price_delta_atr": 1.3540439799612685,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_E54CE9EA1DFFF49C",
+      "symbol": "CASHCAT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.197,
+        "range_high": 0.2101,
+        "range_low": 0.197,
+        "manipulation_depth_atr": 0.10322024505177306
+      }
+    },
+    {
+      "event_id": "EVT_951A34CF8AB192E9",
+      "symbol": "HOOD",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 109.46,
+        "bb_width": 4.164758816547817,
+        "kc_width": 3.8289896817995555,
+        "squeeze_duration_bars": 5,
+        "compression_ratio": 1.087691313545263,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 109.30249484089977
+      }
+    },
+    {
+      "event_id": "EVT_19354C36589EBE99",
+      "symbol": "HOOD",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789344000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 109.49,
+        "zone_high": 110.1,
+        "zone_low": 109.49,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789506000000,
+        "bos_ts": 1789351200000
+      }
+    },
+    {
+      "event_id": "EVT_EFF0ACA3066B6D2D",
+      "symbol": "HOOD",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789567200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 109.93,
+        "zone_high": 110.11,
+        "zone_low": 107.97,
+        "origin_ts": 1789567200000,
+        "displacement_atr": 1.7962239249981757,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_313C306A4517828D",
+      "symbol": "MRVL",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 242.43,
+        "range_high": 242.43,
+        "range_low": 240.92,
+        "manipulation_depth_atr": 0.1590286840632235
+      }
+    },
+    {
+      "event_id": "EVT_5FB466055FDB1F71",
+      "symbol": "XAUT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789578000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 4347.51,
+        "zone_high": 4355.32,
+        "zone_low": 4347.51,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789585200000,
+        "bos_ts": 1789581600000
+      }
+    },
+    {
+      "event_id": "EVT_348FD80599F31175",
+      "symbol": "XPL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.08503,
+        "range_high": 0.08607,
+        "range_low": 0.08503,
+        "manipulation_depth_atr": 0.4855649975717177
+      }
+    },
+    {
+      "event_id": "EVT_64C32FAB4D28695D",
+      "symbol": "牛来",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789592400000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.10603,
+        "zone_high": 0.10654,
+        "zone_low": 0.10051,
+        "origin_ts": 1789592400000,
+        "displacement_atr": 1.3947763469391554,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_3E7DEDE08D59533F",
+      "symbol": "ASTER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.7364,
+        "range_high": 0.7412,
+        "range_low": 0.7364,
+        "manipulation_depth_atr": 0.11792486493276877
+      }
+    },
+    {
+      "event_id": "EVT_6A2DA7A220AB0C18",
+      "symbol": "CRV",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789506000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.3332,
+        "zone_high": 0.3344,
+        "zone_low": 0.3218,
+        "origin_ts": 1789506000000,
+        "displacement_atr": 1.2803895994988153,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_EFFC986171828C4E",
+      "symbol": "CRV",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.3251,
+        "range_high": 0.3317,
+        "range_low": 0.3251,
+        "manipulation_depth_atr": 0.4898034804492047
+      }
+    },
+    {
+      "event_id": "EVT_3265F2EB03F08CA9",
+      "symbol": "LITE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 896.78,
+        "range_high": 909.57,
+        "range_low": 896.78,
+        "manipulation_depth_atr": 0.7469016822870173
+      }
+    },
+    {
+      "event_id": "EVT_F84A183CE1D68D4F",
+      "symbol": "BMNR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 23.95,
+        "range_high": 24.41,
+        "range_low": 23.95,
+        "manipulation_depth_atr": 0.3993031567499647
+      }
+    },
+    {
+      "event_id": "EVT_626B058634FBD468",
+      "symbol": "FARTCOIN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.1445,
+        "range_high": 0.1465,
+        "range_low": 0.1445,
+        "manipulation_depth_atr": 0.12665438933639164
+      }
+    },
+    {
+      "event_id": "EVT_A5239F713D618D73",
+      "symbol": "CRWV",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789628400000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 80.26,
+        "p1_price": 86.07,
+        "p2_price": 78.65,
+        "p1_indicator": 5800000.0,
+        "p2_indicator": 12100000.0,
+        "bars_between": 12,
+        "price_delta_atr": 4.594596765797573,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_E1DA550D6815825A",
+      "symbol": "1000SHIB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789498800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.005122,
+        "zone_high": 0.005142,
+        "zone_low": 0.004908,
+        "origin_ts": 1789498800000,
+        "displacement_atr": 1.3540368993412542,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_14597A3F56084486",
+      "symbol": "1000SHIB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.00519,
+        "range_high": 0.00519,
+        "range_low": 0.005144,
+        "manipulation_depth_atr": 0.1234816710018109
+      }
+    },
+    {
+      "event_id": "EVT_EF8B02EA5D593090",
+      "symbol": "OP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789498800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.1008,
+        "zone_high": 0.10108,
+        "zone_low": 0.09433,
+        "origin_ts": 1789498800000,
+        "displacement_atr": 1.6127463614351925,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_933ADB556C095A34",
+      "symbol": "COIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789567200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 173.85,
+        "zone_high": 174.05,
+        "zone_low": 170.0,
+        "origin_ts": 1789567200000,
+        "displacement_atr": 1.8551198992996767,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_6C40DA47B1AE52E5",
+      "symbol": "HBAR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.07518,
+        "range_high": 0.07569,
+        "range_low": 0.07518,
+        "manipulation_depth_atr": 0.22324301560729204
+      }
+    },
+    {
+      "event_id": "EVT_E72C6A0015C7EE33",
+      "symbol": "WLFI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.05833,
+        "compression_ratio": 0.7806622570737116,
+        "ma_spread_atr": 0.07782842031152815,
+        "compression_threshold": 0.09969537992430373,
+        "breakout_atr": 0.7635627762974186,
+        "volume_ratio": 0.908819624729303,
+        "requires_retest": true,
+        "trigger_level": 0.05825,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_64EA6B38CFDA12D3",
+      "symbol": "POL",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.10043,
+        "range_high": 0.10043,
+        "range_low": 0.09753,
+        "manipulation_depth_atr": 0.10539757177686096
+      }
+    },
+    {
+      "event_id": "EVT_1569B949F5EFB70D",
+      "symbol": "AAOI",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789585200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 98.96,
+        "zone_high": 99.71,
+        "zone_low": 95.67,
+        "origin_ts": 1789585200000,
+        "displacement_atr": 1.7065765673736135,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_1AB1EAA8722AA0A9",
+      "symbol": "ZEN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 7.203,
+        "range_high": 7.364,
+        "range_low": 7.203,
+        "manipulation_depth_atr": 0.15026334075658168
+      }
+    },
+    {
+      "event_id": "EVT_9748CEEA5DB2D38F",
+      "symbol": "AVGO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789398000000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 347.89,
+        "zone_high": 349.01,
+        "zone_low": 344.33,
+        "origin_ts": 1789398000000,
+        "displacement_atr": 1.627654184425566,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_67CF28C9E9E793C6",
+      "symbol": "SAGA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789498800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.0215,
+        "zone_high": 0.02442,
+        "zone_low": 0.0215,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789531200000,
+        "bos_ts": 1789506000000
+      }
+    },
+    {
+      "event_id": "EVT_24E9F46697E4C561",
+      "symbol": "TRX",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789495200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.33535,
+        "zone_high": 0.33537,
+        "zone_low": 0.33411,
+        "origin_ts": 1789495200000,
+        "displacement_atr": 1.2055216554769932,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_0A1450D9ABA093A7",
+      "symbol": "AERO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789639200000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.5867,
+        "p1_price": 0.5582,
+        "p2_price": 0.6015,
+        "p1_indicator": 90.5994663452509,
+        "p2_indicator": 74.4401757891189,
+        "bars_between": 9,
+        "price_delta_atr": 4.542265884932236,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_67FCF6537E7442EA",
+      "symbol": "AERO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789639200000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.5867,
+        "p1_price": 0.5582,
+        "p2_price": 0.6015,
+        "p1_indicator": -1571460.4479999992,
+        "p2_indicator": -1714222.487999999,
+        "bars_between": 9,
+        "price_delta_atr": 4.542265884932236,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_026ACC733164D425",
+      "symbol": "UAI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.4064,
+        "compression_ratio": 0.95422560651113,
+        "ma_spread_atr": 0.6674809196872403,
+        "compression_threshold": 0.6995001131102584,
+        "breakout_atr": 0.3720401822923561,
+        "volume_ratio": 0.8360007535890229,
+        "requires_retest": true,
+        "trigger_level": 0.4049,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_8A1FEAA4BE3155D4",
+      "symbol": "UAI",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789495200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.4047,
+        "zone_high": 0.4093,
+        "zone_low": 0.3735,
+        "origin_ts": 1789495200000,
+        "displacement_atr": 1.2356034745750424,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_D9176C8CBCF52565",
+      "symbol": "JUP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789639200000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2328,
+        "p1_price": 0.2276,
+        "p2_price": 0.2341,
+        "p1_indicator": 74.71124209800776,
+        "p2_indicator": 72.15962196892842,
+        "bars_between": 9,
+        "price_delta_atr": 2.043164084218627,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_A073CD40EB632528",
+      "symbol": "JUP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789639200000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2328,
+        "p1_price": 0.2276,
+        "p2_price": 0.2341,
+        "p1_indicator": 93.68168239670773,
+        "p2_indicator": 90.73042439379071,
+        "bars_between": 9,
+        "price_delta_atr": 2.043164084218627,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_94E891F56CC2ADAB",
+      "symbol": "JUP",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789477200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2324,
+        "zone_high": 0.2324,
+        "zone_low": 0.2297,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789668000000,
+        "bos_ts": 1789484400000
+      }
+    },
+    {
+      "event_id": "EVT_76909574CD18125D",
+      "symbol": "ETC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 7.455,
+        "compression_ratio": 0.6268809815001359,
+        "ma_spread_atr": 0.6456006661698176,
+        "compression_threshold": 1.029861624809362,
+        "breakout_atr": 0.5138132513150125,
+        "volume_ratio": 1.558170580408743,
+        "requires_retest": true,
+        "trigger_level": 7.433,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_FD298AEE93FA0780",
+      "symbol": "ETC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789477200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 7.428,
+        "zone_high": 7.428,
+        "zone_low": 7.37,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789621200000,
+        "bos_ts": 1789484400000
+      }
+    },
+    {
+      "event_id": "EVT_D51BFE3AE06779A5",
+      "symbol": "MSFT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789567200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 498.72,
+        "zone_high": 498.79,
+        "zone_low": 493.69,
+        "origin_ts": 1789567200000,
+        "displacement_atr": 1.7987956345741198,
+        "return_tolerance_pct": 0.2
+      }
+    },
+    {
+      "event_id": "EVT_E8DD857B3A417934",
+      "symbol": "0G",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789329600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2039,
+        "zone_high": 0.2039,
+        "zone_low": 0.2014,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789639200000,
+        "bos_ts": 1789340400000
+      }
+    },
+    {
+      "event_id": "EVT_B0F8B04A7EAAE912",
+      "symbol": "GALA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.001857,
+        "range_high": 0.001857,
+        "range_low": 0.001806,
+        "manipulation_depth_atr": 0.15375720453149497
+      }
+    },
+    {
+      "event_id": "EVT_47BF08ADC39CAAA4",
+      "symbol": "PENDLE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 2.336,
+        "compression_ratio": 0.7591793619153029,
+        "ma_spread_atr": 0.4671605570363101,
+        "compression_threshold": 0.615349389711714,
+        "breakout_atr": 1.1148911883999904,
+        "volume_ratio": 1.1675356350084152,
+        "requires_retest": true,
+        "trigger_level": 2.3147,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_6FA437C69D4869E8",
+      "symbol": "PENDLE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1789664400000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "swept_level": 2.2892,
+        "sweep_depth_atr": 0.29621585967949854,
+        "reclaim_displacement_atr": 1.0915671049606521,
+        "volume_ratio": 1.1675356350084152,
+        "trigger_level": 2.2892,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_E52360A57A029B42",
+      "symbol": "PENDLE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "ema_fast": 2.3025846548217825,
+        "ema_slow": 2.279410002851915,
+        "ema200": 2.21351383026106,
+        "body_atr": 1.1148911883999904,
+        "volume_ratio": 1.1675356350084152,
+        "trigger_level": 2.3025846548217825,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_6B1179F80353D86E",
+      "symbol": "PENDLE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 2.3038,
+        "range_high": 2.3472,
+        "range_low": 2.3038,
+        "manipulation_depth_atr": 0.6134233944543869
+      }
+    },
+    {
+      "event_id": "EVT_EA08A2F4A050ABBA",
+      "symbol": "ORCL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789628400000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 150.78,
+        "p1_price": 144.95,
+        "p2_price": 148.87,
+        "p1_indicator": 65.69133560918065,
+        "p2_indicator": 60.42532099622261,
+        "bars_between": 12,
+        "price_delta_atr": 2.900660429109968,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_B983358364224082",
+      "symbol": "ORCL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789628400000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 150.78,
+        "p1_price": 144.95,
+        "p2_price": 148.87,
+        "p1_indicator": 92.04131737977472,
+        "p2_indicator": 66.85236768802224,
+        "bars_between": 12,
+        "price_delta_atr": 2.900660429109968,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_38A9F7B2C872F50E",
+      "symbol": "ORCL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1789628400000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 150.78,
+        "p1_price": 144.95,
+        "p2_price": 148.87,
+        "p1_indicator": -41454.03600000002,
+        "p2_indicator": -44637.24600000003,
+        "bars_between": 12,
+        "price_delta_atr": 2.900660429109968,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_F353495D010DF109",
+      "symbol": "ORCL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_OI",
+      "timestamps": {
+        "pivot_1_ts": 1789628400000,
+        "pivot_2_ts": 1789671600000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 150.78,
+        "p1_price": 144.95,
+        "p2_price": 148.87,
+        "p1_indicator": 29400000.0,
+        "p2_indicator": 28100000.0,
+        "bars_between": 12,
+        "price_delta_atr": 2.900660429109968,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_A94047BE8FC53C07",
+      "symbol": "ZRO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.1389,
+        "range_high": 1.1389,
+        "range_low": 1.0364,
+        "manipulation_depth_atr": 0.5739393736414506
+      }
+    },
+    {
+      "event_id": "EVT_23E9A39644862A66",
+      "symbol": "VIRTUAL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789678800000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.6118,
+        "compression_ratio": 0.8812730600670338,
+        "ma_spread_atr": 0.8392691597790993,
+        "compression_threshold": 0.9523372468860679,
+        "breakout_atr": 0.3191713339624604,
+        "volume_ratio": 0.9746778294027949,
+        "requires_retest": true,
+        "trigger_level": 0.611,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_29D018524DC5AEDF",
+      "symbol": "VIRTUAL",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789477200000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.6115,
+        "zone_high": 0.6115,
+        "zone_low": 0.6038,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789650000000,
+        "bos_ts": 1789484400000
+      }
+    },
+    {
+      "event_id": "EVT_CE55717FE642D76B",
+      "symbol": "ATOM",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.544,
+        "range_high": 1.558,
+        "range_low": 1.544,
+        "manipulation_depth_atr": 0.17996845690017874
+      }
+    },
+    {
+      "event_id": "EVT_91D8C5FEE49602BD",
+      "symbol": "PLTR",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789671600000,
+        "pivot_2_ts": 1789678800000,
+        "detected_at_ts": 1789678800000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 176.16,
+        "range_high": 176.16,
+        "range_low": 174.98,
+        "manipulation_depth_atr": 0.724186160035023
       }
     }
   ]
