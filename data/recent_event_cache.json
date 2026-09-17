@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789612651650,
+  "updated_ts": 1789612926667,
   "events": [
     {
       "event_id": "EVT_22B749E2C4F3BBE7",
@@ -4520,6 +4520,29 @@
         "bars_between": 5,
         "price_delta_atr": 0.506979015975109,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_F40445BA0D65E15C",
+      "symbol": "RAY",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789344000000,
+        "pivot_2_ts": 1789610400000,
+        "detected_at_ts": 1789610400000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 1.4444,
+        "zone_high": 1.4488,
+        "zone_low": 1.3737,
+        "origin_ts": 1789344000000,
+        "displacement_atr": 1.4993472173335238,
+        "return_tolerance_pct": 0.2
       }
     }
   ]
