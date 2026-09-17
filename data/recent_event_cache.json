@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789662907404,
+  "updated_ts": 1789663631344,
   "events": [
     {
       "event_id": "EVT_C1FAB18B83979FF3",
@@ -7079,6 +7079,52 @@
         "bars_between": 14,
         "price_delta_atr": 0.37954920735917336,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_69BB3AB5018196FC",
+      "symbol": "GLW",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1788868800000,
+        "pivot_2_ts": 1789660800000,
+        "detected_at_ts": 1789660800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 153.52,
+        "zone_high": 156.02,
+        "zone_low": 153.52,
+        "breaker_from": "BULLISH_OB",
+        "broken_ts": 1789387200000,
+        "bos_ts": 1788897600000
+      }
+    },
+    {
+      "event_id": "EVT_B745349925B468AF",
+      "symbol": "GLW",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1789401600000,
+        "pivot_2_ts": 1789660800000,
+        "detected_at_ts": 1789660800000
+      },
+      "event_fact": {
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 151.28,
+        "zone_high": 154.42,
+        "zone_low": 145.36,
+        "origin_ts": 1789401600000,
+        "displacement_atr": 1.2825456384490515,
+        "return_tolerance_pct": 0.2
       }
     }
   ]
