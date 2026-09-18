@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789727555870,
+  "updated_ts": 1789727981588,
   "events": [
     {
       "event_id": "EVT_6F888C59A35575AC",
@@ -2741,6 +2741,58 @@
         "bars_between": 12,
         "price_delta_atr": 4.477122707348809,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_026C89115BBAFEE3",
+      "symbol": "SUSHI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789725600000,
+        "pivot_2_ts": 1789725600000,
+        "detected_at_ts": 1789725600000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2516,
+        "donchian_high": 0.2471,
+        "donchian_low": 0.2179,
+        "breakout_atr": 0.9344961660344928,
+        "volume_ratio": 2.045745815935584,
+        "adx": 67.486008055744,
+        "ema200": 0.2212493012916942,
+        "compressed_recent": false,
+        "bb_width": 0.12845993558080004,
+        "trigger_level": 0.2471,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_C82A491859368044",
+      "symbol": "SUSHI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789704000000,
+        "pivot_2_ts": 1789725600000,
+        "detected_at_ts": 1789725600000
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2389,
+        "zone_high": 0.2389,
+        "zone_low": 0.2356,
+        "bos_level": 0.2409,
+        "ob_ts": 1789714800000,
+        "displacement_atr": 1.204461725111123,
+        "volume_ratio": 2.045745815935584,
+        "body_fraction": 0.6170212765957434
       }
     }
   ]
