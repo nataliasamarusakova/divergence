@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789817537521,
+  "updated_ts": 1789817808783,
   "events": [
     {
       "event_id": "EVT_078846DC6B01A245",
@@ -3579,6 +3579,58 @@
         "range_high": 2.4251,
         "range_low": 2.3872,
         "manipulation_depth_atr": 0.594870039868847
+      }
+    },
+    {
+      "event_id": "EVT_A7B3D8DD0C9EDFC1",
+      "symbol": "STX",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789815600000,
+        "pivot_2_ts": 1789815600000,
+        "detected_at_ts": 1789815600000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2999,
+        "donchian_high": 0.2908,
+        "donchian_low": 0.2714,
+        "breakout_atr": 1.7549506178980598,
+        "volume_ratio": 2.657639003029508,
+        "adx": 53.19283335711576,
+        "ema200": 0.2620889368240356,
+        "compressed_recent": true,
+        "bb_width": 0.08742475978415305,
+        "trigger_level": 0.2908,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_01C72BA0170F6B4E",
+      "symbol": "STX",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789768800000,
+        "pivot_2_ts": 1789815600000,
+        "detected_at_ts": 1789815600000
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2832,
+        "zone_high": 0.2832,
+        "zone_low": 0.2772,
+        "bos_level": 0.2907,
+        "ob_ts": 1789797600000,
+        "displacement_atr": 1.7935209611485623,
+        "volume_ratio": 2.657639003029508,
+        "body_fraction": 0.853211009174308
       }
     }
   ]
