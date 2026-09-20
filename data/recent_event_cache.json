@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789921098143,
+  "updated_ts": 1789921457484,
   "events": [
     {
       "event_id": "EVT_52C4761D959984A0",
@@ -5189,6 +5189,53 @@
         "ema200": 0.3500524894666987,
         "distance_ema200_atr": null,
         "engine": "MACD_4H"
+      }
+    },
+    {
+      "event_id": "EVT_3F1795E9A1BC7AC8",
+      "symbol": "RENDER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789920000000,
+        "pivot_2_ts": 1789920000000,
+        "detected_at_ts": 1789920000000
+      },
+      "event_fact": {
+        "detection_close_price": 1.565,
+        "compression_ratio": 0.5516571171470668,
+        "ma_spread_atr": 0.6685866400096567,
+        "compression_threshold": 1.2119605081274019,
+        "breakout_atr": 1.5094138827949573,
+        "volume_ratio": 1.6053188180662206,
+        "requires_retest": true,
+        "trigger_level": 1.538,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_FE3ED98501044271",
+      "symbol": "RENDER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1789920000000,
+        "pivot_2_ts": 1789920000000,
+        "detected_at_ts": 1789920000000
+      },
+      "event_fact": {
+        "ema_fast": 1.5410527164639924,
+        "ema_slow": 1.5301777520986404,
+        "ema200": 1.4558621995648247,
+        "body_atr": 1.5094138827949573,
+        "volume_ratio": 1.6053188180662206,
+        "trigger_level": 1.5410527164639924,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true
       }
     }
   ]
