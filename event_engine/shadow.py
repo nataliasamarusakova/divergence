@@ -180,7 +180,7 @@ def update_divergence_shadow_state(path: Path, market_prices: dict[str, float], 
     return {"active": active, "closed": closed, "updated": updated}
 
 
-def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None = None, divergence_shadow_path: Path | None = None) -> dict:
+def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None = None, divergence_shadow_path: Path | None = None, cycle_stats: dict | None = None) -> dict:
     now_ms = int(time.time() * 1000)
     events = _load_jsonl(events_path)
     trades = _load_jsonl(trades_path) if trades_path else []
@@ -246,12 +246,21 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
             "wins": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and float(t.get("realized_pnl_pct", 0.0) or 0.0) > 0),
             "losses": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and float(t.get("realized_pnl_pct", 0.0) or 0.0) <= 0),
         },
-        "gate_readiness": {"rsi_only_ready": rsi_only >= 40, "cvd_only_ready": cvd_only >= 40, "joint_ready": joint >= 30, "all_criteria_met": rsi_only >= 40 and cvd_only >= 40 and joint >= 30},
+        # CVD needs taker-flow fields that BingX v3 klines do not return, so
+        # cvd_only is structurally 0 and must not hold all_criteria_met hostage.
+        "gate_readiness": {
+            "rsi_only_ready": rsi_only >= 40,
+            "cvd_only_ready": cvd_only >= 40,
+            "cvd_feed_available": cvd_only > 0,
+            "joint_ready": joint >= 30,
+            "all_criteria_met": rsi_only >= 40 and (cvd_only == 0 or (cvd_only >= 40 and joint >= 30)),
+        },
+        "cycle_stats": cycle_stats or {},
     }
 
 
-def append_shadow_health(events_path: Path, health_path: Path, trades_path: Path | None = None, divergence_shadow_path: Path | None = None) -> dict:
-    snapshot = generate_shadow_health_snapshot(events_path, trades_path, divergence_shadow_path)
+def append_shadow_health(events_path: Path, health_path: Path, trades_path: Path | None = None, divergence_shadow_path: Path | None = None, cycle_stats: dict | None = None) -> dict:
+    snapshot = generate_shadow_health_snapshot(events_path, trades_path, divergence_shadow_path, cycle_stats)
     health_path.parent.mkdir(parents=True, exist_ok=True)
     with health_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")

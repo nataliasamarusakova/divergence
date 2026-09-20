@@ -1500,7 +1500,7 @@ def diagnose_15m_trigger(
     event_detected_at_ts: int | None = None,
     max_trigger_delay_min: float = 30.0,
     min_vol_mult: float = 1.05,
-    require_event_ts: bool = False,
+    require_event_ts: bool = True,
 ) -> dict[str, Any]:
 
     result: dict[str, Any] = {

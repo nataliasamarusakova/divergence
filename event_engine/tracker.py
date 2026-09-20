@@ -40,6 +40,22 @@ EARLY_LOSS_CUT_2H_PNL = float(os.environ.get("EARLY_LOSS_CUT_2H_PNL", "-1.50"))
 EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
 EARLY_LOSS_CUT_4H_PNL = float(os.environ.get("EARLY_LOSS_CUT_4H_PNL", "-2.50"))
 
+# Which realised TP leg moves the stop to break-even. build_tp_levels has always
+# documented "TP1 no BE, TP2 move to BE", but the tracker moved on TP1, so every
+# TP1 hit also armed BE (TP1-hit rate and BE rate match to the decimal in both
+# production windows). tp2 restores the documented policy; tp1 reproduces the
+# shipped behaviour for A/B.
+BE_AFTER_LEG = os.environ.get("BE_AFTER_LEG", "tp2").strip().lower()
+if BE_AFTER_LEG not in {"tp1", "tp2"}:
+    BE_AFTER_LEG = "tp2"
+
+
+def _be_milestone_reached(hit_legs: set[str], is_single_tp: bool) -> bool:
+    """A single-TP micro-position can only ever arm BE at its terminal leg."""
+    if is_single_tp:
+        return "tp3" in hit_legs
+    return BE_AFTER_LEG in hit_legs
+
 
 
 def _load_notifications() -> dict[str, dict]:
@@ -1036,7 +1052,7 @@ def update_active_trades() -> None:
             # its terminal TP3 milestone.
             hit_legs = {str(x).lower() for x in trade.get("hit_legs", []) if x}
             is_single_tp = trade.get("tp_mode") == "single_tp"
-            should_move_to_be = ("tp1" in hit_legs) or (is_single_tp and "tp3" in hit_legs)
+            should_move_to_be = _be_milestone_reached(hit_legs, is_single_tp)
             if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
@@ -1128,10 +1144,8 @@ def update_active_trades() -> None:
                     except Exception as exc:
                         log.error("[TELEGRAM] TP notification queue error %s %s %s: %s", symbol, leg, event_id, exc)
 
-                    # Move to BE after TP1 (or terminal TP3 for an explicitly
-                    # single-TP trade). This is the first realised-risk-removal point.
                     is_single_tp = trade.get("tp_mode") == "single_tp"
-                    should_move_to_be = (leg == "tp1") or (is_single_tp and leg == "tp3")
+                    should_move_to_be = _be_milestone_reached(hit_legs, is_single_tp)
                     if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
