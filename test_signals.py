@@ -1265,27 +1265,33 @@ def test_squeeze_tp_levels_are_wider_than_divergence():
     assert tp_sq[2]["close_fraction"] == 0.35
 
 
-def test_tracker_activates_be_after_prior_tp_milestone(monkeypatch, tmp_path):
-    import event_engine.tracker as tr
-    from pathlib import Path
-
-    active_path = tmp_path / "active_trades.json"
-    trade_record = {
+def _be_trade_record(hit_legs, event_id="EVT_TEST"):
+    return {
         "trade_id": "TR_TEST",
-        "event_id": "EVT_TEST",
+        "event_id": event_id,
         "symbol": "TEST",
         "direction": "LONG",
         "entry_price": 100.0,
         "initial_qty": 10.0,
         "remaining_qty": 7.0,
         "entry_ts": 1000,
-        "hit_legs": ["tp1"],  # TP1 now arms BE
+        "hit_legs": list(hit_legs),
         "be_activated": False,
         "sl_order": {"order_id": "OLD_SL", "stop_price": 95.0},
         "tp_orders": [],
         "closed": False,
     }
-    active_path.write_text(json.dumps({"EVT_TEST": trade_record}), encoding="utf-8")
+
+
+def _run_be_case(monkeypatch, tmp_path, hit_legs, be_after_leg, tp_mode=None):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    record = _be_trade_record(hit_legs)
+    if tp_mode:
+        record["tp_mode"] = tp_mode
+    active_path.write_text(json.dumps({"EVT_TEST": record}), encoding="utf-8")
+    monkeypatch.setattr(tr, "BE_AFTER_LEG", be_after_leg)
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
     monkeypatch.setattr(tr, "TRADES_PATH", tmp_path / "trades.jsonl")
     monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.0", "avgPrice": "100.0"})
@@ -1297,8 +1303,36 @@ def test_tracker_activates_be_after_prior_tp_milestone(monkeypatch, tmp_path):
     )
     tr.update_active_trades()
     saved = json.loads(active_path.read_text(encoding="utf-8"))
+    return be_calls, saved["EVT_TEST"]
+
+
+def test_be_default_policy_waits_for_tp2(monkeypatch, tmp_path):
+    """Documented policy: TP1 takes a partial, TP2 removes the risk."""
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp2")
+    assert be_calls == []
+    assert trade["be_activated"] is False
+
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1", "tp2"], "tp2")
     assert len(be_calls) == 1
-    assert saved["EVT_TEST"]["be_activated"] is True
+    assert trade["be_activated"] is True
+
+
+def test_be_tp1_policy_is_still_selectable(monkeypatch, tmp_path):
+    """BE_AFTER_LEG=tp1 reproduces the previously shipped behaviour for A/B."""
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp1")
+    assert len(be_calls) == 1
+    assert trade["be_activated"] is True
+
+
+def test_be_single_tp_position_arms_only_at_terminal_leg(monkeypatch, tmp_path):
+    """A micro-position collapses to one TP3 leg; it cannot wait for a tp2."""
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp2", tp_mode="single_tp")
+    assert be_calls == []
+    assert trade["be_activated"] is False
+
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp3"], "tp2", tp_mode="single_tp")
+    assert len(be_calls) == 1
+    assert trade["be_activated"] is True
 
 
 def test_tracker_does_not_activate_be_without_tp_milestone(monkeypatch, tmp_path):

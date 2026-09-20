@@ -129,6 +129,10 @@ ORDER_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("ORDER_BLOCK_RETEST_MAX_
 BREAKER_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("BREAKER_BLOCK_RETEST_MAX_DELAY_MIN", "120"))
 MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN = float(os.environ.get("MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN", "120"))
 SFP_RETEST_MAX_DELAY_MIN = float(os.environ.get("SFP_RETEST_MAX_DELAY_MIN", "60"))
+# LIQUIDITY_SWEEP emits requires_retest=True but had no window entry, so it fell
+# back to MAX_TRIGGER_DELAY (30 min) -- two 15m candidate bars against the 4-8
+# every other retest engine gets. 60 min matches its nearest sibling, SFP.
+LIQUIDITY_SWEEP_RETEST_MAX_DELAY_MIN = float(os.environ.get("LIQUIDITY_SWEEP_RETEST_MAX_DELAY_MIN", "60"))
 LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN = float(os.environ.get("LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN", "90"))
 CRT_RETEST_MAX_DELAY_MIN = float(os.environ.get("CRT_RETEST_MAX_DELAY_MIN", "60"))
 REQUIRE_4H_CONTEXT_FOR_1H = os.environ.get("REQUIRE_4H_CONTEXT_FOR_1H", "true").lower() == "true"
@@ -277,6 +281,74 @@ def _mark_local_position_state(
             current_positions[key] = dict(position)
 
 
+def _btc_regime_snapshot(btc_1h_df) -> dict[str, Any]:
+    """BTC state at decision time, so regime can be analysed instead of guessed.
+
+    check_btc_regime consumed this and threw it away; btc_corr7d is a 7-day
+    correlation, not a regime, and must not be substituted for it.
+    """
+    out: dict[str, Any] = {"btc_chg_1h_pct": None, "btc_chg_4h_pct": None,
+                           "btc_close": None, "btc_available": False}
+    try:
+        if btc_1h_df is None or len(btc_1h_df) < 5 or "close" not in btc_1h_df.columns:
+            return out
+        close = pd.to_numeric(btc_1h_df["close"], errors="coerce")
+        last, prev_1h, prev_4h = float(close.iloc[-1]), float(close.iloc[-2]), float(close.iloc[-5])
+        if last <= 0 or prev_1h <= 0 or prev_4h <= 0:
+            return out
+        out.update({
+            "btc_close": last,
+            "btc_chg_1h_pct": (last - prev_1h) / prev_1h * 100.0,
+            "btc_chg_4h_pct": (last - prev_4h) / prev_4h * 100.0,
+            "btc_available": True,
+        })
+    except Exception:
+        return out
+    return out
+
+
+def _entry_context(row: Any, ev: dict, btc_regime: dict[str, Any]) -> dict[str, Any]:
+    """Freeze every regime input that the filters used but never journaled."""
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    def _num(name):
+        try:
+            value = getattr(row, name, None)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    return {
+        **btc_regime,
+        "fr_oiw": _num("fr_oiw"),
+        "pfr_oiw": _num("pfr_oiw"),
+        "oi": _num("oi"),
+        "oi_chg24_pct": _num("oi_chg24_pct"),
+        "oi_chg4h_pct": _num("oi_chg4h_pct"),
+        "volume24": _num("volume24"),
+        "cvd24": _num("cvd24"),
+        "ls_accounts": _num("ls_accounts"),
+        "liq_long24": _num("liq_long24"),
+        "liq_short24": _num("liq_short24"),
+        "btc_corr7d": _num("btc_corr7d"),
+        "htf_trend": fact.get("htf_trend"),
+        "htf_trend_ok": fact.get("htf_trend_ok"),
+        "context_source": fact.get("context_source"),
+    }
+
+
+def _is_divergence_event(ev: dict) -> bool:
+    """Engine identity is authoritative; event_type carries the indicator subtype.
+
+    Divergence events are emitted as REGULAR_/HIDDEN_<INDICATOR> (e.g.
+    REGULAR_BULLISH_RSI), never as the literal string "DIVERGENCE". Comparing
+    event_type to "DIVERGENCE" matched nothing, which silently disabled
+    DIVERGENCE_SHADOW_ONLY and ENABLE_DIVERGENCE_ENGINE.
+    """
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    if str(fact.get("engine") or "").upper() == "DIVERGENCE":
+        return True
+    return str(ev.get("event_type") or "").upper().startswith(("REGULAR_", "HIDDEN_"))
+
+
 def _is_liquidation_squeeze_event(event_type: str) -> bool:
     return str(event_type or "").upper() in {"SHORT_SQUEEZE", "LONG_SQUEEZE"}
 
@@ -309,6 +381,8 @@ def _event_trigger_max_delay_min(ev: dict) -> float:
         return MITIGATION_BLOCK_RETEST_MAX_DELAY_MIN
     if engine == "SFP":
         return SFP_RETEST_MAX_DELAY_MIN
+    if engine == "LIQUIDITY_SWEEP":
+        return LIQUIDITY_SWEEP_RETEST_MAX_DELAY_MIN
     if engine == "LIQUIDATION_CASCADE_FVG":
         return LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN
     if engine == "CRT":
@@ -1313,7 +1387,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         # Normal divergence cascade: take a small early partial, protect only
         # after TP2, and keep enough size for the higher-R move.
         # TP1: 0.75R -> 25% (no BE)
-        # TP2: 1.50R -> 40% (move SL to BE)
+        # TP2: 1.50R -> 40% (move SL to BE; tracker.BE_AFTER_LEG must agree)
         # TP3: 2.50R -> 35%
         # Weighted RR = 0.25*0.75 + 0.40*1.50 + 0.35*2.50 = 1.6625R
         tp_levels = [
@@ -2156,6 +2230,9 @@ def main() -> None:
     except Exception as exc:
         log.error("[BTC_REGIME] Fetch error: %s", exc)
 
+    btc_regime_snapshot = _btc_regime_snapshot(btc_regime_df)
+    stats["btc_regime_available"] = bool(btc_regime_snapshot.get("btc_available"))
+
     rows: list[Any] = []
     try:
         log.info("[ENGINE_STAGE] Coinalyze fetch START...")
@@ -2321,7 +2398,7 @@ def main() -> None:
                 continue
 
             event_type_name = str(ev.get("event_type", "")).upper()
-            if event_type_name == "DIVERGENCE" and not ENABLE_DIVERGENCE_ENGINE:
+            if _is_divergence_event(ev) and not ENABLE_DIVERGENCE_ENGINE:
                 continue
             direction = str(ev.get("direction", "")).upper()
             if direction not in {"LONG", "SHORT"}:
@@ -2367,7 +2444,7 @@ def main() -> None:
             event_type = str(ev.get("event_type", "")).upper()
             is_squeeze = _is_squeeze_event(event_type)
             stats["fresh_squeeze"] += int(is_squeeze)
-            is_divergence = event_type == "DIVERGENCE"
+            is_divergence = _is_divergence_event(ev)
             stats["fresh_divergence"] += int(is_divergence)
             tf_stats["fresh_squeeze"] += int(is_squeeze)
             tf_stats["fresh_divergence"] += int(is_divergence)
@@ -2571,6 +2648,7 @@ def main() -> None:
             }
             setup["event_timeframe"] = tf
             setup["event_type"] = event_type
+            setup["entry_context"] = _entry_context(r, ev, btc_regime_snapshot)
             setup["trigger_ok"] = True
 
             key = (symbol, direction)
@@ -2618,9 +2696,9 @@ def main() -> None:
                  loser, symbol, float(rejected.get("score", 0)), rejected.get("event", {}).get("timeframe"),
                  against.get("direction"), symbol, float(against.get("score", 0)), against.get("timeframe"))
 
-    log.info("[RANKING] Unique non-conflicting signals ready: %d.", len(opportunities))
+    log.info("[RANKING] Unique non-conflicting signals ready: %d (ordered by event recency; score is metadata, not a rank key).", len(opportunities))
     for i, opp in enumerate(opportunities[:5], start=1):
-        log.info("  [RANKING] #%d: %s %s | Score: %.0f | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
+        log.info("  [RANKING] #%d: %s %s | Score: %.0f (not ranked on) | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
     trades_this_cycle = 0
 
@@ -2660,7 +2738,7 @@ def main() -> None:
         trigger_age_min = ((now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
             ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
         )
-        if EXECUTION_ENABLED and event_type_name == "DIVERGENCE" and DIVERGENCE_SHADOW_ONLY:
+        if EXECUTION_ENABLED and _is_divergence_event(ev) and DIVERGENCE_SHADOW_ONLY:
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
             trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)
             try:
@@ -2783,9 +2861,15 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
-                elif execution_result.get("bingx_code") == 101400 or "clientorderid unique check failed" in err_str:
+                elif execution_result.get("bingx_code") == 101481 or "clientorderid unique check failed" in err_str or "clientorderid has already been used" in err_str:
                     terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
                     log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
+                elif execution_result.get("bingx_code") == 101400 and ("clientorderid" in err_str or "duplicate" in err_str):
+                    terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
+                    log.warning("[EXECUTION] %s (%s) 101400 reported a duplicate clientOrderId; terminalizing event %s.", symbol, direction, event_id)
+                elif execution_result.get("bingx_code") == 101400 and "suspend" in err_str:
+                    terminal_reason = "SYMBOL_SUSPENDED"
+                    log.warning("[EXECUTION] %s (%s) pair suspended on exchange; terminalizing event %s.", symbol, direction, event_id)
                 elif "min_qty" in err_str:
                     terminal_reason = "MIN_QTY_NOT_REACHABLE"
                     log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)
@@ -2949,7 +3033,7 @@ def main() -> None:
         )
 
     try:
-        append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES, divergence_shadow_path=DIVERGENCE_SHADOW_STATE)
+        append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES, divergence_shadow_path=DIVERGENCE_SHADOW_STATE, cycle_stats=stats)
     except Exception as exc:
         log.error("[SHADOW] Health snapshot error: %s", exc)
 
