@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789907752171,
+  "updated_ts": 1789908108709,
   "events": [
     {
       "event_id": "EVT_109AB73C1DD8C617",
@@ -6529,6 +6529,95 @@
         "bars_between": 6,
         "price_delta_atr": 2.2286006617920395,
         "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_5933D672849391CE",
+      "symbol": "ENSO",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "MACD_4H_BULLISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1789905600000,
+        "pivot_2_ts": 1789905600000,
+        "detected_at_ts": 1789905600000
+      },
+      "event_fact": {
+        "detection_close_price": 1.0611,
+        "macd": 0.018164997792915916,
+        "macd_signal": 0.011137118102152142,
+        "macd_hist": 0.007027879690763773,
+        "ema200": 0.9035961960365524,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H"
+      }
+    },
+    {
+      "event_id": "EVT_13C23B97B7707E10",
+      "symbol": "ENSO",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1789833600000,
+        "pivot_2_ts": 1789905600000,
+        "detected_at_ts": 1789905600000
+      },
+      "event_fact": {
+        "swept_level": 0.9433,
+        "sweep_depth_atr": 0.7350874346534414,
+        "reclaim_displacement_atr": 3.1953247159474274,
+        "volume_ratio": 1.1166233641287129,
+        "trigger_level": 0.9433,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_1BA7A27DE4A436D9",
+      "symbol": "ENSO",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1789905600000,
+        "pivot_2_ts": 1789905600000,
+        "detected_at_ts": 1789905600000
+      },
+      "event_fact": {
+        "ema_fast": 0.9464076383325948,
+        "ema_slow": 0.926663761514515,
+        "ema200": 0.9035961960365524,
+        "body_atr": 3.6293246773664336,
+        "volume_ratio": 1.1166233641287129,
+        "trigger_level": 0.9464076383325948,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_B014698CD6EAF42D",
+      "symbol": "ENSO",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788249600000,
+        "pivot_2_ts": 1789905600000,
+        "detected_at_ts": 1789905600000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.9427,
+        "zone_high": 0.9427,
+        "zone_low": 0.8825,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789142400000,
+        "bos_ts": 1788264000000
       }
     }
   ]
