@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789955527893,
+  "updated_ts": 1789955807348,
   "events": [
     {
       "event_id": "EVT_2C0574AEB0BA27EA",
@@ -3845,6 +3845,53 @@
         "range_high": 335.47,
         "range_low": 334.18,
         "manipulation_depth_atr": 0.6850620537730344
+      }
+    },
+    {
+      "event_id": "EVT_93883EB094FC0115",
+      "symbol": "XAUT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789952400000,
+        "pivot_2_ts": 1789952400000,
+        "detected_at_ts": 1789952400000
+      },
+      "event_fact": {
+        "detection_close_price": 4371.03,
+        "compression_ratio": 0.9898646676072378,
+        "ma_spread_atr": 0.22968062942607967,
+        "compression_threshold": 0.2320323544644521,
+        "breakout_atr": 0.8857188487106463,
+        "volume_ratio": 0.7917693572355236,
+        "requires_retest": true,
+        "trigger_level": 4371.56,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_236B3FF19734A9CF",
+      "symbol": "XAUT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789581600000,
+        "pivot_2_ts": 1789952400000,
+        "detected_at_ts": 1789952400000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 4367.01,
+        "zone_high": 4367.01,
+        "zone_low": 4345.55,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789650000000,
+        "bos_ts": 1789585200000
       }
     }
   ]
