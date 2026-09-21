@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789978692702,
+  "updated_ts": 1789979602991,
   "events": [
     {
       "event_id": "EVT_9F94ECF592BDDE24",
@@ -235,32 +235,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789923600000,
         "bos_ts": 1789916400000
-      }
-    },
-    {
-      "event_id": "EVT_FE65C1E7EA426B01",
-      "symbol": "VVV",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1789974000000,
-        "pivot_2_ts": 1789974000000,
-        "detected_at_ts": 1789974000000
-      },
-      "event_fact": {
-        "detection_close_price": 33.467,
-        "donchian_high": 33.212,
-        "donchian_low": 27.359,
-        "breakout_atr": 0.24850513260275195,
-        "bb_width": 0.241799793696489,
-        "bb_width_threshold": 0.1115475304338402,
-        "volume_ratio": 3.5306517836700255,
-        "adx": 36.00593851328239,
-        "requires_retest": true,
-        "trigger_level": 33.212,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true
       }
     },
     {
@@ -4703,6 +4677,51 @@
         "ema200": 629.0625933483229,
         "distance_ema200_atr": null,
         "engine": "MACD_4H"
+      }
+    },
+    {
+      "event_id": "EVT_7B4C3F171D6A14B3",
+      "symbol": "IOST",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789977600000,
+        "pivot_2_ts": 1789977600000,
+        "detected_at_ts": 1789977600000
+      },
+      "event_fact": {
+        "detection_close_price": 0.0008729,
+        "compression_ratio": 0.16544278424889378,
+        "ma_spread_atr": 0.07247242449855179,
+        "compression_threshold": 0.43805128659780984,
+        "breakout_atr": 0.8985422210198332,
+        "volume_ratio": 0.9685852885825642,
+        "requires_retest": true,
+        "trigger_level": 0.0008662,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_DCB8F7CFFAFB4E5E",
+      "symbol": "IOST",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789970400000,
+        "pivot_2_ts": 1789977600000,
+        "detected_at_ts": 1789977600000
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.0008548,
+        "range_high": 0.0008656,
+        "range_low": 0.0008548,
+        "manipulation_depth_atr": 0.18087538215333737
       }
     }
   ]
