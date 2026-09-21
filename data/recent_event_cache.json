@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790023547846,
+  "updated_ts": 1790024172699,
   "events": [
     {
       "event_id": "EVT_25F57527E8F157A5",
@@ -5676,6 +5676,76 @@
         "range_high": 0.009242,
         "range_low": 0.008726,
         "manipulation_depth_atr": 0.6463003891585379
+      }
+    },
+    {
+      "event_id": "EVT_6C8225D5F8328D2A",
+      "symbol": "GRASS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1789959600000,
+        "pivot_2_ts": 1790013600000,
+        "detected_at_ts": 1790020800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.3728,
+        "p1_price": 0.3555,
+        "p2_price": 0.3647,
+        "p1_indicator": 51.600735417715335,
+        "p2_indicator": 49.48128998480593,
+        "bars_between": 15,
+        "price_delta_atr": 1.5465360902738692,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_7981408AF5D8E433",
+      "symbol": "GRASS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789959600000,
+        "pivot_2_ts": 1790013600000,
+        "detected_at_ts": 1790020800000
+      },
+      "event_fact": {
+        "detection_close_price": 0.3728,
+        "p1_price": 0.3555,
+        "p2_price": 0.3647,
+        "p1_indicator": 54.947433518862006,
+        "p2_indicator": 51.33597367009509,
+        "bars_between": 15,
+        "price_delta_atr": 1.5465360902738692,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_62DA7E0FC9E56C58",
+      "symbol": "GRASS",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1788940800000,
+        "pivot_2_ts": 1790020800000,
+        "detected_at_ts": 1790020800000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.3709,
+        "zone_high": 0.3709,
+        "zone_low": 0.3365,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1789804800000,
+        "liquidity_sweep_level": 0.3297,
+        "mss_ts": 1789992000000,
+        "broken_ts": 1789992000000,
+        "bos_ts": 1789012800000
       }
     }
   ]
