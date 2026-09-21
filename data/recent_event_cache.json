@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790007484237,
+  "updated_ts": 1790008411664,
   "events": [
     {
       "event_id": "EVT_168C4F2044EAF30D",
@@ -22,32 +22,6 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789905600000,
         "bos_ts": 1789898400000
-      }
-    },
-    {
-      "event_id": "EVT_53580F33D958EDD5",
-      "symbol": "1000PEPE",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1790002800000,
-        "pivot_2_ts": 1790002800000,
-        "detected_at_ts": 1790002800000
-      },
-      "event_fact": {
-        "detection_close_price": 0.0048201,
-        "donchian_high": 0.0043509,
-        "donchian_low": 0.0039179,
-        "breakout_atr": 3.266457276548247,
-        "bb_width": 0.18651344596976202,
-        "bb_width_threshold": 0.05825481338776963,
-        "volume_ratio": 1.6342139171306336,
-        "adx": 27.242764417282576,
-        "requires_retest": true,
-        "trigger_level": 0.0043509,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true
       }
     },
     {
@@ -7695,6 +7669,51 @@
         "range_high": 449.35,
         "range_low": 444.09,
         "manipulation_depth_atr": 1.0292242146263637
+      }
+    },
+    {
+      "event_id": "EVT_60DEE04267ABB387",
+      "symbol": "FORM",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1790006400000,
+        "pivot_2_ts": 1790006400000,
+        "detected_at_ts": 1790006400000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2809,
+        "bb_width": 0.025536569855796304,
+        "kc_width": 0.025484589576783123,
+        "squeeze_duration_bars": 5,
+        "compression_ratio": 1.0020396749516631,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.27445729478839154
+      }
+    },
+    {
+      "event_id": "EVT_A4CC5924AA5966E8",
+      "symbol": "FORM",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789848000000,
+        "pivot_2_ts": 1790006400000,
+        "detected_at_ts": 1790006400000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2652,
+        "zone_high": 0.2652,
+        "zone_low": 0.2606,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789977600000,
+        "bos_ts": 1789876800000
       }
     }
   ]
