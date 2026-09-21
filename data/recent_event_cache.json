@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789968075193,
+  "updated_ts": 1789968392828,
   "events": [
     {
       "event_id": "EVT_5AEDD89AD68F64C3",
@@ -4416,6 +4416,30 @@
         "volume_ratio": 0.5738163338693644,
         "requires_retest": true,
         "trigger_level": 1.399,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_B2801B9DD7968CF2",
+      "symbol": "AAPL",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789966800000,
+        "pivot_2_ts": 1789966800000,
+        "detected_at_ts": 1789966800000
+      },
+      "event_fact": {
+        "detection_close_price": 334.43,
+        "compression_ratio": 0.1416980717524246,
+        "ma_spread_atr": 0.07783809950214426,
+        "compression_threshold": 0.5493236325625043,
+        "breakout_atr": 0.5028286836781956,
+        "volume_ratio": 1.065341033830614,
+        "requires_retest": true,
+        "trigger_level": 334.68,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true
       }
