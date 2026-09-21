@@ -660,7 +660,45 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
         if str(after.get("status", "")).lower() != "found" or abs(float(after.get("positionAmt", 0) or 0)) <= 0:
             return {"status": "closed", "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id}
 
-    return {"status": "error", "error": "emergency close did not flatten position", "symbol": bx_symbol, "direction": direction}
+    # Two verified close attempts are the automatic safety limit. Do one final
+    # read-only position check and surface an explicit unresolved state rather
+    # than silently collapsing it into a generic error. The caller can then
+    # trigger its existing rollback/alert path without a blind third POST.
+    try:
+        final_state = get_position_directional(symbol, direction)
+    except Exception as exc:
+        log.critical(
+            "[EMERGENCY_CLOSE] position state unknown after two attempts: %s %s: %s",
+            bx_symbol, direction, exc,
+        )
+        return {
+            "status": "unknown",
+            "error": "emergency close final verification failed after two attempts",
+            "symbol": bx_symbol, "direction": direction, "attempts": 2,
+            "escalation_required": True,
+        }
+
+    if str(final_state.get("status", "")).lower() == "found":
+        try:
+            remaining_qty = abs(float(final_state.get("positionAmt", 0) or 0))
+        except (TypeError, ValueError):
+            remaining_qty = None
+        log.critical(
+            "[EMERGENCY_CLOSE] UNFLATTENED after two attempts: %s %s remaining_qty=%s",
+            bx_symbol, direction, remaining_qty,
+        )
+        return {
+            "status": "UNFLATTENED",
+            "error": "emergency close did not flatten position after two attempts",
+            "symbol": bx_symbol, "direction": direction, "attempts": 2,
+            "remaining_qty": remaining_qty, "escalation_required": True,
+        }
+
+    return {
+        "status": "closed",
+        "symbol": bx_symbol, "direction": direction, "attempts": 2,
+        "verification": "final_readback",
+    }
 
 
 def get_position_directional(symbol: str, direction: str) -> dict:
@@ -1371,6 +1409,8 @@ def ensure_directional_protection(
         }
 
     tp_results = []
+    stale_tp_cancellations = []
+    handled_existing_tp_ids: set[str] = set()
     current_price = None
     current_price_checked = False
 
@@ -1386,6 +1426,9 @@ def ensure_directional_protection(
                 break
 
         if existing_leg:
+            existing_order_id = str(existing_leg.get("orderId", ""))
+            if existing_order_id:
+                handled_existing_tp_ids.add(existing_order_id)
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
             # An existing TP is reusable only when both price and quantity match
             # the current desired leg. Reusing a smaller/older order can leave
@@ -1483,8 +1526,29 @@ def ensure_directional_protection(
             "pnl_pct": pnl_pct,
         })
 
+    # Reconcile the complete desired TP set, not only its members. When a
+    # position changes profile (e.g. 3 TPs -> single TP), any live conditional
+    # order that was not consumed by the current desired set is stale and must
+    # be cancelled and verified. This deliberately runs after desired orders
+    # are healthy so there is no intentional protection gap.
+    stale_tps = [
+        order for order in existing_tp
+        if str(order.get("orderId", "")) and str(order.get("orderId", "")) not in handled_existing_tp_ids
+    ]
+    stale_tp_cleanup_failed = False
+    for stale in stale_tps:
+        order_id = str(stale.get("orderId", ""))
+        ok, note = _cancel_protection_order_verified(symbol, direction, stale)
+        stale_tp_cancellations.append({
+            "order_id": order_id,
+            "status": "cancelled" if ok else "error",
+            "error": None if ok else note,
+        })
+        if not ok:
+            stale_tp_cleanup_failed = True
+
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists"}]
-    if not verified_sl_valid:
+    if not verified_sl_valid or stale_tp_cleanup_failed:
         final_status = "PROTECTION_FAILED"
     elif len(successful_tps) == len(tp_levels_norm):
         final_status = "PROTECTED"
@@ -1513,6 +1577,7 @@ def ensure_directional_protection(
         "effective_tp_levels": effective_levels,
         "effective_weighted_rr": effective_weighted_rr,
         "tp_orders": tp_results,
+        "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
     }
 

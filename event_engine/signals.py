@@ -452,15 +452,20 @@ def detect_donchian_retest(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
 
 
 def detect_liquidity_sweep_reclaim(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
-                                   lookback: int = 20, min_displacement_atr: float = 0.35,
-                                   min_volume_ratio: float = 1.10, sweep_tolerance_pct: float = 0.05) -> list[dict[str, Any]]:
-    """Detect a stop-run beyond a prior swing followed by a reclaim/structure shift.
+                                   lookback: int = 20, min_displacement_atr: float = 0.10,
+                                   min_volume_ratio: float = 1.10,
+                                   min_rejection_wick_fraction: float = 0.35,
+                                   sweep_tolerance_pct: float = 0.0) -> list[dict[str, Any]]:
+    """Detect a prior-range liquidity sweep followed by a reclaim.
 
-    Long: current low sweeps a prior swing low, then closes back above it and above
-    the previous bar high. Short is the mirror image. The Event is a setup; entry
-    still requires the downstream retest/acceptance trigger.
+    The reference geometry is intentionally explicit: use the extreme of the
+    previous ``lookback`` completed bars, exceed it by at least
+    ``min_displacement_atr`` measured against the *previous bar's* ATR, close
+    back inside the level, and devote at least ``min_rejection_wick_fraction``
+    of the current candle range to the rejection wick. Total-volume ratio is
+    retained only as an additional local strategy filter.
     """
-    if timeframe.lower() not in {"1h", "4h"} or len(df) < 80:
+    if timeframe.lower() not in {"1h", "4h"} or len(df) < max(80, lookback + 2):
         return []
     d = df.copy()
     for c in ("close", "open", "high", "low", "volume", "close_time"):
@@ -468,60 +473,88 @@ def detect_liquidity_sweep_reclaim(df: pd.DataFrame, symbol: str, timeframe: str
             return []
         d[c] = pd.to_numeric(d[c], errors="coerce")
     d = d.dropna(subset=["close", "open", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    if len(d) < max(80, lookback + 2):
+        return []
     d["atr"] = _atr(d, 14)
-    if pd.isna(d["atr"].iloc[-1]) or float(d["atr"].iloc[-1]) <= 0:
+    prev_atr = d["atr"].iloc[-2]
+    if pd.isna(prev_atr) or float(prev_atr) <= 0:
+        return []
+    atr_v = float(prev_atr)
+
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    close = float(last["close"])
+    open_v = float(last["open"])
+    high = float(last["high"])
+    low = float(last["low"])
+    candle_range = high - low
+    if candle_range <= 0:
         return []
 
-    lows, highs = _pivots(d, 3, 2)
-    last_idx = len(d) - 1
-    low_candidates = [i for i in lows if i <= last_idx - 3][-lookback:]
-    high_candidates = [i for i in highs if i <= last_idx - 3][-lookback:]
-    if not low_candidates and not high_candidates:
-        return []
-
-    last = d.iloc[-1]; prev = d.iloc[-2]
-    atr_v = float(d["atr"].iloc[-1]); close = float(last["close"]); open_v = float(last["open"])
     vol_mean = float(d["volume"].iloc[-21:-1].mean()) if pd.notna(d["volume"].iloc[-21:-1].mean()) else 0.0
     vol_ratio = float(last["volume"] / vol_mean) if vol_mean > 0 else 0.0
     if vol_ratio < min_volume_ratio:
         return []
 
-    events = []
+    history = d.iloc[-(lookback + 1):-1]
+    if len(history) < lookback:
+        return []
     tol = max(0.0, sweep_tolerance_pct) / 100.0
-    if low_candidates:
-        swing_i = low_candidates[-1]
-        level = float(d["low"].iloc[swing_i])
-        swept = float(last["low"]) < level * (1.0 - tol)
-        reclaim = close > level and close > float(prev["high"]) and close > open_v
-        displacement = (close - level) / atr_v
-        if swept and reclaim and displacement >= min_displacement_atr:
-            ts = int(last["close_time"])
-            typ = "LIQUIDITY_SWEEP_RECLAIM"
-            events.append({
-                "event_id": _event_id(symbol, timeframe, typ + "_LONG", ts, int(d["close_time"].iloc[swing_i])),
-                "symbol": symbol, "timeframe": timeframe, "direction": "LONG", "event_type": typ,
-                "timestamps": {"pivot_1_ts": int(d["close_time"].iloc[swing_i]), "pivot_2_ts": ts, "detected_at_ts": ts},
-                "event_fact": {"swept_level": level, "sweep_depth_atr": (level - float(last["low"])) / atr_v,
-                                "reclaim_displacement_atr": float(displacement), "volume_ratio": vol_ratio,
-                                "trigger_level": level, "requires_retest": True, "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True},
-            })
-    if high_candidates:
-        swing_i = high_candidates[-1]
-        level = float(d["high"].iloc[swing_i])
-        swept = float(last["high"]) > level * (1.0 + tol)
-        reclaim = close < level and close < float(prev["low"]) and close < open_v
-        displacement = (level - close) / atr_v
-        if swept and reclaim and displacement >= min_displacement_atr:
-            ts = int(last["close_time"])
-            typ = "LIQUIDITY_SWEEP_RECLAIM"
-            events.append({
-                "event_id": _event_id(symbol, timeframe, typ + "_SHORT", ts, int(d["close_time"].iloc[swing_i])),
-                "symbol": symbol, "timeframe": timeframe, "direction": "SHORT", "event_type": typ,
-                "timestamps": {"pivot_1_ts": int(d["close_time"].iloc[swing_i]), "pivot_2_ts": ts, "detected_at_ts": ts},
-                "event_fact": {"swept_level": level, "sweep_depth_atr": (float(last["high"]) - level) / atr_v,
-                                "reclaim_displacement_atr": float(displacement), "volume_ratio": vol_ratio,
-                                "trigger_level": level, "requires_retest": True, "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True},
-            })
+
+    low_pos = int(history["low"].idxmin())
+    high_pos = int(history["high"].idxmax())
+    low_level = float(d.loc[low_pos, "low"])
+    high_level = float(d.loc[high_pos, "high"])
+
+    events = []
+    lower_wick = max(0.0, min(open_v, close) - low)
+    upper_wick = max(0.0, high - max(open_v, close))
+    lower_wick_fraction = lower_wick / candle_range
+    upper_wick_fraction = upper_wick / candle_range
+
+    swept_low = low < low_level * (1.0 - tol)
+    reclaim_long = close > low_level
+    sweep_depth_long = (low_level - low) / atr_v
+    if (swept_low and reclaim_long and sweep_depth_long >= min_displacement_atr
+            and lower_wick_fraction >= min_rejection_wick_fraction):
+        ts = int(last["close_time"])
+        typ = "LIQUIDITY_SWEEP_RECLAIM"
+        events.append({
+            "event_id": _event_id(symbol, timeframe, typ + "_LONG", ts, int(d.loc[low_pos, "close_time"])),
+            "symbol": symbol, "timeframe": timeframe, "direction": "LONG", "event_type": typ,
+            "timestamps": {"pivot_1_ts": int(d.loc[low_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
+            "event_fact": {
+                "swept_level": low_level, "sweep_depth_atr": float(sweep_depth_long),
+                "reclaim_displacement_atr": float((close - low_level) / atr_v),
+                "rejection_wick_fraction": float(lower_wick_fraction),
+                "atr_reference": "previous_bar", "atr_reference_ts": int(prev["close_time"]),
+                "lookback_bars": int(lookback), "volume_ratio": vol_ratio,
+                "trigger_level": low_level, "requires_retest": True,
+                "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True,
+            },
+        })
+
+    swept_high = high > high_level * (1.0 + tol)
+    reclaim_short = close < high_level
+    sweep_depth_short = (high - high_level) / atr_v
+    if (swept_high and reclaim_short and sweep_depth_short >= min_displacement_atr
+            and upper_wick_fraction >= min_rejection_wick_fraction):
+        ts = int(last["close_time"])
+        typ = "LIQUIDITY_SWEEP_RECLAIM"
+        events.append({
+            "event_id": _event_id(symbol, timeframe, typ + "_SHORT", ts, int(d.loc[high_pos, "close_time"])),
+            "symbol": symbol, "timeframe": timeframe, "direction": "SHORT", "event_type": typ,
+            "timestamps": {"pivot_1_ts": int(d.loc[high_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
+            "event_fact": {
+                "swept_level": high_level, "sweep_depth_atr": float(sweep_depth_short),
+                "reclaim_displacement_atr": float((high_level - close) / atr_v),
+                "rejection_wick_fraction": float(upper_wick_fraction),
+                "atr_reference": "previous_bar", "atr_reference_ts": int(prev["close_time"]),
+                "lookback_bars": int(lookback), "volume_ratio": vol_ratio,
+                "trigger_level": high_level, "requires_retest": True,
+                "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True,
+            },
+        })
     return events
 
 
@@ -697,9 +730,35 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
                             }, pivot_1_ts=int(d['close_time'].iloc[sl]))]
     return []
 
+def _liquidity_sweep_before_break(
+    d: pd.DataFrame,
+    pivots: list[int],
+    bos_i: int,
+    break_i: int,
+    side: str,
+) -> tuple[int, float] | None:
+    """Return the first post-BOS swing sweep that occurs before MSS/OB break.
+
+    A bearish breaker requires buy-side liquidity to be swept (a later high
+    takes out a confirmed swing high) before the bearish market-structure
+    break. A bullish breaker is the mirrored sell-side sequence.
+    """
+    candidate_pivots = [i for i in pivots if bos_i < i < break_i]
+    if not candidate_pivots:
+        return None
+
+    for pivot_i in reversed(candidate_pivots):
+        level = float(d['high'].iloc[pivot_i] if side == 'bearish' else d['low'].iloc[pivot_i])
+        for sweep_i in range(pivot_i + 1, break_i):
+            sweep_value = float(d['high'].iloc[sweep_i] if side == 'bearish' else d['low'].iloc[sweep_i])
+            if (side == 'bearish' and sweep_value > level) or (side == 'bullish' and sweep_value < level):
+                return sweep_i, level
+    return None
+
+
 def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 120,
                          min_displacement_atr: float = 0.80) -> list[dict[str, Any]]:
-    """Detect an OB that is decisively broken and then retested as a flip zone."""
+    """Detect a true breaker: liquidity sweep -> MSS/OB break -> flip-zone retest."""
     if timeframe.lower() not in {'1h', '4h'}:
         return []
     d = _prepare_pattern_frame(df, {'open','high','low','close','volume','close_time'}, 120)
@@ -728,9 +787,14 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
             if ob_i is not None:
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) < zlo]
-                if breaks:
-                    break_i=breaks[0]
-                    # The breaker must be retested AFTER the first decisive break;
+                for break_i in breaks:
+                    # ICT-style breaker sequencing: buy-side liquidity must be
+                    # swept first, then the later OB break is the MSS/flip event.
+                    sweep = _liquidity_sweep_before_break(d, highs, bos_i, break_i, 'bearish')
+                    if sweep is None:
+                        continue
+                    sweep_i, sweep_level = sweep
+                    # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
                         continue
@@ -740,6 +804,9 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BEARISH','SHORT',ts,int(d['close_time'].iloc[ob_i]),{
                             'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
                             'trigger_level':zlo,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BULLISH_OB',
+                            'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
+                            'liquidity_sweep_level':sweep_level,
+                            'mss_ts':int(d['close_time'].iloc[break_i]),
                             'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
                         },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
         # Bearish OB -> broken upward -> bullish breaker retest.
@@ -749,9 +816,14 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
             if ob_i is not None:
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) > zhi]
-                if breaks:
-                    break_i=breaks[0]
-                    # The breaker must be retested AFTER the first decisive break;
+                for break_i in breaks:
+                    # ICT-style breaker sequencing: sell-side liquidity must be
+                    # swept first, then the later OB break is the MSS/flip event.
+                    sweep = _liquidity_sweep_before_break(d, lows, bos_i, break_i, 'bullish')
+                    if sweep is None:
+                        continue
+                    sweep_i, sweep_level = sweep
+                    # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
                         continue
@@ -761,55 +833,120 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BULLISH','LONG',ts,int(d['close_time'].iloc[ob_i]),{
                             'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
                             'trigger_level':zhi,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BEARISH_OB',
+                            'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
+                            'liquidity_sweep_level':sweep_level,
+                            'mss_ts':int(d['close_time'].iloc[break_i]),
                             'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
                         },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
     return []
 
 def detect_mitigation_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 80,
                             min_displacement_atr: float = 1.20, return_tolerance_pct: float = 0.20) -> list[dict[str, Any]]:
-    """Detect the origin candle of a strong impulse that is being revisited."""
+    """Detect an origin candle revisited after the impulse breaks structure.
+
+    The detector keeps the causal sequence explicit: a strong displacement
+    candle must have a prior opposite candle that serves as the origin zone,
+    and price must subsequently break a pre-existing confirmed structure level
+    before the origin is retested.
+    """
     if timeframe.lower() not in {'1h','4h'}:
         return []
     d=_prepare_pattern_frame(df,{'open','high','low','close','volume','close_time'},100)
     if d is None:
         return []
     d['atr']=_atr(d,14)
+    lows, highs = _pivots(d, 3, 2)
     last=len(d)-1
-    for i in range(last-2,max(20,last-int(lookback)),-1):
+    search_start=max(20,last-int(lookback))
+    for i in range(last-3, search_start-1, -1):
         atr=float(d['atr'].iloc[i]) if pd.notna(d['atr'].iloc[i]) else 0.0
-        if atr<=0: continue
+        if atr<=0:
+            continue
         body=abs(float(d['close'].iloc[i])-float(d['open'].iloc[i]))
-        if body/atr<min_displacement_atr: continue
+        if body/atr<min_displacement_atr:
+            continue
         bullish=float(d['close'].iloc[i])>float(d['open'].iloc[i])
-        zone_hi=float(d['high'].iloc[i]); zone_lo=float(d['low'].iloc[i])
-        post=d.iloc[i+1:last+1]
-        if len(post)<2: continue
+
+        # The origin is the last opposite candle immediately before the
+        # displacement. The impulse candle itself is not used as the zone.
+        origin_i = None
+        for k in range(i-1, max(search_start, i-8), -1):
+            opposite = (float(d['close'].iloc[k]) < float(d['open'].iloc[k])) if bullish else (float(d['close'].iloc[k]) > float(d['open'].iloc[k]))
+            if opposite:
+                origin_i = k
+                break
+        if origin_i is None:
+            continue
+
+        zone_hi=float(d['high'].iloc[origin_i]); zone_lo=float(d['low'].iloc[origin_i])
+
+        # Only use pivots that were already fully confirmed before the impulse
+        # to avoid introducing future information into the structure test.
+        prior_highs=[p for p in highs if search_start <= p < i-2]
+        prior_lows=[p for p in lows if search_start <= p < i-2]
         if bullish:
-            if float(post['high'].max()) < zone_hi + atr: continue
-            level=float(d['open'].iloc[i])
+            if not prior_highs:
+                continue
+            structure_i=prior_highs[-1]
+            structure_level=float(d['high'].iloc[structure_i])
+            breaks=[k for k in range(i+1,last) if float(d['close'].iloc[k]) > structure_level]
+            if not breaks:
+                continue
+            bos_i=breaks[0]
+            post=d.iloc[origin_i+1:bos_i+1]
+            if len(post)<2:
+                continue
+            if float(post['high'].max()) < zone_hi + atr:
+                continue
+            level=float(d['open'].iloc[origin_i])
             touched=float(d['low'].iloc[-1]) <= level*(1+return_tolerance_pct/100.0)
             still_valid=float(d['close'].iloc[-1]) > zone_lo
             direction='LONG'; typ='MITIGATION_BLOCK_BULLISH'
         else:
-            if float(post['low'].min()) > zone_lo - atr: continue
-            level=float(d['open'].iloc[i])
+            if not prior_lows:
+                continue
+            structure_i=prior_lows[-1]
+            structure_level=float(d['low'].iloc[structure_i])
+            breaks=[k for k in range(i+1,last) if float(d['close'].iloc[k]) < structure_level]
+            if not breaks:
+                continue
+            bos_i=breaks[0]
+            post=d.iloc[origin_i+1:bos_i+1]
+            if len(post)<2:
+                continue
+            if float(post['low'].min()) > zone_lo - atr:
+                continue
+            level=float(d['open'].iloc[origin_i])
             touched=float(d['high'].iloc[-1]) >= level*(1-return_tolerance_pct/100.0)
             still_valid=float(d['close'].iloc[-1]) < zone_hi
             direction='SHORT'; typ='MITIGATION_BLOCK_BEARISH'
+
         if touched and still_valid:
             ts=int(d['close_time'].iloc[-1])
-            return [_make_event(symbol,timeframe,typ,direction,ts,int(d['close_time'].iloc[i]),{
+            return [_make_event(symbol,timeframe,typ,direction,ts,int(d['close_time'].iloc[origin_i]),{
                 'engine':'MITIGATION_BLOCK','requires_htf_context':True,'requires_retest':True,
-                'trigger_level':level,'zone_high':zone_hi,'zone_low':zone_lo,'origin_ts':int(d['close_time'].iloc[i]),
+                'trigger_level':level,'zone_high':zone_hi,'zone_low':zone_lo,'origin_ts':int(d['close_time'].iloc[origin_i]),
+                'impulse_ts':int(d['close_time'].iloc[i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
+                'structure_level':structure_level,'structure_pivot_ts':int(d['close_time'].iloc[structure_i]),
                 'displacement_atr':body/atr,'return_tolerance_pct':return_tolerance_pct,
-            },pivot_1_ts=int(d['close_time'].iloc[i]))]
+            },pivot_1_ts=int(d['close_time'].iloc[structure_i]))]
     return []
 
 
 
 def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 30,
-               min_sweep_atr: float = 0.10, min_volume_ratio: float = 1.20) -> list[dict[str, Any]]:
-    """Detect confirmed Swing Failure Pattern: sweep prior swing, close back across it."""
+               min_sweep_atr: float = 0.10, min_volume_ratio: float = 1.20,
+               min_outside_volume_share: float = 0.20) -> list[dict[str, Any]]:
+    """Detect a confirmed SFP and require volume participation in the sweep wick.
+
+    BingX supplies aggregated candle volume but not lower-timeframe intrabar
+    volume in this detector. We therefore use a conservative candle-level
+    proxy: the share of total candle volume attributed to the price segment
+    outside the swept level, estimated from the outside-range fraction.
+    ``volume_ratio`` remains the historical total-volume guard; the new
+    ``outside_volume_share`` prevents a large total-volume candle whose sweep
+    wick is only a negligible fraction of the range from passing as an SFP.
+    """
     if timeframe.lower() not in {'1h','4h'}: return []
     d=_prepare_pattern_frame(df,{'open','high','low','close','volume','close_time'},80)
     if d is None: return []
@@ -821,24 +958,48 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
     base=float(d['volume'].iloc[-21:-1].mean()) if len(d)>=22 else 0.0
     vr=float(d['volume'].iloc[-1]/base) if base>0 else 0.0
     if vr<min_volume_ratio: return []
+
+    last_row = d.iloc[-1]
+    candle_range = float(last_row['high']) - float(last_row['low'])
+    if candle_range <= 0:
+        return []
+
+    def outside_volume_share(level: float, direction: str) -> float:
+        if direction == 'LONG':
+            outside_range = max(0.0, level - float(last_row['low']))
+        else:
+            outside_range = max(0.0, float(last_row['high']) - level)
+        # With only OHLCV available, allocate candle volume proportionally to
+        # price-range segments. This is explicitly a proxy for LTF/wick-volume
+        # accounting, not a fabricated intrabar data series.
+        return max(0.0, min(1.0, outside_range / candle_range))
+
     if lows:
         li=[i for i in lows if i<=last-3]
         if li:
             i=li[-1]; level=float(d['low'].iloc[i]); sweep=(level-float(d['low'].iloc[-1]))/atr
-            if sweep>=min_sweep_atr and float(d['close'].iloc[-1])>level and float(d['close'].iloc[-1])>float(d['open'].iloc[-1]):
+            outside_share = outside_volume_share(level, 'LONG')
+            if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
+                    and float(d['close'].iloc[-1])>level and float(d['close'].iloc[-1])>float(d['open'].iloc[-1])):
                 ts=int(d['close_time'].iloc[-1])
                 return [_make_event(symbol,timeframe,'SFP_BULLISH','LONG',ts,int(d['close_time'].iloc[i]),{
                     'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
-                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
+                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
+                    'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
+                    'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
     if highs:
         hi=[i for i in highs if i<=last-3]
         if hi:
             i=hi[-1]; level=float(d['high'].iloc[i]); sweep=(float(d['high'].iloc[-1])-level)/atr
-            if sweep>=min_sweep_atr and float(d['close'].iloc[-1])<level and float(d['close'].iloc[-1])<float(d['open'].iloc[-1]):
+            outside_share = outside_volume_share(level, 'SHORT')
+            if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
+                    and float(d['close'].iloc[-1])<level and float(d['close'].iloc[-1])<float(d['open'].iloc[-1])):
                 ts=int(d['close_time'].iloc[-1])
                 return [_make_event(symbol,timeframe,'SFP_BEARISH','SHORT',ts,int(d['close_time'].iloc[i]),{
                     'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
-                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
+                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
+                    'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
+                    'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
     return []
 
 
@@ -924,13 +1085,17 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
     c1_range=float(c1['high'])-float(c1['low'])
     if c1_range/atr<min_range_atr: return []
     # Bullish CRT: C2 sweeps below C1 low and C3 reclaims C1 low.
-    if float(c2['low']) < float(c1['low']) - min_sweep_atr*atr and float(c3['close']) > float(c1['low']) and float(c3['close']) > float(c3['open']):
+    if (float(c2['low']) < float(c1['low']) - min_sweep_atr*atr
+            and float(c1['low']) < float(c3['close']) < float(c1['high'])
+            and float(c3['close']) > float(c3['open'])):
         ts=int(c3['close_time'])
         return [_make_event(symbol,timeframe,'CRT_BULLISH','LONG',ts,int(c1['close_time']),{
             'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['low']),
             'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c1['low'])-float(c2['low']))/atr,
         },pivot_1_ts=int(c1['close_time']))]
-    if float(c2['high']) > float(c1['high']) + min_sweep_atr*atr and float(c3['close']) < float(c1['high']) and float(c3['close']) < float(c3['open']):
+    if (float(c2['high']) > float(c1['high']) + min_sweep_atr*atr
+            and float(c1['low']) < float(c3['close']) < float(c1['high'])
+            and float(c3['close']) < float(c3['open'])):
         ts=int(c3['close_time'])
         return [_make_event(symbol,timeframe,'CRT_BEARISH','SHORT',ts,int(c1['close_time']),{
             'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['high']),
@@ -1170,13 +1335,22 @@ def detect_divergences(
         )
 
     def scan_pivots(pivots: list[int], is_low: bool) -> None:
+        # Multi-pivot ledger: every earlier pivot is a candidate anchor for the
+        # current pivot, then emit_divergence applies the actual bar-distance
+        # window [min_bars, max_bars].  Do not restrict the scan to adjacent
+        # pivots: valid divergence can span the 3rd, 4th, ... prior pivot.
         num_piv = len(pivots)
         for i in range(num_piv):
-            for step in (1, 2):
-                if i + step >= num_piv:
+            p1 = pivots[i]
+            for j in range(i + 1, num_piv):
+                p2 = pivots[j]
+                bars = p2 - p1
+                if bars > max_bars:
+                    # pivots are chronological, so all later pairs are even
+                    # farther apart and cannot enter the allowed bar window.
+                    break
+                if bars < min_bars:
                     continue
-                p1 = pivots[i]
-                p2 = pivots[i + step]
                 for indicator in indicators:
                     emit_divergence(p1, p2, indicator, is_low)
 
