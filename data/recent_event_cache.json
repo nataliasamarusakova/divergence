@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1789982722846,
+  "updated_ts": 1789983284521,
   "events": [
     {
       "event_id": "EVT_C04E234E2EF75486",
@@ -487,32 +487,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789952400000,
         "bos_ts": 1789873200000
-      }
-    },
-    {
-      "event_id": "EVT_A87ECC06344CE897",
-      "symbol": "龙虾",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1789977600000,
-        "pivot_2_ts": 1789977600000,
-        "detected_at_ts": 1789977600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.27757,
-        "donchian_high": 0.27333,
-        "donchian_low": 0.21824,
-        "breakout_atr": 0.43355007573711324,
-        "bb_width": 0.2124579102564411,
-        "bb_width_threshold": 0.07810074135176953,
-        "volume_ratio": 13.42979824130157,
-        "adx": 32.14592165656527,
-        "requires_retest": true,
-        "trigger_level": 0.27333,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true
       }
     },
     {
@@ -1136,32 +1110,6 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789776000000,
         "bos_ts": 1789084800000
-      }
-    },
-    {
-      "event_id": "EVT_B72F026D13E2C513",
-      "symbol": "龙虾",
-      "timeframe": "4h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1789977600000,
-        "pivot_2_ts": 1789977600000,
-        "detected_at_ts": 1789977600000
-      },
-      "event_fact": {
-        "detection_close_price": 0.27757,
-        "donchian_high": 0.25,
-        "donchian_low": 0.19302,
-        "breakout_atr": 1.6563897530809117,
-        "bb_width": 0.20322217920567784,
-        "bb_width_threshold": 0.3946073724765791,
-        "volume_ratio": 3.1021482083637517,
-        "adx": 39.21261462848163,
-        "requires_retest": true,
-        "trigger_level": 0.25,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true
       }
     },
     {
@@ -5378,6 +5326,100 @@
         "breaker_from": "BEARISH_OB",
         "broken_ts": 1789830000000,
         "bos_ts": 1789639200000
+      }
+    },
+    {
+      "event_id": "EVT_34A346BF3EC19C67",
+      "symbol": "EIGEN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789981200000,
+        "pivot_2_ts": 1789981200000,
+        "detected_at_ts": 1789981200000
+      },
+      "event_fact": {
+        "detection_close_price": 0.2382,
+        "compression_ratio": 0.5771190735887931,
+        "ma_spread_atr": 0.3414731468622635,
+        "compression_threshold": 0.59168577593325,
+        "breakout_atr": 0.8209654075633669,
+        "volume_ratio": 1.694195137632988,
+        "requires_retest": true,
+        "trigger_level": 0.2358,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_544290845945FD70",
+      "symbol": "EIGEN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1789981200000,
+        "pivot_2_ts": 1789981200000,
+        "detected_at_ts": 1789981200000
+      },
+      "event_fact": {
+        "ema_fast": 0.2339587915179482,
+        "ema_slow": 0.23040053944016178,
+        "ema200": 0.21789305846734075,
+        "body_atr": 0.8209654075633669,
+        "volume_ratio": 1.694195137632988,
+        "trigger_level": 0.2339587915179482,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true
+      }
+    },
+    {
+      "event_id": "EVT_937966AF61F3F564",
+      "symbol": "EIGEN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789869600000,
+        "pivot_2_ts": 1789981200000,
+        "detected_at_ts": 1789981200000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2374,
+        "zone_high": 0.2374,
+        "zone_low": 0.2321,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789941600000,
+        "bos_ts": 1789873200000
+      }
+    },
+    {
+      "event_id": "EVT_71B4BE9C6C63B9B7",
+      "symbol": "KAITO",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789981200000,
+        "pivot_2_ts": 1789981200000,
+        "detected_at_ts": 1789981200000
+      },
+      "event_fact": {
+        "detection_close_price": 0.336,
+        "compression_ratio": 0.2246828028817507,
+        "ma_spread_atr": 0.22878167279737852,
+        "compression_threshold": 1.0182429178515502,
+        "breakout_atr": 1.090362733613863,
+        "volume_ratio": 0.9451724733109617,
+        "requires_retest": true,
+        "trigger_level": 0.3325,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true
       }
     }
   ]
