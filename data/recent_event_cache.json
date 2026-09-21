@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790000352937,
+  "updated_ts": 1790000813758,
   "events": [
     {
       "event_id": "EVT_C0C7EDC6072C5DDF",
@@ -3591,6 +3591,56 @@
         "breaker_from": "BULLISH_OB",
         "broken_ts": 1789995600000,
         "bos_ts": 1789984800000
+      }
+    },
+    {
+      "event_id": "EVT_45114F63517E27C8",
+      "symbol": "AMZN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1789812000000,
+        "pivot_2_ts": 1789999200000,
+        "detected_at_ts": 1789999200000
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 254.66,
+        "zone_high": 254.66,
+        "zone_low": 254.28,
+        "breaker_from": "BEARISH_OB",
+        "broken_ts": 1789945200000,
+        "bos_ts": 1789822800000
+      }
+    },
+    {
+      "event_id": "EVT_DC62E0DA85DDFA2F",
+      "symbol": "GALA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1789999200000,
+        "pivot_2_ts": 1789999200000,
+        "detected_at_ts": 1789999200000
+      },
+      "event_fact": {
+        "detection_close_price": 0.00209,
+        "donchian_high": 0.002083,
+        "donchian_low": 0.001902,
+        "breakout_atr": 0.16571739467772337,
+        "volume_ratio": 1.6698985406822715,
+        "adx": 35.14266959153323,
+        "ema200": 0.0018339101209740728,
+        "compressed_recent": false,
+        "bb_width": 0.09797679097325404,
+        "trigger_level": 0.002083,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true
       }
     }
   ]
