@@ -16,6 +16,7 @@ from event_engine.signals import (
     build_15m_trigger,
     diagnose_15m_trigger,
     detect_divergences,
+    detect_liquidity_sweep_reclaim,
     detect_squeeze_release,
     detect_liquidation_squeeze,
     detect_order_block,
@@ -111,6 +112,40 @@ def test_trigger_long_and_short():
     assert build_15m_trigger(df_short, "SHORT", min_vol_mult=0.0) is True
     assert build_15m_trigger(df_short, "short", min_vol_mult=0.0) is True
     assert build_15m_trigger(df_short, "LONG", min_vol_mult=0.0) is False
+
+
+def test_divergence_detector_checks_non_adjacent_pivot_pairs(monkeypatch):
+    # Four pivots are present, but only the first -> fourth pair falls inside
+    # the configured bar window. The detector must therefore inspect a pivot
+    # that is more than two positions away in the pivot ledger.
+    from event_engine import signals as sig
+
+    df = _generate_synthetic_candles(75)
+    df["high"] = 101.0
+    df["low"] = 99.0
+    df["close"] = 100.0
+    df.loc[10, "low"] = 90.0
+    df.loc[40, "low"] = 80.0
+
+    rsi = pd.Series(50.0, index=df.index)
+    rsi.iloc[40] = 60.0
+    monkeypatch.setattr(sig, "_rsi", lambda series, n=14: rsi.copy())
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=3, right=2: ([10, 20, 30, 40], []))
+
+    events = sig.detect_divergences(
+        df,
+        "BTC-USDT",
+        "1h",
+        left=3,
+        right=2,
+        min_bars=25,
+        max_bars=35,
+    )
+
+    rsi_events = [ev for ev in events if ev["event_type"] == "REGULAR_BULLISH_RSI"]
+    assert len(rsi_events) == 1
+    assert rsi_events[0]["event_fact"]["bars_between"] == 30
+    assert rsi_events[0]["timestamps"]["pivot_1_ts"] < rsi_events[0]["timestamps"]["pivot_2_ts"]
 
 
 def test_divergence_detector_causality():
@@ -1565,6 +1600,37 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
     assert calls[0]["clientOrderId"].isalnum()
 
 
+def test_emergency_close_reports_unflattened_after_two_attempts(monkeypatch):
+    import event_engine.bingx as bx
+
+    state = {"qty": 1.25}
+    calls = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(
+        bx,
+        "get_position_directional",
+        lambda symbol, direction: {
+            "status": "found", "positionAmt": str(state["qty"]), "avgPrice": "100"
+        },
+    )
+
+    def fake_request(method, path, params):
+        calls.append(dict(params))
+        # Exchange acknowledges both requests but the position remains live.
+        return {"code": 0, "msg": "OK", "data": {"order": {"orderId": f"CLOSE{len(calls)}"}}}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
+
+    out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="UNIT")
+    assert out["status"] == "UNFLATTENED"
+    assert out["attempts"] == 2
+    assert out["remaining_qty"] == 1.25
+    assert out["escalation_required"] is True
+    assert len(calls) == 2
+
+
 def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch):
     from event_engine import bingx as bx
     captured = []
@@ -1587,6 +1653,44 @@ def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch
     conditional = [p for p in captured if p.get("type") in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}]
     assert conditional
     assert all("clientOrderId" not in p for p in conditional)
+
+
+def test_ensure_protection_cancels_stale_tp_profile_legs(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001,
+    })
+
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "95.00", "origQty": "1.0"}
+    tp1 = {"orderId": "TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "101.00", "origQty": "1.0"}
+    tp2 = {"orderId": "TP2", "type": "TAKE_PROFIT_MARKET", "stopPrice": "102.00", "origQty": "1.0"}
+    state = {"tps": [tp1, tp2]}
+    cancel_calls = []
+
+    def fake_protection(*args, **kwargs):
+        return {"status": "ok", "sl_orders": [sl], "tp_orders": list(state["tps"])}
+
+    monkeypatch.setattr(bx, "get_open_protection_directional", fake_protection)
+
+    def fake_cancel(symbol, order_id):
+        cancel_calls.append(order_id)
+        state["tps"] = [o for o in state["tps"] if str(o.get("orderId")) != str(order_id)]
+        return {"code": 0}
+
+    monkeypatch.setattr(bx, "cancel_order", fake_cancel)
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 5.0,
+        [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0}],
+        trade_id="TRD1",
+    )
+
+    assert out["status"] == "PROTECTED"
+    assert cancel_calls == ["TP2"]
+    assert out["stale_tp_cancellations"] == [{"order_id": "TP2", "status": "cancelled", "error": None}]
+    assert [x["leg"] for x in out["tp_orders"]] == ["tp1"]
 
 
 def test_reconciliation_uses_tp_price_when_current_conditional_orders_have_no_client_id(monkeypatch):
@@ -2032,22 +2136,43 @@ def test_donchian_engine_can_detect_valid_long_breakout():
     assert any(e["direction"]=="LONG" and e["event_type"]=="DONCHIAN_RETEST_BREAKOUT" for e in events)
 
 
-def test_liquidity_sweep_engine_can_detect_long_reclaim(monkeypatch):
-    import event_engine.signals as sig
+def test_liquidity_sweep_engine_can_detect_long_reclaim():
     rows=[]; p=100.0
     for i in range(100):
         o=p; c=p+0.01; h=c+0.05; l=o-0.05
         rows.append({"open":o,"high":h,"low":l,"close":c,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
         p=c
     df=pd.DataFrame(rows)
-    # Make a clear prior pivot low at 95 with a few surrounding bars.
-    for j,v in [(94,96.0),(95,95.0),(96,96.0)]:
-        df.loc[j,["open","high","low","close"]] = [v+0.2,v+0.4,v-0.4,v]
-    prev_high=float(df["high"].iloc[-2])
-    df.loc[df.index[-1],["open","low","high","close","volume"]] = [99.0,94.0,prev_high+0.5,prev_high+0.3,1500.0]
-    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([95], []))
-    events=sig.detect_liquidity_sweep_reclaim(df,"TEST","1h")
+    # Previous 20 completed bars contain the swept low at 95.0.
+    df.loc[95,["open","high","low","close"]] = [95.2,95.4,95.0,95.1]
+    df.loc[99,["open","low","high","close","volume"]] = [99.0,94.0,101.0,99.5,1500.0]
+    events = detect_liquidity_sweep_reclaim(df,"TEST","1h")
     assert any(e["direction"]=="LONG" and e["event_type"]=="LIQUIDITY_SWEEP_RECLAIM" for e in events)
+    event = next(e for e in events if e["direction"] == "LONG")
+    assert event["event_fact"]["swept_level"] == pytest.approx(95.0)
+    assert event["event_fact"]["atr_reference"] == "previous_bar"
+    assert event["event_fact"]["rejection_wick_fraction"] >= 0.35
+
+
+def test_liquidity_sweep_rejects_weak_sweep_and_small_rejection_wick(monkeypatch):
+    import event_engine.signals as sig
+
+    rows=[]
+    for i in range(100):
+        rows.append({"open":100.0,"high":100.2,"low":99.8,"close":100.0,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+    df=pd.DataFrame(rows)
+    df.loc[90,["open","high","low","close"]] = [95.2,95.4,95.0,95.1]
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series(
+        [1.0] * len(d), index=d.index, dtype=float
+    ))
+
+    # 0.05 ATR sweep is below the 0.10 previous-ATR minimum.
+    df.loc[99,["open","high","low","close","volume"]] = [99.0,100.0,94.95,99.5,1500.0]
+    assert sig.detect_liquidity_sweep_reclaim(df,"TEST","1h") == []
+
+    # Now the sweep is deep enough, but only 20% of the range is lower wick.
+    df.loc[99,["open","high","low","close","volume"]] = [95.0,100.0,93.5,99.0,1500.0]
+    assert sig.detect_liquidity_sweep_reclaim(df,"TEST","1h") == []
 
 
 def test_expected_engine_registry_contains_v5_and_smc_engines():
@@ -2058,6 +2183,88 @@ def test_expected_engine_registry_contains_v5_and_smc_engines():
         "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
         "LIQUIDATION_CASCADE_FVG", "CRT",
     }
+
+
+def _make_breaker_fixture(with_liquidity_sweep: bool) -> pd.DataFrame:
+    n = 140
+    rows = []
+    for i in range(n):
+        rows.append({
+            "open": 100.0, "high": 100.4, "low": 99.6, "close": 100.0,
+            "volume": 1000.0, "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    df = pd.DataFrame(rows)
+    # Bearish candle = the original bullish OB source.
+    df.loc[109, ["open", "high", "low", "close"]] = [100.5, 101.0, 99.0, 100.0]
+    # BOS above an earlier swing high.
+    df.loc[110, ["open", "high", "low", "close", "volume"]] = [100.5, 112.0, 100.0, 111.0, 1800.0]
+    # A confirmed swing high that can be swept before the bearish MSS.
+    df.loc[115, ["open", "high", "low", "close"]] = [108.0, 110.0, 107.0, 108.5]
+    df.loc[116, ["open", "high", "low", "close"]] = [108.0, 109.0, 107.5, 108.2]
+    df.loc[117, ["open", "high", "low", "close"]] = [108.0, 109.0, 107.5, 108.2]
+    sweep_high = 111.5 if with_liquidity_sweep else 109.0
+    df.loc[118, ["open", "high", "low", "close"]] = [108.5, sweep_high, 107.0, 108.0]
+    # First decisive break through the bullish OB low = bearish MSS/flip.
+    df.loc[121, ["open", "high", "low", "close", "volume"]] = [100.0, 100.5, 97.0, 98.0, 1600.0]
+    # Current bar retests the broken zone from below.
+    df.loc[139, ["open", "high", "low", "close"]] = [98.0, 100.0, 96.5, 98.5]
+    return df
+
+
+def test_breaker_requires_liquidity_sweep_before_mss(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [105, 115]))
+
+    without_sweep = sig.detect_breaker_block(_make_breaker_fixture(False), "TEST", "1h")
+    assert without_sweep == []
+
+    with_sweep = sig.detect_breaker_block(_make_breaker_fixture(True), "TEST", "1h")
+    assert len(with_sweep) == 1
+    event = with_sweep[0]
+    assert event["event_type"] == "BREAKER_BLOCK_BEARISH"
+    assert event["event_fact"]["liquidity_sweep_level"] == pytest.approx(110.0)
+    assert event["event_fact"]["liquidity_sweep_ts"] < event["event_fact"]["mss_ts"]
+    assert event["event_fact"]["mss_ts"] == event["event_fact"]["broken_ts"]
+
+
+def _make_mitigation_fixture(with_bos: bool) -> pd.DataFrame:
+    rows=[]
+    for i in range(140):
+        rows.append({
+            "open":100.0,"high":100.4,"low":99.6,"close":100.0,
+            "volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000,
+        })
+    df=pd.DataFrame(rows)
+    # Confirmed structure high before the displacement.
+    df.loc[100,["open","high","low","close"]]=[104.0,105.0,103.6,104.5]
+    # Origin = last opposite candle before the strong bullish impulse.
+    df.loc[105,["open","high","low","close"]]=[100.6,101.0,99.0,100.0]
+    df.loc[106,["open","high","low","close"]]=[100.0,111.5,99.8,111.0]
+    if with_bos:
+        df.loc[108,["open","high","low","close"]]=[111.0,112.0,110.5,106.0]
+    else:
+        df.loc[108,["open","high","low","close"]]=[111.0,112.0,110.5,104.0]
+    # Price expands away from origin, then returns to origin open.
+    df.loc[139,["open","high","low","close"]]=[101.0,102.0,100.4,101.2]
+    return df
+
+
+def test_mitigation_block_requires_origin_and_post_impulse_bos(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0]*len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [100]))
+
+    assert sig.detect_mitigation_block(_make_mitigation_fixture(False), "TEST", "1h") == []
+
+    events = sig.detect_mitigation_block(_make_mitigation_fixture(True), "TEST", "1h")
+    assert len(events) == 1
+    event = events[0]
+    assert event["event_type"] == "MITIGATION_BLOCK_BULLISH"
+    assert event["event_fact"]["origin_ts"] < event["event_fact"]["impulse_ts"] < event["event_fact"]["bos_ts"]
+    assert event["event_fact"]["zone_low"] == pytest.approx(99.0)
+    assert event["event_fact"]["trigger_level"] == pytest.approx(100.6)
 
 
 def test_smc_detectors_fail_closed_on_incomplete_data():
@@ -2079,6 +2286,48 @@ def test_crt_bullish_three_candle_pattern():
     df.loc[i+2,["open","high","low","close"]]=[98.5,101.5,98.2,100.8]
     events=detect_crt(df,"TEST","1h")
     assert any(e["event_type"]=="CRT_BULLISH" and e["direction"]=="LONG" for e in events)
+
+
+def test_crt_requires_reclaim_inside_c1_range():
+    from event_engine.signals import detect_crt
+
+    rows=[]
+    for i in range(50):
+        rows.append({
+            "open":100.0,"high":100.6,"low":99.4,"close":100.2,
+            "close_time":1_700_000_000_000+i*3_600_000,
+        })
+    df=pd.DataFrame(rows)
+    i=47
+    # C1 range is [99, 102]. C2 sweeps below it. C3 closes ABOVE C1.high,
+    # so it is not a reclaim inside C1 and must be rejected.
+    df.loc[i,["open","high","low","close"]]=[100.0,102.0,99.0,101.0]
+    df.loc[i+1,["open","high","low","close"]]=[101.0,101.4,97.5,98.5]
+    df.loc[i+2,["open","high","low","close"]]=[102.2,113.0,101.8,102.5]
+    assert detect_crt(df,"TEST","1h") == []
+
+
+def test_sfp_requires_volume_in_sweep_wick(monkeypatch):
+    import event_engine.signals as sig
+
+    rows=[]
+    for i in range(100):
+        rows.append({"open":100.0,"high":100.2,"low":99.8,"close":100.0,"volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000})
+    df=pd.DataFrame(rows)
+    df.loc[95,["open","high","low","close"]]=[95.2,95.4,94.8,95.1]
+    df.loc[99,["open","high","low","close","volume"]]=[99.0,99.8,94.8,99.2,1500.0]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([95], []))
+
+    # Same total volume and valid sweep, but only ~4% of the candle range is
+    # outside the swing level: the wick-volume condition must reject it.
+    assert sig.detect_sfp(df, "TEST", "1h", min_outside_volume_share=0.20) == []
+
+    df.loc[99, ["low", "close"]] = [93.5, 99.2]
+    events = sig.detect_sfp(df, "TEST", "1h", min_outside_volume_share=0.20)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "SFP_BULLISH"
+    assert events[0]["event_fact"]["outside_volume_share"] >= 0.20
+    assert events[0]["event_fact"]["outside_volume_share_method"] == "candle_range_proxy"
 
 
 def test_sfp_bearish_sweep_reclaim():
