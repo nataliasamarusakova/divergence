@@ -866,6 +866,32 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
     raise RuntimeError(f"Kline fetch failed for {symbol}/{timeframe} after {max_attempts} attempts: {last_error}") from last_error
 
 
+def _record_trigger_failure(stats: dict, tf_stats: dict, reason: str) -> None:
+    """Classify a 15m trigger rejection without treating a missing window as bad data."""
+    stats["rejected_trigger"] += 1
+    if reason in {"no_trigger_window", "no_retest_window"}:
+        stats["trigger_no_window"] += 1
+        tf_stats["trigger_no_window"] += 1
+    elif reason == "breakout_failed":
+        stats["trigger_breakout_failed"] += 1
+        tf_stats["trigger_breakout_failed"] += 1
+    elif reason == "volume_failed":
+        stats["trigger_volume_failed"] += 1
+        tf_stats["trigger_volume_failed"] += 1
+    else:
+        stats["trigger_data_failed"] += 1
+        tf_stats["trigger_data_failed"] += 1
+
+
+def _record_scan_error(stats: dict, stage: str, tf_stats: dict | None = None) -> None:
+    """Record a cycle scan error and preserve its stage for forensic summaries."""
+    stats["scan_errors"] += 1
+    by_stage = stats.setdefault("scan_errors_by_stage", {})
+    by_stage[stage] = int(by_stage.get(stage, 0) or 0) + 1
+    if tf_stats is not None:
+        tf_stats["scan_errors"] += 1
+
+
 def _tf_stats(stats: dict, timeframe: str) -> dict:
     by_tf = stats.setdefault("by_timeframe", {})
     tf = str(timeframe).lower()
@@ -975,19 +1001,16 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
             _save_timeframe_scan_state(scan_state)
         except (BinanceRateLimitError, BingXRateLimitError) as exc:
-            stats["scan_errors"] += 1
-            tf_stats["scan_errors"] += 1
+            _record_scan_error(stats, f"timeframe_{timeframe.lower()}_rate_limit", tf_stats)
             venue = "BINANCE" if MARKET_DATA_SOURCE == "binance" else "BINGX"
             log.warning("[SIGNALS] %s %s Kline rate limit reached on %s; stopping this timeframe scan for the cycle: %s", venue, timeframe.upper(), symbol, exc)
             break
         except BinanceSymbolUnavailableError as exc:
-            stats["scan_errors"] += 1
-            tf_stats["scan_errors"] += 1
+            _record_scan_error(stats, f"timeframe_{timeframe.lower()}_symbol_unavailable", tf_stats)
             log.warning("[SIGNALS] %s %s market-data symbol unavailable on Binance; skipping symbol: %s", timeframe.upper(), symbol, exc)
             continue
         except Exception as exc:
-            stats["scan_errors"] += 1
-            tf_stats["scan_errors"] += 1
+            _record_scan_error(stats, f"timeframe_{timeframe.lower()}_fetch_detection", tf_stats)
             log.warning("[SIGNALS] %s %s fetch/detection error: %s", timeframe.upper(), symbol, exc)
     return fresh
 
@@ -2578,6 +2601,7 @@ def main() -> None:
         "execution_attempts": 0,
         "trades": 0,
         "scan_errors": 0,
+        "scan_errors_by_stage": {},
         "cached_events": 0,
         "timeframe_scanned_symbols_1h": 0,
         "timeframe_scanned_symbols_4h": 0,
@@ -2614,7 +2638,7 @@ def main() -> None:
         log.info("[ENGINE_STAGE] Coinalyze fetch END in %.2fs; rows=%d.", time.monotonic() - stage_started, len(rows))
         log.info("[COINALYZE] Ingested %d rows from Coinalyze.", len(rows))
     except Exception as exc:
-        stats["scan_errors"] += 1
+        _record_scan_error(stats, "coinalyze_fetch")
         log.error("[COINALYZE] Scrape error: %s", exc)
 
     stats["coinalyze_rows"] = len(rows)
@@ -2629,7 +2653,7 @@ def main() -> None:
             stats["divergence_shadow_active"] = shadow_updates.get("active", 0)
             stats["divergence_shadow_closed"] = shadow_updates.get("closed", 0)
         except Exception as exc:
-            stats["scan_errors"] += 1
+            _record_scan_error(stats, "shadow_state_update")
             log.warning("[SHADOW] Divergence shadow state update failed: %s", exc)
 
     # Audit fix B2: persist OI snapshots per 1h bucket so Price-vs-OI swing
@@ -2648,7 +2672,7 @@ def main() -> None:
         contracts = refresh_contracts()
         log.info("[BINGX] Refreshed %d active perpetual contracts.", len(contracts))
     except Exception as exc:
-        stats["scan_errors"] += 1
+        _record_scan_error(stats, "bingx_contract_refresh")
         log.error("[BINGX] Contracts refresh error: %s", exc)
 
     now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
@@ -2713,7 +2737,7 @@ def main() -> None:
                         continue
                 except BinanceRateLimitError as exc:
                     _set_binance_rate_limit_cooldown(exc)
-                    stats["scan_errors"] += 1
+                    _record_scan_error(stats, "candidate_binance_exchangeinfo_rate_limit")
                     log.error("[BINANCE] exchangeInfo rate limit reached while building candidate universe; stopping candidate build: %s", exc)
                     break
                 except BinanceSymbolUnavailableError:
@@ -2721,8 +2745,9 @@ def main() -> None:
 
             stats["contract_candidates"] += 1
             candidates.append(r)
-        except Exception:
-            stats["scan_errors"] += 1
+        except Exception as exc:
+            _record_scan_error(stats, "candidate_build_exception")
+            log.warning("[UNIVERSE] Candidate build error for %s: %s", getattr(r, "symbol", "<unknown>"), exc)
             continue
 
     if MAX_CANDIDATES > 0:
@@ -2868,7 +2893,7 @@ def main() -> None:
                 except (BinanceRateLimitError, BingXRateLimitError) as exc:
                     d15_rate_limited = True
                     stats["trigger_data_failed"] += 1
-                    stats["scan_errors"] += 1
+                    _record_scan_error(stats, "trigger_15m_rate_limit")
                     log.warning("[SIGNALS] 15M market-data rate limited for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
                     continue
                 except BinanceSymbolUnavailableError as exc:
@@ -2878,7 +2903,7 @@ def main() -> None:
                     continue
                 except Exception as exc:
                     stats["trigger_data_failed"] += 1
-                    stats["scan_errors"] += 1
+                    _record_scan_error(stats, "trigger_15m_fetch")
                     log.warning("[SIGNALS] 15M fetch error for %s: %s", symbol, exc)
                     continue
                 if len(k15) < 20:
@@ -2892,7 +2917,8 @@ def main() -> None:
 
             signal_price = _safe_float(ev.get("event_fact", {}).get("detection_close_price") or r.price, 0.0)
             if signal_price <= 0:
-                stats["scan_errors"] += 1
+                _record_scan_error(stats, "signal_price_invalid")
+                log.warning("[SIGNALS] Invalid signal price for %s %s (%s/%s): %.8f", direction, symbol, tf, event_type, signal_price)
                 continue
 
             # 1H divergences require a 4H directional context; hidden divergences
@@ -2957,15 +2983,7 @@ def main() -> None:
                     trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
                 if not trigger_diag.get("ok"):
                     reason = trigger_diag.get("reason") or "failed"
-                    stats["rejected_trigger"] += 1
-                    if reason == "no_trigger_window":
-                        stats["trigger_no_window"] += 1; tf_stats["trigger_no_window"] += 1
-                    elif reason == "breakout_failed":
-                        stats["trigger_breakout_failed"] += 1; tf_stats["trigger_breakout_failed"] += 1
-                    elif reason == "volume_failed":
-                        stats["trigger_volume_failed"] += 1; tf_stats["trigger_volume_failed"] += 1
-                    else:
-                        stats["trigger_data_failed"] += 1; tf_stats["trigger_data_failed"] += 1
+                    _record_trigger_failure(stats, tf_stats, reason)
                     log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
                     continue
                 trigger_price = _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0)
@@ -3034,7 +3052,7 @@ def main() -> None:
                         continue
                     risk_1h_cache[symbol] = pd.DataFrame(k1_risk)
                 except Exception as exc:
-                    stats["scan_errors"] += 1
+                    _record_scan_error(stats, "risk_1h_fetch")
                     log.warning("[RISK] Fresh 1H ATR fetch error for %s: %s", symbol, exc)
                     continue
 
@@ -3045,7 +3063,7 @@ def main() -> None:
                 log.warning("[RISK] Invalid setup for %s %s (%s/%s): %s", direction, symbol, tf, event_type, exc)
                 continue
             except Exception as exc:
-                stats["scan_errors"] += 1
+                _record_scan_error(stats, "risk_setup_unexpected")
                 log.exception("[RISK] Unexpected setup error for %s %s (%s/%s)", direction, symbol, tf, event_type)
                 continue
             setup["trigger"] = {
@@ -3458,6 +3476,8 @@ def main() -> None:
 
     for tf_name, tf_rec in sorted(stats.get("by_timeframe", {}).items()):
         log.info("[TF_STATS] %s %s", tf_name.upper(), " ".join(f"{k}={v}" for k, v in tf_rec.items()))
+
+    log.info("[SUMMARY] [SCAN_ERRORS_BY_STAGE] %s", stats.get("scan_errors_by_stage", {}))
 
     summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
     log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)

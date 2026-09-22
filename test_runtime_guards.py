@@ -170,3 +170,56 @@ def test_real_journal_divergence_events_route_to_shadow(tmp_path):
         state, {str(sample["symbol"]): 105.1}, 1_700_000_600_000
     )
     assert moved["closed"] == 1 if str(sample["direction"]).upper() == "LONG" else moved["active"] >= 0
+
+def test_retest_window_failure_is_classified_as_no_window_not_data_error():
+    import run_once
+
+    stats = {"rejected_trigger": 0, "trigger_no_window": 0, "trigger_data_failed": 0,
+             "trigger_breakout_failed": 0, "trigger_volume_failed": 0}
+    tf_stats = dict(stats)
+
+    run_once._record_trigger_failure(stats, tf_stats, "no_retest_window")
+
+    assert stats["rejected_trigger"] == 1
+    assert stats["trigger_no_window"] == 1
+    assert stats["trigger_data_failed"] == 0
+    assert tf_stats["trigger_no_window"] == 1
+    assert tf_stats["trigger_data_failed"] == 0
+
+
+def test_trigger_failure_categories_remain_distinct():
+    import run_once
+
+    for reason, expected in [
+        ("no_trigger_window", "trigger_no_window"),
+        ("breakout_failed", "trigger_breakout_failed"),
+        ("volume_failed", "trigger_volume_failed"),
+        ("invalid_15m_data", "trigger_data_failed"),
+    ]:
+        stats = {"rejected_trigger": 0, "trigger_no_window": 0, "trigger_data_failed": 0,
+                 "trigger_breakout_failed": 0, "trigger_volume_failed": 0}
+        tf_stats = dict(stats)
+        run_once._record_trigger_failure(stats, tf_stats, reason)
+        assert stats["rejected_trigger"] == 1
+        assert stats[expected] == 1
+        for key in ("trigger_no_window", "trigger_data_failed", "trigger_breakout_failed", "trigger_volume_failed"):
+            if key != expected:
+                assert stats[key] == 0, (reason, key)
+
+def test_scan_errors_are_preserved_by_stage():
+    import run_once
+
+    stats = {"scan_errors": 0, "scan_errors_by_stage": {}}
+    tf_stats = {"scan_errors": 0}
+
+    run_once._record_scan_error(stats, "risk_1h_fetch")
+    run_once._record_scan_error(stats, "risk_1h_fetch")
+    run_once._record_scan_error(stats, "timeframe_1h_fetch_detection", tf_stats)
+
+    assert stats["scan_errors"] == 3
+    assert stats["scan_errors_by_stage"] == {
+        "risk_1h_fetch": 2,
+        "timeframe_1h_fetch_detection": 1,
+    }
+    assert tf_stats["scan_errors"] == 1
+
