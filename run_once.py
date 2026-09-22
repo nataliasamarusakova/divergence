@@ -33,9 +33,12 @@ from event_engine.bingx import (
 from event_engine.signals import (
     add_cvd,
     detect_divergences,
+    detect_volume_profile_divergence,
+    detect_harmonic_patterns,
     detect_squeeze_release,
     detect_liquidation_squeeze,
     attach_oi_series,
+    attach_funding_series,
     build_15m_trigger,
     diagnose_15m_trigger,
     check_btc_regime,
@@ -98,6 +101,8 @@ MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "10000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
+ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE", "false").lower() == "true"
+ENABLE_HARMONIC_PATTERN_ENGINE = os.environ.get("ENABLE_HARMONIC_PATTERN_ENGINE", "false").lower() == "true"
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "60"))
@@ -483,9 +488,13 @@ def _merge_event_cache(existing: list[dict], new_events: list[dict]) -> list[dic
 
 
 OI_HISTORY = DATA / "oi_history.json"
+FUNDING_HISTORY = DATA / "funding_history.json"
 _OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": ""}
 _OI_HIST_CACHE_TTL = 30.0
 _OI_HIST_MAX_BUCKETS = 500
+_FUNDING_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": ""}
+_FUNDING_HIST_CACHE_TTL = 30.0
+_FUNDING_HIST_MAX_BUCKETS = 500
 
 
 def _load_oi_history() -> dict[str, dict[str, float]]:
@@ -551,6 +560,60 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
     return updated
 
 
+def _load_funding_history() -> dict[str, dict[str, float]]:
+    """Cached funding-rate snapshots keyed by symbol and 1h bucket."""
+    now = time.monotonic()
+    cache_path = str(FUNDING_HISTORY.resolve())
+    if (
+        _FUNDING_HIST_CACHE.get("path") == cache_path
+        and now - float(_FUNDING_HIST_CACHE.get("ts", 0.0)) < _FUNDING_HIST_CACHE_TTL
+        and "data" in _FUNDING_HIST_CACHE
+    ):
+        return _FUNDING_HIST_CACHE["data"]
+    raw = _load_json(FUNDING_HISTORY, {})
+    data = raw if isinstance(raw, dict) else {}
+    _FUNDING_HIST_CACHE["ts"] = now
+    _FUNDING_HIST_CACHE["path"] = cache_path
+    _FUNDING_HIST_CACHE["data"] = data
+    return data
+
+
+def _record_funding_snapshots(rows: list[Any], now_ms: int) -> int:
+    """Persist the latest available OI-weighted funding rate per 1h bucket."""
+    if not rows:
+        return 0
+    history = _load_json(FUNDING_HISTORY, {})
+    if not isinstance(history, dict):
+        history = {}
+    bucket = str(int(now_ms // 3_600_000))
+    updated = 0
+    for row in rows:
+        symbol = str(getattr(row, "symbol", "") or "").upper()
+        raw_fr = getattr(row, "fr_oiw", None)
+        if not symbol or raw_fr is None:
+            continue
+        try:
+            fr = float(raw_fr)
+        except (TypeError, ValueError):
+            continue
+        if not (-float("inf") < fr < float("inf")):
+            continue
+        rec = history.setdefault(symbol, {})
+        if not isinstance(rec, dict):
+            rec = history[symbol] = {}
+        rec[bucket] = fr
+        if len(rec) > _FUNDING_HIST_MAX_BUCKETS:
+            for key in sorted(rec, key=lambda k: int(k))[: len(rec) - _FUNDING_HIST_MAX_BUCKETS]:
+                del rec[key]
+        updated += 1
+    if updated:
+        _save_json_atomic(FUNDING_HISTORY, history)
+        _FUNDING_HIST_CACHE["data"] = history
+        _FUNDING_HIST_CACHE["ts"] = time.monotonic()
+    _FUNDING_HIST_CACHE["path"] = str(FUNDING_HISTORY.resolve())
+    return updated
+
+
 def _acquire_scan_slot(min_interval: float) -> None:
     """Process-local pacing for BingX kline scans.
 
@@ -574,7 +637,10 @@ def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
     The old implementation persisted time.monotonic() in a file. That is
     invalid across ephemeral GitHub Actions runners because monotonic clocks
     are not comparable between different VMs. The lock_dir argument is retained
-    only for API/test compatibility and is intentionally unused.
+    only for API/test compatibility and is intentionally unused. Global
+    serialization for the production GitHub workflow is provided by the
+    workflow-level ``concurrency.group``; this helper must not be mistaken for
+    a cross-process or cross-runner rate limiter.
     """
     _ = lock_dir
     _acquire_scan_slot(min_interval)
@@ -682,7 +748,10 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             # detect_divergences can emit Price-vs-OI divergence when coverage
             # is sufficient (no events until enough buckets are recorded).
             d = attach_oi_series(d, _load_oi_history().get(symbol))
+            d = attach_funding_series(d, _load_funding_history().get(symbol))
             divs = detect_divergences(d, symbol, timeframe)
+            vp_events = detect_volume_profile_divergence(d, symbol, timeframe) if ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE else []
+            harmonic_events = detect_harmonic_patterns(d, symbol, timeframe) if ENABLE_HARMONIC_PATTERN_ENGINE else []
             sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
             # Forced-liquidation squeeze is an opt-in research engine until local
             # liquidation time-series coverage is available; the code remains intact.
@@ -720,8 +789,8 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             stats["squeeze_events"] += len(sqs) + len(liqs)
             tf_stats["divergence_events"] += len(divs)
             tf_stats["squeeze_events"] += len(sqs) + len(liqs)
-            stats["events_total"] += len(divs) + len(sqs) + len(liqs) + len(strategy_events)
-            for ev in divs + sqs + liqs + strategy_events:
+            stats["events_total"] += len(divs) + len(vp_events) + len(harmonic_events) + len(sqs) + len(liqs) + len(strategy_events)
+            for ev in divs + vp_events + harmonic_events + sqs + liqs + strategy_events:
                 if not _event_is_fresh(ev, now_ms, MAX_AGE):
                     continue
                 fresh.append(ev)
@@ -1192,7 +1261,7 @@ def calculate_setup_score(
     elif delta_atr >= 0.5:
         score += 10.0
 
-    if event_type.endswith(("_MACD", "_STOCH", "_OBV", "_OI")):
+    if event_type.endswith(("_MACD", "_MACD_HIST", "_STOCH", "_OBV", "_OI", "_FR_OIW_Z", "_MFI", "_CMF")):
         score += 15.0
 
     if "CVD" in event_type:
@@ -1224,6 +1293,10 @@ def calculate_setup_score(
         score += 25.0
     elif event_type.startswith("CRT_"):
         score += 20.0
+    elif event_type.startswith("VOLUME_PROFILE_"):
+        score += 20.0
+    elif event_type.startswith("HARMONIC_"):
+        score += 25.0
 
     # Squeeze families retain a bonus, but volatility compression and liquidation
     # squeeze are separate event types and can be analysed independently.
@@ -1539,6 +1612,47 @@ def _find_active_trade_for_position(bx_symbol: str, direction: str, active_trade
     return None
 
 
+def _reconciliation_event_id(
+    bx_symbol: str,
+    direction: str,
+    avg_price: float,
+    qty: float,
+    position: dict[str, Any],
+    active_trades: dict[str, dict],
+) -> str:
+    """Return a stable id for one reconciled orphan position.
+
+    Identity uses exchange position fields when available. A collision with a
+    previously closed record gets a one-time suffix so reopening the same
+    symbol/direction cannot overwrite the historical trade.
+    """
+    direction = str(direction).upper()
+    symbol = str(bx_symbol).upper()
+    position_ts = 0
+    for key in ("entryTime", "openTime", "positionTime", "updateTime", "time", "timestamp"):
+        raw = position.get(key)
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            position_ts = value
+            break
+
+    identity = f"{symbol}|{direction}|{avg_price:.12g}|{qty:.12g}|{position_ts}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12].upper()
+    base = f"RECON_{symbol}_{direction}_{digest}"
+
+    existing = active_trades.get(base) if isinstance(active_trades, dict) else None
+    if existing is None or not bool(existing.get("closed", False)):
+        return base
+
+    candidate = f"{base}_{int(time.time() * 1000)}"
+    if candidate in active_trades:
+        candidate = f"{base}_{hashlib.sha256(candidate.encode('utf-8')).hexdigest()[:8].upper()}"
+    return candidate
+
+
 def reconcile_all_open_positions() -> None:
     # Reconciliation must never monopolize the 5-minute event loop. The normal
     # BingX session intentionally retries GETs, but that can turn one network
@@ -1715,8 +1829,11 @@ def reconcile_all_open_positions() -> None:
                             "target_price": avg_price,
                             "event_type": "RECONCILED_POSITION",
                         }
+                        reconciliation_event_id = _reconciliation_event_id(
+                            bx_symbol, direction, avg_price, qty, p, active_trades
+                        )
                         register_active_trade(
-                            event_id=f"RECON_{bx_symbol}_{direction}",
+                            event_id=reconciliation_event_id,
                             symbol=bx_symbol.replace("-USDT", ""),
                             name=bx_symbol.replace("-USDT", ""),
                             direction=direction,
@@ -1732,7 +1849,7 @@ def reconcile_all_open_positions() -> None:
                         )
                         _record_reconciled_trade_open(
                             bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
-                            event_id=f"RECON_{bx_symbol}_{direction}",
+                            event_id=reconciliation_event_id,
                             tp_orders=tracker_tp, sl_result=tracker_sl, setup=inferred_setup,
                         )
                         log.warning("[RECONCILIATION] Registered orphan protected position %s (%s) into tracker and journal.", bx_symbol, direction)
@@ -1866,8 +1983,11 @@ def reconcile_all_open_positions() -> None:
                 effective_weighted_rr=res.get("effective_weighted_rr"),
             )
             if not tracked and not matched_trade:
+                reconciliation_event_id = _reconciliation_event_id(
+                    bx_symbol, direction, avg_price, qty, p, active_trades
+                )
                 register_active_trade(
-                    event_id=f"RECON_{bx_symbol}_{direction}",
+                    event_id=reconciliation_event_id,
                     symbol=bx_symbol.replace("-USDT", ""),
                     name=bx_symbol.replace("-USDT", ""),
                     direction=direction,
@@ -1879,7 +1999,7 @@ def reconcile_all_open_positions() -> None:
                 )
                 _record_reconciled_trade_open(
                     bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
-                    event_id=f"RECON_{bx_symbol}_{direction}",
+                    event_id=reconciliation_event_id,
                     tp_orders=repaired_tp, sl_result=repaired_sl,
                 )
 
@@ -2267,6 +2387,11 @@ def main() -> None:
         log.error("[OI_HISTORY] Snapshot record error: %s", exc)
 
     try:
+        stats["funding_snapshots_recorded"] = _record_funding_snapshots(rows, int(pd.Timestamp.utcnow().timestamp() * 1000))
+    except Exception as exc:
+        log.error("[FUNDING_HISTORY] Snapshot record error: %s", exc)
+
+    try:
         contracts = refresh_contracts()
         log.info("[BINGX] Refreshed %d active perpetual contracts.", len(contracts))
     except Exception as exc:
@@ -2502,7 +2627,13 @@ def main() -> None:
                     try:
                         kctx = _fetch_klines_scan(symbol, context_tf, context_limit)
                         cdf = pd.DataFrame(kctx)
-                        htf_context = {"df": cdf} if len(kctx) >= 60 else {"df": None}
+                        if len(kctx) >= 60:
+                            cdf = add_cvd(cdf)
+                            cdf = attach_oi_series(cdf, _load_oi_history().get(symbol))
+                            cdf = attach_funding_series(cdf, _load_funding_history().get(symbol))
+                            htf_context = {"df": cdf}
+                        else:
+                            htf_context = {"df": None}
                         htf_context_cache[cache_key] = htf_context
                     except Exception as exc:
                         htf_context = {"df": None, "error": str(exc)}

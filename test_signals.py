@@ -568,6 +568,168 @@ def test_closed_message_uses_trade_timeframe():
     assert "TF <b>4h</b>" in msg
 
 
+def test_add_macd_produces_signal_and_histogram_with_warmup():
+    from event_engine.signals import add_macd
+
+    df = pd.DataFrame({"close": [100.0 + i for i in range(50)]})
+    out = add_macd(df)
+
+    assert out["macd"].iloc[:25].isna().all()
+    assert out["macd"].iloc[25] == pytest.approx(
+        out["close"].ewm(span=12, adjust=False, min_periods=12).mean().iloc[25]
+        - out["close"].ewm(span=26, adjust=False, min_periods=26).mean().iloc[25]
+    )
+    assert out["macd_signal"].iloc[25:33].isna().all()
+    assert out["macd_hist"].iloc[34] == pytest.approx(
+        out["macd"].iloc[34] - out["macd_signal"].iloc[34]
+    )
+
+
+def test_cvd_divergence_requires_price_to_be_within_vwap_band(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _generate_synthetic_candles(90)
+    df["volume"] = 1000.0
+    df["quote_volume"] = df["volume"] * df["close"]
+    df["taker_flow_valid"] = True
+    df["bar_delta_usdt"] = 0.0
+    df.loc[30, "low"] = 90.0
+    df.loc[50, "low"] = 80.0
+    df.loc[30, "bar_delta_usdt"] = -1000.0
+    df.loc[50, "bar_delta_usdt"] = 1000.0
+    df.loc[52, "close"] = 120.0
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=3, right=2: ([30, 50], []))
+
+    df = sig.add_cvd(df)
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    assert not any(e["event_type"] == "REGULAR_BULLISH_BINGX_CVD" for e in events)
+
+    # Move the detection bar close close to its cumulative VWAP so the CVD event can pass.
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    vwap_52 = float((typical.iloc[:53] * df["volume"].iloc[:53]).sum() / df["volume"].iloc[:53].sum())
+    df.loc[52, "close"] = vwap_52
+    df = sig.add_cvd(df)
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    cvd_events = [e for e in events if e["event_type"] == "REGULAR_BULLISH_BINGX_CVD"]
+    assert cvd_events
+    assert cvd_events[0]["event_fact"]["vwap_distance_pct"] <= 1.50
+
+
+def test_mfi_uses_signed_money_flow_and_handles_zero_negative_flow():
+    from event_engine.signals import add_mfi
+
+    df = pd.DataFrame({
+        "high": [10.0 + i for i in range(20)],
+        "low": [9.0 + i for i in range(20)],
+        "close": [9.5 + i for i in range(20)],
+        "volume": [100.0] * 20,
+    })
+    out = add_mfi(df, length=14)
+    assert out["mfi"].iloc[:13].isna().all()
+    assert out["mfi"].iloc[-1] == pytest.approx(100.0)
+
+    flat = df.copy()
+    flat["high"] = 10.0
+    flat["low"] = 9.0
+    flat["close"] = 9.5
+    flat_out = add_mfi(flat, length=14)
+    assert flat_out["mfi"].iloc[-1] == pytest.approx(50.0)
+
+
+def test_cmf_uses_close_location_and_zero_range_guard():
+    from event_engine.signals import add_cmf
+
+    df = pd.DataFrame({
+        "high": [10.0] * 20,
+        "low": [9.0] * 20,
+        "close": [9.75] * 20,
+        "volume": [100.0] * 20,
+    })
+    out = add_cmf(df, length=20)
+    assert out["cmf"].iloc[:19].isna().all()
+    assert out["cmf"].iloc[-1] == pytest.approx(0.5)
+
+    flat = df.copy()
+    flat["high"] = 10.0
+    flat["low"] = 10.0
+    flat["close"] = 10.0
+    flat_out = add_cmf(flat, length=20)
+    assert flat_out["cmf"].iloc[-1] == pytest.approx(0.0)
+
+
+def test_volume_confirmed_divergence_is_opt_in_and_enforces_both_thresholds(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _generate_synthetic_candles(90)
+    df["volume"] = 1000.0
+    df["taker_flow_valid"] = True
+    df["bar_delta_usdt"] = 0.0
+    df.loc[30, "low"] = 90.0
+    df.loc[50, "low"] = 80.0
+    df.loc[30, "bar_delta_usdt"] = -1000.0
+    df.loc[50, "bar_delta_usdt"] = 1000.0
+    df = sig.add_cvd(df)
+    def _forced_rsi(close, n=14):
+        out = pd.Series(50.0, index=close.index)
+        out.loc[30] = 40.0
+        out.loc[50] = 60.0
+        return out
+    monkeypatch.setattr(sig, "_rsi", _forced_rsi)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=3, right=2: ([30, 50], []))
+
+    monkeypatch.delenv("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", raising=False)
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    assert any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
+
+    monkeypatch.setenv("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "true")
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    assert not any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
+
+    df.loc[52, "volume"] = 1300.0
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    assert any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
+
+
+def test_validate_divergence_context_marks_matching_htf_confirmation(monkeypatch):
+    import event_engine.signals as sig
+
+    htf_event = {
+        "event_id": "HTF1",
+        "event_type": "REGULAR_BULLISH_RSI",
+        "direction": "LONG",
+        "timestamps": {"detected_at_ts": 1_700_000_000_000},
+    }
+    monkeypatch.setattr(sig, "detect_divergences", lambda *args, **kwargs: [htf_event])
+    monkeypatch.setattr(sig, "_trend_context", lambda df, direction: {"trend": "BULLISH", "trend_ok": True})
+
+    ev = {
+        "symbol": "TEST-USDT",
+        "event_type": "REGULAR_BULLISH_RSI",
+        "direction": "LONG",
+        "timestamps": {"detected_at_ts": 1_700_000_000_000 + 3 * 3_600_000},
+        "event_fact": {"price_delta_atr": 1.0},
+    }
+    ok, reason, meta = sig.validate_divergence_context(ev, pd.DataFrame(index=range(60)), "4h")
+    assert ok is True
+    assert reason == "REGULAR_CONTEXT_OK"
+    assert meta["mtf_confirmed"] is True
+    assert meta["mtf_confirmation_event_id"] == "HTF1"
+
+
+def test_calc_trade_pnl_returns_none_for_invalid_prices_and_message_marks_data_error():
+    from event_engine.tracker import _calc_trade_pnl_pct, format_trade_closed_message
+
+    assert _calc_trade_pnl_pct(0.0, 101.0, "LONG") is None
+    assert _calc_trade_pnl_pct(100.0, 0.0, "LONG") is None
+
+    msg = format_trade_closed_message(
+        name="TEST", symbol="TEST-USDT", direction="LONG", entry_price=0.0, exit_price=101.0,
+        pnl_pct=None, realized_rr=None, planned_rr=1.05, duration_min=10.0, peak_pnl=0.0,
+        max_drawdown=0.0, exit_reason="DATA_ERROR", event_type="RECONCILED_POSITION", timeframe="1h"
+    )
+    assert "DATA_ERROR" in msg
+
+
 def test_active_trade_register_persists_timeframe(tmp_path, monkeypatch):
     import event_engine.tracker as tr
     monkeypatch.setattr(tr, "_load_active_trades", lambda: {})
@@ -749,6 +911,7 @@ def test_divergence_detectors_emit_macd_stoch_obv_and_oi_types():
             types.add(ev["event_type"])
 
     assert any(t.endswith("_MACD") for t in types), "MACD divergence missing"
+    assert any(t.endswith("_MACD_HIST") for t in types), "MACD histogram divergence missing"
     assert any(t.endswith("_STOCH") for t in types), "Stochastic divergence missing"
     assert any(t.endswith("_OBV") for t in types), "Volume (OBV) divergence missing"
     assert any(t.endswith("_OI") for t in types), "OI divergence missing"
@@ -883,8 +1046,7 @@ def test_diagnose_15m_trigger_marks_missing_event_ts():
 
 
 def test_global_rate_limiter_serializes_processes(tmp_path):
-    """Audit B5: the file-lock limiter enforces spacing across independent
-    limiter instances sharing one lock directory."""
+    """The compatibility limiter enforces spacing within one process."""
     import run_once as ro
     import time as time_mod
 
@@ -995,6 +1157,49 @@ def test_oi_history_recorder_persists_bucket_snapshots(tmp_path, monkeypatch):
     bar = pd.DataFrame({"close_time": [ct]})
     attached = ro.attach_oi_series(bar, history.get("TEST-USDT")) if hasattr(ro, "attach_oi_series") else attach_oi_series(bar, history.get("TEST-USDT"))
     assert float(attached["oi"].iloc[0]) == 5_000_000.0
+
+
+def test_funding_history_recorder_and_attachment_are_causal(tmp_path, monkeypatch):
+    import run_once as ro
+    from event_engine.signals import attach_funding_series
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "FUNDING_HISTORY", tmp_path / "funding_history.json")
+    monkeypatch.setattr(ro, "_FUNDING_HIST_CACHE", {"ts": 0.0, "data": {}, "path": ""})
+    rows = [
+        SimpleNamespace(symbol="TEST-USDT", fr_oiw=-0.0125),
+        SimpleNamespace(symbol="BAD", fr_oiw=None),
+    ]
+    now_ms = 1_700_000_000_123
+    assert ro._record_funding_snapshots(rows, now_ms) == 1
+    history = ro._load_funding_history()
+    bucket = str(now_ms // 3_600_000)
+    assert history["TEST-USDT"][bucket] == pytest.approx(-0.0125)
+    assert "BAD" not in history
+
+    close_time = int(bucket) * 3_600_000 + 1_800_000
+    bar = pd.DataFrame({"close_time": [close_time]})
+    attached = attach_funding_series(bar, history["TEST-USDT"])
+    assert float(attached["fr_oiw"].iloc[0]) == pytest.approx(-0.0125)
+
+
+def test_funding_zscore_divergence_uses_normalized_series(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _divergence_fixture(120)
+    df["fr_oiw"] = 0.0
+    df.loc[30, "high"] = 110.0
+    df.loc[40, "fr_oiw"] = 0.030
+    df.loc[70, "fr_oiw"] = -0.010
+    df.loc[70, "high"] = 109.0
+    df.loc[90, "high"] = 120.0
+    df.loc[90, "fr_oiw"] = -0.005
+
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=3, right=2: ([], [30, 50, 70, 90]))
+    events = sig.detect_divergences(
+        df, "TEST-USDT", "1h", min_bars=20, max_bars=70, min_delta_atr=0.1
+    )
+    assert any(e["event_type"] == "REGULAR_BEARISH_FR_OIW_Z" for e in events)
 
 
 def test_score_gives_squeeze_bonus_to_liquidation_squeezes():
@@ -1553,14 +1758,37 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
 
     ro.reconcile_all_open_positions()
     assert len(registrations) == 1
-    assert registrations[0]["event_id"] == "RECON_TEST-USDT_LONG"
+    assert registrations[0]["event_id"].startswith("RECON_TEST-USDT_LONG_")
+    assert registrations[0]["event_id"] != "RECON_TEST-USDT_LONG"
     assert registrations[0]["direction"] == "LONG"
     assert registrations[0]["qty"] == 1.0
     assert registrations[0]["setup"]["event_type"] == "RECONCILED_POSITION"
     assert len(journaled) == 1
     assert journaled[0]["record_type"] == "TRADE_OPEN"
     assert journaled[0]["reconciliation"] is True
-    assert journaled[0]["event_id"] == "RECON_TEST-USDT_LONG"
+    assert journaled[0]["event_id"] == registrations[0]["event_id"]
+
+
+def test_reconciliation_event_id_changes_after_closed_collision(monkeypatch):
+    import run_once as ro
+
+    closed_id = "RECON_TEST-USDT_LONG_ABC123"
+    active = {closed_id: {"closed": True}}
+    position = {"updateTime": 1_700_000_000_000}
+
+    first = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
+    assert first.startswith("RECON_TEST-USDT_LONG_")
+
+    # Force the deterministic base to collide with a closed historical record.
+    digest = __import__("hashlib").sha256(
+        "TEST-USDT|LONG|100|1|1700000000000".encode("utf-8")
+    ).hexdigest()[:12].upper()
+    collided = f"RECON_TEST-USDT_LONG_{digest}"
+    assert collided == ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
+
+    new_id = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {collided: {"closed": True}})
+    assert new_id.startswith(collided + "_")
+    assert new_id != collided
 
 
 def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
@@ -2365,3 +2593,58 @@ def test_tracker_trade_closed_log_format_has_all_arguments():
     assert "TEST" in rendered
     assert "PnL: +1.25%" in rendered
     assert "Duration: 12.0 min" in rendered
+
+
+def test_volume_profile_divergence_detects_hvn_accumulation_proxy():
+    from event_engine.signals import detect_volume_profile_divergence
+
+    n = 100
+    df = pd.DataFrame({
+        "high": [101.0] * n,
+        "low": [99.0] * n,
+        "close": [100.0] * n,
+        "volume": [100.0] * n,
+        "close_time": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+    })
+    df.loc[80:98, "volume"] = 150.0
+    df.loc[99, "high"] = 91.0
+    df.loc[99, "low"] = 89.0
+    df.loc[99, "close"] = 90.0
+    df.loc[99, "volume"] = 150.0
+
+    events = detect_volume_profile_divergence(df, "TEST-USDT", "1h", lookback=100, recent_bars=20)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["event_type"] == "VOLUME_PROFILE_ACCUMULATION"
+    assert ev["direction"] == "LONG"
+    assert ev["event_fact"]["volume_profile_method"] == "ohlcv_typical_price_proxy"
+    assert ev["event_fact"]["hvn_growth_ratio"] >= 1.10
+    assert ev["event_fact"]["price_left_hvn"] is True
+
+
+def test_harmonic_gartley_uses_confirmed_alternating_pivots(monkeypatch):
+    import event_engine.signals as sig
+
+    n = 90
+    df = pd.DataFrame({
+        "high": [105.0] * n,
+        "low": [95.0] * n,
+        "close": [100.0] * n,
+        "close_time": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+    })
+    prices = {10: (100.0, "low"), 20: (200.0, "high"), 30: (138.2, "low"), 40: (169.1, "high"), 50: (121.4, "low")}
+    for idx, (price, kind) in prices.items():
+        if kind == "low":
+            df.loc[idx, "low"] = price
+            df.loc[idx, "close"] = price
+        else:
+            df.loc[idx, "high"] = price
+            df.loc[idx, "close"] = price
+
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_GARTLEY_LONG" for e in events)
+    event = next(e for e in events if e["event_type"] == "HARMONIC_GARTLEY_LONG")
+    assert event["event_fact"]["trigger_level"] == pytest.approx(121.4)
+    assert event["timestamps"]["d_ts"] == df.loc[50, "close_time"]
+    assert event["timestamps"]["detected_at_ts"] == df.loc[55, "close_time"]
