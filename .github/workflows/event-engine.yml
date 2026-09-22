@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     env:
@@ -123,6 +123,7 @@ jobs:
       SYMBOL_QUARANTINE_MIN: "360"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+      VPN_EXPECTED_COUNTRY: NL
 
     steps:
       - name: Checkout
@@ -170,9 +171,181 @@ jobs:
         run: |
           python -m pytest -q
 
+      # VPN is intentionally connected only after dependencies/tests so pip/Playwright do not consume VPN time/bandwidth.
+      - name: Detect WireGuard package version
+        id: wireguard-package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(apt-cache policy wireguard-tools 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+          if [ -z "${version:-}" ] || [ "$version" = "(none)" ]; then
+            echo "wireguard-tools candidate is not present in the runner APT index; refreshing indexes once."
+            sudo apt-get update -qq
+            version="$(apt-cache policy wireguard-tools | awk '/Candidate:/ {print $2; exit}')"
+          fi
+
+          if [ -z "${version:-}" ] || [ "$version" = "(none)" ]; then
+            echo "ERROR: unable to resolve wireguard-tools package version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "wireguard-tools candidate=$version"
+
+      - name: Cache WireGuard package
+        id: cache-wireguard-package
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apt-archives
+          key: wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}
+
+      - name: Install WireGuard tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CACHE_DIR="$HOME/.cache/apt-archives"
+          mkdir -p "$CACHE_DIR"
+
+          if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+            echo "WireGuard tools already installed on runner image; skipping package install."
+          else
+            deb="$(find "$CACHE_DIR" -maxdepth 1 -type f -name 'wireguard-tools_*.deb' -print -quit || true)"
+
+            if [ -z "$deb" ]; then
+              echo "WireGuard .deb not found in cache; downloading without apt-get update."
+              if ! (cd "$CACHE_DIR" && apt-get download "wireguard-tools=${{ steps.wireguard-package.outputs.version }}"); then
+                echo "Cached APT metadata was insufficient; refreshing indexes once."
+                sudo apt-get update -qq
+                (cd "$CACHE_DIR" && apt-get download "wireguard-tools=${{ steps.wireguard-package.outputs.version }}")
+              fi
+              deb="$(find "$CACHE_DIR" -maxdepth 1 -type f -name 'wireguard-tools_*.deb' -print -quit || true)"
+            fi
+
+            if [ -z "$deb" ]; then
+              echo "ERROR: WireGuard .deb was not downloaded" >&2
+              exit 1
+            fi
+
+            echo "Installing cached package: $deb"
+            sudo dpkg -i "$deb" || sudo apt-get -f install -y
+          fi
+
+          if ! command -v resolvconf >/dev/null 2>&1; then
+            echo "resolvconf is not present; installing it only when required by wg-quick DNS handling."
+            if ! sudo apt-get install -y resolvconf; then
+              sudo apt-get update -qq
+              sudo apt-get install -y resolvconf
+            fi
+          fi
+
+      - name: Connect Proton WireGuard VPN
+        env:
+          WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WIREGUARD_CONF:-}" ]; then
+            echo "ERROR: GitHub Actions secret WIREGUARD_CONF is not configured" >&2
+            exit 1
+          fi
+
+          printf '%s\n' "$WIREGUARD_CONF" | sudo tee /etc/wireguard/wg0.conf >/dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+
+          echo "=== WireGuard interface ==="
+          sudo wg show wg0
+
+          echo "=== Outbound IP ==="
+          curl -fsS --max-time 10 https://ipinfo.io/json -o /tmp/ipinfo.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/ipinfo.json').read_text())
+          print(json.dumps({k: data.get(k) for k in ('ip', 'country', 'city', 'org')}, indent=2))
+          expected = '${{ env.VPN_EXPECTED_COUNTRY }}'
+          actual = str(data.get('country', '')).upper()
+          if expected and actual != expected.upper():
+              raise SystemExit(f'VPN country mismatch: expected {expected}, got {actual}')
+          PY
+
+      - name: Binance Futures preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="${BINANCE_BASE_URL%/}"
+          export TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          request_json() {
+            local name="$1"
+            local url="$2"
+            local out="$TMP_DIR/$3"
+
+            echo "=== $name ==="
+            curl -fsS --max-time 15 --retry 1 --retry-delay 1 \
+              "$url" -o "$out"
+          }
+
+          request_json "Futures ping" \
+            "$BASE/fapi/v1/ping" ping.json
+
+          request_json "Futures time" \
+            "$BASE/fapi/v1/time" time.json
+
+          request_json "Futures exchangeInfo" \
+            "$BASE/fapi/v1/exchangeInfo" exchange.json
+
+          request_json "BTCUSDT 1h Klines" \
+            "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10" klines.json
+
+          request_json "BTCUSDT ticker" \
+            "$BASE/fapi/v1/ticker/price?symbol=BTCUSDT" ticker.json
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["TMP_DIR"])
+          exchange = json.loads((root / "exchange.json").read_text())
+          symbols = exchange.get("symbols", [])
+          active = {
+              str(row.get("symbol", "")).upper()
+              for row in symbols
+              if str(row.get("status", "")).upper() == "TRADING"
+              and str(row.get("contractType", "")).upper() == "PERPETUAL"
+              and str(row.get("quoteAsset", "")).upper() == "USDT"
+          }
+
+          if "BTCUSDT" not in active:
+              raise SystemExit("BTCUSDT is missing from active Binance USDT perpetual contracts")
+
+          klines = json.loads((root / "klines.json").read_text())
+          if not isinstance(klines, list) or len(klines) < 2:
+              raise SystemExit(f"Unexpected BTCUSDT 1h klines response: {len(klines) if isinstance(klines, list) else type(klines).__name__}")
+
+          ticker = json.loads((root / "ticker.json").read_text())
+          price = float(ticker.get("price", 0))
+          if price <= 0:
+              raise SystemExit(f"Invalid BTCUSDT Futures ticker price: {ticker}")
+
+          print(f"Binance Futures preflight OK: active_usdt_perpetuals={len(active)}, BTCUSDT_1h_rows={len(klines)}, BTCUSDT_price={price}")
+          PY
+
       - name: Run engine
         run: |
           python run_once.py
+
+      - name: Disconnect Proton WireGuard VPN
+        if: always()
+        shell: bash
+        run: |
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
 
       - name: Commit state
         if: always()
