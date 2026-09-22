@@ -20,6 +20,7 @@ from event_engine.bingx import (
     get_contract,
     to_bx_symbol,
     fetch_klines,
+    BingXRateLimitError,
     open_market,
     wait_for_position_fill_directional,
     get_positions,
@@ -90,6 +91,8 @@ ACTIONS = DATA / "actions.jsonl"
 HEALTH = DATA / "health.jsonl"
 TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
 EVENT_CACHE = DATA / "recent_event_cache.json"
+KLINE_RATE_LIMIT_STATE = DATA / "bingx_kline_rate_limit.json"
+_KLINE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
 # BingX Kline endpoint is rate-limited per IP; serialize heavyweight scan requests.
 BAR_CLOSE_GRACE_MIN = float(os.environ.get("BAR_CLOSE_GRACE_MIN", "2"))
 
@@ -631,6 +634,59 @@ def _acquire_scan_slot(min_interval: float) -> None:
             time.sleep(wait)
     _acquire_scan_slot._last_call = time.monotonic()
 
+def _load_kline_rate_limit_state() -> dict[str, Any]:
+    """Load the persisted BingX Kline cooldown shared across workflow runs."""
+    cache_path = str(KLINE_RATE_LIMIT_STATE.resolve())
+    now = time.monotonic()
+    if _KLINE_RATE_LIMIT_CACHE.get("path") == cache_path and now - float(_KLINE_RATE_LIMIT_CACHE.get("loaded_ts", 0.0)) < 5.0:
+        return dict(_KLINE_RATE_LIMIT_CACHE)
+    raw = _load_json(KLINE_RATE_LIMIT_STATE, {})
+    state = raw if isinstance(raw, dict) else {}
+    try:
+        cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
+    except (TypeError, ValueError):
+        cooldown_until_ms = 0
+    _KLINE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, cooldown_until_ms), loaded_ts=now)
+    return dict(_KLINE_RATE_LIMIT_CACHE)
+
+
+def _set_kline_rate_limit_cooldown(exc: BingXRateLimitError) -> int:
+    """Persist a server-directed Kline cooldown and return its absolute timestamp."""
+    now_ms = int(time.time() * 1000)
+    retry_after_ms = int(exc.retry_after_ms or 0)
+    try:
+        fallback_sec = float(os.environ.get("BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC", "900"))
+    except (TypeError, ValueError):
+        fallback_sec = 900.0
+    fallback_ms = now_ms + int(max(60.0, fallback_sec) * 1000)
+    previous = _load_kline_rate_limit_state()
+    cooldown_until_ms = retry_after_ms if retry_after_ms > now_ms + 1000 else fallback_ms
+    cooldown_until_ms = max(cooldown_until_ms, int(previous.get("cooldown_until_ms", 0) or 0))
+    state = {
+        "cooldown_until_ms": cooldown_until_ms,
+        "saved_at_ms": now_ms,
+        "code": exc.code,
+        "reason": str(exc),
+    }
+    _save_json_atomic(KLINE_RATE_LIMIT_STATE, state)
+    _KLINE_RATE_LIMIT_CACHE.update(path=str(KLINE_RATE_LIMIT_STATE.resolve()), cooldown_until_ms=cooldown_until_ms, loaded_ts=time.monotonic())
+    remaining = max(0, cooldown_until_ms - now_ms)
+    log.error("[BINGX_KLINE] RATE_LIMIT cooldown=%.1fs; no further Kline requests will be attempted until %d", remaining / 1000.0, cooldown_until_ms)
+    return cooldown_until_ms
+
+
+def _raise_if_kline_rate_limited(symbol: str, timeframe: str) -> None:
+    state = _load_kline_rate_limit_state()
+    cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
+    now_ms = int(time.time() * 1000)
+    if cooldown_until_ms > now_ms:
+        remaining = cooldown_until_ms - now_ms
+        raise BingXRateLimitError(
+            f"[BINGX] Kline endpoint cooldown active for {symbol}/{timeframe}; retry after {cooldown_until_ms} ({remaining / 1000.0:.1f}s remaining)",
+            code=state.get("code"), retry_after_ms=cooldown_until_ms,
+        )
+
+
 def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
     """Backward-compatible name; pacing is intentionally process-local.
 
@@ -648,14 +704,15 @@ def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
 
 
 def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
-    """Fetch Klines with serialized pacing and bounded transient-error retry.
+    """Fetch Klines with pacing and bounded transient-error retry.
 
-    This protects the runner from burst traffic and BingX application-level
-    errors while never marking a symbol/timeframe processed until the caller
-    validates the returned dataset. Pacing is process-local because GitHub-hosted
-    runners are ephemeral and cross-run monotonic timestamps are not comparable.
+    BingX rate-limit responses are a hard circuit-breaker condition: they are
+    persisted with the server-provided retry timestamp and never retried blindly.
+    Ordinary network/transient failures retain the bounded retry path.
     """
-    min_interval = float(os.environ.get("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "1.05"))
+    _raise_if_kline_rate_limited(symbol, timeframe)
+    min_interval = float(os.environ.get("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "1.25"))
+
     max_attempts = int(os.environ.get("BINGX_KLINE_RETRY_ATTEMPTS", "3"))
     max_attempts = max(1, min(max_attempts, 5))
     backoff_base = float(os.environ.get("BINGX_KLINE_RETRY_BACKOFF_SEC", "1.0"))
@@ -689,6 +746,9 @@ def _fetch_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
                 time.monotonic() - request_started, len(result or [])
             )
             return result
+        except BingXRateLimitError as exc:
+            _set_kline_rate_limit_cooldown(exc)
+            raise
         except (RuntimeError, requests.RequestException, TimeoutError) as exc:
             last_error = exc
             if attempt + 1 >= max_attempts:
@@ -806,6 +866,11 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             # across workflow timeout/interruption.
             _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
             _save_timeframe_scan_state(scan_state)
+        except BingXRateLimitError as exc:
+            stats["scan_errors"] += 1
+            tf_stats["scan_errors"] += 1
+            log.warning("[SIGNALS] %s Kline rate limit reached on %s; stopping this timeframe scan for the cycle: %s", timeframe.upper(), symbol, exc)
+            break
         except Exception as exc:
             stats["scan_errors"] += 1
             tf_stats["scan_errors"] += 1
@@ -1629,7 +1694,10 @@ def _reconciliation_event_id(
     direction = str(direction).upper()
     symbol = str(bx_symbol).upper()
     position_ts = 0
-    for key in ("entryTime", "openTime", "positionTime", "updateTime", "time", "timestamp"):
+    # Only use stable/opening timestamps for reconciliation identity. An
+    # exchange updateTime can change every cycle and would otherwise create a
+    # fresh event_id for the same still-open orphan position.
+    for key in ("entryTime", "openTime", "positionTime", "time", "timestamp"):
         raw = position.get(key)
         try:
             value = int(float(raw))
@@ -1639,13 +1707,31 @@ def _reconciliation_event_id(
             position_ts = value
             break
 
-    identity = f"{symbol}|{direction}|{avg_price:.12g}|{qty:.12g}|{position_ts}"
+    identity = f"{symbol}|{direction}|{avg_price:.12g}|{position_ts}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12].upper()
     base = f"RECON_{symbol}_{direction}_{digest}"
 
-    existing = active_trades.get(base) if isinstance(active_trades, dict) else None
-    if existing is None or not bool(existing.get("closed", False)):
+    if not isinstance(active_trades, dict):
         return base
+
+    existing = active_trades.get(base)
+    if existing is None:
+        return base
+    if not bool(existing.get("closed", False)):
+        return base
+
+    # A prior reconciliation of this exact position may already have created a
+    # suffixed ID after the base record was closed. Reuse that live ID instead
+    # of minting another ID on every reconciliation cycle.
+    active_suffixes = sorted(
+        str(event_id)
+        for event_id, trade in active_trades.items()
+        if str(event_id).startswith(base + "_")
+        and isinstance(trade, dict)
+        and not bool(trade.get("closed", False))
+    )
+    if active_suffixes:
+        return active_suffixes[-1]
 
     candidate = f"{base}_{int(time.time() * 1000)}"
     if candidate in active_trades:
@@ -2517,6 +2603,7 @@ def main() -> None:
             continue
 
         d15 = None
+        d15_rate_limited = False
         for ev in sorted(all_events, key=lambda x: int(x.get("timestamps", {}).get("detected_at_ts", 0) or 0), reverse=True):
             event_id = ev.get("event_id")
             if not event_id or event_id in executed_event_ids or event_id in terminal_event_ids:
@@ -2592,8 +2679,17 @@ def main() -> None:
                 continue
 
             if d15 is None:
+                if d15_rate_limited:
+                    stats["trigger_data_failed"] += 1
+                    continue
                 try:
                     k15 = _fetch_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
+                except BingXRateLimitError as exc:
+                    d15_rate_limited = True
+                    stats["trigger_data_failed"] += 1
+                    stats["scan_errors"] += 1
+                    log.warning("[SIGNALS] 15M rate limited for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
+                    continue
                 except Exception as exc:
                     stats["trigger_data_failed"] += 1
                     stats["scan_errors"] += 1
@@ -2623,7 +2719,7 @@ def main() -> None:
                 context_limit = int(os.environ.get("KLINE_LIMIT_1D", "250")) if context_tf == "1d" else int(os.environ.get("KLINE_LIMIT_4H", "250"))
                 cache_key = f"{symbol}:{context_tf}"
                 htf_context = htf_context_cache.get(cache_key)
-                if htf_context is None or htf_context.get("error"):
+                if htf_context is None or (htf_context.get("error") and not htf_context.get("rate_limited")):
                     try:
                         kctx = _fetch_klines_scan(symbol, context_tf, context_limit)
                         cdf = pd.DataFrame(kctx)
@@ -2635,9 +2731,12 @@ def main() -> None:
                         else:
                             htf_context = {"df": None}
                         htf_context_cache[cache_key] = htf_context
+                    except BingXRateLimitError as exc:
+                        htf_context = {"df": None, "error": str(exc), "rate_limited": True}
+                        htf_context_cache[cache_key] = htf_context
                     except Exception as exc:
                         htf_context = {"df": None, "error": str(exc)}
-                        # Do not cache transient errors; a later event/cycle may succeed.
+                        # Do not cache ordinary transient errors; a later event/cycle may succeed.
                         htf_context_cache.pop(cache_key, None)
 
                 ctx_df = (htf_context or {}).get("df") if isinstance(htf_context, dict) else None

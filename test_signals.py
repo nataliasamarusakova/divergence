@@ -1772,23 +1772,124 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
 def test_reconciliation_event_id_changes_after_closed_collision(monkeypatch):
     import run_once as ro
 
-    closed_id = "RECON_TEST-USDT_LONG_ABC123"
-    active = {closed_id: {"closed": True}}
-    position = {"updateTime": 1_700_000_000_000}
+    position = {"entryTime": 1_700_000_000_000}
+    base = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
+    assert base.startswith("RECON_TEST-USDT_LONG_")
 
-    first = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
-    assert first.startswith("RECON_TEST-USDT_LONG_")
+    active = {base: {"closed": True}}
+    collided = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, active)
+    assert collided != base
+    assert collided.startswith(base + "_")
 
-    # Force the deterministic base to collide with a closed historical record.
-    digest = __import__("hashlib").sha256(
-        "TEST-USDT|LONG|100|1|1700000000000".encode("utf-8")
-    ).hexdigest()[:12].upper()
-    collided = f"RECON_TEST-USDT_LONG_{digest}"
-    assert collided == ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
-
-    new_id = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {collided: {"closed": True}})
-    assert new_id.startswith(collided + "_")
+    new_id = ro._reconciliation_event_id(
+        "TEST-USDT", "LONG", 100.0, 1.0, position,
+        {base: {"closed": True}, collided: {"closed": True}},
+    )
+    assert new_id.startswith(base + "_")
     assert new_id != collided
+
+
+
+def test_reconciliation_event_id_reuses_existing_suffixed_open_id():
+    import run_once as ro
+
+    position = {"entryTime": 1_700_000_000_000}
+    base = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
+    active_id = base + "_1700000000123"
+    active = {
+        base: {"closed": True},
+        active_id: {"closed": False},
+    }
+
+    event_id = ro._reconciliation_event_id(
+        "TEST-USDT", "LONG", 100.0, 1.0, position, active
+    )
+    assert event_id == active_id
+
+
+def test_reconciliation_event_id_ignores_changing_update_time():
+    import run_once as ro
+
+    active = {}
+    p1 = {"entryTime": 1_700_000_000_000, "updateTime": 1_700_000_100_000}
+    p2 = {"entryTime": 1_700_000_000_000, "updateTime": 1_700_000_200_000}
+    first = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, p1, active)
+    second = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, p2, active)
+    assert first == second
+
+def test_reconciliation_event_id_ignores_quantity_changes_after_partial_reduction():
+    import run_once as ro
+
+    position = {"entryTime": 1_700_000_000_000, "updateTime": 1_700_000_100_000}
+    first = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 1.0, position, {})
+    second = ro._reconciliation_event_id("TEST-USDT", "LONG", 100.0, 0.6, position, {first: {"closed": False}})
+    assert second == first
+
+
+def test_kline_rate_limit_is_not_retried_and_persists_cooldown(monkeypatch, tmp_path):
+    import event_engine.bingx as bx
+    import run_once as ro
+
+    calls = {"request": 0}
+    future_ms = int(__import__("time").time() * 1000) + 120_000
+    monkeypatch.setattr(ro, "KLINE_RATE_LIMIT_STATE", tmp_path / "bingx_kline_rate_limit.json")
+    ro._KLINE_RATE_LIMIT_CACHE.update(path="", cooldown_until_ms=0, loaded_ts=0.0)
+
+    def fake_request(*args, **kwargs):
+        calls["request"] += 1
+        return {
+            "code": 109429,
+            "msg": f"over 5 error code:109415 requests within 900000 ms for this api, please verify and fix it, can retry after time: {future_ms}",
+        }
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(ro, "fetch_klines", bx.fetch_klines)
+
+    try:
+        ro._fetch_klines_scan("TEST", "15m", 250)
+    except bx.BingXRateLimitError as exc:
+        assert exc.code == 109429
+        assert exc.retry_after_ms == future_ms
+    else:
+        raise AssertionError("rate-limit exception expected")
+
+    assert calls["request"] == 1
+    state = ro._load_json(ro.KLINE_RATE_LIMIT_STATE, {})
+    assert int(state["cooldown_until_ms"]) == future_ms
+
+    # A second call during the persisted cooldown must fail before HTTP.
+    try:
+        ro._fetch_klines_scan("TEST", "1h", 250)
+    except bx.BingXRateLimitError as exc:
+        assert exc.retry_after_ms == future_ms
+    else:
+        raise AssertionError("persisted cooldown expected")
+    assert calls["request"] == 1
+
+
+def test_kline_transient_error_keeps_bounded_retry(monkeypatch, tmp_path):
+    import run_once as ro
+
+    calls = {"fetch": 0}
+    monkeypatch.setattr(ro, "KLINE_RATE_LIMIT_STATE", tmp_path / "bingx_kline_rate_limit.json")
+    ro._KLINE_RATE_LIMIT_CACHE.update(path="", cooldown_until_ms=0, loaded_ts=0.0)
+    monkeypatch.setenv("BINGX_KLINE_SCAN_MIN_INTERVAL_SEC", "0")
+    monkeypatch.setenv("BINGX_KLINE_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("BINGX_KLINE_RETRY_BACKOFF_SEC", "0")
+
+    def transient(*args, **kwargs):
+        calls["fetch"] += 1
+        raise RuntimeError("temporary network failure")
+
+    monkeypatch.setattr(ro, "fetch_klines", transient)
+    try:
+        ro._fetch_klines_scan("TEST", "15m", 250)
+    except RuntimeError as exc:
+        assert "after 3 attempts" in str(exc)
+    else:
+        raise AssertionError("transient RuntimeError expected")
+    assert calls["fetch"] == 3
 
 
 def test_emergency_close_flattens_remaining_directional_position(monkeypatch):

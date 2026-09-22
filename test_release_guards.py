@@ -52,3 +52,10 @@ def test_kline_history_warms_ema200():
     for key in ("KLINE_LIMIT_1H", "KLINE_LIMIT_4H", "KLINE_LIMIT_1D"):
         line = next(l for l in workflow.splitlines() if l.strip().startswith(key + ":"))
         assert int(line.split('"')[1]) >= 400, line
+
+
+def test_kline_rate_limit_circuit_breaker_settings():
+    workflow = _workflow()
+    assert 'BINGX_KLINE_SCAN_MIN_INTERVAL_SEC: "1.25"' in workflow
+    assert 'BINGX_KLINE_RETRY_ATTEMPTS: "3"' in workflow
+    assert 'BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC: "900"' in workflow
