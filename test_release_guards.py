@@ -79,3 +79,48 @@ def test_release_has_cross_exchange_price_guard():
     workflow = _workflow()
     assert 'CROSS_EXCHANGE_PRICE_GUARD_ENABLED: "true"' in workflow
     assert 'MAX_CROSS_EXCHANGE_DRIFT_PCT: "1.00"' in workflow
+
+
+def test_release_pins_runner_and_installs_wireguard_without_unconditional_apt_update():
+    workflow = _workflow()
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert "Cache WireGuard package" in workflow
+    assert "key: wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}" in workflow
+    assert "apt-get update -qq" in workflow  # fallback only
+    assert "sudo apt-get update -y" not in workflow
+
+    assert "Detect WireGuard package version" in workflow
+
+
+def test_release_has_vpn_preflight_before_engine_and_cleanup_before_commit():
+    workflow = _workflow()
+    assert "Connect Proton WireGuard VPN" in workflow
+    assert "Binance Futures preflight" in workflow
+    assert '"$BASE/fapi/v1/exchangeInfo"' in workflow
+    assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in workflow
+    assert '"$BASE/fapi/v1/ticker/price?symbol=BTCUSDT"' in workflow
+    assert "Disconnect Proton WireGuard VPN" in workflow
+    assert workflow.index("Binance Futures preflight") < workflow.index("Run engine")
+    assert workflow.index("Disconnect Proton WireGuard VPN") < workflow.index("Commit state")
+
+
+def test_release_requires_wireguard_secret_and_country_guard():
+    workflow = _workflow()
+    assert 'WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}' in workflow
+    assert 'VPN_EXPECTED_COUNTRY: NL' in workflow
+    assert 'actual != expected.upper()' in workflow
+
+
+def test_release_has_manual_vpn_test_workflow():
+    from pathlib import Path
+
+    workflow = Path('.github/workflows/vpn-test.yml')
+    assert workflow.exists()
+    text = workflow.read_text(encoding='utf-8')
+    assert 'workflow_dispatch:' in text
+    assert 'wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}' in text
+    assert 'BASE="${BINANCE_BASE_URL%/}"' in text
+    assert '"$BASE/fapi/v1/exchangeInfo"' in text
+    assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in text
+    assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10"' in text
+    assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"' in text
