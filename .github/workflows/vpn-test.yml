@@ -1,4 +1,4 @@
-name: VPN + Binance Futures Connectivity Test
+name: VPN + Exchange API Deep Diagnostic
 
 on:
   workflow_dispatch:
@@ -9,11 +9,14 @@ permissions:
 jobs:
   vpn-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     env:
       BINANCE_BASE_URL: https://fapi.binance.com
+      BINGX_BASE_URL: https://open-api-vst.bingx.com
       VPN_EXPECTED_COUNTRY: NL
+      AUDIT_SYMBOLS_BINANCE: BTCUSDT,XRPUSDT,KAITOUSDT
+      AUDIT_SYMBOLS_BINGX: BTC-USDT,XRP-USDT,KAITO-USDT
 
     steps:
       - name: Set up Python
@@ -67,6 +70,14 @@ jobs:
 
           command -v resolvconf >/dev/null 2>&1 || sudo apt-get install -y resolvconf
 
+      - name: Prepare diagnostic directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf vpn-audit
+          mkdir -p vpn-audit/responses vpn-audit/pretty
+          echo "label|url|http_status|curl_exit|body_sha256|body_bytes" > vpn-audit/manifest.tsv
+
       - name: Connect Proton WireGuard VPN
         env:
           WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
@@ -74,67 +85,266 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${WIREGUARD_CONF:-}"
+
           printf '%s\n' "$WIREGUARD_CONF" | sudo tee /etc/wireguard/wg0.conf >/dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
+
+          echo '=== WIREGUARD STATE ==='
           sudo wg show wg0
 
-          curl -fsS --max-time 10 https://ipinfo.io/json -o /tmp/ipinfo.json
+          echo '=== OUTBOUND IP / GEO RESPONSE ==='
+          curl -sS --connect-timeout 10 --max-time 20 \
+            -D vpn-audit/ipinfo.headers \
+            -o vpn-audit/responses/ipinfo.json \
+            -w 'HTTP_STATUS=%{http_code}\nCURL_EXIT=%{exitcode}\n' \
+            https://ipinfo.io/json || true
+          cat vpn-audit/ipinfo.headers || true
+          cat vpn-audit/responses/ipinfo.json || true
+          printf '\n'
+
           python - <<'PY'
           import json
           from pathlib import Path
-          data = json.loads(Path('/tmp/ipinfo.json').read_text())
-          print(json.dumps({k: data.get(k) for k in ('ip', 'country', 'city', 'org')}, indent=2))
+          p = Path('vpn-audit/responses/ipinfo.json')
+          data = json.loads(p.read_text())
           expected = 'NL'
           actual = str(data.get('country', '')).upper()
+          print('IPINFO_PARSED=', json.dumps({k: data.get(k) for k in ('ip', 'country', 'region', 'city', 'org')}, sort_keys=True))
           if actual != expected:
               raise SystemExit(f'Unexpected VPN country: expected {expected}, got {actual}')
           PY
 
-      - name: Test Binance Futures API
+      - name: DNS and routing diagnostics
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${BINANCE_BASE_URL%/}"
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TMP_DIR"' EXIT
 
-          curl -fsS --max-time 15 "$BASE/fapi/v1/ping" -o "$TMP_DIR/ping.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/time" -o "$TMP_DIR/time.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/exchangeInfo" -o "$TMP_DIR/exchange.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10" -o "$TMP_DIR/klines.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10" -o "$TMP_DIR/klines4h.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10" -o "$TMP_DIR/klines15m.json"
-          curl -fsS --max-time 15 "$BASE/fapi/v1/ticker/price?symbol=BTCUSDT" -o "$TMP_DIR/ticker.json"
+          {
+            echo '=== DNS ==='
+            getent ahostsv4 fapi.binance.com || true
+            getent ahostsv4 open-api-vst.bingx.com || true
+            echo
+            echo '=== ROUTES ==='
+            ip -4 route || true
+            echo
+            echo '=== PUBLIC ROUTE CHECK ==='
+            curl -sS --connect-timeout 10 --max-time 20 https://fapi.binance.com/fapi/v1/ping || true
+            echo
+          } | tee vpn-audit/dns-routing.txt
 
-          TMP_DIR="$TMP_DIR" python - <<'PY'
+      - name: Run public API requests and save exact responses
+        shell: bash
+        run: |
+          set -u
+
+          request() {
+            local label="$1"
+            local url="$2"
+            local safe_label
+            safe_label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-zA-Z0-9._-' '_')"
+            local headers="vpn-audit/responses/${safe_label}.headers"
+            local body="vpn-audit/responses/${safe_label}.body"
+            local pretty="vpn-audit/pretty/${safe_label}.json"
+            local http_status curl_exit body_sha body_bytes
+
+            echo
+            echo "================================================================"
+            echo "REQUEST: $label"
+            echo "URL: $url"
+            echo "================================================================"
+
+            local status_file="${body}.status"
+
+            set +e
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -D "$headers" \
+              -o "$body" \
+              -w '%{http_code}' \
+              "$url" >"$status_file"
+            curl_exit=$?
+            set -e
+
+            http_status="$(cat "$status_file" 2>/dev/null || true)"
+            [ -n "$http_status" ] || http_status="000"
+
+            body_sha="$(sha256sum "$body" | awk '{print $1}')"
+            body_bytes="$(wc -c < "$body" | tr -d ' ')"
+
+            printf '%s|%s|%s|%s|%s|%s\n' \
+              "$label" "$url" "$http_status" "$curl_exit" "$body_sha" "$body_bytes" \
+              >> vpn-audit/manifest.tsv
+
+            echo "HTTP_STATUS=$http_status"
+            echo "CURL_EXIT=$curl_exit"
+            echo "BODY_SHA256=$body_sha"
+            echo "BODY_BYTES=$body_bytes"
+            echo '--- RESPONSE HEADERS ---'
+            cat "$headers" || true
+            echo '--- RESPONSE BODY ---'
+            if [ "$body_bytes" -le 262144 ]; then
+              cat "$body" || true
+            else
+              echo "[large body: full exact response is in the uploaded artifact]"
+              echo '--- BODY HEAD (8192 bytes) ---'
+              head -c 8192 "$body" || true
+              echo
+              echo '--- BODY TAIL (8192 bytes) ---'
+              tail -c 8192 "$body" || true
+            fi
+            echo
+
+            # Pretty-print JSON when possible; leave non-JSON bodies untouched.
+            python - "$body" "$pretty" <<'PY'
+          import json, sys
+          from pathlib import Path
+          src = Path(sys.argv[1])
+          dst = Path(sys.argv[2])
+          raw = src.read_text(errors='replace')
+          try:
+              obj = json.loads(raw)
+          except Exception:
+              dst.write_text(raw)
+          else:
+              dst.write_text(json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True))
+          PY
+          }
+
+          echo '================ BINANCE FUTURES: BASIC ================'
+          request 'binance_ping' \
+            "$BINANCE_BASE_URL/fapi/v1/ping"
+          request 'binance_time' \
+            "$BINANCE_BASE_URL/fapi/v1/time"
+          request 'binance_exchangeInfo' \
+            "$BINANCE_BASE_URL/fapi/v1/exchangeInfo"
+
+          for symbol in ${AUDIT_SYMBOLS_BINANCE//,/ }; do
+            request "binance_ticker_${symbol}" \
+              "$BINANCE_BASE_URL/fapi/v1/ticker/price?symbol=$symbol"
+          done
+
+          echo '================ BINANCE FUTURES: EXACT ENGINE KLINE SHAPES ================'
+          request 'binance_BTCUSDT_1h_limit10' \
+            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"
+          request 'binance_BTCUSDT_4h_limit10' \
+            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10"
+          request 'binance_BTCUSDT_15m_limit10' \
+            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"
+          request 'binance_BTCUSDT_1d_limit400' \
+            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=400"
+
+          echo '================ BINANCE FUTURES: REPRESENTATIVE LIVE SIGNAL SYMBOLS ================'
+          for symbol in XRPUSDT KAITOUSDT; do
+            request "binance_${symbol}_15m_limit250" \
+              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=15m&limit=250"
+            request "binance_${symbol}_1h_limit400" \
+              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=1h&limit=400"
+            request "binance_${symbol}_4h_limit400" \
+              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=4h&limit=400"
+            request "binance_${symbol}_1d_limit400" \
+              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=1d&limit=400"
+          done
+
+          echo '================ BINGX VST: PUBLIC ================'
+          request 'bingx_contracts' \
+            "$BINGX_BASE_URL/openApi/swap/v2/quote/contracts"
+
+          for symbol in ${AUDIT_SYMBOLS_BINGX//,/ }; do
+            request "bingx_${symbol}_1m_limit2" \
+              "$BINGX_BASE_URL/openApi/swap/v3/quote/klines?symbol=$symbol&interval=1m&limit=2"
+          done
+
+      - name: Parse and cross-check the captured public responses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
           import json
-          import os
           from pathlib import Path
 
-          root = Path(os.environ['TMP_DIR'])
-          exchange = json.loads((root / 'exchange.json').read_text())
-          active = [
-              row for row in exchange.get('symbols', [])
+          root = Path('vpn-audit/responses')
+
+          def read_json(name):
+              return json.loads((root / name).read_text())
+
+          checks = []
+
+          exchange = read_json('binance_exchangeInfo.body')
+          active_binance = {
+              str(row.get('symbol', '')).upper(): row
+              for row in exchange.get('symbols', [])
               if str(row.get('status', '')).upper() == 'TRADING'
               and str(row.get('contractType', '')).upper() == 'PERPETUAL'
               and str(row.get('quoteAsset', '')).upper() == 'USDT'
-          ]
-          if not any(str(row.get('symbol', '')).upper() == 'BTCUSDT' for row in active):
-              raise SystemExit('BTCUSDT missing from active USDT perpetuals')
+          }
 
-          for name in ('klines.json', 'klines4h.json', 'klines15m.json'):
-              rows = json.loads((root / name).read_text())
-              if not isinstance(rows, list) or len(rows) < 2:
-                  raise SystemExit(f'{name}: invalid response')
+          for symbol in ('BTCUSDT', 'XRPUSDT', 'KAITOUSDT'):
+              row = active_binance.get(symbol)
+              checks.append({
+                  'binance_symbol': symbol,
+                  'active_usdt_perpetual': bool(row),
+                  'contractType': row.get('contractType') if row else None,
+                  'status': row.get('status') if row else None,
+              })
 
-          ticker = json.loads((root / 'ticker.json').read_text())
-          if float(ticker.get('price', 0)) <= 0:
-              raise SystemExit(f'Invalid ticker: {ticker}')
+          bx = read_json('bingx_contracts.body')
+          bx_rows = bx.get('data', []) if isinstance(bx, dict) else []
+          by_symbol = {str(row.get('symbol', '')).upper(): row for row in bx_rows if isinstance(row, dict)}
+          for symbol in ('BTC-USDT', 'XRP-USDT', 'KAITO-USDT'):
+              row = by_symbol.get(symbol)
+              checks.append({
+                  'bingx_symbol': symbol,
+                  'contract_present': bool(row),
+                  'status': row.get('status') if row else None,
+                  'apiStateOpen': row.get('apiStateOpen') if row else None,
+              })
 
-          print(f'Binance Futures connectivity OK: active_usdt_perpetuals={len(active)}')
-          print(f"BTCUSDT price={ticker['price']}; 1h/4h/15m klines=OK")
+          print('=== PARSED CROSS-CHECKS ===')
+          print(json.dumps({
+              'binance_active_usdt_perpetuals': len(active_binance),
+              'bingx_contracts_returned': len(bx_rows),
+              'checks': checks,
+          }, indent=2, ensure_ascii=False, sort_keys=True))
+
+          for name in (
+              'binance_BTCUSDT_1h_limit10.body',
+              'binance_BTCUSDT_4h_limit10.body',
+              'binance_BTCUSDT_15m_limit10.body',
+          ):
+              rows = read_json(name)
+              print(f'{name}: rows={len(rows)} first_open={rows[0][0] if rows else None} last_open={rows[-1][0] if rows else None}')
+
+          for symbol in ('XRPUSDT', 'KAITOUSDT'):
+              for interval, limit in (('15m', 250), ('1h', 400), ('4h', 400), ('1d', 400)):
+                  name = f'binance_{symbol}_{interval}_limit{limit}.body'
+                  rows = read_json(name)
+                  print(f'{name}: rows={len(rows)} first_open={rows[0][0] if rows else None} last_open={rows[-1][0] if rows else None}')
+
+          for symbol in ('BTC-USDT', 'XRP-USDT', 'KAITO-USDT'):
+              name = f'bingx_{symbol}_1m_limit2.body'
+              rows = read_json(name)
+              data = rows.get('data') if isinstance(rows, dict) else None
+              print(f'{name}: code={rows.get("code") if isinstance(rows, dict) else None} rows={len(data) if isinstance(data, list) else None}')
           PY
+
+      - name: Publish diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-exchange-deep-diagnostic
+          path: vpn-audit/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Print manifest
+        if: always()
+        shell: bash
+        run: |
+          echo '================ FINAL REQUEST MANIFEST ================'
+          cat vpn-audit/manifest.tsv || true
 
       - name: Cleanup VPN
         if: always()
