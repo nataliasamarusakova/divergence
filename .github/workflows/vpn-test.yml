@@ -263,7 +263,7 @@ jobs:
           set -euo pipefail
 
           python - <<'PY'
-          import json
+          import json, math, re
           from pathlib import Path
 
           root = Path('vpn-audit/responses')
@@ -372,7 +372,6 @@ jobs:
 
           # Cross-exchange price sanity check using the latest returned candle.
           # This is observational only; no orders are placed.
-          import math, re
           for b_symbol, bx_symbol in (
               ('BTCUSDT', 'BTC-USDT'),
               ('XRPUSDT', 'XRP-USDT'),
