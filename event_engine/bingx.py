@@ -242,7 +242,9 @@ def to_bx_symbol(symbol: str) -> str | None:
 
 def contract_exists(symbol: str) -> bool:
     c = get_contract(symbol)
-    status_ok = c and str(c.get("status", "")).strip() in {"1", "1.0"}
+    if not isinstance(c, dict):
+        return False
+    status_ok = str(c.get("status", "")).strip() in {"1", "1.0"}
     api_open = str(c.get("apiStateOpen", "")).strip().lower() == "true"
     return bool(status_ok and api_open)
 
