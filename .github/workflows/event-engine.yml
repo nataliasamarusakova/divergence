@@ -9,6 +9,9 @@ permissions:
   contents: write
 
 concurrency:
+  # _file_lock_pace/_acquire_scan_slot are intentionally process-local. This
+  # workflow-level group prevents two GitHub-hosted runners for the same event
+  # engine from scanning BingX concurrently and bypassing that local pacing.
   group: divergence-engine
   cancel-in-progress: false
 
@@ -32,6 +35,9 @@ jobs:
       EXECUTION_ENABLED: "true"
       EXECUTION_MODE: vst
       REQUIRE_CVD_CONFIRMATION: "false"
+      DIVERGENCE_VOLUME_CONFIRMATION_ENABLED: "false"
+      ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE: "false"
+      ENABLE_HARMONIC_PATTERN_ENGINE: "false"
       REQUIRE_15M_TRIGGER: "true"
       MAX_TRIGGER_DELAY_MIN: "30"
       MAX_TRIGGER_TO_ORDER_DELAY_MIN: "8"
@@ -50,6 +56,10 @@ jobs:
       LIQUIDATION_CASCADE_FVG_RETEST_MAX_DELAY_MIN: "90"
       CRT_RETEST_MAX_DELAY_MIN: "60"
       KLINE_LIMIT_1D: "400"
+      BINGX_KLINE_SCAN_MIN_INTERVAL_SEC: "1.25"
+      BINGX_KLINE_RETRY_ATTEMPTS: "3"
+      BINGX_KLINE_RETRY_BACKOFF_SEC: "1.0"
+      BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC: "900"
       REQUIRE_4H_CONTEXT_FOR_1H: "true"
       ENABLE_MACD_4H_ENGINE: "true"
       ENABLE_MA_COMPRESSION_ENGINE: "true"
