@@ -9,6 +9,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _legacy_divergence_defaults(monkeypatch):
+    """Keep legacy unit cases deterministic; production defaults stay explicit in release config."""
+    monkeypatch.setenv("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "false")
+    import run_once as _ro
+    monkeypatch.setattr(_ro, "MARKET_DATA_SOURCE", "bingx")
+    monkeypatch.setattr(_ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
+
+
 from event_engine.coinalyze import parse_number, CoinalyzeRow
 from event_engine.signals import (
     _rsi,
@@ -349,6 +359,23 @@ def test_rsi_matches_wilder_sma_seed_reference():
     assert float(diff.max()) < 0.1
 
 
+def test_execute_new_position_blocks_cross_exchange_drift(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "MARKET_DATA_SOURCE", "binance")
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
+    monkeypatch.setattr(ro, "MAX_CROSS_EXCHANGE_DRIFT_PCT", 1.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 102.0)
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: pytest.fail("BingX order must not be sent"))
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        "EVT_CROSS_DRIFT",
+    )
+    assert out["status"] == "CROSS_EXCHANGE_DRIFT_EXCEEDED"
+    assert out["execution_quality"]["cross_exchange_drift_pct"] == pytest.approx(1.960784, rel=1e-5)
+
+
 def test_execute_new_position_defines_pre_order_price(monkeypatch):
     import run_once as ro
     monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 3.0)
@@ -508,7 +535,7 @@ def test_scheduler_uses_rate_limited_scan_wrapper():
     import run_once as ro
     import inspect
     src = inspect.getsource(ro._refresh_timeframe_events)
-    assert "_fetch_klines_scan" in src
+    assert "_fetch_market_klines_scan" in src
 
 
 def test_successful_scan_persists_watermark_after_event_emission(monkeypatch, tmp_path):
@@ -657,7 +684,7 @@ def test_cmf_uses_close_location_and_zero_range_guard():
     assert flat_out["cmf"].iloc[-1] == pytest.approx(0.0)
 
 
-def test_volume_confirmed_divergence_is_opt_in_and_enforces_both_thresholds(monkeypatch):
+def test_volume_confirmed_divergence_defaults_on_and_enforces_both_thresholds(monkeypatch):
     import event_engine.signals as sig
 
     df = _generate_synthetic_candles(90)
@@ -678,6 +705,10 @@ def test_volume_confirmed_divergence_is_opt_in_and_enforces_both_thresholds(monk
     monkeypatch.setattr(sig, "_pivots", lambda work, left=3, right=2: ([30, 50], []))
 
     monkeypatch.delenv("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", raising=False)
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
+    assert not any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
+
+    monkeypatch.setenv("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "false")
     events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=10, max_bars=30, min_delta_atr=0.1)
     assert any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
 
@@ -2510,7 +2541,7 @@ def test_expected_engine_registry_contains_v5_and_smc_engines():
         "DIVERGENCE", "VOLATILITY_SQUEEZE", "MACD_4H", "MA_COMPRESSION",
         "BREAKOUT_MOMENTUM", "DONCHIAN_RETEST", "LIQUIDITY_SWEEP", "EMA_PULLBACK",
         "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
-        "LIQUIDATION_CASCADE_FVG", "CRT",
+        "LIQUIDATION_CASCADE_FVG", "CRT", "VOLUME_PROFILE_DIVERGENCE", "HARMONIC_PATTERN",
     }
 
 
@@ -2721,6 +2752,25 @@ def test_volume_profile_divergence_detects_hvn_accumulation_proxy():
     assert ev["event_fact"]["volume_profile_method"] == "ohlcv_typical_price_proxy"
     assert ev["event_fact"]["hvn_growth_ratio"] >= 1.10
     assert ev["event_fact"]["price_left_hvn"] is True
+
+
+def test_volume_profile_does_not_repeat_after_hvn_transition():
+    from event_engine.signals import detect_volume_profile_divergence
+
+    n = 100
+    df = pd.DataFrame({
+        "high": [101.0] * n,
+        "low": [99.0] * n,
+        "close": [100.0] * n,
+        "volume": [100.0] * n,
+        "close_time": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+    })
+    df.loc[80:97, "volume"] = 150.0
+    df.loc[98:99, ["high", "low", "close"]] = [91.0, 89.0, 90.0]
+    df.loc[98:99, "volume"] = 150.0
+
+    events = detect_volume_profile_divergence(df, "TEST-USDT", "1h", lookback=100, recent_bars=20)
+    assert events == []
 
 
 def test_harmonic_gartley_uses_confirmed_alternating_pivots(monkeypatch):

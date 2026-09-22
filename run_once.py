@@ -12,12 +12,20 @@ import pandas as pd
 import requests
 
 from event_engine.coinalyze import fetch_data
+from event_engine.binance import (
+    BinanceRateLimitError,
+    BinanceSymbolUnavailableError,
+    contract_exists as binance_contract_exists,
+    fetch_klines as fetch_binance_klines,
+    fetch_price as fetch_binance_price,
+)
 from event_engine.bingx import (
     API_KEY,
     SECRET_KEY,
     BASE_URL,
     refresh_contracts,
     get_contract,
+    contract_exists as bingx_contract_exists,
     to_bx_symbol,
     fetch_klines,
     BingXRateLimitError,
@@ -92,8 +100,12 @@ HEALTH = DATA / "health.jsonl"
 TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
 EVENT_CACHE = DATA / "recent_event_cache.json"
 KLINE_RATE_LIMIT_STATE = DATA / "bingx_kline_rate_limit.json"
+BINANCE_RATE_LIMIT_STATE = DATA / "binance_market_rate_limit.json"
 _KLINE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
-# BingX Kline endpoint is rate-limited per IP; serialize heavyweight scan requests.
+_BINANCE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
+MARKET_DATA_SOURCE = os.environ.get("MARKET_DATA_SOURCE", "binance").strip().lower()
+# Binance is the signal/market-data venue; BingX remains the execution venue.
+# Coinalyze remains an independent context/derivatives source.
 BAR_CLOSE_GRACE_MIN = float(os.environ.get("BAR_CLOSE_GRACE_MIN", "2"))
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
@@ -104,8 +116,8 @@ MIN_OI = float(os.environ.get("MIN_OPEN_INTEREST", "10000000"))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "false").lower() == "true"
 REQUIRE_CVD = os.environ.get("REQUIRE_CVD_CONFIRMATION", "false").lower() == "true"
-ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE", "false").lower() == "true"
-ENABLE_HARMONIC_PATTERN_ENGINE = os.environ.get("ENABLE_HARMONIC_PATTERN_ENGINE", "false").lower() == "true"
+ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE", "true").lower() == "true"
+ENABLE_HARMONIC_PATTERN_ENGINE = os.environ.get("ENABLE_HARMONIC_PATTERN_ENGINE", "true").lower() == "true"
 CVD_MIN_CONFIRMATION = float(os.environ.get("MIN_CVD24_CONFIRMATION", "55"))
 REQUIRE_TRIGGER = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
 MAX_AGE = int(os.environ.get("MAX_EVENT_AGE_MIN", "60"))
@@ -148,6 +160,8 @@ ENABLE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_DIVERGENCE_ENGINE", "true").lo
 DIVERGENCE_SHADOW_ONLY = os.environ.get("DIVERGENCE_SHADOW_ONLY", "false").lower() == "true"
 DIVERGENCE_SHADOW_STATE = DATA / "divergence_shadow_trades.json"
 MAX_PRE_ORDER_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_PRE_ORDER_DRIFT_REJECTIONS", "3")))
+CROSS_EXCHANGE_PRICE_GUARD_ENABLED = os.environ.get("CROSS_EXCHANGE_PRICE_GUARD_ENABLED", "true").lower() == "true"
+MAX_CROSS_EXCHANGE_DRIFT_PCT = float(os.environ.get("MAX_CROSS_EXCHANGE_DRIFT_PCT", "1.00"))
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
 ENABLE_MA_COMPRESSION_ENGINE = os.environ.get("ENABLE_MA_COMPRESSION_ENGINE", "true").lower() == "true"
 ENABLE_BREAKOUT_MOMENTUM_ENGINE = os.environ.get("ENABLE_BREAKOUT_MOMENTUM_ENGINE", "true").lower() == "true"
@@ -172,7 +186,7 @@ EXPECTED_EVENT_ENGINES = {
     "DIVERGENCE", "VOLATILITY_SQUEEZE", "MACD_4H", "MA_COMPRESSION",
     "BREAKOUT_MOMENTUM", "DONCHIAN_RETEST", "LIQUIDITY_SWEEP", "EMA_PULLBACK",
     "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
-    "LIQUIDATION_CASCADE_FVG", "CRT",
+    "LIQUIDATION_CASCADE_FVG", "CRT", "VOLUME_PROFILE_DIVERGENCE", "HARMONIC_PATTERN",
 }
 
 
@@ -687,6 +701,98 @@ def _raise_if_kline_rate_limited(symbol: str, timeframe: str) -> None:
         )
 
 
+def _load_binance_rate_limit_state() -> dict[str, Any]:
+    """Load persisted Binance market-data cooldown shared across workflow runs."""
+    cache_path = str(BINANCE_RATE_LIMIT_STATE.resolve())
+    now = time.monotonic()
+    if _BINANCE_RATE_LIMIT_CACHE.get("path") == cache_path and now - float(_BINANCE_RATE_LIMIT_CACHE.get("loaded_ts", 0.0)) < 5.0:
+        return dict(_BINANCE_RATE_LIMIT_CACHE)
+    raw = _load_json(BINANCE_RATE_LIMIT_STATE, {})
+    state = raw if isinstance(raw, dict) else {}
+    try:
+        cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
+    except (TypeError, ValueError):
+        cooldown_until_ms = 0
+    _BINANCE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, cooldown_until_ms), loaded_ts=now)
+    return dict(_BINANCE_RATE_LIMIT_CACHE)
+
+
+def _set_binance_rate_limit_cooldown(exc: BinanceRateLimitError) -> int:
+    now_ms = int(time.time() * 1000)
+    retry_after_ms = int(exc.retry_after_ms or 0)
+    fallback_ms = now_ms + int(60_000)
+    previous = _load_binance_rate_limit_state()
+    cooldown_until_ms = retry_after_ms if retry_after_ms > now_ms + 1000 else fallback_ms
+    cooldown_until_ms = max(cooldown_until_ms, int(previous.get("cooldown_until_ms", 0) or 0))
+    state = {
+        "cooldown_until_ms": cooldown_until_ms,
+        "saved_at_ms": now_ms,
+        "code": exc.code,
+        "reason": str(exc),
+    }
+    _save_json_atomic(BINANCE_RATE_LIMIT_STATE, state)
+    _BINANCE_RATE_LIMIT_CACHE.update(
+        path=str(BINANCE_RATE_LIMIT_STATE.resolve()),
+        cooldown_until_ms=cooldown_until_ms,
+        loaded_ts=time.monotonic(),
+    )
+    remaining = max(0, cooldown_until_ms - now_ms)
+    log.error(
+        "[BINANCE_KLINE] RATE_LIMIT cooldown=%.1fs; no further market-data requests until %d",
+        remaining / 1000.0, cooldown_until_ms,
+    )
+    return cooldown_until_ms
+
+
+def _raise_if_binance_rate_limited(symbol: str, timeframe: str) -> None:
+    state = _load_binance_rate_limit_state()
+    cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
+    now_ms = int(time.time() * 1000)
+    if cooldown_until_ms > now_ms:
+        remaining = cooldown_until_ms - now_ms
+        raise BinanceRateLimitError(
+            f"[BINANCE] market-data cooldown active for {symbol}/{timeframe}; retry after {cooldown_until_ms} ({remaining / 1000.0:.1f}s remaining)",
+            code=state.get("code"),
+            retry_after_ms=cooldown_until_ms,
+        )
+
+
+def _fetch_market_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch signal-side candles from the configured market-data source.
+
+    Production default is Binance. BingX remains available only when explicitly
+    selected via MARKET_DATA_SOURCE=bingx, which keeps execution and market-data
+    concerns separate without removing the existing BingX client.
+    """
+    source = MARKET_DATA_SOURCE
+    if source == "bingx":
+        return _fetch_klines_scan(symbol, timeframe, limit)
+    if source != "binance":
+        raise RuntimeError(f"Unsupported MARKET_DATA_SOURCE={source!r}; expected 'binance' or 'bingx'")
+
+    _raise_if_binance_rate_limited(symbol, timeframe)
+    try:
+        result = fetch_binance_klines(symbol, timeframe, limit)
+        log.info("[BINANCE_KLINE] END %s/%s rows=%d.", symbol, timeframe, len(result or []))
+        return result
+    except BinanceRateLimitError as exc:
+        _set_binance_rate_limit_cooldown(exc)
+        raise
+
+
+def _fetch_market_price(symbol: str) -> float:
+    if MARKET_DATA_SOURCE == "bingx":
+        return _current_close_price(symbol)
+    if MARKET_DATA_SOURCE != "binance":
+        raise RuntimeError(f"Unsupported MARKET_DATA_SOURCE={MARKET_DATA_SOURCE!r}")
+    _raise_if_binance_rate_limited(symbol, "ticker")
+    try:
+        return fetch_binance_price(symbol)
+    except BinanceRateLimitError as exc:
+        _set_binance_rate_limit_cooldown(exc)
+        raise
+
+
 def _file_lock_pace(lock_dir: Path, min_interval: float) -> float:
     """Backward-compatible name; pacing is intentionally process-local.
 
@@ -799,7 +905,7 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             continue
         tf_stats = _tf_stats(stats, timeframe)
         try:
-            klines = _fetch_klines_scan(symbol, timeframe, limit)
+            klines = _fetch_market_klines_scan(symbol, timeframe, limit)
             if len(klines) < 60:
                 log.warning("[SIGNALS] %s %s returned only %d candles; watermark deferred.", timeframe.upper(), symbol, len(klines))
                 continue
@@ -851,6 +957,8 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             tf_stats["squeeze_events"] += len(sqs) + len(liqs)
             stats["events_total"] += len(divs) + len(vp_events) + len(harmonic_events) + len(sqs) + len(liqs) + len(strategy_events)
             for ev in divs + vp_events + harmonic_events + sqs + liqs + strategy_events:
+                ev.setdefault("event_fact", {})["market_data_source"] = MARKET_DATA_SOURCE
+                ev["event_fact"]["execution_exchange"] = "BingX"
                 if not _event_is_fresh(ev, now_ms, MAX_AGE):
                     continue
                 fresh.append(ev)
@@ -866,11 +974,17 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             # across workflow timeout/interruption.
             _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
             _save_timeframe_scan_state(scan_state)
-        except BingXRateLimitError as exc:
+        except (BinanceRateLimitError, BingXRateLimitError) as exc:
             stats["scan_errors"] += 1
             tf_stats["scan_errors"] += 1
-            log.warning("[SIGNALS] %s Kline rate limit reached on %s; stopping this timeframe scan for the cycle: %s", timeframe.upper(), symbol, exc)
+            venue = "BINANCE" if MARKET_DATA_SOURCE == "binance" else "BINGX"
+            log.warning("[SIGNALS] %s %s Kline rate limit reached on %s; stopping this timeframe scan for the cycle: %s", venue, timeframe.upper(), symbol, exc)
             break
+        except BinanceSymbolUnavailableError as exc:
+            stats["scan_errors"] += 1
+            tf_stats["scan_errors"] += 1
+            log.warning("[SIGNALS] %s %s market-data symbol unavailable on Binance; skipping symbol: %s", timeframe.upper(), symbol, exc)
+            continue
         except Exception as exc:
             stats["scan_errors"] += 1
             tf_stats["scan_errors"] += 1
@@ -1991,7 +2105,7 @@ def reconcile_all_open_positions() -> None:
         if sl_pct <= 0:
             sl_pct = 2.0
         try:
-            k1 = _fetch_klines_scan(bx_symbol, "1h", limit=30)
+            k1 = _fetch_market_klines_scan(bx_symbol, "1h", limit=30)
             if not matched_trade and len(k1) >= 20:
                 df1 = pd.DataFrame(k1)
                 for col in ("high", "low", "close"):
@@ -2108,9 +2222,61 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     event_type_for_risk = str(setup.get("event_type", "")).upper()
     drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type_for_risk) else MAX_ENTRY_DRIFT_PCT
     try:
+        # Execution remains on BingX; this reference is the actual BingX market price.
         live_reference = _current_close_price(symbol)
     except Exception as exc:
         return {"status": "PRE_ORDER_PRICE_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "error": str(exc)}
+
+    execution_quality_guard = {}
+    if CROSS_EXCHANGE_PRICE_GUARD_ENABLED and MARKET_DATA_SOURCE == "binance":
+        try:
+            binance_live_price = fetch_binance_price(symbol)
+        except BinanceRateLimitError as exc:
+            _set_binance_rate_limit_cooldown(exc)
+            return {
+                "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "error": str(exc),
+            }
+        except BinanceSymbolUnavailableError as exc:
+            return {
+                "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "error": str(exc),
+            }
+        except Exception as exc:
+            # Do not place a BingX order when the Binance execution-quality reference cannot be verified.
+            return {
+                "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "error": str(exc),
+            }
+        if live_reference is None or float(live_reference) <= 0 or binance_live_price <= 0:
+            return {
+                "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "error": f"invalid BingX/Binance reference prices: bingx={live_reference}, binance={binance_live_price}",
+            }
+        cross_exchange_drift_pct = abs(float(live_reference) - float(binance_live_price)) / float(binance_live_price) * 100.0
+        execution_quality_guard = {
+            "binance_live_price": float(binance_live_price),
+            "bingx_live_price": float(live_reference),
+            "cross_exchange_drift_pct": float(cross_exchange_drift_pct),
+            "cross_exchange_drift_limit_pct": float(MAX_CROSS_EXCHANGE_DRIFT_PCT),
+        }
+        if MAX_CROSS_EXCHANGE_DRIFT_PCT > 0 and cross_exchange_drift_pct > MAX_CROSS_EXCHANGE_DRIFT_PCT:
+            return {
+                "status": "CROSS_EXCHANGE_DRIFT_EXCEEDED",
+                "mode": EXECUTION_MODE,
+                "order_id": None,
+                "error": f"Binance/BingX price drift={cross_exchange_drift_pct:.6f}% > limit={MAX_CROSS_EXCHANGE_DRIFT_PCT:.6f}%",
+                "execution_quality": execution_quality_guard,
+            }
+
     pre_order_drift = _entry_drift_pct(_safe_float(setup.get("signal_price", price), price), live_reference, direction) if live_reference else None
     trigger_price = _safe_float((setup.get("trigger") or {}).get("trigger_price"), 0.0)
     trigger_live_drift = _entry_drift_pct(trigger_price, live_reference, direction) if trigger_price > 0 and live_reference else None
@@ -2204,6 +2370,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     execution_quality["signal_to_pre_order_drift_pct"] = pre_order_drift
     execution_quality["trigger_to_pre_order_drift_pct"] = trigger_live_drift
     execution_quality["pre_order_price"] = live_reference
+    execution_quality.update(execution_quality_guard)
     fill_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     log.info(
         "[EXECUTION] Fill confirmed: %s %s at avgPrice=%.8g (Qty: %.8g, Slippage: %+.2f%%)",
@@ -2423,7 +2590,7 @@ def main() -> None:
     try:
         log.info("[ENGINE_STAGE] BTC regime fetch START (1h, limit=10)...")
         stage_started = time.monotonic()
-        btc_klines = _fetch_klines_scan("BTC-USDT", "1h", limit=10)
+        btc_klines = _fetch_market_klines_scan("BTCUSDT", "1h", limit=10)
         log.info("[ENGINE_STAGE] BTC regime fetch END in %.2fs; rows=%d.", time.monotonic() - stage_started, len(btc_klines or []))
         if btc_klines:
             btc_regime_df = pd.DataFrame(btc_klines)
@@ -2535,8 +2702,22 @@ def main() -> None:
                 continue
 
             stats["liquidity_candidates"] += 1
-            if not get_contract(r.symbol):
+            if not bingx_contract_exists(r.symbol):
+                # A symbol may remain visible in cached/Coinalyze universe data
+                # while BingX has paused trading. Never create a candidate that
+                # can only fail later at execution time.
                 continue
+            if MARKET_DATA_SOURCE == "binance":
+                try:
+                    if not binance_contract_exists(r.symbol):
+                        continue
+                except BinanceRateLimitError as exc:
+                    _set_binance_rate_limit_cooldown(exc)
+                    stats["scan_errors"] += 1
+                    log.error("[BINANCE] exchangeInfo rate limit reached while building candidate universe; stopping candidate build: %s", exc)
+                    break
+                except BinanceSymbolUnavailableError:
+                    continue
 
             stats["contract_candidates"] += 1
             candidates.append(r)
@@ -2548,7 +2729,7 @@ def main() -> None:
         candidates = candidates[:MAX_CANDIDATES]
 
     stats["candidates_scanned"] = len(candidates)
-    log.info("[UNIVERSE] %d liquidity candidates ($%.0fM Vol, $%.0fM OI) -> %d scanned on BingX.", stats["liquidity_candidates"], MIN_VOL/1e6, MIN_OI/1e6, len(candidates))
+    log.info("[UNIVERSE] %d liquidity candidates ($%.0fM Vol, $%.0fM OI) -> %d scanned via %s / executed on BingX.", stats["liquidity_candidates"], MIN_VOL/1e6, MIN_OI/1e6, len(candidates), MARKET_DATA_SOURCE.upper())
 
     seen_events = load_ids(EVENTS)
     executed_event_ids = load_successful_trade_ids(TRADES)
@@ -2683,12 +2864,17 @@ def main() -> None:
                     stats["trigger_data_failed"] += 1
                     continue
                 try:
-                    k15 = _fetch_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
-                except BingXRateLimitError as exc:
+                    k15 = _fetch_market_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
+                except (BinanceRateLimitError, BingXRateLimitError) as exc:
                     d15_rate_limited = True
                     stats["trigger_data_failed"] += 1
                     stats["scan_errors"] += 1
-                    log.warning("[SIGNALS] 15M rate limited for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
+                    log.warning("[SIGNALS] 15M market-data rate limited for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
+                    continue
+                except BinanceSymbolUnavailableError as exc:
+                    d15_rate_limited = True
+                    stats["trigger_data_failed"] += 1
+                    log.warning("[SIGNALS] 15M Binance symbol unavailable for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
                     continue
                 except Exception as exc:
                     stats["trigger_data_failed"] += 1
@@ -2721,7 +2907,7 @@ def main() -> None:
                 htf_context = htf_context_cache.get(cache_key)
                 if htf_context is None or (htf_context.get("error") and not htf_context.get("rate_limited")):
                     try:
-                        kctx = _fetch_klines_scan(symbol, context_tf, context_limit)
+                        kctx = _fetch_market_klines_scan(symbol, context_tf, context_limit)
                         cdf = pd.DataFrame(kctx)
                         if len(kctx) >= 60:
                             cdf = add_cvd(cdf)
@@ -2731,8 +2917,11 @@ def main() -> None:
                         else:
                             htf_context = {"df": None}
                         htf_context_cache[cache_key] = htf_context
-                    except BingXRateLimitError as exc:
+                    except (BinanceRateLimitError, BingXRateLimitError) as exc:
                         htf_context = {"df": None, "error": str(exc), "rate_limited": True}
+                        htf_context_cache[cache_key] = htf_context
+                    except BinanceSymbolUnavailableError as exc:
+                        htf_context = {"df": None, "error": str(exc), "symbol_unavailable": True}
                         htf_context_cache[cache_key] = htf_context
                     except Exception as exc:
                         htf_context = {"df": None, "error": str(exc)}
@@ -2839,7 +3028,7 @@ def main() -> None:
 
             if symbol not in risk_1h_cache:
                 try:
-                    k1_risk = _fetch_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
+                    k1_risk = _fetch_market_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
                     if len(k1_risk) < 20:
                         stats["trigger_data_failed"] += 1
                         continue

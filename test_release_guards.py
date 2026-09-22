@@ -59,3 +59,23 @@ def test_kline_rate_limit_circuit_breaker_settings():
     assert 'BINGX_KLINE_SCAN_MIN_INTERVAL_SEC: "1.25"' in workflow
     assert 'BINGX_KLINE_RETRY_ATTEMPTS: "3"' in workflow
     assert 'BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC: "900"' in workflow
+
+
+def test_release_uses_binance_for_signal_market_data_and_bingx_for_execution():
+    workflow = _workflow()
+    assert 'MARKET_DATA_SOURCE: binance' in workflow
+    assert 'BINGX_BASE_URL: https://open-api-vst.bingx.com' in workflow
+    assert 'EXECUTION_MODE: vst' in workflow
+
+
+def test_release_enables_requested_signal_engines():
+    workflow = _workflow()
+    assert 'DIVERGENCE_VOLUME_CONFIRMATION_ENABLED: "true"' in workflow
+    assert 'ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE: "true"' in workflow
+    assert 'ENABLE_HARMONIC_PATTERN_ENGINE: "true"' in workflow
+
+
+def test_release_has_cross_exchange_price_guard():
+    workflow = _workflow()
+    assert 'CROSS_EXCHANGE_PRICE_GUARD_ENABLED: "true"' in workflow
+    assert 'MAX_CROSS_EXCHANGE_DRIFT_PCT: "1.00"' in workflow
