@@ -223,3 +223,10 @@ def test_scan_errors_are_preserved_by_stage():
     }
     assert tf_stats["scan_errors"] == 1
 
+
+
+def test_bingx_contract_exists_returns_false_for_unknown_symbol(monkeypatch):
+    import event_engine.bingx as bingx
+
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: None)
+    assert bingx.contract_exists("XAU") is False
