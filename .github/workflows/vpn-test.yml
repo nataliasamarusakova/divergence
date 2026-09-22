@@ -136,6 +136,7 @@ jobs:
       - name: Run public API requests and save exact responses
         shell: bash
         run: |
+          BASE="${BINANCE_BASE_URL%/}"
           set -u
 
           request() {
@@ -214,37 +215,37 @@ jobs:
 
           echo '================ BINANCE FUTURES: BASIC ================'
           request 'binance_ping' \
-            "$BINANCE_BASE_URL/fapi/v1/ping"
+            "$BASE/fapi/v1/ping"
           request 'binance_time' \
-            "$BINANCE_BASE_URL/fapi/v1/time"
+            "$BASE/fapi/v1/time"
           request 'binance_exchangeInfo' \
-            "$BINANCE_BASE_URL/fapi/v1/exchangeInfo"
+            "$BASE/fapi/v1/exchangeInfo"
 
           for symbol in ${AUDIT_SYMBOLS_BINANCE//,/ }; do
             request "binance_ticker_${symbol}" \
-              "$BINANCE_BASE_URL/fapi/v1/ticker/price?symbol=$symbol"
+              "$BASE/fapi/v1/ticker/price?symbol=$symbol"
           done
 
           echo '================ BINANCE FUTURES: EXACT ENGINE KLINE SHAPES ================'
           request 'binance_BTCUSDT_1h_limit10' \
-            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"
+            "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"
           request 'binance_BTCUSDT_4h_limit10' \
-            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10"
+            "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10"
           request 'binance_BTCUSDT_15m_limit10' \
-            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"
+            "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"
           request 'binance_BTCUSDT_1d_limit400' \
-            "$BINANCE_BASE_URL/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=400"
+            "$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=400"
 
           echo '================ BINANCE FUTURES: REPRESENTATIVE LIVE SIGNAL SYMBOLS ================'
           for symbol in XRPUSDT KAITOUSDT; do
             request "binance_${symbol}_15m_limit250" \
-              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=15m&limit=250"
+              "$BASE/fapi/v1/klines?symbol=$symbol&interval=15m&limit=250"
             request "binance_${symbol}_1h_limit400" \
-              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=1h&limit=400"
+              "$BASE/fapi/v1/klines?symbol=$symbol&interval=1h&limit=400"
             request "binance_${symbol}_4h_limit400" \
-              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=4h&limit=400"
+              "$BASE/fapi/v1/klines?symbol=$symbol&interval=4h&limit=400"
             request "binance_${symbol}_1d_limit400" \
-              "$BINANCE_BASE_URL/fapi/v1/klines?symbol=$symbol&interval=1d&limit=400"
+              "$BASE/fapi/v1/klines?symbol=$symbol&interval=1d&limit=400"
           done
 
           echo '================ BINGX VST: PUBLIC ================'
