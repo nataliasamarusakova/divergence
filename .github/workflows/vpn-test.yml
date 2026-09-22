@@ -268,10 +268,12 @@ jobs:
           root = Path('vpn-audit/responses')
 
           def read_json(name):
-              return json.loads((root / name).read_text())
+              path = root / name.lower()
+              return json.loads(path.read_text())
 
           checks = []
 
+          # The request() helper normalizes filenames to lowercase.
           exchange = read_json('binance_exchangeInfo.body')
           active_binance = {
               str(row.get('symbol', '')).upper(): row
@@ -309,6 +311,20 @@ jobs:
               'checks': checks,
           }, indent=2, ensure_ascii=False, sort_keys=True))
 
+          failures = []
+
+          for item in checks:
+              if item.get('binance_symbol'):
+                  if not item.get('active_usdt_perpetual'):
+                      failures.append(f"Binance missing active USDT perpetual: {item['binance_symbol']}")
+              if item.get('bingx_symbol'):
+                  if not item.get('contract_present'):
+                      failures.append(f"BingX missing contract: {item['bingx_symbol']}")
+                  elif str(item.get('status')) != '1':
+                      failures.append(f"BingX contract not status=1: {item['bingx_symbol']} status={item.get('status')}")
+                  elif str(item.get('apiStateOpen')).lower() != 'true':
+                      failures.append(f"BingX contract apiStateOpen != true: {item['bingx_symbol']} value={item.get('apiStateOpen')}")
+
           for name in (
               'binance_BTCUSDT_1h_limit10.body',
               'binance_BTCUSDT_4h_limit10.body',
@@ -327,7 +343,61 @@ jobs:
               name = f'bingx_{symbol}_1m_limit2.body'
               rows = read_json(name)
               data = rows.get('data') if isinstance(rows, dict) else None
-              print(f'{name}: code={rows.get("code") if isinstance(rows, dict) else None} rows={len(data) if isinstance(data, list) else None}')
+              code = rows.get('code') if isinstance(rows, dict) else None
+              count = len(data) if isinstance(data, list) else None
+              print(f'{name}: code={code} rows={count}')
+              if code != 0:
+                  failures.append(f'BingX kline code != 0 for {symbol}: {code}')
+              if count != 2:
+                  failures.append(f'BingX kline row count != 2 for {symbol}: {count}')
+
+          # Verify the exact HTTP layer captured by request(): every request
+          # in the manifest must be HTTP 200 with curl exit 0.
+          manifest = Path('vpn-audit/manifest.tsv').read_text().splitlines()[1:]
+          for line in manifest:
+              parts = line.split('|')
+              if len(parts) != 6:
+                  failures.append(f'Bad manifest row: {line}')
+                  continue
+              label, url, status, curl_exit, body_sha, body_bytes = parts
+              if status != '200' or curl_exit != '0':
+                  failures.append(
+                      f'HTTP transport failure: {label} status={status} curl_exit={curl_exit}'
+                  )
+              if not re.fullmatch(r'[0-9a-f]{64}', body_sha):
+                  failures.append(f'Invalid SHA-256 for {label}: {body_sha}')
+              if not body_bytes.isdigit():
+                  failures.append(f'Invalid body byte count for {label}: {body_bytes}')
+
+          # Cross-exchange price sanity check using the latest returned candle.
+          # This is observational only; no orders are placed.
+          import math, re
+          for b_symbol, bx_symbol in (
+              ('BTCUSDT', 'BTC-USDT'),
+              ('XRPUSDT', 'XRP-USDT'),
+              ('KAITOUSDT', 'KAITO-USDT'),
+          ):
+              bt = read_json(f'binance_ticker_{b_symbol}.body')
+              bxk = read_json(f'bingx_{bx_symbol}_1m_limit2.body')
+              try:
+                  bp = float(bt['price'])
+                  bxp = float(bxk['data'][0]['close'])
+                  drift = abs(bp - bxp) / bp * 100.0
+                  print(f'PRICE_GUARD {b_symbol}/{bx_symbol}: binance={bp} bingx={bxp} drift_pct={drift:.6f}')
+                  if not math.isfinite(drift) or drift > 1.0:
+                      failures.append(
+                          f'Cross-exchange price drift >1% for {b_symbol}/{bx_symbol}: {drift:.6f}%'
+                      )
+              except Exception as exc:
+                  failures.append(f'Price cross-check failed for {b_symbol}/{bx_symbol}: {exc}')
+
+          if failures:
+              print('=== AUDIT FAILURES ===')
+              for failure in failures:
+                  print(f'FAIL: {failure}')
+              raise SystemExit(1)
+
+          print('=== AUDIT RESULT: PASS ===')
           PY
 
       - name: Publish diagnostic artifact
@@ -351,3 +421,12 @@ jobs:
         shell: bash
         run: |
           sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+      - name: Final diagnostic status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== DIAGNOSTIC ARTIFACT READY ==='
+          ls -lh vpn-audit || true
+          echo 'manifest_rows='$(($(wc -l < vpn-audit/manifest.tsv)-1))
