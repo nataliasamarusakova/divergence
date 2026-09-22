@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790047047456,
+  "updated_ts": 1790047944592,
   "events": [
     {
       "event_id": "EVT_B09B1AFC36693165",
@@ -445,32 +445,6 @@
         "requires_retest": true,
         "trigger_level": 0.10676,
         "engine": "MA_COMPRESSION",
-        "requires_htf_context": true
-      }
-    },
-    {
-      "event_id": "EVT_8D32D85843C922BD",
-      "symbol": "TRX",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1790042400000,
-        "pivot_2_ts": 1790042400000,
-        "detected_at_ts": 1790042400000
-      },
-      "event_fact": {
-        "detection_close_price": 0.34769,
-        "donchian_high": 0.34632,
-        "donchian_low": 0.34261,
-        "breakout_atr": 1.3348691639250283,
-        "bb_width": 0.011618607220453601,
-        "bb_width_threshold": 0.008178053908071645,
-        "volume_ratio": 3.9443286049182555,
-        "adx": 25.248129778401815,
-        "requires_retest": true,
-        "trigger_level": 0.34632,
-        "engine": "BREAKOUT_MOMENTUM",
         "requires_htf_context": true
       }
     },
@@ -4036,6 +4010,72 @@
         "range_high": 0.0875,
         "range_low": 0.0861,
         "manipulation_depth_atr": 0.34579910453671986
+      }
+    },
+    {
+      "event_id": "EVT_D03DDAF034663CA2",
+      "symbol": "MEGA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1789984800000,
+        "pivot_2_ts": 1790038800000,
+        "detected_at_ts": 1790046000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.04541,
+        "p1_price": 0.0445,
+        "p2_price": 0.04641,
+        "p1_indicator": 72.2164207022551,
+        "p2_indicator": 53.147477786657845,
+        "bars_between": 15,
+        "price_delta_atr": 1.7529257543129315,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_4F3A919DD0AD791D",
+      "symbol": "MEGA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "HIDDEN_BEARISH_RSI",
+      "timestamps": {
+        "pivot_1_ts": 1790006400000,
+        "pivot_2_ts": 1790038800000,
+        "detected_at_ts": 1790046000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.04541,
+        "p1_price": 0.04764,
+        "p2_price": 0.04641,
+        "p1_indicator": 63.09355202440089,
+        "p2_indicator": 63.95258221824612,
+        "bars_between": 9,
+        "price_delta_atr": 1.1288474752905273,
+        "engine": "DIVERGENCE"
+      }
+    },
+    {
+      "event_id": "EVT_9493F5BAC076C827",
+      "symbol": "MEGA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "HIDDEN_BEARISH_OBV",
+      "timestamps": {
+        "pivot_1_ts": 1790006400000,
+        "pivot_2_ts": 1790038800000,
+        "detected_at_ts": 1790046000000
+      },
+      "event_fact": {
+        "detection_close_price": 0.04541,
+        "p1_price": 0.04764,
+        "p2_price": 0.04641,
+        "p1_indicator": -39020150.93000013,
+        "p2_indicator": -25883081.840000123,
+        "bars_between": 9,
+        "price_delta_atr": 1.1288474752905273,
+        "engine": "DIVERGENCE"
       }
     }
   ]
