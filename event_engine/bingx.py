@@ -25,6 +25,19 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
 
+
+class BingXRateLimitError(RuntimeError):
+    """A BingX rate-limit response that must not be blind-retried.
+
+    ``retry_after_ms`` is the server-provided absolute retry timestamp when
+    BingX includes one in the error message.
+    """
+
+    def __init__(self, message: str, *, code: int | str | None = None, retry_after_ms: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.retry_after_ms = retry_after_ms
+
 API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
 BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
@@ -256,7 +269,36 @@ def fetch_klines(
     )
     code = resp.get("code")
     if code not in (0, "0"):
-        raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={resp.get('msg')}")
+        msg = str(resp.get("msg") or "")
+        try:
+            code_int = int(code)
+        except (TypeError, ValueError):
+            code_int = None
+
+        # BingX Kline limits can surface as a 109429 wrapper whose message
+        # contains the backend 109415 counter (for example, ">5 ... requests
+        # within 900000 ms"). Treat both forms as a hard cooldown condition.
+        rate_limited = (
+            code_int == 109429
+            or ("109415" in msg and "requests within" in msg.lower())
+        )
+        if rate_limited:
+            import re
+
+            retry_after_ms = None
+            match = re.search(r"retry\s+after\s+time\s*:\s*(\d{13})", msg, flags=re.IGNORECASE)
+            if match:
+                try:
+                    retry_after_ms = int(match.group(1))
+                except (TypeError, ValueError):
+                    retry_after_ms = None
+            raise BingXRateLimitError(
+                f"[BINGX] Klines rate limited {bx}/{interval}: code={code} msg={msg}",
+                code=code_int if code_int is not None else code,
+                retry_after_ms=retry_after_ms,
+            )
+
+        raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={msg}")
 
     rows = resp.get("data") or []
     out: list[dict] = []

@@ -446,20 +446,22 @@ def format_tp_hit_message(
 
 def format_trade_closed_message(
     name: str, symbol: str, direction: str, entry_price: float, exit_price: float,
-    pnl_pct: float, realized_rr: float | None, planned_rr: float | None,
+    pnl_pct: float | None, realized_rr: float | None, planned_rr: float | None,
     duration_min: float, peak_pnl: float, max_drawdown: float,
     exit_reason: str, event_type: str, timeframe: str = "1h",
 ) -> str:
-    is_win = pnl_pct >= 0.0
-    emoji = "💚" if is_win else "💔"
-    pnl_sign = "+" if pnl_pct > 0 else ""
+    is_data_error = pnl_pct is None
+    is_win = (pnl_pct >= 0.0) if pnl_pct is not None else False
+    emoji = "⚠️" if is_data_error else ("💚" if is_win else "💔")
+    pnl_sign = "+" if pnl_pct is not None and pnl_pct > 0 else ""
+    pnl_text = "DATA_ERROR" if is_data_error else f"{pnl_sign}{pnl_pct:.2f}%"
     realized_rr_text = f"{realized_rr:.3f}" if realized_rr is not None else "—"
     planned_rr_text = f"{planned_rr:.3f}" if planned_rr is not None else "—"
 
     lines = [
         f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
         "",
-        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
+        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
@@ -724,9 +726,13 @@ def _move_sl_to_break_even(
     }
 
 
-def _calc_trade_pnl_pct(entry_price: float, exit_price: float, direction: str) -> float:
+def _calc_trade_pnl_pct(entry_price: float, exit_price: float, direction: str) -> float | None:
     if entry_price <= 0 or exit_price <= 0:
-        return 0.0
+        log.warning(
+            "[TRACKER_DATA_ERROR] Cannot calculate trade PnL: entry_price=%r exit_price=%r direction=%s",
+            entry_price, exit_price, direction,
+        )
+        return None
     if str(direction).upper() == "LONG":
         return (exit_price - entry_price) / entry_price * 100.0
     return (entry_price - exit_price) / entry_price * 100.0
@@ -790,7 +796,7 @@ def _derive_planned_risk_pct(trade: dict) -> float | None:
 
 
 def _calc_realized_rr(pnl_pct: float, risk_pct: float | None) -> float | None:
-    if risk_pct is None or risk_pct <= 0:
+    if pnl_pct is None or risk_pct is None or risk_pct <= 0:
         return None
     return pnl_pct / risk_pct
 
@@ -1017,7 +1023,7 @@ def update_active_trades() -> None:
             # exit is recorded as a distinct research outcome.
             duration_min = max(0.0, (now_ms - entry_ts) / 60000.0)
             early_loss_reason = None
-            if EARLY_LOSS_CUT_ENABLED and pos_status == "found" and pos_amt > 0:
+            if EARLY_LOSS_CUT_ENABLED and current_pnl is not None and pos_status == "found" and pos_amt > 0:
                 if duration_min >= EARLY_LOSS_CUT_4H_MIN and current_pnl <= EARLY_LOSS_CUT_4H_PNL:
                     early_loss_reason = "EARLY_LOSS_CUT_4H"
                 elif duration_min >= EARLY_LOSS_CUT_2H_MIN and current_pnl <= EARLY_LOSS_CUT_2H_PNL:
@@ -1101,6 +1107,14 @@ def update_active_trades() -> None:
                     log.warning("[TRACKER_TP] %s %s %s has no actual avgPrice; deferring realized PnL", symbol, direction, leg)
                     continue
                 pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
+                if pnl_tp is None:
+                    trade["data_error"] = "INVALID_PRICE_FOR_TP_PNL"
+                    trade["exit_reason"] = "DATA_ERROR"
+                    log.error(
+                        "[TRACKER_DATA_ERROR] %s %s TP leg %s has invalid entry/exit price; realized PnL is not recorded.",
+                        symbol, direction, leg,
+                    )
+                    continue
 
                 rem_qty = max(0.0, rem_qty - delta_qty)
                 realized_qty += delta_qty
@@ -1226,15 +1240,24 @@ def update_active_trades() -> None:
             residual_qty = rem_qty if position_gone and rem_qty > 0 and init_qty > 0 else 0.0
             if residual_qty > 0:
                 residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
-                realized_weighted += residual_qty * residual_pnl
-                realized_qty += residual_qty
+                if residual_pnl is None:
+                    trade["data_error"] = "INVALID_PRICE_FOR_RESIDUAL_PNL"
+                    trade["exit_reason"] = "DATA_ERROR"
+                else:
+                    realized_weighted += residual_qty * residual_pnl
+                    realized_qty += residual_qty
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
+            if final_pnl is None:
+                trade["data_error"] = trade.get("data_error") or "INVALID_PRICE_FOR_FINAL_PNL"
+                exit_reason = "DATA_ERROR"
+                trade["exit_reason"] = exit_reason
             if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
-                exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
+                if final_pnl is not None:
+                    exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct)
+            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None else None
             initial_notional_usdt = _safe_float(trade.get("initial_notional_usdt"), entry_price * init_qty)
             realized_pnl_usdt = (realized_weighted / 100.0) * entry_price if entry_price > 0 else None
             planned_risk_usdt = (initial_notional_usdt * planned_risk_pct / 100.0) if planned_risk_pct else None
@@ -1246,8 +1269,8 @@ def update_active_trades() -> None:
                     stop_slippage_pct = max(0.0, (actual_initial_sl_price - sl_exit_price) / actual_initial_sl_price * 100.0)
                 else:
                     stop_slippage_pct = max(0.0, (sl_exit_price - actual_initial_sl_price) / actual_initial_sl_price * 100.0)
-            loss_pct = max(0.0, -final_pnl)
-            tail_loss_multiple = (loss_pct / planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else None
+            loss_pct = max(0.0, -final_pnl) if final_pnl is not None else None
+            tail_loss_multiple = (loss_pct / planned_risk_pct) if loss_pct is not None and planned_risk_pct and planned_risk_pct > 0 else None
             execution_anomaly = bool(
                 exit_reason in {"STOP_LOSS", "BREAK_EVEN"}
                 and tail_loss_multiple is not None
@@ -1320,8 +1343,9 @@ def update_active_trades() -> None:
                     updated_trades[event_id] = trade
                     continue
 
-            close_emoji = "💚" if final_pnl >= 0.0 else "💔"
-            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
+            close_emoji = "⚠️" if final_pnl is None else ("💚" if final_pnl >= 0.0 else "💔")
+            pnl_text = "DATA_ERROR" if final_pnl is None else f"{final_pnl:+.2f}%"
+            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
             notification_persisted = True
             try:

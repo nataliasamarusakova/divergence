@@ -178,17 +178,84 @@ def add_cvd(
 
 
 def add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    """Append a classic MACD line (ema_fast - ema_slow) with NaN warmup.
+    """Append MACD line, signal line and histogram with deterministic warmup.
 
-    The MACD line is the value compared at swing pivots. ema_slow carries
-    min_periods=slow so early unreliable bars are excluded from divergence
-    checks (emit_divergence drops NaN pivots).
+    The MACD line is ``EMA(fast) - EMA(slow)``. The signal is an EMA of the
+    MACD line and the histogram is ``macd - macd_signal``. ``min_periods`` on
+    the slow EMA and signal EMA prevents early partial values from becoming
+    divergence pivots.
     """
     work = df.copy()
     close = pd.to_numeric(work.get("close"), errors="coerce")
     ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean() if close is not None else pd.Series(dtype=float)
     ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean() if close is not None else pd.Series(dtype=float)
     work["macd"] = ema_fast - ema_slow
+    work["macd_signal"] = work["macd"].ewm(span=signal, adjust=False, min_periods=signal).mean()
+    work["macd_hist"] = work["macd"] - work["macd_signal"]
+    return work
+
+
+def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """Append cumulative VWAP using HLC3 and base volume."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["vwap"] = float("nan")
+        return work
+
+    typical_price = (high + low + close) / 3.0
+    volume_cum = volume.clip(lower=0).cumsum()
+    value_cum = (typical_price * volume.clip(lower=0)).cumsum()
+    work["vwap"] = value_cum / volume_cum.replace(0.0, np.nan)
+    return work
+
+
+def add_mfi(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    """Append Money Flow Index using HLC3 and signed rolling money flow."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["mfi"] = float("nan")
+        return work
+
+    typical_price = (high + low + close) / 3.0
+    raw_money_flow = typical_price * volume.clip(lower=0)
+    delta = typical_price.diff()
+    positive = raw_money_flow.where(delta > 0, 0.0)
+    negative = raw_money_flow.where(delta < 0, 0.0)
+    positive_sum = positive.rolling(length, min_periods=length).sum()
+    negative_sum = negative.rolling(length, min_periods=length).sum()
+    total = positive_sum + negative_sum
+    work["mfi"] = 100.0 * positive_sum / total.replace(0.0, np.nan)
+    work.loc[total == 0, "mfi"] = 50.0
+    work.loc[(negative_sum == 0) & (positive_sum > 0), "mfi"] = 100.0
+    return work
+
+
+def add_cmf(df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
+    """Append Chaikin Money Flow using rolling money-flow volume."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["cmf"] = float("nan")
+        return work
+
+    hl_range = high - low
+    mfm = ((close - low) - (high - close)) / hl_range.replace(0.0, np.nan)
+    mfm = mfm.fillna(0.0)
+    mfv = mfm * volume.clip(lower=0)
+    mfv_sum = mfv.rolling(length, min_periods=length).sum()
+    volume_sum = volume.clip(lower=0).rolling(length, min_periods=length).sum()
+    work["cmf"] = mfv_sum / volume_sum.replace(0.0, np.nan)
     return work
 
 
@@ -1199,6 +1266,21 @@ def attach_oi_series(df: pd.DataFrame, oi_history: dict[str, float] | None) -> p
     return work
 
 
+def attach_funding_series(df: pd.DataFrame, funding_history: dict[str, float] | None) -> pd.DataFrame:
+    """Map 1h funding-rate snapshots onto closed bars without look-ahead."""
+    work = df.copy()
+    if not isinstance(funding_history, dict) or not funding_history:
+        work["fr_oiw"] = float("nan")
+        return work
+
+    close_time = pd.to_numeric(work.get("close_time"), errors="coerce")
+    buckets = (close_time - 1).floordiv(3_600_000)
+    work["fr_oiw"] = buckets.map(
+        lambda b: funding_history.get(str(int(b)), float("nan")) if pd.notna(b) else float("nan")
+    )
+    return work
+
+
 def detect_divergences(
     df: pd.DataFrame,
     symbol: str,
@@ -1228,15 +1310,30 @@ def detect_divergences(
     work["rsi"] = _rsi(work["close"], 14)
     work["atr"] = _atr(work, 14)
     # Additional divergence sources (audit gaps B2 / missing features):
-    # MACD line, slow Stochastic %K, OBV (volume divergence) and, when the
-    # caller attached a historical OI series, Price-vs-OI divergence.
+    # MACD line + histogram, slow Stochastic %K, OBV (volume divergence) and,
+    # when the caller attached a historical OI series, Price-vs-OI divergence.
     work = add_macd(work)
     work = add_stochastic(work)
     work = add_obv(work)
+    work = add_vwap(work)
+    work = add_mfi(work)
+    work = add_cmf(work)
 
-    indicators: list[str] = ["rsi", "bingx_cvd", "macd", "stoch", "obv"]
+    indicators: list[str] = ["rsi", "bingx_cvd", "macd", "macd_hist", "stoch", "obv"]
     if "oi" in work.columns:
         indicators.append("oi")
+    if "fr_oiw" in work.columns:
+        # Funding can be negative and its raw magnitude is not comparable
+        # across regimes. Compare pivot z-scores instead of raw rates.
+        fr = pd.to_numeric(work["fr_oiw"], errors="coerce")
+        rolling_mean = fr.rolling(50, min_periods=20).mean()
+        rolling_std = fr.rolling(50, min_periods=20).std(ddof=0)
+        work["fr_oiw_z"] = (fr - rolling_mean) / rolling_std.replace(0.0, np.nan)
+        indicators.append("fr_oiw_z")
+    if "mfi" in work.columns:
+        indicators.append("mfi")
+    if "cmf" in work.columns:
+        indicators.append("cmf")
 
     lows, highs = _pivots(work, left, right)
     events: list[dict[str, Any]] = []
@@ -1276,6 +1373,16 @@ def detect_divergences(
             if valid.mean() < 0.80:
                 return
 
+            vwap_value = work["vwap"].iloc[detected] if "vwap" in work.columns else float("nan")
+            detected_price = work["close"].iloc[detected]
+            if pd.isna(vwap_value) or float(vwap_value) <= 0 or pd.isna(detected_price):
+                return
+            vwap_distance_pct = abs(float(detected_price) - float(vwap_value)) / float(vwap_value) * 100.0
+            if not math.isfinite(vwap_distance_pct) or vwap_distance_pct > 1.50:
+                return
+        else:
+            vwap_distance_pct = None
+
         price_column = "low" if is_low else "high"
         p1_price = float(work[price_column].iloc[p1i])
         p2_price = float(work[price_column].iloc[p2i])
@@ -1283,6 +1390,24 @@ def detect_divergences(
 
         if not math.isfinite(price_delta_atr) or price_delta_atr < min_delta_atr:
             return
+
+        price_delta_pct = abs(p2_price - p1_price) / max(abs(p1_price), 1e-12) * 100.0
+        volume_ratio_20 = None
+        volume_mean_20 = None
+        if "volume" in work.columns:
+            try:
+                volume_mean_20 = float(work["volume"].iloc[detected - 20:detected].mean()) if detected >= 20 else None
+                if volume_mean_20 and math.isfinite(volume_mean_20) and volume_mean_20 > 0:
+                    volume_ratio_20 = float(work["volume"].iloc[detected]) / volume_mean_20
+            except (TypeError, ValueError):
+                volume_ratio_20 = None
+
+        volume_confirmation_enabled = str(os.environ.get("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+        if volume_confirmation_enabled:
+            if volume_ratio_20 is None or not math.isfinite(volume_ratio_20) or volume_ratio_20 < 1.20:
+                return
+            if not math.isfinite(price_delta_pct) or price_delta_pct < 1.0:
+                return
 
         typ = None
         direction = None
@@ -1329,6 +1454,11 @@ def detect_divergences(
                     "p2_indicator": float(p2v),
                     "bars_between": bars,
                     "price_delta_atr": float(price_delta_atr),
+                    "price_delta_pct": float(price_delta_pct),
+                    "volume_ratio_20": float(volume_ratio_20) if volume_ratio_20 is not None else None,
+                    "volume_confirmation_enabled": volume_confirmation_enabled,
+                    "vwap": float(work["vwap"].iloc[detected]) if pd.notna(work["vwap"].iloc[detected]) else None,
+                    "vwap_distance_pct": float(vwap_distance_pct) if vwap_distance_pct is not None else None,
                     "engine": "DIVERGENCE",
                 },
             }
@@ -1361,6 +1491,277 @@ def detect_divergences(
         scan_pivots(highs, is_low=False)
 
     return events
+
+
+def _harmonic_event_id(symbol: str, timeframe: str, pattern: str, d_ts: int) -> str:
+    fp = f"{symbol}:{timeframe}:{pattern}:{int(d_ts)}"
+    return "HAR_" + hashlib.sha256(fp.encode()).hexdigest()[:16].upper()
+
+
+def _ratio_in(value: float, lo: float, hi: float, tolerance: float) -> bool:
+    if not math.isfinite(value):
+        return False
+    pad_lo = lo * (1.0 - tolerance)
+    pad_hi = hi * (1.0 + tolerance)
+    return pad_lo <= value <= pad_hi
+
+
+def _ratio_near(value: float, target: float, tolerance: float) -> bool:
+    if not math.isfinite(value):
+        return False
+    return abs(value / target - 1.0) <= tolerance
+
+
+def detect_harmonic_patterns(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    left: int = 5,
+    right: int = 5,
+    max_pivots: int = 40,
+    tolerance: float | None = None,
+) -> list[dict[str, Any]]:
+    """Detect completed XABCD harmonic patterns from alternating confirmed pivots.
+
+    Gartley/Bat/Butterfly follow the requested ratios. Crab/Cypher/Shark use
+    published open implementation ranges where the user plan did not specify all
+    legs explicitly. D is already a confirmed pivot, so this detector never
+    forecasts an unconfirmed D point.
+    """
+    required = {"high", "low", "close", "close_time"}
+    if len(df) < 80 or not required.issubset(df.columns):
+        return []
+
+    w = df.copy().reset_index(drop=True)
+    for col in ("high", "low", "close", "close_time"):
+        w[col] = pd.to_numeric(w[col], errors="coerce")
+    w = w.dropna(subset=["high", "low", "close", "close_time"]).reset_index(drop=True)
+    if len(w) < 80:
+        return []
+
+    tol = 0.05 if tolerance is None else max(0.0, float(tolerance))
+    lows, highs = _pivots(w, left=left, right=right)
+    pivots = [(i, "low", float(w["low"].iloc[i])) for i in lows]
+    pivots += [(i, "high", float(w["high"].iloc[i])) for i in highs]
+    pivots.sort(key=lambda x: x[0])
+    if len(pivots) < 5:
+        return []
+    pivots = pivots[-max(5, int(max_pivots)):]
+
+    results: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
+    for start in range(0, len(pivots) - 4):
+        points = pivots[start:start + 5]
+        kinds = [p[1] for p in points]
+        if any(kinds[i] == kinds[i + 1] for i in range(4)):
+            continue
+
+        prices = [p[2] for p in points]
+        x, a, b, c, d = prices
+        xa = abs(a - x)
+        ab = abs(b - a)
+        bc = abs(c - b)
+        cd = abs(d - c)
+        ad = abs(d - a)
+        xc = abs(c - x)
+        if min(xa, ab, bc, cd, ad, xc) <= 0:
+            continue
+
+        ab_xa = ab / xa
+        bc_ab = bc / ab
+        cd_bc = cd / bc
+        ad_xa = ad / xa
+        xd_xa = abs(d - x) / xa
+        xd_xc = abs(d - x) / xc
+
+        candidates: list[str] = []
+        # Ratios follow the user-specified plan for Gartley/Bat/Butterfly.
+        if _ratio_near(ab_xa, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 1.272, 1.618, tol) and _ratio_near(ad_xa, 0.786, tol):
+            candidates.append("GARTLEY")
+        if _ratio_in(ab_xa, 0.382, 0.500, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_near(ad_xa, 0.886, tol):
+            candidates.append("BAT")
+        if _ratio_near(ab_xa, 0.786, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 1.272, 1.618, tol) and _ratio_near(ad_xa, 1.272, tol):
+            candidates.append("BUTTERFLY")
+
+        # These three use the published public ratio families from the open
+        # HarmonicPatterns project / TradingView implementations.
+        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 2.618, 3.618, tol) and _ratio_near(xd_xa, 1.618, tol):
+            candidates.append("CRAB")
+        if _ratio_in(ab_xa, 0.382, 0.786, tol) and _ratio_in(bc_ab, 1.272, 1.414, tol) and _ratio_near(xd_xc, 0.786, tol):
+            candidates.append("CYPHER")
+        if _ratio_in(ab_xa, 0.500, 0.886, tol) and _ratio_in(bc_ab, 1.130, 1.618, tol) and _ratio_in(cd_bc, 1.618, 2.240, tol) and _ratio_in(ad_xa, 0.886, 1.130, tol):
+            candidates.append("SHARK")
+
+        if not candidates:
+            continue
+
+        direction = "LONG" if points[0][1] == "low" else "SHORT"
+        d_idx = points[4][0]
+        confirmation_idx = d_idx + right
+        if confirmation_idx >= len(w):
+            continue
+        d_ts = int(w["close_time"].iloc[d_idx])
+        detected_ts = int(w["close_time"].iloc[confirmation_idx])
+        d_price = float(d)
+        for pattern in candidates:
+            event_id = _harmonic_event_id(symbol, timeframe, pattern, d_ts)
+            if event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event_id)
+            results.append({
+                "event_id": event_id,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": f"HARMONIC_{pattern}_{direction}",
+                "timestamps": {
+                    "x_ts": int(w["close_time"].iloc[points[0][0]]),
+                    "a_ts": int(w["close_time"].iloc[points[1][0]]),
+                    "b_ts": int(w["close_time"].iloc[points[2][0]]),
+                    "c_ts": int(w["close_time"].iloc[points[3][0]]),
+                    "d_ts": d_ts,
+                    "detected_at_ts": detected_ts,
+                },
+                "event_fact": {
+                    "trigger_level": d_price,
+                    "detection_close_price": float(w["close"].iloc[confirmation_idx]),
+                    "pattern": pattern,
+                    "x_price": x,
+                    "a_price": a,
+                    "b_price": b,
+                    "c_price": c,
+                    "d_price": d_price,
+                    "ab_xa": ab_xa,
+                    "bc_ab": bc_ab,
+                    "cd_bc": cd_bc,
+                    "ad_xa": ad_xa,
+                    "xd_xa": xd_xa,
+                    "xd_xc": xd_xc,
+                    "ratio_tolerance": tol,
+                    "engine": "HARMONIC_PATTERN",
+                },
+            })
+
+    return results
+
+
+def _profile_event_id(symbol: str, timeframe: str, event_type: str, detected_ts: int) -> str:
+    fp = f"{symbol}:{timeframe}:{event_type}:{int(detected_ts)}"
+    return "VP_" + hashlib.sha256(fp.encode()).hexdigest()[:16].upper()
+
+
+def detect_volume_profile_divergence(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    lookback: int = 100,
+    bins: int = 24,
+    recent_bars: int = 20,
+    growth_ratio: float = 1.10,
+    min_distance_bins: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Detect an OHLCV approximation of price-vs-HVN accumulation/distribution.
+
+    Exact exchange volume-profile reconstruction needs lower-timeframe/tick
+    allocation of volume across the candle's traded price range. This engine uses
+    the candle typical price (HLC3) as the deterministic proxy, then compares the
+    recent HVN-bin volume against the preceding baseline. It is intentionally a
+    separate research engine rather than silently redefining classic divergence.
+    """
+    required = {"high", "low", "close", "volume", "close_time"}
+    if len(df) < max(lookback, 60) or not required.issubset(df.columns):
+        return []
+
+    w = df.copy().tail(lookback).reset_index(drop=True)
+    for col in ("high", "low", "close", "volume", "close_time"):
+        w[col] = pd.to_numeric(w[col], errors="coerce")
+    w = w.dropna(subset=["high", "low", "close", "volume", "close_time"]).reset_index(drop=True)
+    if len(w) < max(lookback, 60) or len(w) <= recent_bars + 20:
+        return []
+
+    price_low = float(w["low"].min())
+    price_high = float(w["high"].max())
+    if not math.isfinite(price_low) or not math.isfinite(price_high) or price_high <= price_low:
+        return []
+
+    bin_count = max(8, min(int(bins), 100))
+    width = (price_high - price_low) / bin_count
+    if width <= 0:
+        return []
+
+    typical = (w["high"] + w["low"] + w["close"]) / 3.0
+    vol = w["volume"].clip(lower=0.0)
+    positions = np.floor((typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+
+    profile = np.zeros(bin_count, dtype=float)
+    for idx, volume in zip(positions.to_numpy(), vol.to_numpy(dtype=float)):
+        if math.isfinite(volume) and volume > 0:
+            profile[int(idx)] += volume
+
+    hvn_idx = int(np.argmax(profile))
+    hvn_volume = float(profile[hvn_idx])
+    if not math.isfinite(hvn_volume) or hvn_volume <= 0:
+        return []
+
+    baseline = w.iloc[:-recent_bars]
+    recent = w.iloc[-recent_bars:]
+    baseline_typical = (baseline["high"] + baseline["low"] + baseline["close"]) / 3.0
+    recent_typical = (recent["high"] + recent["low"] + recent["close"]) / 3.0
+
+    baseline_pos = np.floor((baseline_typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+    recent_pos = np.floor((recent_typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+    baseline_hvn_volume = float(baseline["volume"].where(baseline_pos == hvn_idx, 0.0).sum())
+    recent_hvn_volume = float(recent["volume"].where(recent_pos == hvn_idx, 0.0).sum())
+    baseline_projected = baseline_hvn_volume / max(1, len(baseline)) * len(recent)
+    if baseline_projected <= 0 or recent_hvn_volume < baseline_projected * float(growth_ratio):
+        return []
+
+    current_price = float(w["close"].iloc[-1])
+    hvn_center = price_low + (hvn_idx + 0.5) * width
+    distance_bins = abs(current_price - hvn_center) / width
+    if not math.isfinite(distance_bins) or distance_bins < float(min_distance_bins):
+        return []
+    # Require an actual recent transition away from the HVN, not merely a
+    # current price that happens to sit far from it.
+    current_bin = int(np.floor((current_price - price_low) / width))
+    current_bin = min(bin_count - 1, max(0, current_bin))
+    recent_positions = recent_pos.to_numpy(dtype=int)
+    if len(recent_positions) < 2 or recent_positions[-1] == hvn_idx or not np.any(recent_positions[:-1] == hvn_idx):
+        return []
+
+    atr_series = _atr(w, 14)
+    atr_value = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else float("nan")
+    side = "below" if current_price < hvn_center else "above"
+    if side == "below":
+        direction = "LONG"
+        event_type = "VOLUME_PROFILE_ACCUMULATION"
+    else:
+        direction = "SHORT"
+        event_type = "VOLUME_PROFILE_DISTRIBUTION"
+
+    detected_ts = int(w["close_time"].iloc[-1])
+    return [{
+        "event_id": _profile_event_id(symbol, timeframe, event_type, detected_ts),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "event_type": event_type,
+        "timestamps": {"detected_at_ts": detected_ts},
+        "event_fact": {
+            "detection_close_price": current_price,
+            "hvn_center": float(hvn_center),
+            "hvn_bin": int(hvn_idx),
+            "hvn_volume": hvn_volume,
+            "baseline_hvn_volume_projected": float(baseline_projected),
+            "recent_hvn_volume": recent_hvn_volume,
+            "hvn_growth_ratio": float(recent_hvn_volume / baseline_projected) if baseline_projected > 0 else None,
+            "distance_from_hvn_bins": float(distance_bins),
+            "price_left_hvn": True,
+            "atr": atr_value if math.isfinite(atr_value) else None,
+            "volume_profile_method": "ohlcv_typical_price_proxy",
+            "engine": "VOLUME_PROFILE_DIVERGENCE",
+        },
+    }]
 
 
 def detect_squeeze_release(
@@ -2010,6 +2411,30 @@ def validate_divergence_context(
     if isinstance(df_htf, pd.DataFrame) and len(df_htf) >= 60:
         ctx = _trend_context(df_htf, direction)
         meta.update({"context_source": str(context_timeframe).lower(), "htf_trend": ctx.get("trend"), "htf_trend_ok": ctx.get("trend_ok")})
+        try:
+            htf_events = detect_divergences(df_htf, str(ev.get("symbol", "")), context_timeframe)
+            detected_ts = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+            htf_bar_minutes = 1_440 if str(context_timeframe).lower() == "1d" else 240
+            lookback_bars = max(1, int(os.environ.get("DIVERGENCE_MTF_LOOKBACK_BARS", "6")))
+            lookback_ms = lookback_bars * htf_bar_minutes * 60_000
+            matched = []
+            for candidate in htf_events:
+                if str(candidate.get("event_type", "")).upper() != event_type:
+                    continue
+                if str(candidate.get("direction", "")).upper() != direction:
+                    continue
+                candidate_ts = int(candidate.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+                if candidate_ts <= 0 or detected_ts <= 0:
+                    continue
+                if 0 <= detected_ts - candidate_ts <= lookback_ms:
+                    matched.append(candidate)
+            meta["mtf_confirmed"] = bool(matched)
+            meta["mtf_confirmation_event_id"] = matched[-1].get("event_id") if matched else None
+            meta["mtf_confirmation_timeframe"] = str(context_timeframe).lower()
+        except Exception:
+            # MTF confirmation is a metadata enhancement; it must never turn a
+            # valid divergence into a false rejection if the secondary scan fails.
+            meta["mtf_confirmed"] = False
     else:
         # Local event context fallback: do not fabricate a trend decision.
         ctx = _trend_context(pd.DataFrame(), direction)
