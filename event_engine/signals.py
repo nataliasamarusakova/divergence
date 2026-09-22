@@ -1402,7 +1402,7 @@ def detect_divergences(
             except (TypeError, ValueError):
                 volume_ratio_20 = None
 
-        volume_confirmation_enabled = str(os.environ.get("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+        volume_confirmation_enabled = str(os.environ.get("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         if volume_confirmation_enabled:
             if volume_ratio_20 is None or not math.isfinite(volume_ratio_20) or volume_ratio_20 < 1.20:
                 return
@@ -1726,7 +1726,11 @@ def detect_volume_profile_divergence(
     current_bin = int(np.floor((current_price - price_low) / width))
     current_bin = min(bin_count - 1, max(0, current_bin))
     recent_positions = recent_pos.to_numpy(dtype=int)
-    if len(recent_positions) < 2 or recent_positions[-1] == hvn_idx or not np.any(recent_positions[:-1] == hvn_idx):
+    # Emit only on the first confirmed bar that leaves the HVN. Without an
+    # immediate transition guard, several subsequent candles could emit the
+    # same accumulation/distribution event while merely remaining away from
+    # the HVN.
+    if len(recent_positions) < 2 or recent_positions[-1] == hvn_idx or recent_positions[-2] != hvn_idx:
         return []
 
     atr_series = _atr(w, 14)
