@@ -157,10 +157,16 @@ jobs:
 
             local status_file="${body}.status"
 
+            # Always create output files first. A network timeout can otherwise
+            # leave the body file absent and crash the diagnostic itself.
+            : > "$headers"
+            : > "$body"
+            : > "$status_file"
+
             set +e
             curl -sS \
               --connect-timeout 10 \
-              --max-time 30 \
+              --max-time 60 \
               -D "$headers" \
               -o "$body" \
               -w '%{http_code}' \
@@ -270,15 +276,25 @@ jobs:
 
           def read_json(name):
               path = root / name.lower()
-              return json.loads(path.read_text())
+              if not path.exists() or path.stat().st_size == 0:
+                  return None
+              try:
+                  return json.loads(path.read_text())
+              except Exception as exc:
+                  failures = globals().get("failures")
+                  if isinstance(failures, list):
+                      failures.append(f"Invalid JSON in {name}: {exc}")
+                  return None
 
+          failures = []
           checks = []
 
           # The request() helper normalizes filenames to lowercase.
           exchange = read_json('binance_exchangeInfo.body')
+          if not isinstance(exchange, dict):
+              exchange = {}
           active_binance = {
               str(row.get('symbol', '')).upper(): row
-              for row in exchange.get('symbols', [])
               if str(row.get('status', '')).upper() == 'TRADING'
               and str(row.get('contractType', '')).upper() == 'PERPETUAL'
               and str(row.get('quoteAsset', '')).upper() == 'USDT'
@@ -312,8 +328,6 @@ jobs:
               'checks': checks,
           }, indent=2, ensure_ascii=False, sort_keys=True))
 
-          failures = []
-
           for item in checks:
               if item.get('binance_symbol'):
                   if not item.get('active_usdt_perpetual'):
@@ -332,13 +346,23 @@ jobs:
               'binance_BTCUSDT_15m_limit10.body',
           ):
               rows = read_json(name)
+              if not isinstance(rows, list):
+                  failures.append(f'Invalid/missing Binance kline response: {name}')
+                  rows = []
               print(f'{name}: rows={len(rows)} first_open={rows[0][0] if rows else None} last_open={rows[-1][0] if rows else None}')
+              if len(rows) != 10:
+                  failures.append(f'Binance row count != 10 for {name}: {len(rows)}')
 
           for symbol in ('XRPUSDT', 'KAITOUSDT'):
               for interval, limit in (('15m', 250), ('1h', 400), ('4h', 400), ('1d', 400)):
                   name = f'binance_{symbol}_{interval}_limit{limit}.body'
                   rows = read_json(name)
+                  if not isinstance(rows, list):
+                      failures.append(f'Invalid/missing Binance kline response: {name}')
+                      rows = []
                   print(f'{name}: rows={len(rows)} first_open={rows[0][0] if rows else None} last_open={rows[-1][0] if rows else None}')
+                  if len(rows) != limit:
+                      failures.append(f'Binance row count != {limit} for {name}: {len(rows)}')
 
           for symbol in ('BTC-USDT', 'XRP-USDT', 'KAITO-USDT'):
               name = f'bingx_{symbol}_1m_limit2.body'
@@ -381,7 +405,8 @@ jobs:
               bxk = read_json(f'bingx_{bx_symbol}_1m_limit2.body')
               try:
                   bp = float(bt['price'])
-                  bxp = float(bxk['data'][0]['close'])
+                  data = bxk.get('data') if isinstance(bxk, dict) else None
+                  bxp = float(data[-1]['close'])
                   drift = abs(bp - bxp) / bp * 100.0
                   print(f'PRICE_GUARD {b_symbol}/{bx_symbol}: binance={bp} bingx={bxp} drift_pct={drift:.6f}')
                   if not math.isfinite(drift) or drift > 1.0:
@@ -400,6 +425,19 @@ jobs:
           print('=== AUDIT RESULT: PASS ===')
           PY
 
+      - name: Print manifest
+        if: always()
+        shell: bash
+        run: |
+          echo '================ FINAL REQUEST MANIFEST ================'
+          cat vpn-audit/manifest.tsv || true
+
+      - name: Cleanup VPN before artifact upload
+        if: always()
+        shell: bash
+        run: |
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
       - name: Publish diagnostic artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -409,19 +447,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
-      - name: Print manifest
-        if: always()
-        shell: bash
-        run: |
-          echo '================ FINAL REQUEST MANIFEST ================'
-          cat vpn-audit/manifest.tsv || true
-
-      - name: Cleanup VPN
-        if: always()
-        shell: bash
-        run: |
-          sudo wg-quick down wg0 >/dev/null 2>&1 || true
-
       - name: Final diagnostic status
         if: always()
         shell: bash
@@ -429,4 +454,6 @@ jobs:
           set -euo pipefail
           echo '=== DIAGNOSTIC ARTIFACT READY ==='
           ls -lh vpn-audit || true
-          echo 'manifest_rows='$(($(wc -l < vpn-audit/manifest.tsv)-1))
+          rows=$(($(wc -l < vpn-audit/manifest.tsv)-1))
+          echo "manifest_rows=$rows"
+          test "$rows" -eq 22 || echo "WARNING: expected 22 request rows, got $rows"
