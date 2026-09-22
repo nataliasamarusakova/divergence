@@ -11,7 +11,7 @@ permissions:
 concurrency:
   # _file_lock_pace/_acquire_scan_slot are intentionally process-local. This
   # workflow-level group prevents two GitHub-hosted runners for the same event
-  # engine from scanning BingX concurrently and bypassing that local pacing.
+  # engine from running overlapping market-data scans and bypassing local pacing.
   group: divergence-engine
   cancel-in-progress: false
 
@@ -32,12 +32,21 @@ jobs:
       BINGX_LEVERAGE: "10"
       BINGX_MAX_LEVERAGE: "10"
       BINGX_POSITION_MODE: HEDGE
+      MARKET_DATA_SOURCE: binance
+      BINANCE_BASE_URL: https://fapi.binance.com
+      BINANCE_HTTP_TIMEOUT_SEC: "5"
+      BINANCE_REQUEST_MIN_INTERVAL_SEC: "0.10"
+      BINANCE_MARKET_RETRY_ATTEMPTS: "2"
+      BINANCE_MARKET_RETRY_BACKOFF_SEC: "0.5"
+      BINANCE_EXCHANGE_INFO_TTL_SEC: "900"
       EXECUTION_ENABLED: "true"
       EXECUTION_MODE: vst
       REQUIRE_CVD_CONFIRMATION: "false"
-      DIVERGENCE_VOLUME_CONFIRMATION_ENABLED: "false"
-      ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE: "false"
-      ENABLE_HARMONIC_PATTERN_ENGINE: "false"
+      DIVERGENCE_VOLUME_CONFIRMATION_ENABLED: "true"
+      ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE: "true"
+      ENABLE_HARMONIC_PATTERN_ENGINE: "true"
+      CROSS_EXCHANGE_PRICE_GUARD_ENABLED: "true"
+      MAX_CROSS_EXCHANGE_DRIFT_PCT: "1.00"
       REQUIRE_15M_TRIGGER: "true"
       MAX_TRIGGER_DELAY_MIN: "30"
       MAX_TRIGGER_TO_ORDER_DELAY_MIN: "8"
