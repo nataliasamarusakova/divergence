@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790183707580,
+  "updated_ts": 1790183971329,
   "events": [
     {
       "event_id": "EVT_09E6313054F2D87B",
@@ -9582,6 +9582,35 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_95EFF9F6BDB2ADF2",
+      "symbol": "RIVER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1790153999999,
+        "pivot_2_ts": 1790175599999,
+        "detected_at_ts": 1790182799999
+      },
+      "event_fact": {
+        "detection_close_price": 1.137,
+        "p1_price": 1.247,
+        "p2_price": 1.054,
+        "p1_indicator": -0.09389007071929976,
+        "p2_indicator": -0.030869435156204647,
+        "bars_between": 6,
+        "price_delta_atr": 5.419029583987869,
+        "price_delta_pct": 15.477145148356058,
+        "volume_ratio_20": 2.555642811483544,
+        "volume_confirmation_enabled": true,
+        "vwap": 1.2654086708454715,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
