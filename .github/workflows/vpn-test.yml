@@ -222,8 +222,6 @@ jobs:
           echo '================ BINANCE FUTURES: BASIC ================'
           request 'binance_ping' \
             "$BASE/fapi/v1/ping"
-          request 'binance_time' \
-            "$BASE/fapi/v1/time"
           request 'binance_exchangeInfo' \
             "$BASE/fapi/v1/exchangeInfo"
 
@@ -257,6 +255,8 @@ jobs:
           echo '================ BINGX VST: PUBLIC ================'
           request 'bingx_contracts' \
             "$BINGX_BASE_URL/openApi/swap/v2/quote/contracts"
+          request 'bingx_live_price_all' \
+            "$BINGX_BASE_URL/openApi/swap/v2/quote/price"
 
           for symbol in ${AUDIT_SYMBOLS_BINGX//,/ }; do
             request "bingx_${symbol}_1m_limit2" \
@@ -295,7 +295,9 @@ jobs:
               exchange = {}
           active_binance = {
               str(row.get('symbol', '')).upper(): row
-              if str(row.get('status', '')).upper() == 'TRADING'
+              for row in exchange.get('symbols', [])
+              if isinstance(row, dict)
+              and str(row.get('status', '')).upper() == 'TRADING'
               and str(row.get('contractType', '')).upper() == 'PERPETUAL'
               and str(row.get('quoteAsset', '')).upper() == 'USDT'
           }
@@ -379,6 +381,15 @@ jobs:
           # Verify the exact HTTP layer captured by request(): every request
           # in the manifest must be HTTP 200 with curl exit 0.
           manifest = Path('vpn-audit/manifest.tsv').read_text().splitlines()[1:]
+          expected_request_count = 22
+          if len(manifest) != expected_request_count:
+              failures.append(
+                  f'Manifest request count mismatch: expected {expected_request_count}, got {len(manifest)}'
+              )
+          labels = [line.split('|', 1)[0] for line in manifest if '|' in line]
+          if len(labels) != len(set(labels)):
+              failures.append('Duplicate request labels detected in manifest')
+
           for line in manifest:
               parts = line.split('|')
               if len(parts) != 6:
@@ -394,27 +405,41 @@ jobs:
               if not body_bytes.isdigit():
                   failures.append(f'Invalid body byte count for {label}: {body_bytes}')
 
-          # Cross-exchange price sanity check using the latest returned candle.
-          # This is observational only; no orders are placed.
+          # Cross-exchange price sanity check must use BingX live/latest-price data,
+          # not a closed 1m candle. This is observational only; no orders are placed.
+          bingx_live = read_json('bingx_live_price_all.body')
+          bingx_live_rows = bingx_live.get('data') if isinstance(bingx_live, dict) else None
+          if isinstance(bingx_live_rows, dict):
+              bingx_live_rows = [bingx_live_rows]
+          if not isinstance(bingx_live_rows, list):
+              failures.append('BingX live-price response has no data list/object')
+              bingx_live_rows = []
+          live_by_symbol = {
+              str(row.get('symbol', '')).upper(): row
+              for row in bingx_live_rows
+              if isinstance(row, dict)
+          }
+
           for b_symbol, bx_symbol in (
               ('BTCUSDT', 'BTC-USDT'),
               ('XRPUSDT', 'XRP-USDT'),
               ('KAITOUSDT', 'KAITO-USDT'),
           ):
               bt = read_json(f'binance_ticker_{b_symbol}.body')
-              bxk = read_json(f'bingx_{bx_symbol}_1m_limit2.body')
+              live_row = live_by_symbol.get(bx_symbol)
               try:
                   bp = float(bt['price'])
-                  data = bxk.get('data') if isinstance(bxk, dict) else None
-                  bxp = float(data[-1]['close'])
+                  bxp = float(live_row['price']) if live_row else float('nan')
+                  if not math.isfinite(bxp) or bxp <= 0:
+                      raise ValueError(f'invalid BingX live price row: {live_row!r}')
                   drift = abs(bp - bxp) / bp * 100.0
-                  print(f'PRICE_GUARD {b_symbol}/{bx_symbol}: binance={bp} bingx={bxp} drift_pct={drift:.6f}')
+                  print(f'PRICE_GUARD {b_symbol}/{bx_symbol}: binance={bp} bingx_live={bxp} drift_pct={drift:.6f}')
                   if not math.isfinite(drift) or drift > 1.0:
                       failures.append(
-                          f'Cross-exchange price drift >1% for {b_symbol}/{bx_symbol}: {drift:.6f}%'
+                          f'Cross-exchange live price drift >1% for {b_symbol}/{bx_symbol}: {drift:.6f}%'
                       )
               except Exception as exc:
-                  failures.append(f'Price cross-check failed for {b_symbol}/{bx_symbol}: {exc}')
+                  failures.append(f'Live price cross-check failed for {b_symbol}/{bx_symbol}: {exc}')
 
           if failures:
               print('=== AUDIT FAILURES ===')
@@ -456,4 +481,5 @@ jobs:
           ls -lh vpn-audit || true
           rows=$(($(wc -l < vpn-audit/manifest.tsv)-1))
           echo "manifest_rows=$rows"
-          test "$rows" -eq 22 || echo "WARNING: expected 22 request rows, got $rows"
+          test "$rows" -eq 22
+          echo "=== DIAGNOSTIC REQUEST COUNT: 22/22 ==="
