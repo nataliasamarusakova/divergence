@@ -20,6 +20,19 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
 DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "").strip()
 
 
+class CoinalyzeIncompleteDataError(RuntimeError):
+    """Raised when pagination did not produce a complete derivatives universe.
+
+    ``rows`` intentionally preserves the successfully parsed prefix for shadow
+    state, OI/funding history, and forensic logging. Callers must not use those
+    rows as a complete new-entry universe until a later cycle succeeds.
+    """
+
+    def __init__(self, message: str, rows: list["CoinalyzeRow"]):
+        super().__init__(message)
+        self.rows = rows
+
+
 @dataclass(frozen=True)
 class CoinalyzeRow:
     symbol: str
@@ -508,6 +521,10 @@ def fetch_data() -> list[CoinalyzeRow]:
 
     if page_errors:
         log.warning("[COINALYZE] Scrape incomplete: %d page errors", len(page_errors))
+        raise CoinalyzeIncompleteDataError(
+            f"Coinalyze pagination incomplete: {len(page_errors)} page(s) failed",
+            all_rows,
+        )
 
     log.info("[COINALYZE] Total unique rows=%d", len(all_rows))
     return all_rows

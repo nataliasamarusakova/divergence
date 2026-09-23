@@ -15,6 +15,7 @@ from event_engine.bingx import (
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
+    get_live_price,
     to_bx_symbol,
     get_contract,
     _format_price,
@@ -458,10 +459,11 @@ def format_trade_closed_message(
     realized_rr_text = f"{realized_rr:.3f}" if realized_rr is not None else "—"
     planned_rr_text = f"{planned_rr:.3f}" if planned_rr is not None else "—"
 
+    exit_text = f"{exit_price:.8g}" if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
     lines = [
         f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
         "",
-        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_text}</b>",
+        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
@@ -1003,16 +1005,31 @@ def update_active_trades() -> None:
                 if exchange_avg > 0:
                     trade["last_exchange_avg_price"] = exchange_avg
 
-            cur_price = entry_price
+            cur_price = None
+            current_price_source = "UNAVAILABLE"
+            estimated_mark_price = None
+            live_price = get_live_price(symbol)
+            if live_price is not None:
+                cur_price = live_price
+                current_price_source = "LIVE_TICKER"
+
             try:
+                # Closed klines are historical context only. They may provide a
+                # forensic estimate when a position disappears without a known
+                # execution fill, but they never become the current execution/
+                # reference price used for current PnL or early-loss decisions.
                 k1m = fetch_klines(symbol, "1m", limit=60)
                 if k1m:
-                    cur_price = _safe_float(k1m[-1].get("close"), entry_price)
+                    last_close = _safe_float(k1m[-1].get("close"), 0.0)
+                    if last_close > 0:
+                        estimated_mark_price = last_close
                     _update_mfe_mae(trade, k1m)
             except Exception as exc:
                 log.warning("[TRACKER] Kline fetch error for %s: %s", symbol, exc)
 
-            current_pnl = _calc_trade_pnl_pct(entry_price, cur_price, direction)
+            trade["current_price_source"] = current_price_source
+            current_pnl = (_calc_trade_pnl_pct(entry_price, cur_price, direction)
+                           if cur_price is not None else None)
             trade["current_pnl_pct"] = current_pnl
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
@@ -1043,6 +1060,9 @@ def update_active_trades() -> None:
                             cut = {"status": "error", "error": str(exc)}
                     if safe_to_close and str(cut.get("status", "")).lower() == "closed":
                         trade["manual_exit_reason"] = early_loss_reason
+                        manual_execution_price = _safe_float(cut.get("execution_price"), 0.0)
+                        if manual_execution_price > 0:
+                            trade["manual_exit_price"] = manual_execution_price
                         try:
                             pos = get_position_directional(symbol, direction)
                             pos_status = str(pos.get("status", "")).lower()
@@ -1213,16 +1233,21 @@ def update_active_trades() -> None:
                 updated_trades[event_id] = trade
                 continue
 
-            # Фиксация выхода и закрытие
+            # Фиксация выхода и закрытие. Never use the last TP execution price
+            # as a fallback for an unaccounted residual position: that can turn a
+            # real loss after a partial TP into a false profit.
             duration_min = (now_ms - entry_ts) / 60000.0
-            exit_price = _safe_float(trade.get("last_tp_exec_price"), cur_price)
+            exit_price = cur_price
+            exit_price_source = "MARKET_ESTIMATE"
             sl_order_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
 
             sl_exit_price, filled_sl_id = _get_filled_sl_from_trade(symbol, trade)
             if closed_by_tp and rem_qty <= 1e-12:
                 exit_reason = "TAKE_PROFIT_FULL"
+                exit_price_source = "TP_WEIGHTED_AVERAGE"
             elif sl_exit_price is not None:
                 exit_price = sl_exit_price
+                exit_price_source = "SL_FILL"
                 if trade.get("be_activated") and abs(exit_price - entry_price) / max(entry_price, 1e-12) < 0.003:
                     exit_reason = "BREAK_EVEN"
                 else:
@@ -1233,12 +1258,21 @@ def update_active_trades() -> None:
             if trade.get("manual_exit_reason"):
                 exit_reason = str(trade.get("manual_exit_reason"))
 
-            if exit_price <= 0:
-                exit_price = cur_price
+            manual_exit_price = _safe_float(trade.get("manual_exit_price"), 0.0)
+            if manual_exit_price > 0:
+                exit_price = manual_exit_price
+                exit_price_source = "MANUAL_EXECUTION"
 
             tp_closed_qty = realized_qty
             residual_qty = rem_qty if position_gone and rem_qty > 0 and init_qty > 0 else 0.0
-            if residual_qty > 0:
+            unknown_execution = position_gone and not closed_by_tp and sl_exit_price is None and manual_exit_price <= 0
+            estimated_exit_price = (cur_price if _safe_float(cur_price, 0.0) > 0 else estimated_mark_price)
+            if unknown_execution:
+                trade["data_error"] = trade.get("data_error") or "UNKNOWN_EXECUTION_PRICE"
+                exit_reason = "DATA_ERROR"
+                exit_price = None
+                exit_price_source = "UNKNOWN_EXECUTION"
+            elif residual_qty > 0:
                 residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
                 if residual_pnl is None:
                     trade["data_error"] = "INVALID_PRICE_FOR_RESIDUAL_PNL"
@@ -1249,6 +1283,8 @@ def update_active_trades() -> None:
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
+            if unknown_execution:
+                final_pnl = None
             if final_pnl is None:
                 trade["data_error"] = trade.get("data_error") or "INVALID_PRICE_FOR_FINAL_PNL"
                 exit_reason = "DATA_ERROR"
@@ -1256,6 +1292,7 @@ def update_active_trades() -> None:
             if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
                 if final_pnl is not None:
                     exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
+                    exit_price_source = "TP_WEIGHTED_AVERAGE"
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None else None
             initial_notional_usdt = _safe_float(trade.get("initial_notional_usdt"), entry_price * init_qty)
@@ -1283,6 +1320,8 @@ def update_active_trades() -> None:
                 actual_initial_sl_risk_pct = abs(entry_price - stored_sl_price) / entry_price * 100.0
             exit_reason_confidence = "confirmed" if (exit_reason in {"TAKE_PROFIT_FULL", "STOP_LOSS", "BREAK_EVEN"} and (closed_by_tp or sl_exit_price is not None)) or exit_reason.startswith("EARLY_LOSS_CUT") else "unknown"
             planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.6625)), 1.6625)
+            if final_pnl is None:
+                realized_pnl_usdt = None
 
             trade["remaining_qty"] = 0.0
             trade["realized_pnl_pct"] = final_pnl
@@ -1290,6 +1329,8 @@ def update_active_trades() -> None:
             trade["realized_pnl_weighted_sum"] = realized_weighted
             trade["realized_rr"] = realized_rr
             trade["exit_price"] = exit_price
+            trade["exit_price_source"] = exit_price_source
+            trade["estimated_exit_price"] = estimated_exit_price
             trade["exit_reason"] = exit_reason
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
@@ -1309,6 +1350,8 @@ def update_active_trades() -> None:
                         "exit_reason_confidence": exit_reason_confidence,
                         "entry_price": entry_price,
                         "exit_price": exit_price,
+                        "exit_price_source": exit_price_source,
+                        "estimated_exit_price": estimated_exit_price,
                         "realized_pnl_pct": final_pnl,
                         "realized_rr": realized_rr,
                         "effective_weighted_rr": planned_rr,
@@ -1345,7 +1388,8 @@ def update_active_trades() -> None:
 
             close_emoji = "⚠️" if final_pnl is None else ("💚" if final_pnl >= 0.0 else "💔")
             pnl_text = "DATA_ERROR" if final_pnl is None else f"{final_pnl:+.2f}%"
-            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
+            exit_text = f"{exit_price:.8g}" if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
+            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %.2f | Exit: %s (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_text, exit_reason, duration_min)
 
             notification_persisted = True
             try:

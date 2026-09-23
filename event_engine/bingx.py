@@ -53,6 +53,7 @@ except Exception:
 
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
+LIVE_PRICE_PATH = "/openApi/swap/v2/quote/price"
 ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
@@ -541,9 +542,9 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
-    sizing_price = _current_close_price(symbol) or float(price)
-    if sizing_price <= 0:
-        return {"status": "error", "error": "invalid sizing price", "symbol": bx}
+    sizing_price = _current_close_price(symbol)
+    if sizing_price is None or sizing_price <= 0:
+        return {"status": "error", "error": "live sizing price unavailable", "symbol": bx}
 
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
     # Swap order quantity is expressed in the base coin. Contract ``size`` is
@@ -697,12 +698,31 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             continue
 
         time.sleep(0.25)
+        execution_price = None
+        if isinstance(response, dict):
+            data = response.get("data") or {}
+            order = data.get("order") if isinstance(data, dict) else {}
+            if isinstance(order, dict):
+                for key in ("avgPrice", "avg_price", "executedAvgPrice"):
+                    try:
+                        candidate = float(order.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if candidate > 0:
+                        execution_price = candidate
+                        break
         try:
             after = get_position_directional(symbol, direction)
         except Exception as exc:
             return {"status": "unknown", "error": f"emergency close submitted but verification failed: {exc}", "symbol": bx_symbol, "client_order_id": client_order_id}
         if str(after.get("status", "")).lower() != "found" or abs(float(after.get("positionAmt", 0) or 0)) <= 0:
-            return {"status": "closed", "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id}
+            return {
+                "status": "closed",
+                "symbol": bx_symbol,
+                "direction": direction,
+                "client_order_id": client_order_id,
+                "execution_price": execution_price,
+            }
 
     # Two verified close attempts are the automatic safety limit. Do one final
     # read-only position check and surface an explicit unresolved state rather
@@ -983,21 +1003,67 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     return _price_matches()
 
 
-def _current_close_price(symbol: str) -> float | None:
+def get_live_price(symbol: str) -> float | None:
+    """Return the current BingX execution/reference price from the live ticker.
+
+    Signal-side candles remain closed-bar data. This function deliberately does
+    not read klines, and malformed/API-error responses fail closed instead of
+    fabricating a zero price.
+    """
+    bx_symbol = to_bx_symbol(symbol)
+    if not bx_symbol:
+        log.warning("[BINGX] Live price unavailable: unknown symbol=%s", symbol)
+        return None
+
     try:
-        rows = fetch_klines(symbol, "1m", limit=2)
+        resp = _request(
+            "GET",
+            LIVE_PRICE_PATH,
+            {"symbol": bx_symbol},
+            signed=False,
+            retryable=False,
+        )
     except Exception as exc:
-        log.warning("[BINGX] Failed to read current 1m price for %s: %s", symbol, exc)
+        log.warning("[BINGX] Failed to read live price for %s: %s", bx_symbol, exc)
         return None
 
-    if not rows:
-        return None
     try:
-        price = float(rows[-1].get("close", 0) or 0)
-    except (TypeError, ValueError):
+        code = int(resp.get("code"))
+    except (TypeError, ValueError, AttributeError):
+        log.warning("[BINGX] Malformed live-price response for %s: %r", bx_symbol, resp)
+        return None
+    if code != 0:
+        log.warning("[BINGX] Live-price API error for %s: code=%s msg=%s", bx_symbol, code, resp.get("msg"))
         return None
 
-    return price if (math.isfinite(price) and price > 0) else None
+    data = resp.get("data")
+    if isinstance(data, list):
+        row = next((item for item in data if isinstance(item, dict) and str(item.get("symbol", "")).upper() == bx_symbol), None)
+        row = row or (data[0] if data and isinstance(data[0], dict) else None)
+    elif isinstance(data, dict):
+        row = data
+    else:
+        row = None
+
+    if not isinstance(row, dict):
+        log.warning("[BINGX] Live-price response has no data row for %s", bx_symbol)
+        return None
+
+    try:
+        price = float(row.get("price"))
+    except (TypeError, ValueError):
+        log.warning("[BINGX] Invalid live price for %s: %r", bx_symbol, row.get("price"))
+        return None
+
+    if not math.isfinite(price) or price <= 0:
+        log.warning("[BINGX] Non-positive live price for %s: %r", bx_symbol, price)
+        return None
+    return price
+
+
+def _current_close_price(symbol: str) -> float | None:
+    """Backward-compatible name for the live execution/reference price."""
+    return get_live_price(symbol)
 
 
 
@@ -1343,7 +1409,10 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
+        is_break_even = _sl_price_matches(desired_sl_price, avg_price) and _sl_price_matches(sl_price, avg_price)
         protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
+        if is_break_even:
+            protective_side = True
         if protective_side and _sl_price_matches(sl_price, desired_sl_price) and _qty_matches_position(sl_qty, position_qty):
             valid_existing_sl = sl
             break
@@ -1650,6 +1719,12 @@ def _validate_sl_order_for_position(
         protective = sl_price > avg_price
     else:
         return False
+
+    # A break-even stop at the exact entry price is a valid protection state,
+    # but only when the caller explicitly expects that entry price. Do not
+    # globally relax the directional check for arbitrary equal-price stops.
+    if not protective and expected_price is not None:
+        protective = _sl_price_matches(float(expected_price), avg_price) and _sl_price_matches(sl_price, avg_price)
 
     if not protective:
         return False

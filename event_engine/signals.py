@@ -734,7 +734,8 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
     if d is None:
         return []
     d['atr'] = _atr(d, 14)
-    lows, highs = _pivots(d, 3, 2)
+    pivot_right = 2
+    lows, highs = _pivots(d, 3, pivot_right)
     last = len(d) - 1
     recent_start = max(0, last - int(lookback))
     swing_highs = [i for i in highs if recent_start <= i < last - 1]
@@ -752,7 +753,7 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
         if body / atr < min_displacement_atr or body_frac < min_body_fraction or vol_ratio < min_volume_ratio:
             continue
 
-        prior_highs = [i for i in swing_highs if i < bos_i]
+        prior_highs = [i for i in swing_highs if i + pivot_right < bos_i]
         if prior_highs:
             sh = prior_highs[-1]
             bos_level = float(d['high'].iloc[sh])
@@ -774,7 +775,7 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
                                 'displacement_atr':body/atr,'volume_ratio':vol_ratio,'body_fraction':body_frac,
                             }, pivot_1_ts=int(d['close_time'].iloc[sh]))]
 
-        prior_lows = [i for i in swing_lows if i < bos_i]
+        prior_lows = [i for i in swing_lows if i + pivot_right < bos_i]
         if prior_lows:
             sl = prior_lows[-1]
             bos_level = float(d['low'].iloc[sl])
@@ -803,6 +804,7 @@ def _liquidity_sweep_before_break(
     bos_i: int,
     break_i: int,
     side: str,
+    pivot_right: int = 2,
 ) -> tuple[int, float] | None:
     """Return the first post-BOS swing sweep that occurs before MSS/OB break.
 
@@ -817,6 +819,9 @@ def _liquidity_sweep_before_break(
     for pivot_i in reversed(candidate_pivots):
         level = float(d['high'].iloc[pivot_i] if side == 'bearish' else d['low'].iloc[pivot_i])
         for sweep_i in range(pivot_i + 1, break_i):
+            # The swept level must already be known when the sweep occurs.
+            if pivot_i + pivot_right >= sweep_i:
+                continue
             sweep_value = float(d['high'].iloc[sweep_i] if side == 'bearish' else d['low'].iloc[sweep_i])
             if (side == 'bearish' and sweep_value > level) or (side == 'bullish' and sweep_value < level):
                 return sweep_i, level
@@ -832,7 +837,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
     if d is None:
         return []
     d['atr'] = _atr(d, 14)
-    lows, highs = _pivots(d, 3, 2)
+    pivot_right = 2
+    lows, highs = _pivots(d, 3, pivot_right)
     last = len(d) - 1
     search_start = max(10, last - int(lookback))
 
@@ -845,8 +851,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
         body = abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i]))
         if body / atr < min_displacement_atr:
             continue
-        prior_highs = [i for i in highs if search_start <= i < bos_i]
-        prior_lows = [i for i in lows if search_start <= i < bos_i]
+        prior_highs = [i for i in highs if search_start <= i + pivot_right < bos_i]
+        prior_lows = [i for i in lows if search_start <= i + pivot_right < bos_i]
         # Bullish OB -> broken downward -> bearish breaker retest.
         if prior_highs and float(d['close'].iloc[bos_i]) > float(d['high'].iloc[prior_highs[-1]]) + 0.05 * atr:
             ob_i = next((k for k in range(bos_i-1, max(search_start, bos_i-8), -1)
@@ -857,7 +863,7 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                 for break_i in breaks:
                     # ICT-style breaker sequencing: buy-side liquidity must be
                     # swept first, then the later OB break is the MSS/flip event.
-                    sweep = _liquidity_sweep_before_break(d, highs, bos_i, break_i, 'bearish')
+                    sweep = _liquidity_sweep_before_break(d, highs, bos_i, break_i, 'bearish', pivot_right)
                     if sweep is None:
                         continue
                     sweep_i, sweep_level = sweep
@@ -886,7 +892,7 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                 for break_i in breaks:
                     # ICT-style breaker sequencing: sell-side liquidity must be
                     # swept first, then the later OB break is the MSS/flip event.
-                    sweep = _liquidity_sweep_before_break(d, lows, bos_i, break_i, 'bullish')
+                    sweep = _liquidity_sweep_before_break(d, lows, bos_i, break_i, 'bullish', pivot_right)
                     if sweep is None:
                         continue
                     sweep_i, sweep_level = sweep
@@ -1041,8 +1047,9 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
         # accounting, not a fabricated intrabar data series.
         return max(0.0, min(1.0, outside_range / candle_range))
 
+    lookback_start = max(0, last - int(lookback))
     if lows:
-        li=[i for i in lows if i<=last-3]
+        li=[i for i in lows if lookback_start <= i <= last-3]
         if li:
             i=li[-1]; level=float(d['low'].iloc[i]); sweep=(level-float(d['low'].iloc[-1]))/atr
             outside_share = outside_volume_share(level, 'LONG')
@@ -1055,7 +1062,7 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
                     'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
                     'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
     if highs:
-        hi=[i for i in highs if i<=last-3]
+        hi=[i for i in highs if lookback_start <= i <= last-3]
         if hi:
             i=hi[-1]; level=float(d['high'].iloc[i]); sweep=(float(d['high'].iloc[-1])-level)/atr
             outside_share = outside_volume_share(level, 'SHORT')
@@ -1569,7 +1576,10 @@ def detect_harmonic_patterns(
 
         ab_xa = ab / xa
         bc_ab = bc / ab
+        bc_xa = bc / xa
+        xc_xa = xc / xa
         cd_bc = cd / bc
+        cd_xc = cd / xc
         ad_xa = ad / xa
         xd_xa = abs(d - x) / xa
         xd_xc = abs(d - x) / xc
@@ -1587,7 +1597,7 @@ def detect_harmonic_patterns(
         # HarmonicPatterns project / TradingView implementations.
         if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 2.618, 3.618, tol) and _ratio_near(xd_xa, 1.618, tol):
             candidates.append("CRAB")
-        if _ratio_in(ab_xa, 0.382, 0.786, tol) and _ratio_in(bc_ab, 1.272, 1.414, tol) and _ratio_near(xd_xc, 0.786, tol):
+        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(xc_xa, 1.272, 1.414, tol) and _ratio_near(cd_xc, 0.786, tol):
             candidates.append("CYPHER")
         if _ratio_in(ab_xa, 0.500, 0.886, tol) and _ratio_in(bc_ab, 1.130, 1.618, tol) and _ratio_in(cd_bc, 1.618, 2.240, tol) and _ratio_in(ad_xa, 0.886, 1.130, tol):
             candidates.append("SHARK")
@@ -1633,7 +1643,10 @@ def detect_harmonic_patterns(
                     "d_price": d_price,
                     "ab_xa": ab_xa,
                     "bc_ab": bc_ab,
+                    "bc_xa": bc_xa,
+                    "xc_xa": xc_xa,
                     "cd_bc": cd_bc,
+                    "cd_xc": cd_xc,
                     "ad_xa": ad_xa,
                     "xd_xa": xd_xa,
                     "xd_xc": xd_xc,

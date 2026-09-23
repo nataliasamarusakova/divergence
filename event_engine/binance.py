@@ -171,7 +171,16 @@ class BinanceMarketClient:
                 f"[BINANCE] no active USDT perpetual contract for {symbol}",
                 symbol=str(symbol),
             )
-        rows = self._request_json(KLINE_PATH, {"symbol": resolved, "interval": interval, "limit": int(limit)})
+        requested_limit = max(1, int(limit))
+        # Binance includes the currently forming candle in kline responses.
+        # Signal generation must remain causal, so request one extra row and
+        # discard any still-open candle while preserving the requested number
+        # of closed bars whenever the exchange returns enough history.
+        api_limit = min(1500, requested_limit + 1)
+        rows = self._request_json(
+            KLINE_PATH,
+            {"symbol": resolved, "interval": interval, "limit": api_limit},
+        )
         if not isinstance(rows, list):
             raise BinanceHTTPError(f"[BINANCE] Klines response for {resolved}/{interval} is not a list")
 
@@ -193,11 +202,17 @@ class BinanceMarketClient:
                 volume = float(row[5])
                 close_time = int(row[6])
                 quote_volume = float(row[7])
+                try:
+                    trade_count = int(row[8])
+                except (TypeError, ValueError):
+                    trade_count = None
                 taker_buy_base = float(row[9])
                 taker_buy_quote = float(row[10])
             except (TypeError, ValueError, IndexError):
                 continue
             if not all(map(lambda x: x == x and abs(x) != float("inf"), [open_price, high, low, close, volume, quote_volume, taker_buy_base, taker_buy_quote])):
+                continue
+            if close_time > int(time.time() * 1000):
                 continue
             out.append({
                 "open_time": open_time,
@@ -208,12 +223,17 @@ class BinanceMarketClient:
                 "close": close,
                 "volume": volume,
                 "quote_volume": quote_volume,
+                "trade_count": trade_count,
                 "taker_buy_base": taker_buy_base,
                 "taker_buy_quote": taker_buy_quote,
+                # Keep the exchange row verbatim for forensic/audit purposes.
+                # This preserves index 8 (trade count) and index 11 (reserved/ignore)
+                # without changing the established OHLCV field semantics.
+                "raw_row": list(row),
                 "taker_flow_valid": True,
                 "bar_delta_usdt": 2.0 * taker_buy_quote - quote_volume,
             })
-        return out
+        return out[-requested_limit:]
 
     def fetch_price(self, symbol: str) -> float:
         resolved = self.resolve_symbol(symbol)
