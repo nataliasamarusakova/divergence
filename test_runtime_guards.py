@@ -27,6 +27,14 @@ def test_vst_research_mode_disables_entry_caps(monkeypatch):
     assert run_once.MAX_TRADES <= 0
 
 
+def test_vst_workflow_has_unlimited_cycle_entry_cap():
+    from pathlib import Path
+
+    workflow = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    text = workflow.read_text(encoding="utf-8")
+    assert 'MAX_TRADES_PER_CYCLE: "0"' in text
+
+
 def test_repeated_pre_order_drift_failures_are_counted(tmp_path, monkeypatch):
     import run_once
 
