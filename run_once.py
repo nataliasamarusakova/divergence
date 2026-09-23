@@ -197,19 +197,46 @@ EXPECTED_EVENT_ENGINES = {
 }
 
 
+VALID_EXECUTION_MODES = {
+    "vst", "test", "demo", "simulated",
+    "live", "prod", "production", "prod-live",
+}
+VST_EXECUTION_MODES = {"vst", "test", "demo", "simulated"}
+LIVE_EXECUTION_MODES = {"live", "prod", "production", "prod-live"}
+BINGX_VST_BASE_URL = "https://open-api-vst.bingx.com"
+BINGX_LIVE_BASE_URL = "https://open-api.bingx.com"
+
+
 def _validate_execution_config() -> tuple[bool, str]:
     if not EXECUTION_ENABLED:
         return True, "EXECUTION_DISABLED"
     if not API_KEY or not SECRET_KEY:
         return False, "BINGX credentials are missing while EXECUTION_ENABLED=true"
+
     mode = str(EXECUTION_MODE or "vst").strip().lower()
-    base = str(BASE_URL or "").strip().lower()
-    if mode in {"vst", "test", "demo", "simulated"} and "open-api-vst." not in base:
-        return False, f"EXECUTION_MODE={mode} requires BingX VST base URL, got {BASE_URL!r}"
+    base = str(BASE_URL or "").strip().lower().rstrip("/")
+
+    if mode not in VALID_EXECUTION_MODES:
+        return False, f"Unsupported EXECUTION_MODE={mode!r}"
+
+    if mode in VST_EXECUTION_MODES and base != BINGX_VST_BASE_URL:
+        return False, (
+            f"EXECUTION_MODE={mode} requires BingX VST base URL "
+            f"{BINGX_VST_BASE_URL}, got {BASE_URL!r}"
+        )
+
+    if mode in LIVE_EXECUTION_MODES:
+        if base != BINGX_LIVE_BASE_URL:
+            return False, (
+                f"EXECUTION_MODE={mode} requires BingX live base URL "
+                f"{BINGX_LIVE_BASE_URL}, got {BASE_URL!r}"
+            )
+        if os.environ.get("ALLOW_LIVE_TRADING", "false").strip().lower() != "true":
+            return False, "Live execution requires explicit ALLOW_LIVE_TRADING=true"
+
     if POSITION_MODE != "HEDGE":
         return False, f"This engine requires BINGX_POSITION_MODE=HEDGE, got {POSITION_MODE!r}"
-    if mode in {"live", "prod", "production", "prod-live"} and os.environ.get("ALLOW_LIVE_TRADING", "false").lower() != "true":
-        return False, "Live execution requires explicit ALLOW_LIVE_TRADING=true"
+
     return True, "OK"
 
 
@@ -323,7 +350,12 @@ def _btc_regime_snapshot(btc_1h_df) -> dict[str, Any]:
             return out
         close = pd.to_numeric(btc_1h_df["close"], errors="coerce")
         last, prev_1h, prev_4h = float(close.iloc[-1]), float(close.iloc[-2]), float(close.iloc[-5])
-        if last <= 0 or prev_1h <= 0 or prev_4h <= 0:
+        if (
+            not all(math.isfinite(value) for value in (last, prev_1h, prev_4h))
+            or last <= 0
+            or prev_1h <= 0
+            or prev_4h <= 0
+        ):
             return out
         out.update({
             "btc_close": last,
@@ -2250,6 +2282,16 @@ def reconcile_all_open_positions() -> None:
     log.info("[RECONCILIATION] Finished in %.1fs.", time.monotonic() - started)
 
 
+def _market_entry_outcome_unknown(execution_result: dict[str, Any]) -> bool:
+    """Return True when an accepted/denied entry left the exchange outcome unprovable."""
+    if not isinstance(execution_result, dict):
+        return False
+    if str(execution_result.get("status", "")).upper() != "OPEN_FAILED":
+        return False
+    open_result = execution_result.get("open_result")
+    return isinstance(open_result, dict) and str(open_result.get("status", "")).lower() == "unknown"
+
+
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
@@ -2641,9 +2683,14 @@ def main() -> None:
             last_c = float(btc_regime_df["close"].iloc[-1])
             prev_1h = float(btc_regime_df["close"].iloc[-2])
             prev_4h = float(btc_regime_df["close"].iloc[-5])
-            chg_1h = ((last_c - prev_1h) / prev_1h) * 100.0
-            chg_4h = ((last_c - prev_4h) / prev_4h) * 100.0
-            log.info("[BTC_REGIME] BTC: %.1f | 1H: %+.2f%% | 4H: %+.2f%% | Filter: OK", last_c, chg_1h, chg_4h)
+            if not all(math.isfinite(value) for value in (last_c, prev_1h, prev_4h)):
+                log.warning("[BTC_REGIME] Invalid/non-finite close values; regime snapshot unavailable.")
+            elif last_c <= 0 or prev_1h <= 0 or prev_4h <= 0:
+                log.warning("[BTC_REGIME] Non-positive close values; regime snapshot unavailable.")
+            else:
+                chg_1h = ((last_c - prev_1h) / prev_1h) * 100.0
+                chg_4h = ((last_c - prev_4h) / prev_4h) * 100.0
+                log.info("[BTC_REGIME] BTC: %.1f | 1H: %+.2f%% | 4H: %+.2f%% | Filter: OK", last_c, chg_1h, chg_4h)
     except Exception as exc:
         log.error("[BTC_REGIME] Fetch error: %s", exc)
 
@@ -3344,6 +3391,18 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif _market_entry_outcome_unknown(execution_result):
+                    # A MARKET entry whose exchange outcome is genuinely UNKNOWN
+                    # must never be retried as a fresh signal on a later cycle: the
+                    # original order may have been accepted while its ACK was lost.
+                    # Reconciliation will adopt/track any position that eventually
+                    # appears; a new market entry requires a new, independently
+                    # validated event.
+                    terminal_reason = "MARKET_ENTRY_OUTCOME_UNKNOWN"
+                    log.critical(
+                        "[EXECUTION] %s (%s) MARKET entry outcome is UNKNOWN; terminalizing event %s to prevent a duplicate entry. ",
+                        symbol, direction, event_id,
+                    )
                 elif execution_result.get("bingx_code") == 101481 or "clientorderid unique check failed" in err_str or "clientorderid has already been used" in err_str:
                     terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
                     log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)
