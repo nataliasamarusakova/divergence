@@ -27,6 +27,21 @@ def test_terminal_event_ids_are_loaded(tmp_path):
     assert run_once.load_terminal_event_ids(path) == {"EVT_A"}
 
 
+REAL_JOURNAL_EVENT_ROWS = r'''
+{"event_id":"EVT_43EE38BD756FB23E","symbol":"SUI","timeframe":"1h","direction":"SHORT","event_type":"REGULAR_BEARISH_OBV","timestamps":{"pivot_1_ts":1789898400000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":0.8804,"p1_price":0.8322,"p2_price":0.9204,"p1_indicator":-18630681.0,"p2_indicator":-21786836.0,"bars_between":8,"price_delta_atr":4.292094457948584,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_E8C471415357C331","symbol":"ARB","timeframe":"1h","direction":"SHORT","event_type":"HIDDEN_BEARISH_MACD","timestamps":{"pivot_1_ts":1789880400000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":0.21086,"p1_price":0.21864,"p2_price":0.21455,"p1_indicator":-0.00034084894194141846,"p2_indicator":-0.00013967256783065096,"bars_between":13,"price_delta_atr":0.5841441055479232,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_035A6899DB6B7FE8","symbol":"ARB","timeframe":"1h","direction":"SHORT","event_type":"HIDDEN_BEARISH_OBV","timestamps":{"pivot_1_ts":1789880400000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":0.21086,"p1_price":0.21864,"p2_price":0.21455,"p1_indicator":12861155.799999945,"p2_indicator":19306567.99999995,"bars_between":13,"price_delta_atr":0.5841441055479232,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_C9F7F84B4AF6C1A2","symbol":"BR","timeframe":"1h","direction":"SHORT","event_type":"REGULAR_BEARISH_RSI","timestamps":{"pivot_1_ts":1789876800000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":1.05003,"p1_price":1.11027,"p2_price":1.17706,"p1_indicator":60.836385052029726,"p2_indicator":58.18136027102264,"bars_between":14,"price_delta_atr":0.9622225318730075,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_302ED7C4446373D9","symbol":"BR","timeframe":"1h","direction":"SHORT","event_type":"REGULAR_BEARISH_MACD","timestamps":{"pivot_1_ts":1789876800000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":1.05003,"p1_price":1.11027,"p2_price":1.17706,"p1_indicator":0.05848628233917186,"p2_indicator":0.043975508296217214,"bars_between":14,"price_delta_atr":0.9622225318730075,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_D5D1D921E9E43CBE","symbol":"BR","timeframe":"1h","direction":"SHORT","event_type":"REGULAR_BEARISH_STOCH","timestamps":{"pivot_1_ts":1789876800000,"pivot_2_ts":1789927200000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":1.05003,"p1_price":1.11027,"p2_price":1.17706,"p1_indicator":67.13531093132947,"p2_indicator":47.33247401951069,"bars_between":14,"price_delta_atr":0.9622225318730075,"engine":"DIVERGENCE"}}
+{"event_id":"EVT_50FB48BB6DE91DF1","symbol":"ZEC","timeframe":"1h","direction":"LONG","event_type":"VOLATILITY_SQUEEZE_RELEASE","timestamps":{"pivot_1_ts":1789934400000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":1516.09,"bb_width":70.33697986124844,"kc_width":68.75439690736357,"squeeze_duration_bars":7,"compression_ratio":1.0230179163089332,"engine":"VOLATILITY_SQUEEZE","requires_retest":true,"trigger_level":1487.6901984536817}}
+{"event_id":"EVT_131CDA2F347C8BC5","symbol":"ZEC","timeframe":"1h","direction":"LONG","event_type":"MA_COMPRESSION_BREAKOUT","timestamps":{"pivot_1_ts":1789934400000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"detection_close_price":1516.09,"compression_ratio":0.503855963830888,"ma_spread_atr":0.5086615149194595,"compression_threshold":1.0095375492869711,"breakout_atr":2.096862570381622,"volume_ratio":0.9049313344860339,"requires_retest":true,"trigger_level":1482.0,"engine":"MA_COMPRESSION","requires_htf_context":true}}
+{"event_id":"EVT_016991FF29D01A0E","symbol":"AKE","timeframe":"1h","direction":"SHORT","event_type":"CRT_BEARISH","timestamps":{"pivot_1_ts":1789927200000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"CRT","requires_retest":true,"requires_htf_context":true,"trigger_level":0.062676,"range_high":0.062676,"range_low":0.05451,"manipulation_depth_atr":0.48592152367227925}}
+{"event_id":"EVT_004B03CD72B86B53","symbol":"XRP","timeframe":"1h","direction":"SHORT","event_type":"BREAKER_BLOCK_BEARISH","timestamps":{"pivot_1_ts":1789812000000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"BREAKER_BLOCK","requires_htf_context":true,"requires_retest":true,"trigger_level":1.41,"zone_high":1.4182,"zone_low":1.41,"breaker_from":"BULLISH_OB","broken_ts":1789866000000,"bos_ts":1789819200000}}
+{"event_id":"EVT_52B9C4CDADEC8A4B","symbol":"NEAR","timeframe":"1h","direction":"LONG","event_type":"CRT_BULLISH","timestamps":{"pivot_1_ts":1789927200000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"CRT","requires_retest":true,"requires_htf_context":true,"trigger_level":4.043,"range_high":4.276,"range_low":4.043,"manipulation_depth_atr":0.4555508972314215}}
+{"event_id":"EVT_C5740BE651D5B53A","symbol":"HYPE","timeframe":"1h","direction":"LONG","event_type":"CRT_BULLISH","timestamps":{"pivot_1_ts":1789927200000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"CRT","requires_retest":true,"requires_htf_context":true,"trigger_level":92.367,"range_high":93.304,"range_low":92.367,"manipulation_depth_atr":0.14141977378585924}}
+'''
+
 REAL_DIVERGENCE_EVENT_TYPES = [
     "REGULAR_BULLISH_RSI", "REGULAR_BEARISH_STOCH", "REGULAR_BULLISH_MACD",
     "HIDDEN_BULLISH_OBV", "HIDDEN_BEARISH_RSI", "REGULAR_BEARISH_OI",
@@ -128,17 +143,13 @@ def test_real_journal_divergence_events_route_to_shadow(tmp_path):
     import run_once
     from event_engine.shadow import record_divergence_shadow_open, update_divergence_shadow_state
 
-    fixture_path = Path("tests/fixtures/real_events.jsonl")
-    assert fixture_path.exists(), "missing committed real-event fixture"
-
     divergence, other = [], []
-    with fixture_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            ev = json.loads(line)
-            engine = str((ev.get("event_fact") or {}).get("engine") or "")
-            (divergence if engine == "DIVERGENCE" else other).append(ev)
+    for line in REAL_JOURNAL_EVENT_ROWS.splitlines():
+        if not line.strip():
+            continue
+        ev = json.loads(line)
+        engine = str((ev.get("event_fact") or {}).get("engine") or "")
+        (divergence if engine == "DIVERGENCE" else other).append(ev)
 
     assert divergence, "real-event fixture has no divergence events"
     assert other, "real-event fixture has no non-divergence events"
