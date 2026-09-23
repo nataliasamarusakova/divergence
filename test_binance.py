@@ -27,11 +27,67 @@ def test_binance_kline_normalizes_to_signal_schema(monkeypatch):
         "close": 105.0,
         "volume": 1000.0,
         "quote_volume": 100000.0,
+        "trade_count": 42,
         "taker_buy_base": 550.0,
         "taker_buy_quote": 55000.0,
+        "raw_row": [
+            1_700_000_000_000,
+            "100.0", "110.0", "90.0", "105.0", "1000.0",
+            1_700_000_059_999, "100000.0", "42", "550.0", "55000.0", "0",
+        ],
         "taker_flow_valid": True,
         "bar_delta_usdt": 10000.0,
     }]
+
+
+def test_binance_kline_preserves_all_12_exchange_fields(monkeypatch):
+    client = bx.BinanceMarketClient()
+    monkeypatch.setattr(client, "resolve_symbol", lambda symbol: "BTCUSDT")
+    raw_row = [
+        1_700_000_000_000,
+        "100.0", "110.0", "90.0", "105.0", "1000.0",
+        1_700_000_059_999, "100000.0", "42", "550.0", "55000.0", "reserved",
+    ]
+    monkeypatch.setattr(client, "_request_json", lambda path, params=None: [raw_row])
+
+    rows = client.fetch_klines("BTC-USDT", "1m", 1)
+
+    assert rows[0]["trade_count"] == 42
+    assert rows[0]["raw_row"] == raw_row
+    assert len(rows[0]["raw_row"]) == 12
+    assert rows[0]["raw_row"][8] == "42"
+    assert rows[0]["raw_row"][11] == "reserved"
+
+
+def test_binance_kline_excludes_unclosed_bar_and_preserves_closed_limit(monkeypatch):
+    client = bx.BinanceMarketClient()
+    monkeypatch.setattr(client, "resolve_symbol", lambda symbol: "BTCUSDT")
+    requested = {}
+    now_ms = 1_700_000_060_000
+    monkeypatch.setattr(bx.time, "time", lambda: now_ms / 1000.0)
+
+    closed = [
+        1_700_000_000_000,
+        "100.0", "110.0", "90.0", "105.0", "1000.0",
+        1_700_000_059_999, "100000.0", "42", "550.0", "55000.0", "0",
+    ]
+    open_bar = [
+        1_700_000_060_000,
+        "105.0", "111.0", "104.0", "109.0", "900.0",
+        1_700_000_119_999, "98000.0", "40", "500.0", "54500.0", "0",
+    ]
+
+    def fake_request(path, params=None):
+        requested.update(params or {})
+        return [closed, open_bar]
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+    rows = client.fetch_klines("BTC-USDT", "1m", 1)
+
+    assert requested["limit"] == 2
+    assert len(rows) == 1
+    assert rows[0]["close_time"] == 1_700_000_059_999
+    assert rows[0]["close"] == 105.0
 
 
 def test_binance_paused_or_nontrading_symbol_is_not_resolved(monkeypatch):

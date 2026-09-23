@@ -230,3 +230,127 @@ def test_bingx_contract_exists_returns_false_for_unknown_symbol(monkeypatch):
 
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: None)
     assert bingx.contract_exists("XAU") is False
+
+
+def _coinalyze_test_row(symbol="BTC"):
+    from event_engine.coinalyze import CoinalyzeRow
+
+    return CoinalyzeRow(
+        symbol, symbol, 100.0, 0.0, 50_000_000.0, 15_000_000.0,
+        0.0, 0.0, 0.0, 0.0, 0.05, None, 100_000.0, 100_000.0,
+        1.0, 0.0, 0.0, 0.0, {},
+    )
+
+
+def test_coinalyze_page_failure_raises_with_partial_rows(monkeypatch):
+    import playwright.sync_api as sync_api
+    import event_engine.coinalyze as coinalyze
+
+    row1 = _coinalyze_test_row("AAA")
+    browser = type("Browser", (), {"close": lambda self: None})()
+    page = type("Page", (), {"query_selector": lambda self, selector: None})()
+    state = {"failed": True}
+    htmls = {"p1": "HTML1", "p2": "HTML2"}
+
+    class _PlaywrightContext:
+        def __enter__(self):
+            return object()
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
+    monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
+    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: ["p1", "p2"])
+    monkeypatch.setattr(coinalyze, "parse_table", lambda html: [row1] if html == "HTML1" else [_coinalyze_test_row("BBB")])
+
+    def fake_load(_page, url):
+        if url == coinalyze.COINALYZE_URL:
+            return htmls["p1"]
+        if url == "p2" and state["failed"]:
+            raise RuntimeError("page 2 transient failure")
+        return htmls[url]
+
+    monkeypatch.setattr(coinalyze, "_load_page", fake_load)
+
+    try:
+        coinalyze.fetch_data()
+        assert False, "expected incomplete pagination error"
+    except coinalyze.CoinalyzeIncompleteDataError as exc:
+        assert [row.symbol for row in exc.rows] == ["AAA"]
+        assert "1 page" in str(exc)
+
+
+def test_coinalyze_page_retry_then_all_pages_succeed(monkeypatch):
+    import playwright.sync_api as sync_api
+    import event_engine.coinalyze as coinalyze
+
+    browser = type("Browser", (), {"close": lambda self: None})()
+    page = type("Page", (), {"query_selector": lambda self, selector: None})()
+
+    class _PlaywrightContext:
+        def __enter__(self):
+            return object()
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
+    monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
+    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: ["p1", "p2"])
+    monkeypatch.setattr(
+        coinalyze,
+        "_load_page",
+        lambda _page, url: "p1" if url == coinalyze.COINALYZE_URL else url,
+    )
+    monkeypatch.setattr(
+        coinalyze,
+        "parse_table",
+        lambda html: [_coinalyze_test_row("AAA")] if html == "p1" else [_coinalyze_test_row("BBB")],
+    )
+
+    rows = coinalyze.fetch_data()
+    assert [row.symbol for row in rows] == ["AAA", "BBB"]
+
+
+def test_incomplete_coinalyze_rows_cannot_enter_new_entry_universe():
+    import run_once
+
+    row = _coinalyze_test_row("AAA")
+    assert run_once._coinalyze_rows_for_new_entries([row], complete=True) == [row]
+    assert run_once._coinalyze_rows_for_new_entries([row], complete=False) == []
+
+
+def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
+    import run_once
+    from event_engine.coinalyze import CoinalyzeIncompleteDataError
+
+    trace = []
+    row = _coinalyze_test_row("AAA")
+
+    monkeypatch.setattr(run_once, "EXECUTION_ENABLED", True)
+    monkeypatch.setattr(run_once, "_validate_execution_config", lambda: (True, ""))
+    monkeypatch.setattr(run_once, "update_active_trades", lambda: trace.append("tracker"))
+    monkeypatch.setattr(run_once, "reconcile_all_open_positions", lambda: trace.append("reconcile"))
+    monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: [])
+    monkeypatch.setattr(run_once, "fetch_data", lambda: (_ for _ in ()).throw(CoinalyzeIncompleteDataError("page 2 failed", [row])))
+    monkeypatch.setattr(run_once, "_record_oi_snapshots", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(run_once, "_record_funding_snapshots", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(run_once, "refresh_contracts", lambda: [])
+    monkeypatch.setattr(run_once, "get_positions", lambda: [])
+    monkeypatch.setattr(run_once, "_load_recent_successful_entries", lambda *args, **kwargs: {})
+    monkeypatch.setattr(run_once, "_load_symbol_quarantines", lambda *args, **kwargs: {})
+    monkeypatch.setattr(run_once, "load_successful_telegram_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(run_once, "send_pending_open_trade_notifications", lambda *args, **kwargs: [])
+    monkeypatch.setattr(run_once, "_refresh_timeframe_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(run_once, "_save_json_atomic", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "_save_timeframe_scan_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "_load_timeframe_scan_state", lambda: {})
+    monkeypatch.setattr(run_once, "_load_cached_events", lambda: [])
+    monkeypatch.setattr(run_once, "load_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(run_once, "load_successful_trade_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(run_once, "load_terminal_event_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(run_once, "load_pre_order_drift_failure_counts", lambda *args, **kwargs: {})
+    monkeypatch.setattr(run_once, "append_shadow_health", lambda *args, **kwargs: None)
+
+    run_once.main()
+
+    assert trace == ["tracker", "reconcile"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import logging
 import os
 import time
@@ -11,7 +12,7 @@ from typing import Any, List, Tuple
 import pandas as pd
 import requests
 
-from event_engine.coinalyze import fetch_data
+from event_engine.coinalyze import CoinalyzeIncompleteDataError, fetch_data
 from event_engine.binance import (
     BinanceRateLimitError,
     BinanceSymbolUnavailableError,
@@ -90,6 +91,11 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+
+def _coinalyze_rows_for_new_entries(rows: list[Any], complete: bool) -> list[Any]:
+    """Expose only a reconciled/complete derivatives universe to entry logic."""
+    return list(rows) if complete else []
+
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
 
@@ -140,6 +146,7 @@ MAX_SHORT_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_SQUEEZE_ADVE
 MAX_LONG_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_LONG_SQUEEZE_ADVERSE_FUNDING", "0.10"))
 EXTREME_SHORT_FUNDING = float(os.environ.get("EXTREME_SHORT_FUNDING", "-0.50"))
 EXTREME_LONG_FUNDING = float(os.environ.get("EXTREME_LONG_FUNDING", "0.50"))
+FUNDING_REQUIRED = os.environ.get("FUNDING_REQUIRED", "false").strip().lower() == "true"
 MAX_TRIGGER_TO_ORDER_DELAY_MIN = float(os.environ.get("MAX_TRIGGER_TO_ORDER_DELAY_MIN", "8"))
 DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN = float(os.environ.get("MAX_DIVERGENCE_POST_CONFIRM_AGE_MIN", os.environ.get("MAX_DIVERGENCE_FORMATION_AGE_MIN", "45")))
 MA_COMPRESSION_RETEST_MAX_DELAY_MIN = float(os.environ.get("MA_COMPRESSION_RETEST_MAX_DELAY_MIN", "120"))
@@ -780,6 +787,14 @@ def _fetch_market_klines_scan(symbol: str, timeframe: str, limit: int) -> list[d
         raise
 
 
+def _is_btc_symbol(symbol: str) -> bool:
+    """Recognize BTC consistently across engine and exchange symbol forms."""
+    normalized = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    if normalized.endswith("USDT"):
+        normalized = normalized[:-4]
+    return normalized == "BTC"
+
+
 def _fetch_market_price(symbol: str) -> float:
     if MARKET_DATA_SOURCE == "bingx":
         return _current_close_price(symbol)
@@ -1352,18 +1367,21 @@ def check_funding_filter(
 
     Funding is stored in percentage-point units (0.10 == +0.10%).
     Extreme funding is a safety veto for every engine; liquidation squeezes
-    additionally use tighter directional limits. Explicit thresholds remain
-    supported for tests/backward compatibility.
+    additionally use tighter directional limits. Missing/invalid funding is
+    policy-controlled by ``FUNDING_REQUIRED`` rather than silently hidden.
+    Explicit thresholds remain supported for tests/backward compatibility.
     """
     if row is None:
-        return True, "NO_ROW"
+        return (False, "FUNDING_REQUIRED_NO_ROW") if FUNDING_REQUIRED else (True, "NO_ROW")
     fr = getattr(row, "fr_oiw", None)
     if fr is None:
-        return True, "NO_FUNDING_DATA"
+        return (False, "FUNDING_REQUIRED_NO_FUNDING_DATA") if FUNDING_REQUIRED else (True, "NO_FUNDING_DATA")
     try:
         fr_val = float(fr)
     except (TypeError, ValueError):
-        return True, "INVALID_FUNDING_DATA"
+        return (False, "FUNDING_REQUIRED_INVALID_FUNDING_DATA") if FUNDING_REQUIRED else (True, "INVALID_FUNDING_DATA")
+    if not math.isfinite(fr_val):
+        return (False, "FUNDING_REQUIRED_INVALID_FUNDING_DATA") if FUNDING_REQUIRED else (True, "INVALID_FUNDING_DATA")
 
     d = str(direction).upper()
     event_upper = str(event_type or "").upper()
@@ -2567,6 +2585,8 @@ def main() -> None:
 
     stats = {
         "coinalyze_rows": 0,
+        "coinalyze_complete": False,
+        "coinalyze_new_entries_frozen": False,
         "liquidity_candidates": 0,
         "contract_candidates": 0,
         "candidates_scanned": 0,
@@ -2631,16 +2651,26 @@ def main() -> None:
     stats["btc_regime_available"] = bool(btc_regime_snapshot.get("btc_available"))
 
     rows: list[Any] = []
+    coinalyze_complete = False
     try:
         log.info("[ENGINE_STAGE] Coinalyze fetch START...")
         stage_started = time.monotonic()
         rows = fetch_data()
+        coinalyze_complete = True
         log.info("[ENGINE_STAGE] Coinalyze fetch END in %.2fs; rows=%d.", time.monotonic() - stage_started, len(rows))
         log.info("[COINALYZE] Ingested %d rows from Coinalyze.", len(rows))
+    except CoinalyzeIncompleteDataError as exc:
+        rows = list(exc.rows)
+        _record_scan_error(stats, "coinalyze_fetch_incomplete")
+        log.error(
+            "[COINALYZE] Incomplete derivatives universe: retaining %d partial rows for state/history, but freezing NEW ENTRIES: %s",
+            len(rows), exc,
+        )
     except Exception as exc:
         _record_scan_error(stats, "coinalyze_fetch")
         log.error("[COINALYZE] Scrape error: %s", exc)
 
+    stats["coinalyze_complete"] = coinalyze_complete
     stats["coinalyze_rows"] = len(rows)
 
     # Maintain persistent paper-trade lifecycle for divergence shadow setups.
@@ -2713,7 +2743,13 @@ def main() -> None:
     stats["telegram_pending_retry_success"] = sum(1 for eid in telegram_attempted_this_cycle if eid in telegram_sent_event_ids)
 
     candidates: List[Any] = []
-    for r in rows:
+    if not coinalyze_complete:
+        stats["coinalyze_new_entries_frozen"] = True
+        log.warning(
+            "[UNIVERSE] Coinalyze context is incomplete; NEW ENTRIES are frozen for this cycle. "
+            "Existing-position reconciliation/protection already ran before the derivatives fetch."
+        )
+    for r in _coinalyze_rows_for_new_entries(rows, coinalyze_complete):
         try:
             if (
                 r.price is None
@@ -2868,7 +2904,7 @@ def main() -> None:
             tf_stats["fresh_divergence"] += int(is_divergence)
             log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
-            if btc_regime_df is not None and symbol != "BTC-USDT":
+            if btc_regime_df is not None and not _is_btc_symbol(symbol):
                 btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
                 if not btc_ok:
                     stats["rejected_btc"] += 1
@@ -2969,6 +3005,7 @@ def main() -> None:
                         continue
                 ev.setdefault("event_fact", {}).update(ctx_meta)
 
+            trigger_observed_at_ts: int | None = None
             if REQUIRE_TRIGGER:
                 if bool(ev.get("event_fact", {}).get("requires_retest")):
                     ref_level = _safe_float(ev.get("event_fact", {}).get("trigger_level"), 0.0)
@@ -3003,6 +3040,10 @@ def main() -> None:
                     log.info("[SIGNALS] %s %s (%s/%s) rejected: entry drift %.2f%% > %.2f%%", direction, symbol, tf, event_type, drift_pct, drift_limit)
                     continue
                 trigger_diag["signal_to_trigger_drift_pct"] = round(drift_pct, 6)
+                # Capture the trigger observation time at the moment the trigger
+                # actually passes validation. Do not reuse the cycle-start now_ms:
+                # the opportunity list may spend seconds/minutes before execution.
+                trigger_observed_at_ts = int(time.time() * 1000)
                 stats["trigger_passed"] += 1
                 tf_stats["trigger_passed"] += 1
             else:
@@ -3068,7 +3109,7 @@ def main() -> None:
                 continue
             setup["trigger"] = {
                 "event_detected_at_ts": detected_at,
-                "trigger_observed_at_ts": int(now_ms),
+                "trigger_observed_at_ts": trigger_observed_at_ts,
                 "trigger_bar_close_ts": trigger_diag.get("trigger_bar_close_ts"),
                 "trigger_price": _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0) or None,
                 "trigger_delay_min": trigger_diag.get("trigger_delay_min"),
@@ -3172,9 +3213,14 @@ def main() -> None:
         trigger_meta = setup.get("trigger") or {}
         trigger_observed_ts = _safe_float(trigger_meta.get("trigger_observed_at_ts"), 0.0)
         trigger_bar_ts = _safe_float(trigger_meta.get("trigger_bar_close_ts"), 0.0)
-        trigger_age_min = ((now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
-            ((now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
+        # The cycle-start now_ms is intentionally not used here. The opportunity
+        # list may contain many signals, and earlier trades can consume enough time
+        # for a previously-valid trigger to become stale before this order is sent.
+        execution_now_ms = int(time.time() * 1000)
+        trigger_age_min = ((execution_now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
+            ((execution_now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
         )
+        trigger_age_min = max(0.0, trigger_age_min)
         if EXECUTION_ENABLED and _is_divergence_event(ev) and DIVERGENCE_SHADOW_ONLY:
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
             trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)

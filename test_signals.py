@@ -1058,6 +1058,41 @@ def test_move_sl_to_break_even_aborts_when_old_cancel_fails(monkeypatch):
     assert not any(c[0] == "post" for c in calls), "no new SL may be created after a failed old-SL cancel"
 
 
+def test_trigger_stale_guard_uses_current_time_not_cycle_start(monkeypatch):
+    import run_once
+
+    observed_ms = 1_000_000
+    cycle_start_ms = observed_ms + 10 * 60_000
+    current_ms = observed_ms + 11 * 60_000
+    meta = {"trigger_observed_at_ts": observed_ms, "trigger_bar_close_ts": observed_ms}
+
+    # The regression target is the production pattern used by main():
+    # the stale-age calculation must be based on the clock at execution time,
+    # not the frozen cycle-start timestamp.
+    monkeypatch.setattr(run_once.time, "time", lambda: current_ms / 1000.0)
+    execution_now_ms = int(run_once.time.time() * 1000)
+    observed_ts = run_once._safe_float(meta.get("trigger_observed_at_ts"), 0.0)
+    cycle_age_min = (cycle_start_ms - observed_ts) / 60_000.0
+    execution_age_min = max(0.0, (execution_now_ms - observed_ts) / 60_000.0)
+
+    assert cycle_age_min == 10.0
+    assert execution_age_min == 11.0
+    assert execution_age_min > cycle_age_min
+
+
+def test_trigger_observation_timestamp_is_distinct_from_cycle_start(monkeypatch):
+    import run_once
+
+    calls = iter([1000.0, 1007.0])
+    monkeypatch.setattr(run_once.time, "time", lambda: next(calls))
+    cycle_start_ms = int(run_once.time.time() * 1000)
+    trigger_observed_at_ts = int(run_once.time.time() * 1000)
+
+    assert cycle_start_ms == 1_000_000
+    assert trigger_observed_at_ts == 1_007_000
+    assert trigger_observed_at_ts > cycle_start_ms
+
+
 def test_diagnose_15m_trigger_marks_missing_event_ts():
     """Audit B7: last-bar fallback must be explicit and optionally forbidden."""
     df = pd.DataFrame({"high": [100, 105], "low": [95, 100], "close": [99, 106]})
@@ -1277,6 +1312,46 @@ def test_sl_validation_requires_expected_price_and_qty():
     assert bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=95.0, expected_qty=1.0)
     assert not bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=90.0, expected_qty=1.0)
     assert not bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=95.0, expected_qty=2.0)
+
+
+def test_sl_validation_accepts_break_even_only_when_explicitly_expected():
+    from event_engine import bingx as bx
+    long_be = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1"}
+    short_be = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1"}
+
+    assert bx._validate_sl_order_for_position(long_be, "LONG", 100.0, expected_price=100.0, expected_qty=1.0)
+    assert bx._validate_sl_order_for_position(short_be, "SHORT", 100.0, expected_price=100.0, expected_qty=1.0)
+    assert not bx._validate_sl_order_for_position(long_be, "LONG", 100.0, expected_price=99.0, expected_qty=1.0)
+    assert not bx._validate_sl_order_for_position(short_be, "SHORT", 100.0, expected_price=101.0, expected_qty=1.0)
+
+
+def test_ensure_protection_accepts_existing_break_even_sl_without_emergency_close(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001,
+    })
+    be_sl = {
+        "orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100.00", "origQty": "1.0",
+    }
+    monkeypatch.setattr(
+        bx, "get_open_protection_directional",
+        lambda *a, **k: {"status": "ok", "sl_orders": [be_sl], "tp_orders": []},
+    )
+
+    def fail_emergency(*args, **kwargs):
+        raise AssertionError("BE protection must not trigger emergency close")
+
+    monkeypatch.setattr(bx, "emergency_close_position", fail_emergency)
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 5.0, [], trade_id="TRD1", stop_loss_price=100.0
+    )
+
+    assert out["status"] == "SL_ONLY"
+    assert out["sl_result"]["status"] == "already_exists"
+    assert out["sl_result"]["stop_price"] == 100.0
 
 
 def test_protection_transport_error_verifies_existing_order_before_retry(monkeypatch):
@@ -1945,7 +2020,7 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
     def fake_request(method, path, params):
         calls.append(dict(params))
         state["qty"] = 0.0
-        return {"code": 0, "msg": "OK", "data": {"order": {"orderId": "CLOSE1", "clientOrderId": params["clientOrderId"]}}}
+        return {"code": 0, "msg": "OK", "data": {"order": {"orderId": "CLOSE1", "clientOrderId": params["clientOrderId"], "avgPrice": "99.5"}}}
 
     monkeypatch.setattr(bx, "_request", fake_request)
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
@@ -1958,6 +2033,7 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
     assert calls[0]["type"] == "MARKET"
     assert calls[0]["quantity"] == "1.250"
     assert calls[0]["clientOrderId"].isalnum()
+    assert out["execution_price"] == pytest.approx(99.5)
 
 
 def test_emergency_close_reports_unflattened_after_two_attempts(monkeypatch):
@@ -2799,3 +2875,708 @@ def test_harmonic_gartley_uses_confirmed_alternating_pivots(monkeypatch):
     assert event["event_fact"]["trigger_level"] == pytest.approx(121.4)
     assert event["timestamps"]["d_ts"] == df.loc[50, "close_time"]
     assert event["timestamps"]["detected_at_ts"] == df.loc[55, "close_time"]
+
+
+def test_tracker_residual_close_does_not_reuse_last_tp_price(monkeypatch, tmp_path):
+    """A partial TP followed by an unpriced residual close must not reuse TP1 as exit price."""
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_RESIDUAL",
+        "event_id": "EVT_RESIDUAL",
+        "symbol": "TEST",
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "initial_qty": 100.0,
+        "remaining_qty": 75.0,
+        "entry_ts": 1_000,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}],
+        "sl_order": {"order_id": "SL1", "stop_price": 95.0},
+        "sl_order_history": [],
+        "hit_legs": ["tp1"],
+        "tp_filled_qty": {"tp1": 25.0},
+        "realized_pnl_qty": 25.0,
+        "realized_pnl_weighted_sum": 25.0,
+        "last_tp_exec_price": 101.0,
+        "be_activated": False,
+        "be_required": False,
+        "closed": False,
+        "manual_exit_reason": None,
+        "planned_risk_pct": 1.0,
+        "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625,
+        "effective_tp_levels": [],
+        "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_RESIDUAL": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(
+        tr,
+        "get_order",
+        lambda symbol, order_id: (
+            {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 101.0}
+            if order_id == "TP1"
+            else {"status": "error", "error": "SL history unavailable"}
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "fetch_klines",
+        lambda symbol, timeframe, limit=60: [{"open_time": 1_000, "close_time": 2_000, "high": 96.0, "low": 94.0, "close": 95.0}],
+    )
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+
+    assert saved["exit_price"] is None
+    assert saved["exit_price_source"] == "UNKNOWN_EXECUTION"
+    assert saved["estimated_exit_price"] == pytest.approx(95.0)
+    assert saved["realized_pnl_pct"] is None
+    assert saved["exit_reason"] == "DATA_ERROR"
+    assert saved["realized_pnl_usdt"] is None
+    # The journal stores only the known partial TP state; the residual execution
+    # and therefore total realized PnL remain explicitly unknown.
+    assert saved["exit_price"] != pytest.approx(101.0)
+    assert not json.loads(active_path.read_text(encoding="utf-8"))
+
+
+def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypatch, tmp_path):
+    """A confirmed SL fill remains the authoritative residual exit price."""
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_SL",
+        "event_id": "EVT_SL",
+        "symbol": "TEST",
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "initial_qty": 100.0,
+        "remaining_qty": 75.0,
+        "entry_ts": 1_000,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}],
+        "sl_order": {"order_id": "SL1", "stop_price": 95.0},
+        "sl_order_history": [],
+        "hit_legs": ["tp1"],
+        "tp_filled_qty": {"tp1": 25.0},
+        "realized_pnl_qty": 25.0,
+        "realized_pnl_weighted_sum": 25.0,
+        "last_tp_exec_price": 101.0,
+        "be_activated": False,
+        "be_required": False,
+        "closed": False,
+        "manual_exit_reason": None,
+        "planned_risk_pct": 1.0,
+        "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625,
+        "effective_tp_levels": [],
+        "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_SL": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(
+        tr,
+        "get_order",
+        lambda symbol, order_id: (
+            {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 101.0}
+            if order_id == "TP1"
+            else {"status": "ok", "order_status": "FILLED", "avg_price": 94.0}
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "fetch_klines",
+        lambda symbol, timeframe, limit=60: [{"open_time": 1_000, "close_time": 2_000, "high": 96.0, "low": 94.0, "close": 95.0}],
+    )
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert not json.loads(active_path.read_text(encoding="utf-8"))
+    assert saved["exit_price"] == pytest.approx(94.0)
+    assert saved["exit_price_source"] == "SL_FILL"
+    assert saved["realized_pnl_pct"] == pytest.approx(-4.25)
+
+
+def test_tracker_partial_tp_plus_break_even_fill_is_realized(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_BE", "event_id": "EVT_BE", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 100.0, "remaining_qty": 75.0, "entry_ts": 1_000,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}], "sl_order": {"order_id": "BE1", "stop_price": 100.0},
+        "sl_order_history": [], "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 25.0},
+        "realized_pnl_qty": 25.0, "realized_pnl_weighted_sum": 25.0, "last_tp_exec_price": 101.0,
+        "be_activated": True, "be_required": False, "closed": False, "manual_exit_reason": None,
+        "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625, "effective_weighted_rr": 1.6625,
+        "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_BE": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_order", lambda _symbol, order_id: (
+        {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 101.0}
+        if order_id == "TP1" else {"status": "ok", "order_status": "FILLED", "avg_price": 100.0}
+    ))
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 99.0, "high": 100.0, "low": 98.0, "close_time": 2_000}])
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+
+    assert saved["exit_price_source"] == "SL_FILL"
+    assert saved["exit_price"] == pytest.approx(100.0)
+    assert saved["exit_reason"] == "BREAK_EVEN"
+    assert saved["realized_pnl_pct"] == pytest.approx(0.25)
+
+
+def test_tracker_manual_market_close_uses_explicit_execution_price(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_MANUAL", "event_id": "EVT_MANUAL", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 10.0, "remaining_qty": 10.0, "entry_ts": 1_000,
+        "tp_orders": [], "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "last_tp_exec_price": None, "be_activated": False, "be_required": False, "closed": False,
+        "manual_exit_reason": "MANUAL_MARKET_CLOSE", "manual_exit_price": 99.0,
+        "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625, "effective_weighted_rr": 1.6625,
+        "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_MANUAL": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_order", lambda *a, **k: {"status": "error"})
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 90.0, "high": 91.0, "low": 89.0, "close_time": 2_000}])
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+
+    assert saved["exit_price_source"] == "MANUAL_EXECUTION"
+    assert saved["exit_price"] == pytest.approx(99.0)
+    assert saved["realized_pnl_pct"] == pytest.approx(-1.0)
+
+
+def test_tracker_duplicate_close_journal_is_not_duplicated(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_DUP", "event_id": "EVT_DUP", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1_000,
+        "tp_orders": [], "sl_order": {}, "sl_order_history": [], "hit_legs": [], "tp_filled_qty": {},
+        "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0, "last_tp_exec_price": None,
+        "be_activated": False, "be_required": False, "closed": False, "manual_exit_reason": "MANUAL_CLOSE",
+        "manual_exit_price": 99.0, "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625, "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_DUP": trade}), encoding="utf-8")
+    existing = {
+        "record_type": "TRADE_CLOSE", "event_id": "EVT_DUP", "exit_reason": "MANUAL_CLOSE",
+        "exit_price": 99.0, "realized_pnl_pct": -1.0,
+    }
+    trades_path.write_text(json.dumps(existing) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_order", lambda *a, **k: {"status": "error"})
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 90.0, "high": 91.0, "low": 89.0, "close_time": 2_000}])
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+    rows = [json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len([r for r in rows if r.get("record_type") == "TRADE_CLOSE" and r.get("event_id") == "EVT_DUP"]) == 1
+
+
+def test_tracker_full_tp_uses_weighted_actual_execution_prices(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_FULL_TP", "event_id": "EVT_FULL_TP", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 100.0, "remaining_qty": 100.0, "entry_ts": 1_000,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "last_tp_exec_price": None, "be_activated": True, "be_required": False, "closed": False,
+        "manual_exit_reason": None, "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625, "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_FULL_TP": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: 102.0)
+    fills = {
+        "TP1": {"status": "ok", "order_status": "FILLED", "executed_qty": 50.0, "avg_price": 101.0},
+        "TP2": {"status": "ok", "order_status": "FILLED", "executed_qty": 50.0, "avg_price": 103.0},
+        "SL1": {"status": "ok", "order_status": "NEW", "avg_price": 0.0},
+    }
+    monkeypatch.setattr(tr, "get_order", lambda symbol, order_id: fills.get(order_id, {"status": "error"}))
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 102.0, "high": 103.0, "low": 99.0, "close_time": 2_000}])
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+
+    assert saved["exit_price_source"] == "TP_WEIGHTED_AVERAGE"
+    assert saved["exit_price"] == pytest.approx(102.0)
+    assert saved["realized_pnl_pct"] == pytest.approx(2.0)
+
+
+def test_tracker_does_not_use_closed_1m_as_current_price_when_live_ticker_missing(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_NO_LIVE_MARK", "event_id": "EVT_NO_LIVE_MARK", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 10.0, "remaining_qty": 10.0, "entry_ts": 1_000,
+        "tp_orders": [], "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "last_tp_exec_price": None, "be_activated": False, "be_required": False, "closed": False,
+        "manual_exit_reason": None, "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625, "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_NO_LIVE_MARK": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {
+        "status": "found", "positionAmt": "10", "avgPrice": "100"
+    })
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{
+        "close": 90.0, "high": 91.0, "low": 89.0, "close_time": 2_000
+    }])
+    monkeypatch.setattr(tr, "get_order", lambda *a, **k: {"status": "error"})
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [{"orderId": "SL1", "stopPrice": "95", "origQty": "10"}], "tp_orders": []
+    })
+
+    tr.update_active_trades()
+    saved = json.loads(active_path.read_text(encoding="utf-8"))["EVT_NO_LIVE_MARK"]
+
+    assert saved["current_price_source"] == "UNAVAILABLE"
+    assert saved["current_pnl_pct"] is None
+    assert saved["current_position_qty"] == pytest.approx(10.0)
+
+
+def test_tracker_invalid_mark_does_not_become_realized_execution(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_BAD_MARK", "event_id": "EVT_BAD_MARK", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 10.0, "remaining_qty": 10.0, "entry_ts": 1_000,
+        "tp_orders": [], "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "last_tp_exec_price": None, "be_activated": False, "be_required": False, "closed": False,
+        "manual_exit_reason": None, "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625,
+        "effective_weighted_rr": 1.6625, "effective_tp_levels": [], "tp_mode": "multi_tp",
+    }
+    active_path.write_text(json.dumps({"EVT_BAD_MARK": trade}), encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_order", lambda *a, **k: {"status": "error"})
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 0.0, "high": 0.0, "low": 0.0, "close_time": 2_000}])
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+
+    assert saved["exit_price"] is None
+    assert saved["realized_pnl_pct"] is None
+    assert saved["exit_reason"] == "DATA_ERROR"
+
+
+def _make_ob_causality_fixture(bos_i: int) -> pd.DataFrame:
+    n = 120
+    rows = []
+    for i in range(n):
+        rows.append({
+            "open": 100.0,
+            "high": 100.4,
+            "low": 99.6,
+            "close": 100.0,
+            "volume": 1000.0,
+            "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    df = pd.DataFrame(rows)
+    pivot_i = 50
+    df.loc[pivot_i, ["open", "high", "low", "close"]] = [101.0, 106.0, 98.0, 99.0]
+    for i in range(pivot_i + 1, bos_i):
+        df.loc[i, ["high", "low"]] = [103.0, 98.5]
+    df.loc[bos_i, ["open", "high", "low", "close", "volume"]] = [99.0, 108.0, 98.0, 107.0, 2200.0]
+    return df
+
+
+def test_order_block_rejects_unconfirmed_bos_pivot(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [50]))
+    # BOS is the first bar that would otherwise confirm the pivot; right=2
+    # means the pivot cannot be used yet.
+    events = sig.detect_order_block(_make_ob_causality_fixture(51), "TEST", "1h")
+    assert events == []
+
+
+def test_order_block_accepts_pivot_after_full_confirmation(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [50]))
+    events = sig.detect_order_block(_make_ob_causality_fixture(53), "TEST", "1h")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "ORDER_BLOCK_BULLISH"
+
+
+def test_breaker_rejects_bos_pivot_confirmed_only_after_bos(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [109]))
+    assert sig.detect_breaker_block(_make_breaker_fixture(True), "TEST", "1h") == []
+
+
+def test_breaker_liquidity_sweep_rejects_unconfirmed_sweep_pivot():
+    import event_engine.signals as sig
+
+    d = pd.DataFrame({
+        "high": [100.0] * 30,
+        "low": [99.0] * 30,
+    })
+    d.loc[10, "high"] = 110.0
+    d.loc[11, "high"] = 112.0  # sweep arrives before two confirmation bars
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bearish") is None
+
+
+def test_breaker_liquidity_sweep_accepts_fully_confirmed_pivot():
+    import event_engine.signals as sig
+
+    d = pd.DataFrame({
+        "high": [100.0] * 30,
+        "low": [99.0] * 30,
+    })
+    d.loc[10, "high"] = 110.0
+    d.loc[13, "high"] = 112.0  # pivot has two confirmation bars before sweep
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bearish") == (13, 110.0)
+
+
+def _make_harmonic_fixture(points: dict[int, float], kinds: dict[int, str]) -> pd.DataFrame:
+    n = 90
+    rows = []
+    for i in range(n):
+        rows.append({
+            "high": 105.0,
+            "low": 95.0,
+            "close": 100.0,
+            "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    df = pd.DataFrame(rows)
+    for idx, price in points.items():
+        kind = kinds[idx]
+        if kind == "low":
+            df.loc[idx, "low"] = price
+            df.loc[idx, "close"] = price
+            df.loc[idx, "high"] = max(105.0, price + 1.0)
+        else:
+            df.loc[idx, "high"] = price
+            df.loc[idx, "close"] = price
+            df.loc[idx, "low"] = min(95.0, price - 1.0)
+    return df
+
+
+def test_cypher_uses_canonical_xa_xc_cd_geometry(monkeypatch):
+    import event_engine.signals as sig
+
+    # XA=100, AB=61.8, XC=127.2, CD/XC=0.786.
+    points = {10: 100.0, 20: 200.0, 30: 138.2, 40: 227.2, 50: 127.2208}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.01)
+    cyphers = [e for e in events if e["event_type"] == "HARMONIC_CYPHER_LONG"]
+    assert len(cyphers) == 1
+    fact = cyphers[0]["event_fact"]
+    assert fact["xc_xa"] == pytest.approx(1.272)
+    assert fact["cd_xc"] == pytest.approx(0.786)
+
+
+def test_cypher_rejects_old_xd_xc_geometry_even_when_old_c_ratio_would_pass(monkeypatch):
+    import event_engine.signals as sig
+
+    # This satisfies the old XD/XC=0.786 test and the old BC/AB band, but
+    # CD/XC is ~0.214, so the canonical Cypher detector must reject it.
+    points = {10: 100.0, 20: 200.0, 30: 138.2, 40: 227.2, 50: 199.9792}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_CYPHER_LONG" for e in events)
+
+
+def test_cypher_rejects_wrong_c_ratio_relative_to_xa(monkeypatch):
+    import event_engine.signals as sig
+
+    # C is only 0.60*XA away from X, outside the canonical 1.272-1.414 XA band.
+    points = {10: 100.0, 20: 200.0, 30: 138.2, 40: 160.0, 50: 112.96}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_CYPHER_LONG" for e in events)
+
+
+def test_valid_crab_remains_detected(monkeypatch):
+    import event_engine.signals as sig
+
+    # Probe the existing Crab predicate: XA=100, AB=58, BC=29,
+    # CD=90.8, XD=161.8. The predicate itself is intentionally unchanged.
+    points = {10: 100.0, 20: 200.0, 30: 142.0, 40: 171.0, 50: 261.8}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_CRAB_LONG" for e in events)
+
+
+def test_bingx_live_price_parsing_uses_ticker_not_klines(monkeypatch):
+    from event_engine import bingx as bx
+
+    bx.CACHE["data"] = {"BTC-USDT": {"symbol": "BTC-USDT"}}
+    bx.CACHE["by_display_name"] = {"BTC-USDT": bx.CACHE["data"]["BTC-USDT"]}
+    bx.CACHE["ts"] = 9_999_999_999
+    monkeypatch.setattr(
+        bx,
+        "_request",
+        lambda method, path, params=None, signed=True, **kwargs: {
+            "code": 0,
+            "data": {"symbol": "BTC-USDT", "price": "123456.78", "time": 1700000000000},
+        },
+    )
+    monkeypatch.setattr(bx, "fetch_klines", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ticker path must not read klines")))
+
+    assert bx.get_live_price("BTC") == pytest.approx(123456.78)
+    assert bx._current_close_price("BTC") == pytest.approx(123456.78)
+
+
+def test_bingx_live_price_parses_array_ticker_payload(monkeypatch):
+    from event_engine import bingx as bx
+
+    bx.CACHE["data"] = {"BTC-USDT": {"symbol": "BTC-USDT"}}
+    bx.CACHE["by_display_name"] = {"BTC-USDT": bx.CACHE["data"]["BTC-USDT"]}
+    bx.CACHE["ts"] = 9_999_999_999
+    monkeypatch.setattr(
+        bx,
+        "_request",
+        lambda *args, **kwargs: {
+            "code": 0,
+            "data": [
+                {"symbol": "ETH-USDT", "price": "2000"},
+                {"symbol": "BTC-USDT", "price": "124000"},
+            ],
+        },
+    )
+    assert bx.get_live_price("BTC-USDT") == pytest.approx(124000.0)
+
+
+def test_bingx_live_price_fails_closed_on_api_error_or_malformed_data(monkeypatch):
+    from event_engine import bingx as bx
+
+    bx.CACHE["data"] = {"BTC-USDT": {"symbol": "BTC-USDT"}}
+    bx.CACHE["by_display_name"] = {"BTC-USDT": bx.CACHE["data"]["BTC-USDT"]}
+    bx.CACHE["ts"] = 9_999_999_999
+
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 100, "msg": "temporary error"})
+    assert bx.get_live_price("BTC") is None
+
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"symbol": "BTC-USDT", "price": "bad"}})
+    assert bx.get_live_price("BTC") is None
+
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"symbol": "BTC-USDT", "price": "0"}})
+    assert bx.get_live_price("BTC") is None
+
+
+def test_bingx_open_market_requires_live_sizing_price(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "displayName": "TEST-USDT", "status": 1,
+        "apiStateOpen": "true", "quantityPrecision": 3,
+        "tradeMinQuantity": 0.001, "tradeMinUSDT": 2.0,
+        "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    bx.CACHE["data"] = {"TEST-USDT": contract}
+    bx.CACHE["by_display_name"] = {"TEST-USDT": contract}
+    bx.CACHE["ts"] = 9_999_999_999
+    monkeypatch.setattr(bx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda symbol: None)
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD_NO_LIVE_PRICE")
+    assert out["status"] == "error"
+    assert out["error"] == "live sizing price unavailable"
+
+
+def test_btc_symbol_normalization_covers_engine_and_exchange_forms():
+    import run_once as ro
+
+    assert ro._is_btc_symbol("BTC") is True
+    assert ro._is_btc_symbol("BTC-USDT") is True
+    assert ro._is_btc_symbol("BTCUSDT") is True
+    assert ro._is_btc_symbol("btc/usdt") is True
+    assert ro._is_btc_symbol("ETH") is False
+    assert ro._is_btc_symbol("ETH-USDT") is False
+    assert ro._is_btc_symbol("XRP") is False
+    assert ro._is_btc_symbol("KAITO") is False
+
+
+def test_btc_regime_exemption_uses_normalized_symbol(monkeypatch):
+    import run_once as ro
+
+    calls = []
+    monkeypatch.setattr(ro, "check_btc_regime", lambda df, direction: calls.append((df, direction)) or (False, "BTC_DUMP"))
+    # The production loop delegates the exemption decision to _is_btc_symbol.
+    assert ro._is_btc_symbol("BTC") is True
+    assert ro._is_btc_symbol("BTC-USDT") is True
+    assert ro._is_btc_symbol("BTCUSDT") is True
+    assert calls == []
+
+
+def _make_sfp_lookback_fixture(pivot_index: int) -> pd.DataFrame:
+    rows = []
+    for i in range(100):
+        rows.append({
+            "open": 100.0,
+            "high": 100.2,
+            "low": 99.8,
+            "close": 100.0,
+            "volume": 1000.0,
+            "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    df = pd.DataFrame(rows)
+    df.loc[pivot_index, ["open", "high", "low", "close"]] = [95.2, 95.4, 94.8, 95.1]
+    df.loc[99, ["open", "high", "low", "close", "volume"]] = [99.0, 99.8, 93.5, 99.2, 1500.0]
+    return df
+
+
+def test_sfp_lookback_age_10_is_allowed(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_sfp_lookback_fixture(89)
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([89], []))
+    events = sig.detect_sfp(df, "TEST", "1h", lookback=30)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "SFP_BULLISH"
+
+
+def test_sfp_lookback_age_30_is_allowed(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_sfp_lookback_fixture(69)
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([69], []))
+    events = sig.detect_sfp(df, "TEST", "1h", lookback=30)
+    assert len(events) == 1
+
+
+def test_sfp_lookback_age_31_is_rejected(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_sfp_lookback_fixture(68)
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([68], []))
+    assert sig.detect_sfp(df, "TEST", "1h", lookback=30) == []
+
+
+def test_funding_required_policy_rejects_missing_none_nan_and_malformed(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "FUNDING_REQUIRED", True)
+    for row in (None, SimpleNamespace(fr_oiw=None), SimpleNamespace(fr_oiw=float("nan")), SimpleNamespace(fr_oiw="bad")):
+        ok, reason = ro.check_funding_filter(row, "LONG", event_type="REGULAR_BULLISH_RSI")
+        assert ok is False
+        assert reason.startswith("FUNDING_REQUIRED_")
+
+
+def test_funding_optional_policy_preserves_fail_open_for_missing_or_invalid(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "FUNDING_REQUIRED", False)
+    assert ro.check_funding_filter(None, "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=None), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=float("nan")), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw="bad"), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+
+
+def test_funding_policy_keeps_normal_extreme_and_squeeze_thresholds(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "FUNDING_REQUIRED", True)
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=0.05), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is True
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=-0.05), "SHORT", event_type="REGULAR_BEARISH_RSI")[0] is True
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=0.5001), "LONG", event_type="REGULAR_BULLISH_RSI")[0] is False
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=-0.5001), "SHORT", event_type="REGULAR_BEARISH_RSI")[0] is False
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=0.1001), "LONG", event_type="SHORT_SQUEEZE")[0] is False
+    assert ro.check_funding_filter(SimpleNamespace(fr_oiw=-0.1001), "SHORT", event_type="LONG_SQUEEZE")[0] is False
+
+
+def test_production_workflow_declares_funding_required_policy():
+    text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+    assert 'FUNDING_REQUIRED: "false"' in text

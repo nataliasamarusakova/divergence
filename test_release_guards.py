@@ -123,4 +123,14 @@ def test_release_has_manual_vpn_test_workflow():
     assert '"$BASE/fapi/v1/exchangeInfo"' in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=10"' in text
+    assert 'expected_request_count = 22' in text
+    assert "Manifest request count mismatch" in text
+    assert 'Duplicate request labels detected in manifest' in text
+    assert 'test "$rows" -eq 22' in text
+    assert 'WARNING: expected 22 request rows' not in text
+    assert 'bingx_live_price_all' in text
+    assert '$BINGX_BASE_URL/openApi/swap/v2/quote/price' in text
+    assert 'bingx_live_price_all.body' in text
+    assert 'Cross-exchange live price drift >1%' in text
+    assert 'latest returned candle' not in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"' in text
