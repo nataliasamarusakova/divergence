@@ -990,3 +990,15 @@ def test_get_order_by_client_order_id_queries_exchange_with_client_id(monkeypatc
             {"retryable": False},
         )
     ]
+
+
+def test_vpn_validator_is_transport_first_and_captures_curl_errors():
+    from pathlib import Path
+
+    workflow = Path('.github/workflows/vpn-test.yml').read_text(encoding='utf-8')
+    assert 'local curl_error="vpn-audit/responses/${safe_label}.curl_error"' in workflow
+    assert '2>"$curl_error"' in workflow
+    assert "=== TRANSPORT FAILURES ===" in workflow
+    assert "=== SEMANTIC CHECKS SKIPPED ===" in workflow
+    assert 'if transport_failures:' in workflow
+    assert workflow.index('if transport_failures:') < workflow.index("exchange = read_json('binance_exchangeInfo.body')")
