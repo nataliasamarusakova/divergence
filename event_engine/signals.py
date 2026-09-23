@@ -798,6 +798,34 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
                             }, pivot_1_ts=int(d['close_time'].iloc[sl]))]
     return []
 
+def _level_was_consumed(
+    d: pd.DataFrame,
+    level: float,
+    start_i: int,
+    end_i: int,
+    side: str,
+) -> bool:
+    """Return True when a liquidity/structure level was already consumed.
+
+    A swing level cannot be reused after a prior close-through or prior wick
+    sweep/rejection. Keeping this state explicit prevents stale pivots from
+    generating a second synthetic sweep or MSS later in the same sequence.
+    """
+    if end_i <= start_i:
+        return False
+    for i in range(start_i, end_i):
+        high = float(d['high'].iloc[i])
+        low = float(d['low'].iloc[i])
+        close = float(d['close'].iloc[i])
+        if side == 'bearish':
+            if high > level or close >= level:
+                return True
+        else:
+            if low < level or close <= level:
+                return True
+    return False
+
+
 def _liquidity_sweep_before_break(
     d: pd.DataFrame,
     pivots: list[int],
@@ -819,12 +847,60 @@ def _liquidity_sweep_before_break(
     for pivot_i in reversed(candidate_pivots):
         level = float(d['high'].iloc[pivot_i] if side == 'bearish' else d['low'].iloc[pivot_i])
         for sweep_i in range(pivot_i + 1, break_i):
-            # The swept level must already be known when the sweep occurs.
+            # The swept level must already be known when the sweep occurs and
+            # must not have been consumed by an earlier bar.
             if pivot_i + pivot_right >= sweep_i:
                 continue
+            if _level_was_consumed(d, level, pivot_i + pivot_right + 1, sweep_i, side):
+                continue
             sweep_value = float(d['high'].iloc[sweep_i] if side == 'bearish' else d['low'].iloc[sweep_i])
-            if (side == 'bearish' and sweep_value > level) or (side == 'bullish' and sweep_value < level):
-                return sweep_i, level
+            close_value = float(d['close'].iloc[sweep_i])
+            if side == 'bearish':
+                # A genuine buy-side sweep must reject the level: wick through,
+                # then close back below the swept high. A mere breakout is not
+                # a liquidity sweep.
+                if sweep_value > level and close_value < level:
+                    return sweep_i, level
+            else:
+                # Mirror semantics for sell-side liquidity.
+                if sweep_value < level and close_value > level:
+                    return sweep_i, level
+    return None
+
+
+def _mss_level_before_sweep(
+    d: pd.DataFrame,
+    pivots: list[int],
+    bos_i: int,
+    sweep_i: int,
+    side: str,
+    pivot_right: int = 2,
+) -> tuple[int, float] | None:
+    """Return the confirmed structural level that price must break after the sweep.
+
+    Classic breaker sequencing uses an intervening swing structure: after a
+    sell-side/buy-side sweep, price must close through the opposite confirmed
+    swing before the failed order block is treated as a breaker.
+    """
+    candidates = [
+        i for i in pivots
+        if bos_i < i < sweep_i and i + pivot_right < sweep_i
+    ]
+    if not candidates:
+        return None
+    for pivot_i in reversed(candidates):
+        level = float(d['low'].iloc[pivot_i] if side == 'bearish' else d['high'].iloc[pivot_i])
+        # MSS must be a fresh post-sweep structural break. If the swing was
+        # already closed through before the sweep, it cannot serve as the MSS
+        # level for this breaker sequence. Wicks alone are not enough here; the
+        # structure is considered broken by a close.
+        if side == 'bearish':
+            already_broken = any(float(d['close'].iloc[i]) <= level for i in range(pivot_i + pivot_right + 1, sweep_i))
+        else:
+            already_broken = any(float(d['close'].iloc[i]) >= level for i in range(pivot_i + pivot_right + 1, sweep_i))
+        if already_broken:
+            continue
+        return pivot_i, level
     return None
 
 
@@ -867,6 +943,10 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if sweep is None:
                         continue
                     sweep_i, sweep_level = sweep
+                    mss = _mss_level_before_sweep(d, lows, bos_i, sweep_i, 'bearish', pivot_right)
+                    if mss is None or float(d['close'].iloc[break_i]) >= mss[1]:
+                        continue
+                    mss_pivot_i, mss_level = mss
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
@@ -880,6 +960,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                             'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
                             'liquidity_sweep_level':sweep_level,
                             'mss_ts':int(d['close_time'].iloc[break_i]),
+                            'mss_pivot_ts':int(d['close_time'].iloc[mss_pivot_i]),
+                            'mss_level':mss_level,
                             'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
                         },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
         # Bearish OB -> broken upward -> bullish breaker retest.
@@ -896,6 +978,10 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if sweep is None:
                         continue
                     sweep_i, sweep_level = sweep
+                    mss = _mss_level_before_sweep(d, highs, bos_i, sweep_i, 'bullish', pivot_right)
+                    if mss is None or float(d['close'].iloc[break_i]) <= mss[1]:
+                        continue
+                    mss_pivot_i, mss_level = mss
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     if break_i >= last:
@@ -909,102 +995,151 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                             'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
                             'liquidity_sweep_level':sweep_level,
                             'mss_ts':int(d['close_time'].iloc[break_i]),
+                            'mss_pivot_ts':int(d['close_time'].iloc[mss_pivot_i]),
+                            'mss_level':mss_level,
                             'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
                         },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
     return []
 
 def detect_mitigation_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 80,
                             min_displacement_atr: float = 1.20, return_tolerance_pct: float = 0.20) -> list[dict[str, Any]]:
-    """Detect an origin candle revisited after the impulse breaks structure.
+    """Detect a failure-swing mitigation block with a causal structure sequence.
 
-    The detector keeps the causal sequence explicit: a strong displacement
-    candle must have a prior opposite candle that serves as the origin zone,
-    and price must subsequently break a pre-existing confirmed structure level
-    before the origin is retested.
+    Canonical sequence used here:
+      bullish: confirmed swing low -> confirmed intervening swing high -> higher low
+               -> candle-body close above the intervening swing high -> retest
+      bearish: confirmed swing high -> confirmed intervening swing low -> lower high
+               -> candle-body close below the intervening swing low -> retest
+
+    A prior external sweep invalidates the mitigation setup; such a sequence belongs
+    to the breaker family instead. The existing retest/tolerance contract is kept.
     """
-    if timeframe.lower() not in {'1h','4h'}:
+    if timeframe.lower() not in {'1h', '4h'}:
         return []
-    d=_prepare_pattern_frame(df,{'open','high','low','close','volume','close_time'},100)
+    d = _prepare_pattern_frame(df, {'open', 'high', 'low', 'close', 'volume', 'close_time'}, 100)
     if d is None:
         return []
-    d['atr']=_atr(d,14)
+    d['atr'] = _atr(d, 14)
     lows, highs = _pivots(d, 3, 2)
-    last=len(d)-1
-    search_start=max(20,last-int(lookback))
-    for i in range(last-3, search_start-1, -1):
-        atr=float(d['atr'].iloc[i]) if pd.notna(d['atr'].iloc[i]) else 0.0
-        if atr<=0:
+    last = len(d) - 1
+    search_start = max(20, last - int(lookback))
+
+    def _confirmed_before(pivot_i: int, event_i: int) -> bool:
+        return search_start <= pivot_i < event_i - 2
+
+    def _body_displacement_ok(i: int) -> tuple[bool, float]:
+        atr = float(d['atr'].iloc[i]) if pd.notna(d['atr'].iloc[i]) else 0.0
+        if atr <= 0:
+            return False, atr
+        body = abs(float(d['close'].iloc[i]) - float(d['open'].iloc[i]))
+        return body / atr >= min_displacement_atr, atr
+
+    def _origin_before(pivot_i: int, bullish: bool) -> int | None:
+        """Nearest same-direction origin candle at or immediately before the failure swing pivot."""
+        for k in range(pivot_i, max(search_start, pivot_i - 8) - 1, -1):
+            op = float(d['open'].iloc[k]); cl = float(d['close'].iloc[k])
+            if (cl > op) if bullish else (cl < op):
+                return k
+        return None
+
+    # Bullish mitigation: swing low -> swing high -> higher low -> break above swing high.
+    for low_i in reversed(lows):
+        if not _confirmed_before(low_i, low_i + 3):
             continue
-        body=abs(float(d['close'].iloc[i])-float(d['open'].iloc[i]))
-        if body/atr<min_displacement_atr:
+        low_level = float(d['low'].iloc[low_i])
+        for high_i in highs:
+            if high_i <= low_i or not _confirmed_before(low_i, high_i) or not _confirmed_before(high_i, high_i + 3):
+                continue
+            high_level = float(d['high'].iloc[high_i])
+            higher_lows = [p for p in lows if high_i < p < last and p + 2 < last and float(d['low'].iloc[p]) > low_level]
+            for higher_low_i in higher_lows:
+                if high_i + 2 >= higher_low_i:
+                    continue
+                # No external sell-side sweep before the structural break.
+                if float(d['low'].iloc[low_i + 1:higher_low_i].min()) <= low_level:
+                    continue
+                breaks = [k for k in range(higher_low_i + 1, last) if float(d['close'].iloc[k]) > high_level]
+                if not breaks:
+                    continue
+                bos_i = next((k for k in breaks if _body_displacement_ok(k)[0]), None)
+                if bos_i is None or bos_i <= higher_low_i + 1:
+                    continue
+                post_lo = float(d['low'].iloc[higher_low_i + 1:bos_i].min()) if bos_i > higher_low_i + 1 else float('inf')
+                if post_lo <= low_level:
+                    continue
+                origin_i = _origin_before(high_i, bullish=True)
+                if origin_i is None:
+                    continue
+                zone_hi = float(d['high'].iloc[origin_i]); zone_lo = float(d['low'].iloc[origin_i])
+                level = float(d['open'].iloc[origin_i])
+                touched = float(d['low'].iloc[-1]) <= level * (1 + return_tolerance_pct / 100.0)
+                still_valid = float(d['close'].iloc[-1]) > zone_lo
+                if touched and still_valid:
+                    ok, atr = _body_displacement_ok(bos_i)
+                    ts = int(d['close_time'].iloc[-1])
+                    return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BULLISH', 'LONG', ts,
+                        int(d['close_time'].iloc[origin_i]), {
+                            'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
+                            'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
+                            'origin_ts': int(d['close_time'].iloc[origin_i]),
+                            'failure_swing_ts': int(d['close_time'].iloc[higher_low_i]),
+                            'failure_swing_level': float(d['low'].iloc[higher_low_i]),
+                            'impulse_ts': int(d['close_time'].iloc[bos_i]), 'bos_ts': int(d['close_time'].iloc[bos_i]),
+                            'structure_level': high_level, 'structure_pivot_ts': int(d['close_time'].iloc[high_i]),
+                            'displacement_atr': float(abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i])) / atr),
+                            'return_tolerance_pct': return_tolerance_pct,
+                            'failure_swing_no_sweep': True,
+                        }, pivot_1_ts=int(d['close_time'].iloc[high_i]))]
+
+    # Bearish mitigation: swing high -> swing low -> lower high -> break below swing low.
+    for high_i in reversed(highs):
+        if not _confirmed_before(high_i, high_i + 3):
             continue
-        bullish=float(d['close'].iloc[i])>float(d['open'].iloc[i])
-
-        # The origin is the last opposite candle immediately before the
-        # displacement. The impulse candle itself is not used as the zone.
-        origin_i = None
-        for k in range(i-1, max(search_start, i-8), -1):
-            opposite = (float(d['close'].iloc[k]) < float(d['open'].iloc[k])) if bullish else (float(d['close'].iloc[k]) > float(d['open'].iloc[k]))
-            if opposite:
-                origin_i = k
-                break
-        if origin_i is None:
-            continue
-
-        zone_hi=float(d['high'].iloc[origin_i]); zone_lo=float(d['low'].iloc[origin_i])
-
-        # Only use pivots that were already fully confirmed before the impulse
-        # to avoid introducing future information into the structure test.
-        prior_highs=[p for p in highs if search_start <= p < i-2]
-        prior_lows=[p for p in lows if search_start <= p < i-2]
-        if bullish:
-            if not prior_highs:
+        high_level = float(d['high'].iloc[high_i])
+        for low_i in lows:
+            if low_i <= high_i or not _confirmed_before(high_i, low_i) or not _confirmed_before(low_i, low_i + 3):
                 continue
-            structure_i=prior_highs[-1]
-            structure_level=float(d['high'].iloc[structure_i])
-            breaks=[k for k in range(i+1,last) if float(d['close'].iloc[k]) > structure_level]
-            if not breaks:
-                continue
-            bos_i=breaks[0]
-            post=d.iloc[origin_i+1:bos_i+1]
-            if len(post)<2:
-                continue
-            if float(post['high'].max()) < zone_hi + atr:
-                continue
-            level=float(d['open'].iloc[origin_i])
-            touched=float(d['low'].iloc[-1]) <= level*(1+return_tolerance_pct/100.0)
-            still_valid=float(d['close'].iloc[-1]) > zone_lo
-            direction='LONG'; typ='MITIGATION_BLOCK_BULLISH'
-        else:
-            if not prior_lows:
-                continue
-            structure_i=prior_lows[-1]
-            structure_level=float(d['low'].iloc[structure_i])
-            breaks=[k for k in range(i+1,last) if float(d['close'].iloc[k]) < structure_level]
-            if not breaks:
-                continue
-            bos_i=breaks[0]
-            post=d.iloc[origin_i+1:bos_i+1]
-            if len(post)<2:
-                continue
-            if float(post['low'].min()) > zone_lo - atr:
-                continue
-            level=float(d['open'].iloc[origin_i])
-            touched=float(d['high'].iloc[-1]) >= level*(1-return_tolerance_pct/100.0)
-            still_valid=float(d['close'].iloc[-1]) < zone_hi
-            direction='SHORT'; typ='MITIGATION_BLOCK_BEARISH'
-
-        if touched and still_valid:
-            ts=int(d['close_time'].iloc[-1])
-            return [_make_event(symbol,timeframe,typ,direction,ts,int(d['close_time'].iloc[origin_i]),{
-                'engine':'MITIGATION_BLOCK','requires_htf_context':True,'requires_retest':True,
-                'trigger_level':level,'zone_high':zone_hi,'zone_low':zone_lo,'origin_ts':int(d['close_time'].iloc[origin_i]),
-                'impulse_ts':int(d['close_time'].iloc[i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
-                'structure_level':structure_level,'structure_pivot_ts':int(d['close_time'].iloc[structure_i]),
-                'displacement_atr':body/atr,'return_tolerance_pct':return_tolerance_pct,
-            },pivot_1_ts=int(d['close_time'].iloc[structure_i]))]
+            low_level = float(d['low'].iloc[low_i])
+            lower_highs = [p for p in highs if low_i < p < last and p + 2 < last and float(d['high'].iloc[p]) < high_level]
+            for lower_high_i in lower_highs:
+                if low_i + 2 >= lower_high_i:
+                    continue
+                # No external buy-side sweep before the structural break.
+                if float(d['high'].iloc[high_i + 1:lower_high_i].max()) >= high_level:
+                    continue
+                breaks = [k for k in range(lower_high_i + 1, last) if float(d['close'].iloc[k]) < low_level]
+                if not breaks:
+                    continue
+                bos_i = next((k for k in breaks if _body_displacement_ok(k)[0]), None)
+                if bos_i is None or bos_i <= lower_high_i + 1:
+                    continue
+                post_hi = float(d['high'].iloc[lower_high_i + 1:bos_i].max()) if bos_i > lower_high_i + 1 else float('-inf')
+                if post_hi >= high_level:
+                    continue
+                origin_i = _origin_before(low_i, bullish=False)
+                if origin_i is None:
+                    continue
+                zone_hi = float(d['high'].iloc[origin_i]); zone_lo = float(d['low'].iloc[origin_i])
+                level = float(d['open'].iloc[origin_i])
+                touched = float(d['high'].iloc[-1]) >= level * (1 - return_tolerance_pct / 100.0)
+                still_valid = float(d['close'].iloc[-1]) < zone_hi
+                if touched and still_valid:
+                    ok, atr = _body_displacement_ok(bos_i)
+                    ts = int(d['close_time'].iloc[-1])
+                    return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BEARISH', 'SHORT', ts,
+                        int(d['close_time'].iloc[origin_i]), {
+                            'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
+                            'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
+                            'origin_ts': int(d['close_time'].iloc[origin_i]),
+                            'failure_swing_ts': int(d['close_time'].iloc[lower_high_i]),
+                            'failure_swing_level': float(d['high'].iloc[lower_high_i]),
+                            'impulse_ts': int(d['close_time'].iloc[bos_i]), 'bos_ts': int(d['close_time'].iloc[bos_i]),
+                            'structure_level': low_level, 'structure_pivot_ts': int(d['close_time'].iloc[low_i]),
+                            'displacement_atr': float(abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i])) / atr),
+                            'return_tolerance_pct': return_tolerance_pct,
+                            'failure_swing_no_sweep': True,
+                        }, pivot_1_ts=int(d['close_time'].iloc[low_i]))]
     return []
-
 
 
 def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 30,
@@ -1050,8 +1185,11 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
     lookback_start = max(0, last - int(lookback))
     if lows:
         li=[i for i in lows if lookback_start <= i <= last-3]
-        if li:
-            i=li[-1]; level=float(d['low'].iloc[i]); sweep=(level-float(d['low'].iloc[-1]))/atr
+        for i in reversed(li):
+            level=float(d['low'].iloc[i])
+            if _level_was_consumed(d, level, i + 3, last, 'bullish'):
+                continue
+            sweep=(level-float(d['low'].iloc[-1]))/atr
             outside_share = outside_volume_share(level, 'LONG')
             if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
                     and float(d['close'].iloc[-1])>level and float(d['close'].iloc[-1])>float(d['open'].iloc[-1])):
@@ -1063,8 +1201,11 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
                     'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
     if highs:
         hi=[i for i in highs if lookback_start <= i <= last-3]
-        if hi:
-            i=hi[-1]; level=float(d['high'].iloc[i]); sweep=(float(d['high'].iloc[-1])-level)/atr
+        for i in reversed(hi):
+            level=float(d['high'].iloc[i])
+            if _level_was_consumed(d, level, i + 3, last, 'bearish'):
+                continue
+            sweep=(float(d['high'].iloc[-1])-level)/atr
             outside_share = outside_volume_share(level, 'SHORT')
             if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
                     and float(d['close'].iloc[-1])<level and float(d['close'].iloc[-1])<float(d['open'].iloc[-1])):
@@ -1160,6 +1301,7 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
     if c1_range/atr<min_range_atr: return []
     # Bullish CRT: C2 sweeps below C1 low and C3 reclaims C1 low.
     if (float(c2['low']) < float(c1['low']) - min_sweep_atr*atr
+            and float(c2['high']) <= float(c1['high'])
             and float(c1['low']) < float(c3['close']) < float(c1['high'])
             and float(c3['close']) > float(c3['open'])):
         ts=int(c3['close_time'])
@@ -1168,6 +1310,7 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
             'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c1['low'])-float(c2['low']))/atr,
         },pivot_1_ts=int(c1['close_time']))]
     if (float(c2['high']) > float(c1['high']) + min_sweep_atr*atr
+            and float(c2['low']) >= float(c1['low'])
             and float(c1['low']) < float(c3['close']) < float(c1['high'])
             and float(c3['close']) < float(c3['open'])):
         ts=int(c3['close_time'])
@@ -1588,9 +1731,21 @@ def detect_harmonic_patterns(
         # Ratios follow the user-specified plan for Gartley/Bat/Butterfly.
         if _ratio_near(ab_xa, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 1.272, 1.618, tol) and _ratio_near(ad_xa, 0.786, tol):
             candidates.append("GARTLEY")
-        if _ratio_in(ab_xa, 0.382, 0.500, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_near(ad_xa, 0.886, tol):
+        if (
+            _ratio_in(ab_xa, 0.382, 0.500, tol)
+            and _ratio_in(bc_ab, 0.382, 0.886, tol)
+            and _ratio_in(cd_bc, 1.618, 2.618, tol)
+            and _ratio_near(ad_xa, 0.886, tol)
+        ):
             candidates.append("BAT")
-        if _ratio_near(ab_xa, 0.786, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 1.272, 1.618, tol) and _ratio_near(ad_xa, 1.272, tol):
+        if (
+            _ratio_near(ab_xa, 0.786, tol)
+            and _ratio_in(bc_ab, 0.382, 0.886, tol)
+            and (
+                _ratio_in(cd_bc, 1.618, 2.618, tol)
+                or _ratio_in(ad_xa, 1.272, 2.618, tol)
+            )
+        ):
             candidates.append("BUTTERFLY")
 
         # These three use the published public ratio families from the open
@@ -1599,7 +1754,7 @@ def detect_harmonic_patterns(
             candidates.append("CRAB")
         if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(xc_xa, 1.272, 1.414, tol) and _ratio_near(cd_xc, 0.786, tol):
             candidates.append("CYPHER")
-        if _ratio_in(ab_xa, 0.500, 0.886, tol) and _ratio_in(bc_ab, 1.130, 1.618, tol) and _ratio_in(cd_bc, 1.618, 2.240, tol) and _ratio_in(ad_xa, 0.886, 1.130, tol):
+        if _ratio_in(bc_ab, 1.130, 1.618, tol) and _ratio_in(cd_bc, 1.618, 2.240, tol) and _ratio_in(ad_xa, 0.886, 1.130, tol):
             candidates.append("SHARK")
 
         if not candidates:
