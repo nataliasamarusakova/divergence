@@ -441,17 +441,27 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
     return _normalize_orders_list(resp)
 
 
-def get_order(symbol: str, order_id: str | int) -> dict:
+def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
+    if order_id is None and not client_order_id:
+        return {"status": "error", "error": "order identifier required"}
 
-    resp = _request("GET", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
-    if resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": resp.get("msg"), "code": resp.get("code")}
+    params = {"symbol": bx}
+    if order_id is not None:
+        params["orderId"] = str(order_id)
+    else:
+        params["clientOrderId"] = str(client_order_id)
+
+    resp = _request("GET", ORDER_PATH, params, signed=True, retryable=False)
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        return {"status": "error", "error": resp.get("msg") if isinstance(resp, dict) else str(resp), "code": resp.get("code") if isinstance(resp, dict) else None}
 
     data = resp.get("data") or {}
     order = data.get("order") or data
+    if not isinstance(order, dict):
+        return {"status": "error", "error": "order response missing order object", "code": resp.get("code")}
 
     avg_price_raw = order.get("avgPrice")
     try:
@@ -462,17 +472,34 @@ def get_order(symbol: str, order_id: str | int) -> dict:
         trigger_price = float(order.get("stopPrice", 0) or 0)
     except (TypeError, ValueError):
         trigger_price = 0.0
+    try:
+        executed_qty = float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0)
+    except (TypeError, ValueError):
+        executed_qty = 0.0
+    try:
+        orig_qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
+    except (TypeError, ValueError):
+        orig_qty = 0.0
 
     return {
         "status": "ok",
-        "order_id": str(order.get("orderId", order_id)),
+        "order_id": str(order.get("orderId") or order.get("orderID") or order_id or ""),
         "order_status": str(order.get("status", "")).upper(),
         "avg_price": avg_price,
         "trigger_price": trigger_price,
-        "executed_qty": float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0),
-        "orig_qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
+        "executed_qty": executed_qty,
+        "orig_qty": orig_qty,
         "client_order_id": str(order.get("clientOrderId", "")),
+        "raw_order": order,
     }
+
+
+def get_order(symbol: str, order_id: str | int) -> dict:
+    return _query_order(symbol, order_id=order_id)
+
+
+def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
+    return _query_order(symbol, client_order_id=client_order_id)
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
@@ -509,9 +536,13 @@ def _trade_digest(trade_id: str) -> str:
     return hashlib.sha256(str(trade_id).upper().encode()).hexdigest().upper()[:16]
 
 
-def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
+def _new_open_client_order_id(bx_symbol: str, trade_id: str, retry_index: int = 0) -> str:
     # BingX clientOrderId is constrained to alphanumeric identifiers.
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:24]
+    # The first attempt keeps the historical deterministic ID; a retry is a
+    # distinct deterministic ID so a confirmed CANCELED/EXPIRED order is never
+    # reused as a new order.
+    suffix = "" if retry_index <= 0 else f":RETRY:{int(retry_index)}"
+    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}{suffix}".encode()).hexdigest().upper()[:24]
     return f"EVTOPEN{digest}"
 
 
@@ -589,56 +620,134 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         "clientOrderId": client_order_id,
     }
 
-    response = _request("POST", ORDER_PATH, params)
+    # A confirmed CANCELED/EXPIRED order is no longer active and BingX forbids
+    # reusing its clientOrderId. One deterministic fresh-ID retry is safe.
+    # NEW/unknown or failed lookup states remain UNKNOWN and are never blindly
+    # retried from inside this call.
+    for open_attempt in range(2):
+        response = _request("POST", ORDER_PATH, params)
 
-    if isinstance(response, dict) and response.get("code") not in (0, "0"):
-        # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
-        # the outcome unknown -- the order may have been created even though we
-        # did not receive an ack. Never blindly retry a POST; verify the result
-        # via the position instead. The pre-flight has_open_position check above
-        # guarantees any position present now was opened by THIS order.
-        transport_error = (
-            response.get("code") == -1
-            and "missing bingx credentials" not in str(response.get("msg", "")).lower()
-        )
-        if transport_error:
-            log.warning("[BINGX] Order POST transport error for %s (%s); verifying via position...", bx, response.get("msg"))
-            try:
-                if has_open_position(symbol, direction):
-                    log.warning("[BINGX] Position found after transport error -> treating order as filled (idempotent).")
+        if isinstance(response, dict) and response.get("code") not in (0, "0"):
+            # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
+            # the outcome unknown -- the order may have been created even though we
+            # did not receive an ack. Never blindly retry a POST; verify the result
+            # via the position instead. The pre-flight has_open_position check above
+            # guarantees any position present now was opened by THIS order.
+            transport_error = (
+                response.get("code") == -1
+                and "missing bingx credentials" not in str(response.get("msg", "")).lower()
+            )
+            if transport_error:
+                log.warning("[BINGX] Order POST transport error for %s (%s); querying clientOrderId before retry/reconciliation...", bx, response.get("msg"))
+                try:
+                    queried = get_order_by_client_order_id(symbol, client_order_id)
+                except Exception as exc:
+                    queried = {"status": "error", "error": str(exc)}
+
+                if queried.get("status") == "ok":
+                    order_status = str(queried.get("order_status", "")).upper()
+                    executed_qty = float(queried.get("executed_qty", 0) or 0)
+                    if executed_qty > 0 or order_status in {"FILLED", "PARTIALLY_FILLED"}:
+                        log.warning(
+                            "[BINGX] Order %s found after transport error with status=%s executed_qty=%s; treating entry as accepted.",
+                            client_order_id, order_status, executed_qty,
+                        )
+                        return {
+                            "status": "opened",
+                            "symbol": bx,
+                            "qty": qty,
+                            "leverage": leverage,
+                            "sizing_price": sizing_price,
+                            "signal_price": float(price),
+                            "order_reference_price": sizing_price,
+                            "order_id": queried.get("order_id"),
+                            "client_order_id": client_order_id,
+                            "idempotency": "order_queried_after_transport_error",
+                            "order_status": order_status,
+                            "executed_qty": executed_qty,
+                            "response": response,
+                        }
+                    if order_status in {"CANCELED", "EXPIRED"}:
+                        if open_attempt == 0:
+                            retry_client_order_id = _new_open_client_order_id(bx, trade_id, retry_index=1)
+                            log.warning(
+                                "[BINGX] Entry order %s is %s after transport error; retrying once with fresh clientOrderId=%s.",
+                                client_order_id, order_status, retry_client_order_id,
+                            )
+                            client_order_id = retry_client_order_id
+                            params["clientOrderId"] = client_order_id
+                            continue
+                        return {
+                            "status": "error",
+                            "error": f"market entry retry order {client_order_id} is {order_status} after transport error",
+                            "symbol": bx, "clientOrderId": client_order_id,
+                            "order_id": queried.get("order_id"),
+                            "order_status": order_status,
+                            "retry_exhausted": True,
+                            "response": response,
+                        }
+                    # NEW/unknown exchange states are not safe to retry inside this call.
                     return {
-                        "status": "opened",
-                        "symbol": bx,
-                        "qty": qty,
-                        "leverage": leverage,
-                        "sizing_price": sizing_price,
-                        "signal_price": float(price),
-                        "order_reference_price": sizing_price,
-                        "order_id": None,
-                        "client_order_id": client_order_id,
-                        "idempotency": "position_verified_after_transport_error",
+                        "status": "unknown",
+                        "error": f"market order outcome remains pending after transport error: status={order_status or 'unknown'}",
+                        "symbol": bx, "clientOrderId": client_order_id,
+                        "order_id": queried.get("order_id"),
+                        "order_status": order_status,
                         "response": response,
                     }
-            except Exception as exc:
-                log.error("[BINGX] Post-error position verification failed: %s", exc)
 
-        return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
+                try:
+                    if has_open_position(symbol, direction):
+                        log.warning("[BINGX] Position found after transport error; treating deterministic clientOrderId entry as accepted.")
+                        return {
+                            "status": "opened",
+                            "symbol": bx,
+                            "qty": qty,
+                            "leverage": leverage,
+                            "sizing_price": sizing_price,
+                            "signal_price": float(price),
+                            "order_reference_price": sizing_price,
+                            "order_id": None,
+                            "client_order_id": client_order_id,
+                            "idempotency": "position_verified_after_transport_error",
+                            "response": response,
+                        }
+                except Exception as exc:
+                    log.error("[BINGX] Post-error position verification failed: %s", exc)
 
-    data = response.get("data") or {}
-    order = data.get("order") or {}
-    order_id = order.get("orderId") or data.get("orderId")
+                return {
+                    "status": "unknown",
+                    "error": f"market order outcome unknown after transport error: {response.get('msg', '')}",
+                    "symbol": bx, "clientOrderId": client_order_id,
+                    "response": response,
+                }
+
+            return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
+
+        data = response.get("data") or {}
+        order = data.get("order") or {}
+        order_id = order.get("orderId") or data.get("orderId")
+
+        return {
+            "status": "opened",
+            "symbol": bx,
+            "qty": qty,
+            "leverage": leverage,
+            "sizing_price": sizing_price,
+            "signal_price": float(price),
+            "order_reference_price": sizing_price,
+            "order_id": order_id,
+            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "response": response,
+            "open_attempt": open_attempt + 1,
+        }
 
     return {
-        "status": "opened",
+        "status": "error",
+        "error": "market entry retry exhausted",
         "symbol": bx,
-        "qty": qty,
-        "leverage": leverage,
-        "sizing_price": sizing_price,
-        "signal_price": float(price),
-        "order_reference_price": sizing_price,
-        "order_id": order_id,
-        "client_order_id": order.get("clientOrderId") or client_order_id,
-        "response": response,
+        "clientOrderId": client_order_id,
+        "retry_exhausted": True,
     }
 
 
@@ -663,6 +772,10 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid close parameters: {exc}"}
 
+    client_order_id = "EVTCLOSE" + hashlib.sha256(
+        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}".upper().encode()
+    ).hexdigest().upper()[:24]
+
     for attempt in range(2):
         try:
             live = get_position_directional(symbol, direction)
@@ -678,9 +791,6 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             return {"status": "error", "error": "emergency close quantity is zero", "symbol": bx_symbol}
 
         side = "SELL" if direction == "LONG" else "BUY"
-        token = f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:{attempt}"
-        digest = hashlib.sha256(token.upper().encode()).hexdigest().upper()[:24]
-        client_order_id = f"EVTCLOSE{digest}"
         params = {
             "symbol": bx_symbol,
             "side": side,
@@ -696,6 +806,93 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             if attempt == 1:
                 return {"status": "error", "error": last_error, "symbol": bx_symbol, "client_order_id": client_order_id}
             continue
+
+        if code in (-1, "-1"):
+            try:
+                queried = get_order_by_client_order_id(symbol, client_order_id)
+            except Exception as exc:
+                queried = {"status": "error", "error": str(exc)}
+
+            if queried.get("status") == "ok":
+                order_status = str(queried.get("order_status", "")).upper()
+                executed_qty = float(queried.get("executed_qty", 0) or 0)
+                if order_status in {"FILLED", "PARTIALLY_FILLED"} or executed_qty > 0:
+                    log.warning(
+                        "[EMERGENCY_CLOSE] %s found after transport error with status=%s executed_qty=%s; verifying residual before any new POST.",
+                        client_order_id, order_status, executed_qty,
+                    )
+                    time.sleep(0.25)
+                    try:
+                        after_recovery = get_position_directional(symbol, direction)
+                    except Exception as exc:
+                        return {
+                            "status": "unknown",
+                            "error": f"emergency close order outcome found but residual verification failed: {exc}",
+                            "symbol": bx_symbol, "direction": direction,
+                            "client_order_id": client_order_id, "escalation_required": True,
+                        }
+                    residual_qty = abs(float(after_recovery.get("positionAmt", 0) or 0)) if str(after_recovery.get("status", "")).lower() == "found" else 0.0
+                    if residual_qty <= 0:
+                        return {
+                            "status": "closed",
+                            "symbol": bx_symbol,
+                            "direction": direction,
+                            "client_order_id": client_order_id,
+                            "execution_price": queried.get("avg_price") or None,
+                            "idempotency": "order_queried_after_transport_error",
+                        }
+                    if order_status == "FILLED":
+                        return {
+                            "status": "unknown",
+                            "error": "MARKET close order is FILLED but position remains; refusing blind duplicate",
+                            "symbol": bx_symbol, "direction": direction,
+                            "client_order_id": client_order_id,
+                            "remaining_qty": residual_qty, "escalation_required": True,
+                        }
+                    # A verified partial fill justifies one fresh order for the
+                    # exact residual quantity. Never reuse the filled order id.
+                    digest = hashlib.sha256(
+                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RESIDUAL:{attempt}".upper().encode()
+                    ).hexdigest().upper()[:24]
+                    client_order_id = f"EVTCLOSE{digest}"
+                    requested_qty = residual_qty
+                    continue
+
+                if order_status in {"CANCELED", "EXPIRED"}:
+                    digest = hashlib.sha256(
+                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RETRY:{attempt}".upper().encode()
+                    ).hexdigest().upper()[:24]
+                    client_order_id = f"EVTCLOSE{digest}"
+                    continue
+
+                return {
+                    "status": "unknown",
+                    "error": f"MARKET close order pending after transport error: status={order_status or 'unknown'}; refusing blind duplicate",
+                    "symbol": bx_symbol, "direction": direction,
+                    "client_order_id": client_order_id,
+                    "escalation_required": True,
+                }
+
+            if queried.get("status") == "absent":
+                # A proven-absent order may be safely retried with the SAME
+                # clientOrderId. If the first POST was actually accepted but
+                # the query is only lagging, BingX's unique clientOrderId
+                # prevents creation of a second order.
+                if attempt + 1 < 2:
+                    time.sleep(0.25)
+                    continue
+                continue
+
+            # If the order lookup itself is unavailable, do not manufacture a
+            # new MARKET order. The original clientOrderId remains the canonical
+            # recovery key for the next reconciliation cycle.
+            return {
+                "status": "unknown",
+                "error": f"MARKET close transport outcome unknown; order lookup failed: {queried.get('error', 'unknown')}",
+                "symbol": bx_symbol, "direction": direction,
+                "client_order_id": client_order_id,
+                "escalation_required": True,
+            }
 
         time.sleep(0.25)
         execution_price = None
@@ -723,6 +920,67 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
                 "client_order_id": client_order_id,
                 "execution_price": execution_price,
             }
+
+        # An HTTP-successful MARKET close can still race the position endpoint: the
+        # order may already be FILLED while the live position view has not caught up.
+        # Never infer "partial" solely from a stale position snapshot. Verify the
+        # acknowledged order by its clientOrderId before issuing any second MARKET.
+        try:
+            verified_order = get_order_by_client_order_id(symbol, client_order_id)
+        except Exception as exc:
+            verified_order = {"status": "error", "error": str(exc)}
+
+        if verified_order.get("status") != "ok":
+            # The original POST was acknowledged, but the order lookup endpoint
+            # is unavailable. A single bounded retry with the SAME clientOrderId
+            # is safe: it cannot create a second independent order identity.
+            # Never mint a fresh ID while the original outcome is unverified.
+            if attempt + 1 < 2:
+                time.sleep(0.25)
+                continue
+            continue
+
+        verified_status = str(verified_order.get("order_status", "")).upper()
+        verified_executed_qty = float(verified_order.get("executed_qty", 0) or 0)
+        residual_qty = abs(float(after.get("positionAmt", 0) or 0))
+
+        if verified_status == "FILLED" and residual_qty > 0:
+            return {
+                "status": "unknown",
+                "error": "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate",
+                "symbol": bx_symbol,
+                "direction": direction,
+                "client_order_id": client_order_id,
+                "remaining_qty": residual_qty,
+                "executed_qty": verified_executed_qty,
+                "escalation_required": True,
+            }
+
+        if verified_status in {"CANCELED", "EXPIRED"}:
+            digest = hashlib.sha256(
+                f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:ACK_CANCEL_RETRY:{attempt}".upper().encode()
+            ).hexdigest().upper()[:24]
+            client_order_id = f"EVTCLOSE{digest}"
+            continue
+
+        if verified_status not in {"PARTIALLY_FILLED", "FILLED"} or verified_executed_qty <= 0:
+            return {
+                "status": "unknown",
+                "error": f"MARKET close acknowledged but order status={verified_status or 'unknown'} with residual position; refusing blind duplicate",
+                "symbol": bx_symbol,
+                "direction": direction,
+                "client_order_id": client_order_id,
+                "remaining_qty": residual_qty,
+                "escalation_required": True,
+            }
+
+        # Verified partial fill: a second close is justified for the exact live
+        # residual, but it must use a fresh clientOrderId because the first ID
+        # already belongs to the exchange order.
+        digest = hashlib.sha256(
+            f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:SUCCESS_RESIDUAL:{attempt}".upper().encode()
+        ).hexdigest().upper()[:24]
+        client_order_id = f"EVTCLOSE{digest}"
 
     # Two verified close attempts are the automatic safety limit. Do one final
     # read-only position check and surface an explicit unresolved state rather
@@ -979,12 +1237,30 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     expected_formatted = _format_price(expected_price, price_precision)
     actual_formatted = _format_price(actual_price, price_precision)
 
+    # When a client id explicitly identifies a TP leg, that identity is
+    # authoritative. Do not fall back to trigger-price matching for a different
+    # leg, otherwise one order can be assigned to multiple TP legs when prices
+    # happen to coincide. Current conditional BingX orders may have no
+    # clientOrderId at all, so price matching remains the fallback for that case.
+    declared_leg_num = None
+    if client_id.startswith("EVTTP") and len(client_id) > len("EVTTP") and client_id[len("EVTTP")].isdigit():
+        declared_leg_num = client_id[len("EVTTP")]
+    else:
+        marker = "_TP"
+        marker_pos = client_id.rfind(marker)
+        if marker_pos >= 0 and marker_pos + len(marker) < len(client_id) and client_id[marker_pos + len(marker)].isdigit():
+            declared_leg_num = client_id[marker_pos + len(marker)]
+
+    expected_leg_num = "".join(ch for ch in expected_leg if ch.isdigit())[:1]
+    if declared_leg_num is not None:
+        if declared_leg_num != expected_leg_num:
+            return False
+
     # Prefer the legacy/deterministic client id when it is present. New
     # conditional BingX protection orders do not support clientOrderId, so for
     # those orders the trigger price becomes the stable leg identity.
     if trade_id and client_id:
         digest = _trade_digest(trade_id)
-        expected_leg_num = "".join(ch for ch in expected_leg if ch.isdigit())[:1]
         if client_id == f"EVTTP{expected_leg_num}{digest}":
             return _price_matches()
         # Backward compatibility for protection orders created before the
@@ -995,7 +1271,7 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     if client_id:
         if f"_{expected_leg}_" in f"_{client_id}_":
             return _price_matches()
-        if client_id.startswith(f"EVTTP{''.join(ch for ch in expected_leg if ch.isdigit())[:1]}"):
+        if client_id.startswith(f"EVTTP{expected_leg_num}"):
             return _price_matches()
 
     # Current BingX conditional protection orders: identify the leg by the
@@ -1201,6 +1477,18 @@ def _post_protection_order_verified(
         except Exception as exc:
             resp = {"code": -1, "msg": str(exc)}
         if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+            data = resp.get("data") or {}
+            order = data.get("order") if isinstance(data, dict) else None
+            if not isinstance(order, dict):
+                order = data if isinstance(data, dict) else {}
+            order_id = str(order.get("orderId", "") or "").strip()
+            if not order_id:
+                return {
+                    "code": -1,
+                    "msg": "successful protection response is missing orderId",
+                    "protection_state_unknown": True,
+                    "malformed_success_response": True,
+                }
             return resp
 
         last_resp = resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
@@ -1534,6 +1822,9 @@ def ensure_directional_protection(
 
         existing_leg = None
         for order in existing_tp:
+            existing_order_id = str(order.get("orderId", ""))
+            if existing_order_id and existing_order_id in handled_existing_tp_ids:
+                continue
             if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id):
                 existing_leg = order
                 break

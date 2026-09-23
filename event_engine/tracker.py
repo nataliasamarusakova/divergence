@@ -182,21 +182,31 @@ def _load_active_trades() -> dict[str, dict]:
             normalized = {}
             for event_id, trade in data.items():
                 if not isinstance(trade, dict):
+                    log.error("[TRACKER] Invalid state record %s: expected object, got %s; skipping record", event_id, type(trade).__name__)
                     continue
-                t = dict(trade)
-                t.setdefault("mae_pct", 0.0)
-                t.setdefault("max_drawdown_pct", 0.0)
-                t.setdefault("be_required", False)
-                t.setdefault("be_last_error", None)
-                t.setdefault("sl_order_history", [])
-                t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
-                t.setdefault("effective_tp_levels", t.get("tp_levels", []))
-                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.6625))
-                t.setdefault("close_journal_pending", False)
-                t.setdefault("close_notification_pending", False)
-                t.setdefault("close_cleanup_pending", False)
-                t.setdefault("close_cleanup_last_error", None)
-                normalized[str(event_id)] = t
+                try:
+                    t = dict(trade)
+                    tp_orders = t.get("tp_orders")
+                    if tp_orders is None:
+                        t["tp_orders"] = []
+                    elif not isinstance(tp_orders, list):
+                        log.error("[TRACKER] Invalid tp_orders for state record %s: expected list, got %s; normalizing to []", event_id, type(tp_orders).__name__)
+                        t["tp_orders"] = []
+                    t.setdefault("mae_pct", 0.0)
+                    t.setdefault("max_drawdown_pct", 0.0)
+                    t.setdefault("be_required", False)
+                    t.setdefault("be_last_error", None)
+                    t.setdefault("sl_order_history", [])
+                    t.setdefault("tp_mode", "single_tp" if len(t["tp_orders"]) == 1 else "multi_tp")
+                    t.setdefault("effective_tp_levels", t.get("tp_levels", []))
+                    t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.6625))
+                    t.setdefault("close_journal_pending", False)
+                    t.setdefault("close_notification_pending", False)
+                    t.setdefault("close_cleanup_pending", False)
+                    t.setdefault("close_cleanup_last_error", None)
+                    normalized[str(event_id)] = t
+                except Exception as exc:
+                    log.error("[TRACKER] Invalid state record %s: %s; skipping record", event_id, exc)
             return normalized
         log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
         return {}

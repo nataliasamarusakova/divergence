@@ -2386,7 +2386,12 @@ def check_btc_regime(
     prev_1h = float(close.iloc[-2])
     prev_4h = float(close.iloc[-5])
 
-    if last_close <= 0 or prev_1h <= 0 or prev_4h <= 0:
+    if (
+        not all(math.isfinite(value) for value in (last_close, prev_1h, prev_4h))
+        or last_close <= 0
+        or prev_1h <= 0
+        or prev_4h <= 0
+    ):
         return True, "INSUFFICIENT_DATA"
 
     chg_1h_pct = ((last_close - prev_1h) / prev_1h) * 100.0
