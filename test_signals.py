@@ -2702,7 +2702,7 @@ def _make_breaker_fixture(with_liquidity_sweep: bool) -> pd.DataFrame:
 def test_breaker_requires_liquidity_sweep_before_mss(monkeypatch):
     import event_engine.signals as sig
 
-    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [105, 115]))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
 
     without_sweep = sig.detect_breaker_block(_make_breaker_fixture(False), "TEST", "1h")
     assert without_sweep == []
@@ -2724,17 +2724,17 @@ def _make_mitigation_fixture(with_bos: bool) -> pd.DataFrame:
             "volume":1000.0,"close_time":1_700_000_000_000+i*3_600_000,
         })
     df=pd.DataFrame(rows)
-    # Confirmed structure high before the displacement.
-    df.loc[100,["open","high","low","close"]]=[104.0,105.0,103.6,104.5]
-    # Origin = last opposite candle before the strong bullish impulse.
-    df.loc[105,["open","high","low","close"]]=[100.6,101.0,99.0,100.0]
-    df.loc[106,["open","high","low","close"]]=[100.0,111.5,99.8,111.0]
+    # Canonical bullish mitigation structure: swing low -> intervening swing high -> higher low.
+    df.loc[100,["open","high","low","close"]]=[96.0,96.5,95.0,95.8]
+    df.loc[104,["open","high","low","close"]]=[102.0,104.0,101.5,103.0]  # nearest up-close origin
+    df.loc[105,["open","high","low","close"]]=[104.0,105.0,102.2,103.0]
+    df.loc[110,["open","high","low","close"]]=[99.5,101.5,98.0,100.5]  # higher low (98 > 95)
     if with_bos:
-        df.loc[108,["open","high","low","close"]]=[111.0,112.0,110.5,106.0]
+        df.loc[113,["open","high","low","close"]]=[100.0,109.5,99.5,108.0]
     else:
-        df.loc[108,["open","high","low","close"]]=[111.0,112.0,110.5,104.0]
-    # Price expands away from origin, then returns to origin open.
-    df.loc[139,["open","high","low","close"]]=[101.0,102.0,100.4,101.2]
+        df.loc[113,["open","high","low","close"]]=[100.0,104.5,99.5,104.0]
+    # Price returns to the origin open.
+    df.loc[139,["open","high","low","close"]]=[102.0,103.0,101.9,102.0]
     return df
 
 
@@ -2742,7 +2742,7 @@ def test_mitigation_block_requires_origin_and_post_impulse_bos(monkeypatch):
     import event_engine.signals as sig
 
     monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0]*len(d), index=d.index, dtype=float))
-    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [100]))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([100, 110], [105]))
 
     assert sig.detect_mitigation_block(_make_mitigation_fixture(False), "TEST", "1h") == []
 
@@ -2750,9 +2750,10 @@ def test_mitigation_block_requires_origin_and_post_impulse_bos(monkeypatch):
     assert len(events) == 1
     event = events[0]
     assert event["event_type"] == "MITIGATION_BLOCK_BULLISH"
-    assert event["event_fact"]["origin_ts"] < event["event_fact"]["impulse_ts"] < event["event_fact"]["bos_ts"]
-    assert event["event_fact"]["zone_low"] == pytest.approx(99.0)
-    assert event["event_fact"]["trigger_level"] == pytest.approx(100.6)
+    assert event["event_fact"]["origin_ts"] < event["event_fact"]["failure_swing_ts"] < event["event_fact"]["bos_ts"]
+    assert event["event_fact"]["zone_low"] == pytest.approx(101.5)
+    assert event["event_fact"]["trigger_level"] == pytest.approx(102.0)
+    assert event["event_fact"]["failure_swing_level"] == pytest.approx(98.0)
 
 
 def test_smc_detectors_fail_closed_on_incomplete_data():
@@ -3345,6 +3346,7 @@ def test_breaker_liquidity_sweep_rejects_unconfirmed_sweep_pivot():
     d = pd.DataFrame({
         "high": [100.0] * 30,
         "low": [99.0] * 30,
+        "close": [99.5] * 30,
     })
     d.loc[10, "high"] = 110.0
     d.loc[11, "high"] = 112.0  # sweep arrives before two confirmation bars
@@ -3357,9 +3359,10 @@ def test_breaker_liquidity_sweep_accepts_fully_confirmed_pivot():
     d = pd.DataFrame({
         "high": [100.0] * 30,
         "low": [99.0] * 30,
+        "close": [99.5] * 30,
     })
     d.loc[10, "high"] = 110.0
-    d.loc[13, "high"] = 112.0  # pivot has two confirmation bars before sweep
+    d.loc[13, "high"] = 112.0  # pivot has two confirmation bars before sweep; close rejects back below it
     assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bearish") == (13, 110.0)
 
 

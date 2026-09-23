@@ -1,5 +1,30 @@
+import pytest
 import json
+import pandas as pd
 from pathlib import Path
+
+
+def test_vst_research_mode_disables_entry_caps(monkeypatch):
+    import run_once
+
+    # The current package defaults to VST/demo research mode. In that mode the
+    # portfolio cap (12 total / 6 long / 6 short) and per-cycle entry cap are off
+    # so valid signals are not filtered merely for statistical collection.
+    monkeypatch.setattr(run_once, "PORTFOLIO_CAP_ENABLED", False)
+    monkeypatch.setattr(run_once, "MAX_TRADES", 0)
+
+    active_total = 999
+    active_longs = 999
+    active_shorts = 999
+    direction = "LONG"
+
+    portfolio_cap_hit = run_once.PORTFOLIO_CAP_ENABLED and (
+        active_total >= run_once.MAX_ACTIVE_TRADES
+        or (direction == "LONG" and active_longs >= run_once.MAX_ACTIVE_LONGS)
+        or (direction == "SHORT" and active_shorts >= run_once.MAX_ACTIVE_SHORTS)
+    )
+    assert portfolio_cap_hit is False
+    assert run_once.MAX_TRADES <= 0
 
 
 def test_repeated_pre_order_drift_failures_are_counted(tmp_path, monkeypatch):
@@ -41,6 +66,132 @@ REAL_JOURNAL_EVENT_ROWS = r'''
 {"event_id":"EVT_52B9C4CDADEC8A4B","symbol":"NEAR","timeframe":"1h","direction":"LONG","event_type":"CRT_BULLISH","timestamps":{"pivot_1_ts":1789927200000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"CRT","requires_retest":true,"requires_htf_context":true,"trigger_level":4.043,"range_high":4.276,"range_low":4.043,"manipulation_depth_atr":0.4555508972314215}}
 {"event_id":"EVT_C5740BE651D5B53A","symbol":"HYPE","timeframe":"1h","direction":"LONG","event_type":"CRT_BULLISH","timestamps":{"pivot_1_ts":1789927200000,"pivot_2_ts":1789934400000,"detected_at_ts":1789934400000},"event_fact":{"engine":"CRT","requires_retest":true,"requires_htf_context":true,"trigger_level":92.367,"range_high":93.304,"range_low":92.367,"manipulation_depth_atr":0.14141977378585924}}
 '''
+
+
+
+def test_breaker_liquidity_sweep_requires_rejection_close():
+    import event_engine.signals as sig
+
+    d = pd.DataFrame({
+        "open": [100.0] * 30,
+        "high": [100.0] * 30,
+        "low": [99.0] * 30,
+        "close": [99.5] * 30,
+    })
+    d.loc[10, "high"] = 110.0
+
+    # Wick through the buy-side liquidity but close above it: breakout, not sweep.
+    d.loc[13, ["high", "close"]] = [112.0, 111.0]
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bearish") is None
+
+    # Same wick, but rejection close back below the swept level: valid sweep.
+    d.loc[13, ["high", "close"]] = [112.0, 109.0]
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bearish") == (13, 110.0)
+
+
+
+
+def _make_breaker_mss_fixture(break_close: float) -> pd.DataFrame:
+    rows = []
+    for i in range(140):
+        rows.append({
+            "open": 100.0, "high": 100.4, "low": 99.6, "close": 100.0,
+            "volume": 1000.0, "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    # Bullish OB source candle.
+    rows[109].update({"open": 100.5, "high": 101.0, "low": 99.0, "close": 100.0})
+    # Original BOS above a confirmed swing high.
+    rows[110].update({"open": 100.5, "high": 112.0, "low": 100.0, "close": 111.0, "volume": 1800.0})
+    # Intervening structural low, confirmed before the liquidity sweep.
+    rows[115].update({"open": 108.0, "high": 110.0, "low": 97.0, "close": 108.5})
+    rows[116].update({"open": 108.0, "high": 109.0, "low": 107.5, "close": 108.2})
+    rows[117].update({"open": 108.0, "high": 109.0, "low": 107.5, "close": 108.2})
+    # Buy-side liquidity sweep with rejection close.
+    rows[118].update({"open": 108.5, "high": 111.5, "low": 107.0, "close": 108.0})
+    # Close below the OB edge (99) but optionally not below MSS level (97).
+    rows[121].update({"open": 100.0, "high": 100.5, "low": 96.5, "close": break_close, "volume": 1600.0})
+    # Retest the broken zone from below.
+    rows[139].update({"open": 98.0, "high": 100.0, "low": 96.5, "close": 98.5})
+    return pd.DataFrame(rows)
+
+
+def test_breaker_mss_requires_close_through_confirmed_structure(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+    assert sig._mss_level_before_sweep(_make_breaker_mss_fixture(98.0), [115], 110, 118, "bearish", 2) == (115, 97.0)
+    assert sig.detect_breaker_block(_make_breaker_mss_fixture(98.0), "TEST", "1h") == []
+
+
+def test_breaker_accepts_close_through_confirmed_mss(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+    events = sig.detect_breaker_block(_make_breaker_mss_fixture(96.0), "TEST", "1h")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "BREAKER_BLOCK_BEARISH"
+    assert events[0]["event_fact"]["mss_level"] == 97.0
+
+
+def _make_bullish_breaker_mss_fixture(break_close: float) -> pd.DataFrame:
+    rows = []
+    for i in range(140):
+        rows.append({
+            "open": 100.0, "high": 100.4, "low": 99.6, "close": 100.0,
+            "volume": 1000.0, "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    # Bearish OB source candle.
+    rows[109].update({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5})
+    # Original BOS below a confirmed swing low.
+    rows[110].update({"open": 100.5, "high": 101.0, "low": 88.0, "close": 89.0, "volume": 1800.0})
+    # Intervening structural high, confirmed before the sell-side sweep.
+    rows[116].update({"open": 102.0, "high": 103.0, "low": 100.0, "close": 102.2})
+    rows[117].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 102.2})
+    rows[118].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 102.2})
+    # Sell-side liquidity sweep with rejection close.
+    rows[119].update({"open": 92.5, "high": 94.0, "low": 88.5, "close": 100.0})
+    # Close above the OB edge (101) but optionally not above MSS level (103).
+    rows[122].update({"open": 102.0, "high": 104.0, "low": 101.0, "close": break_close, "volume": 1600.0})
+    # Retest the broken zone from above.
+    rows[139].update({"open": 104.0, "high": 106.0, "low": 100.5, "close": 104.5})
+    return pd.DataFrame(rows)
+
+
+def test_bullish_breaker_mss_requires_close_through_confirmed_structure(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+    assert sig.detect_breaker_block(_make_bullish_breaker_mss_fixture(102.5), "TEST", "1h") == []
+
+
+def test_bullish_breaker_accepts_close_through_confirmed_mss(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+    events = sig.detect_breaker_block(_make_bullish_breaker_mss_fixture(104.0), "TEST", "1h")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "BREAKER_BLOCK_BULLISH"
+    assert events[0]["event_fact"]["mss_level"] == 103.0
+
+
+def test_breaker_sell_side_sweep_requires_rejection_close():
+    import event_engine.signals as sig
+
+    d = pd.DataFrame({
+        "open": [100.0] * 30,
+        "high": [101.0] * 30,
+        "low": [100.0] * 30,
+        "close": [100.5] * 30,
+    })
+    d.loc[10, "low"] = 90.0
+
+    # Wick through sell-side liquidity but close below it: breakout, not sweep.
+    d.loc[13, ["low", "close"]] = [88.0, 89.0]
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bullish") is None
+
+    # Same wick, but rejection close back above the swept level: valid sweep.
+    d.loc[13, ["low", "close"]] = [88.0, 91.0]
+    assert sig._liquidity_sweep_before_break(d, [10], 5, 15, "bullish") == (13, 90.0)
 
 REAL_DIVERGENCE_EVENT_TYPES = [
     "REGULAR_BULLISH_RSI", "REGULAR_BEARISH_STOCH", "REGULAR_BULLISH_MACD",
@@ -1002,3 +1153,354 @@ def test_vpn_validator_is_transport_first_and_captures_curl_errors():
     assert "=== SEMANTIC CHECKS SKIPPED ===" in workflow
     assert 'if transport_failures:' in workflow
     assert workflow.index('if transport_failures:') < workflow.index("exchange = read_json('binance_exchangeInfo.body')")
+
+
+
+def _make_runtime_harmonic_fixture(points, kinds):
+    import pandas as pd
+    n = 90
+    rows = []
+    for i in range(n):
+        rows.append({
+            "open": 150.0, "high": 151.0, "low": 149.0, "close": 150.0,
+            "volume": 1000.0, "close_time": i * 60_000,
+        })
+    df = pd.DataFrame(rows)
+    for idx, price in points.items():
+        kind = kinds[idx]
+        if kind == "low":
+            df.loc[idx, "low"] = price
+            df.loc[idx, "open"] = price + 1.0
+            df.loc[idx, "close"] = price + 1.0
+            df.loc[idx, "high"] = max(price + 2.0, price + 1.5)
+        else:
+            df.loc[idx, "high"] = price
+            df.loc[idx, "open"] = price - 1.0
+            df.loc[idx, "close"] = price - 1.0
+            df.loc[idx, "low"] = min(price - 2.0, price - 1.5)
+    return df
+
+
+def test_shark_accepts_valid_oxabc_without_oxa_ratio_constraint(monkeypatch):
+    import event_engine.signals as sig
+
+    # Canonical O-X-A-B-C mapping into this detector's X-A-B-C-D names:
+    # code X=O, A=X, B=A, C=B, D=C.
+    # OX=100, XA=36 (0.36; intentionally below the erroneous 0.50 floor),
+    # AB=54 (1.50 XA), BC=108 (2.00 AB), XC=90 (0.90 OX).
+    points = {10: 1000.0, 20: 1100.0, 30: 1064.0, 40: 1118.0, 50: 1010.0}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_SHARK_LONG" for e in events)
+
+
+def test_shark_rejects_invalid_oxabc_geometry(monkeypatch):
+    import event_engine.signals as sig
+
+    # The OX/XA part is intentionally unconstrained, but BC/AB is 1.0 here,
+    # below the canonical Shark range of 1.618-2.24, so the event is rejected.
+    points = {10: 1000.0, 20: 1100.0, 30: 1064.0, 40: 1118.0, 50: 1028.0}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_SHARK_LONG" for e in events)
+
+
+def test_bat_accepts_canonical_projection(monkeypatch):
+    import event_engine.signals as sig
+
+    # X=1000, A=1100, B=1050, C=1090, D=1011.4:
+    # AB/XA=0.50, BC/AB=0.80, CD/BC≈1.965, AD/XA=0.886.
+    points = {10: 1000.0, 20: 1100.0, 30: 1050.0, 40: 1090.0, 50: 1011.4}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_BAT_LONG" for e in events)
+
+
+def test_bat_rejects_excessive_cd_bc_projection(monkeypatch):
+    import event_engine.signals as sig
+
+    # Same XA/AB/AD geometry, but C=1069.1 gives BC/AB≈0.382 and
+    # CD/BC≈3.02, above the canonical 2.618 ceiling.
+    points = {10: 1000.0, 20: 1100.0, 30: 1050.0, 40: 1069.1, 50: 1011.4}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_BAT_LONG" for e in events)
+
+
+def _make_crt_three_candle_fixture(bullish: bool, double_sweep: bool) -> pd.DataFrame:
+    rows = []
+    base_ts = 1_700_000_000_000
+    for i in range(50):
+        rows.append({
+            "open": 100.0, "high": 100.8, "low": 99.2, "close": 100.2,
+            "volume": 1000.0, "close_time": base_ts + i * 3_600_000,
+        })
+    c1 = 47
+    rows[c1].update({"open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0})
+    if bullish:
+        rows[c1 + 1].update({
+            "open": 101.0,
+            "high": 103.0 if double_sweep else 101.4,
+            "low": 97.5,
+            "close": 98.5,
+        })
+        rows[c1 + 2].update({"open": 98.5, "high": 101.5, "low": 98.2, "close": 100.8})
+    else:
+        rows[c1 + 1].update({
+            "open": 101.0,
+            "high": 103.5,
+            "low": 98.0 if double_sweep else 99.4,
+            "close": 101.5,
+        })
+        rows[c1 + 2].update({"open": 101.5, "high": 102.0, "low": 99.0, "close": 100.2})
+    return pd.DataFrame(rows)
+
+
+def test_crt_rejects_two_sided_bullish_sweep():
+    from event_engine.signals import detect_crt
+
+    df = _make_crt_three_candle_fixture(True, True)
+    assert detect_crt(df, "TEST", "1h") == []
+
+
+def test_crt_rejects_two_sided_bearish_sweep():
+    from event_engine.signals import detect_crt
+
+    df = _make_crt_three_candle_fixture(False, True)
+    assert detect_crt(df, "TEST", "1h") == []
+
+
+def test_crt_keeps_valid_one_sided_sweeps():
+    from event_engine.signals import detect_crt
+
+    bullish = detect_crt(_make_crt_three_candle_fixture(True, False), "TEST", "1h")
+    bearish = detect_crt(_make_crt_three_candle_fixture(False, False), "TEST", "1h")
+    assert any(e["event_type"] == "CRT_BULLISH" for e in bullish)
+    assert any(e["event_type"] == "CRT_BEARISH" for e in bearish)
+
+
+def _make_ob_wick_invalidation_fixture(bullish: bool) -> pd.DataFrame:
+    import event_engine.signals as sig
+
+    n = 120
+    rows = []
+    for i in range(n):
+        rows.append({
+            "open": 100.0, "high": 100.4, "low": 99.6, "close": 100.0,
+            "volume": 1000.0,
+            "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    pivot_i = 50
+    bos_i = 53
+    ob_i = 52
+    rows[pivot_i].update({"open": 101.0, "high": 106.0, "low": 98.0, "close": 99.0})
+    if bullish:
+        rows[ob_i].update({"open": 101.0, "high": 106.0, "low": 98.0, "close": 99.0})
+        rows[bos_i].update({"open": 99.0, "high": 108.0, "low": 98.0, "close": 107.0, "volume": 2200.0})
+        rows[bos_i + 1].update({"low": 97.0, "close": 100.0})
+    else:
+        rows[ob_i].update({"open": 99.0, "high": 102.0, "low": 94.0, "close": 101.0})
+        rows[pivot_i].update({"open": 99.0, "high": 102.0, "low": 94.0, "close": 101.0})
+        rows[bos_i].update({"open": 101.0, "high": 102.0, "low": 92.0, "close": 93.0, "volume": 2200.0})
+        rows[bos_i + 1].update({"high": 103.0, "close": 100.0})
+    return pd.DataFrame(rows)
+
+
+def test_order_block_uses_wick_invalidation_for_bullish_zone(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([], [50]))
+    events = sig.detect_order_block(_make_ob_wick_invalidation_fixture(True), "TEST", "1h")
+    assert events == []
+
+
+def test_order_block_uses_wick_invalidation_for_bearish_zone(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([50], []))
+    events = sig.detect_order_block(_make_ob_wick_invalidation_fixture(False), "TEST", "1h")
+    assert events == []
+
+
+def _make_mitigation_runtime_fixture(direction: str, *, sweep_before_break: bool = False):
+    import pandas as pd
+    rows = []
+    for i in range(140):
+        rows.append({
+            "open": 100.0, "high": 100.4, "low": 99.6, "close": 100.0,
+            "volume": 1000.0, "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    df = pd.DataFrame(rows)
+    if direction == "bullish":
+        df.loc[100, ["open","high","low","close"]] = [96.0, 96.5, 95.0, 95.8]
+        df.loc[104, ["open","high","low","close"]] = [102.0, 104.0, 101.5, 103.0]
+        df.loc[105, ["open","high","low","close"]] = [104.0, 105.0, 102.2, 103.0]
+        df.loc[108, ["open","high","low","close"]] = [99.0, 101.0, 94.5 if sweep_before_break else 98.5, 100.0]
+        df.loc[110, ["open","high","low","close"]] = [99.5, 101.5, 98.0, 100.5]
+        df.loc[113, ["open","high","low","close"]] = [100.0, 109.5, 99.5, 108.0]
+        df.loc[139, ["open","high","low","close"]] = [102.0, 103.0, 101.9, 102.0]
+    else:
+        df.loc[100, ["open","high","low","close"]] = [104.0, 105.0, 103.5, 104.5]
+        df.loc[104, ["open","high","low","close"]] = [98.0, 98.5, 96.5, 97.0]
+        df.loc[105, ["open","high","low","close"]] = [97.0, 98.5, 95.0, 96.0]
+        df.loc[108, ["open","high","low","close"]] = [101.0, 105.5 if sweep_before_break else 102.0, 99.5, 101.0]
+        df.loc[110, ["open","high","low","close"]] = [101.5, 102.0, 98.5, 100.5]
+        df.loc[113, ["open","high","low","close"]] = [100.0, 100.5, 90.5, 92.0]
+        df.loc[139, ["open","high","low","close"]] = [97.0, 98.5, 96.5, 97.5]
+    return df
+
+
+def test_mitigation_block_requires_failure_swing_and_no_external_sweep(monkeypatch):
+    import pandas as pd
+    import event_engine.signals as sig
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([100, 110], [105]))
+    bullish = sig.detect_mitigation_block(_make_mitigation_runtime_fixture("bullish"), "TEST", "1h")
+    assert len(bullish) == 1
+    assert bullish[0]["event_type"] == "MITIGATION_BLOCK_BULLISH"
+    assert bullish[0]["event_fact"]["failure_swing_no_sweep"] is True
+    assert bullish[0]["event_fact"]["failure_swing_level"] == pytest.approx(98.0)
+
+    swept = sig.detect_mitigation_block(_make_mitigation_runtime_fixture("bullish", sweep_before_break=True), "TEST", "1h")
+    assert swept == []
+
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105], [100, 110]))
+    bearish = sig.detect_mitigation_block(_make_mitigation_runtime_fixture("bearish"), "TEST", "1h")
+    assert len(bearish) == 1
+    assert bearish[0]["event_type"] == "MITIGATION_BLOCK_BEARISH"
+    assert bearish[0]["event_fact"]["failure_swing_no_sweep"] is True
+    assert bearish[0]["event_fact"]["failure_swing_level"] == pytest.approx(102.0)
+
+    swept_bearish = sig.detect_mitigation_block(_make_mitigation_runtime_fixture("bearish", sweep_before_break=True), "TEST", "1h")
+    assert swept_bearish == []
+
+
+def test_butterfly_accepts_published_projection_range(monkeypatch):
+    import event_engine.signals as sig
+
+    # XA=100, AB/XA=0.786, BC/AB=0.636,
+    # CD/BC=2.40 and AD/XA=1.486. This is accepted by the published
+    # Butterfly family because CD/BC is in 1.618-2.618.
+    points = {10: 1000.0, 20: 1100.0, 30: 1021.4, 40: 1071.4, 50: 951.4}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_BUTTERFLY_LONG" for e in events)
+
+
+
+
+def test_butterfly_accepts_published_d_xa_completion_branch(monkeypatch):
+    import event_engine.signals as sig
+
+    # D/XA=1.80 is within the published alternate completion branch, while
+    # CD/BC=3.028 is outside 1.618-2.618; the OR branch must still accept it.
+    points = {10: 1000.0, 20: 1100.0, 30: 1021.4, 40: 1071.4, 50: 920.0}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert any(e["event_type"] == "HARMONIC_BUTTERFLY_LONG" for e in events)
+
+
+def test_butterfly_rejects_when_both_completion_constraints_fail(monkeypatch):
+    import event_engine.signals as sig
+
+    # B=0.786 XA, BC/AB in the allowed retracement band, but CD/BC is only
+    # 1.40 and AD/XA is only 1.20, so neither published completion branch passes.
+    points = {10: 1000.0, 20: 1100.0, 30: 1021.4, 40: 1071.4, 50: 1001.4}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_runtime_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_BUTTERFLY_LONG" for e in events)
+
+
+def test_sfp_does_not_reuse_a_consumed_swing_level(monkeypatch):
+    import event_engine.signals as sig
+
+    rows = []
+    for i in range(85):
+        rows.append({
+            "open": 109.0, "high": 111.0, "low": 108.0, "close": 110.0,
+            "volume": 1000.0, "close_time": 1_700_000_000_000 + i * 3_600_000,
+        })
+    rows[60].update({"open": 111.0, "high": 112.0, "low": 100.0, "close": 110.0})
+    rows[84].update({"open": 100.0, "high": 102.0, "low": 95.0, "close": 101.0, "volume": 2000.0})
+    df = pd.DataFrame(rows)
+    monkeypatch.setattr(sig, "_pivots", lambda *args, **kwargs: ([60], []))
+
+    clean = sig.detect_sfp(df, "TEST", "1h")
+    assert any(e["event_type"] == "SFP_BULLISH" for e in clean)
+
+    consumed = df.copy()
+    consumed.loc[70, ["high", "low", "close"]] = [101.0, 99.0, 98.5]
+    assert sig.detect_sfp(consumed, "TEST", "1h") == []
+
+
+def test_breaker_does_not_reuse_a_liquidity_pivot_after_prior_close_through():
+    import event_engine.signals as sig
+
+    rows = []
+    for i in range(30):
+        rows.append({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    rows[10]["high"] = 110.0
+    # Prior bar already closed above the pivot: the liquidity was consumed.
+    rows[13].update({"high": 112.0, "low": 99.0, "close": 111.0})
+    # A later rejection wick through the same stale pivot is not a new sweep.
+    rows[16].update({"high": 113.0, "low": 99.0, "close": 109.5})
+    df = pd.DataFrame(rows)
+    assert sig._liquidity_sweep_before_break(df, [10], 5, 20, "bearish") is None
+
+
+def test_breaker_mss_requires_a_fresh_unbroken_structure_level():
+    import event_engine.signals as sig
+
+    rows = []
+    for i in range(30):
+        rows.append({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    rows[10].update({"low": 90.0, "high": 101.0, "close": 95.0})
+    df = pd.DataFrame(rows)
+
+    rows_before_sweep = df.copy()
+    rows_before_sweep.loc[15, "close"] = 89.0
+    assert sig._mss_level_before_sweep(rows_before_sweep, [10], 5, 20, "bearish") is None
+
+    rows_clean = df.copy()
+    assert sig._mss_level_before_sweep(rows_clean, [10], 5, 20, "bearish") == (10, 90.0)
+
+
+def test_breaker_mss_requires_fresh_unbroken_bullish_structure_level():
+    import event_engine.signals as sig
+
+    rows = []
+    for i in range(30):
+        rows.append({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    rows[10].update({"high": 110.0, "low": 99.0, "close": 105.0})
+    df = pd.DataFrame(rows)
+
+    rows_before_sweep = df.copy()
+    rows_before_sweep.loc[15, "close"] = 111.0
+    assert sig._mss_level_before_sweep(rows_before_sweep, [10], 5, 20, "bullish") is None
+
+    rows_clean = df.copy()
+    assert sig._mss_level_before_sweep(rows_clean, [10], 5, 20, "bullish") == (10, 110.0)

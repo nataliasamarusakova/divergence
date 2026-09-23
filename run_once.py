@@ -136,7 +136,19 @@ MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
 HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
-MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "3"))
+# Research/VST mode deliberately disables entry-cap throttles so valid signals can be
+# observed and statistically evaluated. Live-like modes keep the production limits.
+_EXECUTION_MODE_HINT = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst")).strip().lower()
+_RESEARCH_UNLIMITED_ENTRY_MODES = {"vst", "test", "demo", "simulated"}
+RESEARCH_UNLIMITED_ENTRIES = os.environ.get(
+    "RESEARCH_UNLIMITED_ENTRIES",
+    "true" if _EXECUTION_MODE_HINT in _RESEARCH_UNLIMITED_ENTRY_MODES else "false",
+).strip().lower() == "true"
+PORTFOLIO_CAP_ENABLED = os.environ.get(
+    "PORTFOLIO_CAP_ENABLED",
+    "false" if RESEARCH_UNLIMITED_ENTRIES else "true",
+).strip().lower() == "true"
+MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "0" if RESEARCH_UNLIMITED_ENTRIES else "3"))
 # Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
 SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
 SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN", "45"))
@@ -186,7 +198,7 @@ ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED",
 MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
 MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
 MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
-EXECUTION_MODE = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst"))
+EXECUTION_MODE = _EXECUTION_MODE_HINT
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
 EXPECTED_EVENT_ENGINES = {
@@ -3332,9 +3344,11 @@ def main() -> None:
             active_total = sum(1 for p in current_open_positions.values() if p)
             active_longs = sum(1 for (sym, d), p in current_open_positions.items() if p and d == "LONG")
             active_shorts = sum(1 for (sym, d), p in current_open_positions.items() if p and d == "SHORT")
-            portfolio_cap_hit = (active_total >= MAX_ACTIVE_TRADES or
-                                  (direction == "LONG" and active_longs >= MAX_ACTIVE_LONGS) or
-                                  (direction == "SHORT" and active_shorts >= MAX_ACTIVE_SHORTS))
+            portfolio_cap_hit = PORTFOLIO_CAP_ENABLED and (
+                active_total >= MAX_ACTIVE_TRADES
+                or (direction == "LONG" and active_longs >= MAX_ACTIVE_LONGS)
+                or (direction == "SHORT" and active_shorts >= MAX_ACTIVE_SHORTS)
+            )
             if portfolio_cap_hit:
                 stats["rejected_portfolio_cap"] += 1
                 execution_result = {"status": "PORTFOLIO_CAP_REACHED", "mode": EXECUTION_MODE, "order_id": None,
@@ -3359,10 +3373,11 @@ def main() -> None:
                     "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
                 }
                 log.info("[EXECUTION] %s (%s) - Already open/executed or blocked by cooldown.", symbol, direction)
-            elif trades_this_cycle < MAX_TRADES:
+            elif MAX_TRADES <= 0 or trades_this_cycle < MAX_TRADES:
                 stats["execution_attempts"] += 1
                 trades_this_cycle += 1
-                log.info("[EXECUTION] Attempt #%d/%d: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, MAX_TRADES, direction, symbol, score, price)
+                attempt_limit = "unlimited" if MAX_TRADES <= 0 else str(MAX_TRADES)
+                log.info("[EXECUTION] Attempt #%d/%s: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, attempt_limit, direction, symbol, score, price)
                 execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
                 actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
                 actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
