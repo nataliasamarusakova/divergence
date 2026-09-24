@@ -63,6 +63,16 @@ def test_event_workflow_uses_binance_only_userspace_vpn_transport():
     assert "      ALL_PROXY:" not in workflow
 
 
+def test_binance_wireproxy_exports_vpn_dir_for_same_step_python():
+    for rel in (
+        Path(".github/workflows/event-engine.yml"),
+        Path(".github/workflows/vpn-test.yml"),
+    ):
+        workflow = rel.read_text(encoding="utf-8")
+        assert 'export VPN_DIR="$(mktemp -d)"' in workflow
+        assert 'echo "VPN_DIR=$VPN_DIR" >> "$GITHUB_ENV"' in workflow
+
+
 def test_vpn_diagnostic_scopes_proxy_to_binance_only():
     workflow = Path(".github/workflows/vpn-test.yml").read_text(encoding="utf-8")
 
