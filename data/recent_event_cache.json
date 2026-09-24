@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790268481874,
+  "updated_ts": 1790268788571,
   "events": [
     {
       "event_id": "EVT_46F7956BCD9933E0",
@@ -7115,6 +7115,88 @@
         "body_atr": 1.7430791284370897,
         "volume_ratio": 1.1045124566353808,
         "trigger_level": 0.07045222892728759,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_A43BDB37FC21FFC1",
+      "symbol": "CHIP",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKOUT_MOMENTUM",
+      "timestamps": {
+        "pivot_1_ts": 1790265599999,
+        "pivot_2_ts": 1790265599999,
+        "detected_at_ts": 1790265599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04411,
+        "donchian_high": 0.04297,
+        "donchian_low": 0.04071,
+        "breakout_atr": 1.1071827041276394,
+        "bb_width": 0.06522399162356504,
+        "bb_width_threshold": 0.06953229717338719,
+        "volume_ratio": 4.576056807739394,
+        "adx": 24.726678391195087,
+        "requires_retest": true,
+        "trigger_level": 0.04297,
+        "engine": "BREAKOUT_MOMENTUM",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_07E9E631DCA9E99E",
+      "symbol": "CHIP",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790265599999,
+        "pivot_2_ts": 1790265599999,
+        "detected_at_ts": 1790265599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04411,
+        "donchian_high": 0.04297,
+        "donchian_low": 0.04071,
+        "breakout_atr": 1.1071827041276394,
+        "volume_ratio": 4.576056807739394,
+        "adx": 24.726678391195087,
+        "ema200": 0.04384808049961213,
+        "compressed_recent": true,
+        "bb_width": 0.06522399162356504,
+        "trigger_level": 0.04297,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_5B3CE4F81F0557D9",
+      "symbol": "CHIP",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1790265599999,
+        "pivot_2_ts": 1790265599999,
+        "detected_at_ts": 1790265599999
+      },
+      "event_fact": {
+        "ema_fast": 0.04386565604246397,
+        "ema_slow": 0.04385585466272614,
+        "ema200": 0.042093496705032166,
+        "body_atr": 1.1370404286719558,
+        "volume_ratio": 1.2053788861527523,
+        "trigger_level": 0.04386565604246397,
         "requires_retest": true,
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
