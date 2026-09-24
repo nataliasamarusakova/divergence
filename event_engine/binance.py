@@ -44,14 +44,37 @@ class BinanceMarketClient:
         self.retry_attempts = max(1, min(3, int(os.environ.get("BINANCE_MARKET_RETRY_ATTEMPTS", "2"))))
         self.retry_backoff_sec = max(0.0, float(os.environ.get("BINANCE_MARKET_RETRY_BACKOFF_SEC", "0.5")))
         self.exchange_info_ttl_sec = max(30.0, float(os.environ.get("BINANCE_EXCHANGE_INFO_TTL_SEC", "900")))
+        self.binance_vpn_enabled = str(os.environ.get("BINANCE_VPN_ENABLED", "false")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        self.binance_http_proxy = str(os.environ.get("BINANCE_HTTP_PROXY", "")).strip()
+        if self.binance_vpn_enabled and not self.binance_http_proxy:
+            raise BinanceHTTPError(
+                "[BINANCE] BINANCE_VPN_ENABLED=true requires BINANCE_HTTP_PROXY; refusing direct fallback"
+            )
+        if self.binance_http_proxy and not self.binance_http_proxy.startswith(("http://", "https://")):
+            raise BinanceHTTPError(
+                "[BINANCE] BINANCE_HTTP_PROXY must use http:// or https://"
+            )
+
         self._last_request_monotonic = 0.0
         self._request_lock = threading.Lock()
         self._exchange_loaded_at = 0.0
         self._symbols: dict[str, dict[str, Any]] = {}
         self._session = requests.Session()
+        # Binance transport is deliberately isolated from runner-wide proxy env vars.
+        # The engine workflow supplies an explicit per-session proxy when VPN mode is on;
+        # all other values resolve directly and cannot accidentally inherit HTTP(S)_PROXY.
+        self._session.trust_env = False
+        if self.binance_vpn_enabled:
+            self._session.proxies.update({
+                "http": self.binance_http_proxy,
+                "https": self.binance_http_proxy,
+            })
         retry = Retry(total=0, connect=0, read=0, redirect=0, status=0)
         self._session.mount("https://", HTTPAdapter(max_retries=retry))
         self._session.headers.update({"Accept": "application/json"})
+        log.info("[BINANCE] transport vpn_proxy_enabled=%s", self.binance_vpn_enabled)
 
     def _acquire_slot(self) -> None:
         with self._request_lock:
