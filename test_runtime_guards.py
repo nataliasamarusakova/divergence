@@ -4,6 +4,78 @@ import pandas as pd
 from pathlib import Path
 
 
+def test_binance_transport_uses_only_explicit_proxy_when_vpn_enabled(monkeypatch):
+    import event_engine.binance as binance
+
+    monkeypatch.setenv("BINANCE_VPN_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_HTTP_PROXY", "http://127.0.0.1:18080")
+    client = binance.BinanceMarketClient()
+
+    assert client._session.trust_env is False
+    assert client._session.proxies.get("http") == "http://127.0.0.1:18080"
+    assert client._session.proxies.get("https") == "http://127.0.0.1:18080"
+
+
+def test_binance_transport_is_direct_and_ignores_global_proxy_env_when_vpn_disabled(monkeypatch):
+    import event_engine.binance as binance
+
+    monkeypatch.setenv("BINANCE_VPN_ENABLED", "false")
+    monkeypatch.delenv("BINANCE_HTTP_PROXY", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://203.0.113.50:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://203.0.113.50:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://203.0.113.50:3128")
+    client = binance.BinanceMarketClient()
+
+    assert client._session.trust_env is False
+    assert client._session.proxies == {}
+
+
+def test_binance_transport_fails_closed_when_vpn_is_enabled_without_proxy(monkeypatch):
+    import event_engine.binance as binance
+
+    monkeypatch.setenv("BINANCE_VPN_ENABLED", "true")
+    monkeypatch.delenv("BINANCE_HTTP_PROXY", raising=False)
+
+    with pytest.raises(binance.BinanceHTTPError, match="BINANCE_HTTP_PROXY"):
+        binance.BinanceMarketClient()
+
+
+def test_event_workflow_uses_binance_only_userspace_vpn_transport():
+    workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+
+    assert 'BINANCE_VPN_ENABLED: "true"' in workflow
+    assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
+    assert "wireproxy_linux_amd64.tar.gz" in workflow
+    assert "e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" in workflow
+    assert "--configtest" in workflow
+    assert "--proxy \"$BINANCE_HTTP_PROXY\"" in workflow
+    assert "--noproxy \"\"" in workflow
+    assert "Run engine" in workflow
+    assert "Stop Binance WireProxy" in workflow
+    assert workflow.index("Binance Futures preflight") < workflow.index("Run engine")
+    assert workflow.index("Run engine") < workflow.index("Stop Binance WireProxy")
+    assert workflow.index("Stop Binance WireProxy") < workflow.index("Commit state")
+    assert "wg-quick up wg0" not in workflow
+    assert "wg-quick down wg0" not in workflow
+    assert "sudo wg" not in workflow
+    assert "      HTTPS_PROXY:" not in workflow
+    assert "      HTTP_PROXY:" not in workflow
+    assert "      ALL_PROXY:" not in workflow
+
+
+def test_vpn_diagnostic_scopes_proxy_to_binance_only():
+    workflow = Path(".github/workflows/vpn-test.yml").read_text(encoding="utf-8")
+
+    assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
+    assert "wireproxy_linux_amd64.tar.gz" in workflow
+    assert "e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" in workflow
+    assert "--proxy \"$BINANCE_HTTP_PROXY\"" in workflow
+    assert "--noproxy \"\"" in workflow
+    assert "wg-quick up wg0" not in workflow
+    assert "wg-quick down wg0" not in workflow
+    assert 'expected_request_count = 22' in workflow
+
+
 def test_vst_research_mode_disables_entry_caps(monkeypatch):
     import run_once
 

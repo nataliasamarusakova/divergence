@@ -81,27 +81,32 @@ def test_release_has_cross_exchange_price_guard():
     assert 'MAX_CROSS_EXCHANGE_DRIFT_PCT: "1.00"' in workflow
 
 
-def test_release_pins_runner_and_installs_wireguard_without_unconditional_apt_update():
+def test_release_pins_runner_and_installs_userspace_wireproxy():
     workflow = _workflow()
     assert "runs-on: ubuntu-24.04" in workflow
-    assert "Cache WireGuard package" in workflow
-    assert "key: wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}" in workflow
-    assert "apt-get update -qq" in workflow  # fallback only
-    assert "sudo apt-get update -y" not in workflow
+    assert "Install pinned Binance WireProxy" in workflow
+    assert "v1.1.3" in workflow
+    assert "wireproxy_linux_amd64.tar.gz" in workflow
+    assert "e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" in workflow
+    assert "--configtest" in workflow
+    assert "wg-quick up wg0" not in workflow
+    assert "wg-quick down wg0" not in workflow
+    assert "sudo wg" not in workflow
 
-    assert "Detect WireGuard package version" in workflow
 
-
-def test_release_has_vpn_preflight_before_engine_and_cleanup_before_commit():
+def test_release_has_binance_proxy_preflight_before_engine_and_cleanup_before_commit():
     workflow = _workflow()
-    assert "Connect Proton WireGuard VPN" in workflow
+    assert "Start Binance-only WireProxy" in workflow
     assert "Binance Futures preflight" in workflow
     assert '"$BASE/fapi/v1/exchangeInfo"' in workflow
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in workflow
     assert '"$BASE/fapi/v1/ticker/price?symbol=BTCUSDT"' in workflow
-    assert "Disconnect Proton WireGuard VPN" in workflow
+    assert "Stop Binance WireProxy" in workflow
+    assert 'BINANCE_VPN_ENABLED: "true"' in workflow
+    assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
+    assert workflow.index("Start Binance-only WireProxy") < workflow.index("Binance Futures preflight")
     assert workflow.index("Binance Futures preflight") < workflow.index("Run engine")
-    assert workflow.index("Disconnect Proton WireGuard VPN") < workflow.index("Commit state")
+    assert workflow.index("Stop Binance WireProxy") < workflow.index("Commit state")
 
 
 def test_release_requires_wireguard_secret_and_country_guard():
@@ -118,7 +123,11 @@ def test_release_has_manual_vpn_test_workflow():
     assert workflow.exists()
     text = workflow.read_text(encoding='utf-8')
     assert 'workflow_dispatch:' in text
-    assert 'wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}' in text
+    assert 'wg-quick up wg0' not in text
+    assert 'wg-quick down wg0' not in text
+    assert 'Install pinned Binance WireProxy' in text
+    assert 'wireproxy_linux_amd64.tar.gz' in text
+    assert 'e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c' in text
     assert 'BASE="${BINANCE_BASE_URL%/}"' in text
     assert '"$BASE/fapi/v1/exchangeInfo"' in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in text
