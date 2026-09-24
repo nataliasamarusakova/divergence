@@ -1594,3 +1594,105 @@ def test_breaker_mss_requires_fresh_unbroken_bullish_structure_level():
 
     rows_clean = df.copy()
     assert sig._mss_level_before_sweep(rows_clean, [10], 5, 20, "bullish") == (10, 110.0)
+
+
+def _reset_bingx_live_price_guards(bx):
+    bx._LIVE_PRICE_INVALID_UNTIL.clear()
+    bx._LIVE_PRICE_INVALID_BURST_COUNT = 0
+    bx._LIVE_PRICE_COOLDOWN_UNTIL = 0.0
+
+
+def _seed_bingx_contracts(bx, symbols):
+    bx.CACHE["data"] = {s: {"symbol": s, "displayName": s, "status": 1, "apiStateOpen": "true"} for s in symbols}
+    bx.CACHE["by_display_name"] = dict(bx.CACHE["data"])
+    bx.CACHE["ts"] = 9_999_999_999
+
+
+def test_bingx_live_price_uses_current_latest_price_endpoint(monkeypatch):
+    import event_engine.bingx as bx
+
+    _reset_bingx_live_price_guards(bx)
+    _seed_bingx_contracts(bx, ["BTC-USDT"])
+    calls = []
+
+    def fake_request(method, path, params=None, **kwargs):
+        calls.append((method, path, dict(params or {}), dict(kwargs)))
+        return {"code": 0, "data": {"symbol": "BTC-USDT", "price": "123456.78", "time": 1700000000000}}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    assert bx.get_live_price("BTC") == pytest.approx(123456.78)
+    assert calls == [
+        ("GET", "/openApi/swap/v1/ticker/price", {"symbol": "BTC-USDT"}, {"signed": False, "retryable": False})
+    ]
+    _reset_bingx_live_price_guards(bx)
+
+
+def test_bingx_live_price_109425_quarantines_symbol_and_blocks_repeat(monkeypatch):
+    import event_engine.bingx as bx
+
+    _reset_bingx_live_price_guards(bx)
+    _seed_bingx_contracts(bx, ["TEST-USDT"])
+    calls = {"count": 0}
+
+    def fake_request(*args, **kwargs):
+        calls["count"] += 1
+        return {"code": 109425, "msg": "trading pair does not exist or is not supported"}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    assert bx.get_live_price("TEST-USDT") is None
+    assert bx.get_live_price("TEST-USDT") is None
+    assert calls["count"] == 1
+    assert "TEST-USDT" in bx._LIVE_PRICE_INVALID_UNTIL
+    _reset_bingx_live_price_guards(bx)
+
+
+def test_bingx_live_price_109425_burst_opens_circuit_breaker(monkeypatch):
+    import event_engine.bingx as bx
+
+    _reset_bingx_live_price_guards(bx)
+    symbols = ["A-USDT", "B-USDT", "C-USDT", "D-USDT"]
+    _seed_bingx_contracts(bx, symbols)
+    calls = []
+
+    monkeypatch.setattr(
+        bx,
+        "_request",
+        lambda method, path, params=None, **kwargs: (
+            calls.append(str((params or {}).get("symbol")))
+            or {"code": 109425, "msg": "trading pair does not exist or is not supported"}
+        ),
+    )
+
+    for symbol in symbols[:3]:
+        assert bx.get_live_price(symbol) is None
+
+    # The fourth symbol must not generate another invalid HTTP request after
+    # the process-local breaker opens at the configured burst limit.
+    assert bx.get_live_price(symbols[3]) is None
+    assert calls == symbols[:3]
+    assert bx._LIVE_PRICE_COOLDOWN_UNTIL > 0
+    _reset_bingx_live_price_guards(bx)
+
+
+def test_bingx_live_price_109429_honors_exchange_retry_after(monkeypatch):
+    import event_engine.bingx as bx
+    import time
+
+    _reset_bingx_live_price_guards(bx)
+    _seed_bingx_contracts(bx, ["TEST-USDT"])
+    calls = {"count": 0}
+    retry_after_ms = int(time.time() * 1000) + 600_000
+
+    def fake_request(*args, **kwargs):
+        calls["count"] += 1
+        return {
+            "code": 109429,
+            "msg": f"over 5 error code:109425 requests within 900000 ms, can retry after time: {retry_after_ms}",
+        }
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    assert bx.get_live_price("TEST-USDT") is None
+    assert bx.get_live_price("TEST-USDT") is None
+    assert calls["count"] == 1
+    assert bx._LIVE_PRICE_COOLDOWN_UNTIL >= retry_after_ms / 1000.0
+    _reset_bingx_live_price_guards(bx)
