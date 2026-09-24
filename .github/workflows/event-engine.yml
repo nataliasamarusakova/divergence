@@ -204,7 +204,7 @@ jobs:
           set -euo pipefail
 
           test -n "${WIREGUARD_CONF:-}"
-          VPN_DIR="$(mktemp -d)"
+          export VPN_DIR="$(mktemp -d)"
           echo "VPN_DIR=$VPN_DIR" >> "$GITHUB_ENV"
           WG_CONF="$VPN_DIR/wg.conf"
           PROXY_CONF="$VPN_DIR/wireproxy.conf"
