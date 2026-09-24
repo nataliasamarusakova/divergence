@@ -172,108 +172,98 @@ jobs:
         run: |
           python -m pytest -q
 
-      # VPN is intentionally connected only after dependencies/tests so pip/Playwright do not consume VPN time/bandwidth.
-      - name: Detect WireGuard package version
-        id: wireguard-package
+      # Binance uses a userspace WireGuard HTTP proxy only. The proxy is scoped to
+      # BinanceMarketClient; BingX, Coinalyze, Telegram, GitHub and git remain direct.
+      - name: Install pinned Binance WireProxy
+        env:
+          WIREPROXY_VERSION: v1.1.3
+          WIREPROXY_URL: https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz
+          WIREPROXY_SHA256: e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c
         shell: bash
         run: |
           set -euo pipefail
-
-          version="$(apt-cache policy wireguard-tools 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-          if [ -z "${version:-}" ] || [ "$version" = "(none)" ]; then
-            echo "wireguard-tools candidate is not present in the runner APT index; refreshing indexes once."
-            sudo apt-get update -qq
-            version="$(apt-cache policy wireguard-tools | awk '/Candidate:/ {print $2; exit}')"
+          CACHE_DIR="$HOME/.cache/wireproxy"
+          BIN_DIR="$HOME/.local/bin"
+          mkdir -p "$CACHE_DIR" "$BIN_DIR"
+          ARCHIVE="$CACHE_DIR/wireproxy_linux_amd64.tar.gz"
+          if [ ! -s "$ARCHIVE" ] || [ "$(sha256sum "$ARCHIVE" | awk '{print $1}')" != "$WIREPROXY_SHA256" ]; then
+            curl --fail --silent --show-error --location \
+              "$WIREPROXY_URL" -o "$ARCHIVE"
           fi
+          echo "$WIREPROXY_SHA256  $ARCHIVE" | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C "$CACHE_DIR"
+          test -f "$CACHE_DIR/wireproxy"
+          install -m 0755 "$CACHE_DIR/wireproxy" "$BIN_DIR/wireproxy"
+          "$BIN_DIR/wireproxy" --version
 
-          if [ -z "${version:-}" ] || [ "$version" = "(none)" ]; then
-            echo "ERROR: unable to resolve wireguard-tools package version" >&2
-            exit 1
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "wireguard-tools candidate=$version"
-
-      - name: Cache WireGuard package
-        id: cache-wireguard-package
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/apt-archives
-          key: wireguard-tools-ubuntu-24.04-${{ steps.wireguard-package.outputs.version }}
-
-      - name: Install WireGuard tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          CACHE_DIR="$HOME/.cache/apt-archives"
-          mkdir -p "$CACHE_DIR"
-
-          if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
-            echo "WireGuard tools already installed on runner image; skipping package install."
-          else
-            deb="$(find "$CACHE_DIR" -maxdepth 1 -type f -name 'wireguard-tools_*.deb' -print -quit || true)"
-
-            if [ -z "$deb" ]; then
-              echo "WireGuard .deb not found in cache; downloading without apt-get update."
-              if ! (cd "$CACHE_DIR" && apt-get download "wireguard-tools=${{ steps.wireguard-package.outputs.version }}"); then
-                echo "Cached APT metadata was insufficient; refreshing indexes once."
-                sudo apt-get update -qq
-                (cd "$CACHE_DIR" && apt-get download "wireguard-tools=${{ steps.wireguard-package.outputs.version }}")
-              fi
-              deb="$(find "$CACHE_DIR" -maxdepth 1 -type f -name 'wireguard-tools_*.deb' -print -quit || true)"
-            fi
-
-            if [ -z "$deb" ]; then
-              echo "ERROR: WireGuard .deb was not downloaded" >&2
-              exit 1
-            fi
-
-            echo "Installing cached package: $deb"
-            sudo dpkg -i "$deb" || sudo apt-get -f install -y
-          fi
-
-          if ! command -v resolvconf >/dev/null 2>&1; then
-            echo "resolvconf is not present; installing it only when required by wg-quick DNS handling."
-            if ! sudo apt-get install -y resolvconf; then
-              sudo apt-get update -qq
-              sudo apt-get install -y resolvconf
-            fi
-          fi
-
-      - name: Connect Proton WireGuard VPN
+      - name: Start Binance-only WireProxy
         env:
           WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${WIREGUARD_CONF:-}" ]; then
-            echo "ERROR: GitHub Actions secret WIREGUARD_CONF is not configured" >&2
+          test -n "${WIREGUARD_CONF:-}"
+          VPN_DIR="$(mktemp -d)"
+          echo "VPN_DIR=$VPN_DIR" >> "$GITHUB_ENV"
+          WG_CONF="$VPN_DIR/wg.conf"
+          PROXY_CONF="$VPN_DIR/wireproxy.conf"
+          printf '%s\n' "$WIREGUARD_CONF" > "$WG_CONF"
+          chmod 600 "$WG_CONF"
+
+          cat > "$PROXY_CONF" <<EOF
+          WGConfig = $WG_CONF
+
+          [http]
+          BindAddress = 127.0.0.1:18080
+          EOF
+          chmod 600 "$PROXY_CONF"
+
+          "$HOME/.local/bin/wireproxy" --configtest -c "$PROXY_CONF"
+          "$HOME/.local/bin/wireproxy" -c "$PROXY_CONF" >"$VPN_DIR/wireproxy.log" 2>&1 &
+          echo $! > "$VPN_DIR/wireproxy.pid"
+
+          for _ in $(seq 1 30); do
+            if curl --silent --show-error --fail --noproxy "" \
+              --proxy "http://127.0.0.1:18080" \
+              --connect-timeout 3 --max-time 8 \
+              https://ipinfo.io/json -o "$VPN_DIR/proxy-ipinfo.json"; then
+              break
+            fi
+            sleep 1
+          done
+
+          test -s "$VPN_DIR/proxy-ipinfo.json" || {
+            echo 'ERROR: Binance WireProxy did not become usable' >&2
+            cat "$VPN_DIR/wireproxy.log" >&2 || true
+            exit 1
+          }
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          vpn_dir = Path(os.environ["VPN_DIR"])
+          data = json.loads((vpn_dir / "proxy-ipinfo.json").read_text())
+          expected = os.environ["VPN_EXPECTED_COUNTRY"]
+          actual = str(data.get("country", "")).upper()
+          print(json.dumps({k: data.get(k) for k in ("ip", "country", "city", "org")}, indent=2))
+          if expected and actual != expected.upper():
+              raise SystemExit(f"VPN country mismatch: expected {expected}, got {actual}")
+          PY
+
+          echo '=== DIRECT EGRESS (NO PROXY) ==='
+          curl --fail --silent --show-error --noproxy '*' --max-time 10 https://ipinfo.io/json
+          echo
+
+          if ip link show wg0 >/dev/null 2>&1; then
+            echo 'ERROR: global wg0 interface exists; Binance VPN must remain userspace-only' >&2
             exit 1
           fi
 
-          printf '%s\n' "$WIREGUARD_CONF" | sudo tee /etc/wireguard/wg0.conf >/dev/null
-          sudo chmod 600 /etc/wireguard/wg0.conf
-          sudo wg-quick up wg0
-
-          echo "=== WireGuard interface ==="
-          sudo wg show wg0
-
-          echo "=== Outbound IP ==="
-          curl -fsS --max-time 10 https://ipinfo.io/json -o /tmp/ipinfo.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          data = json.loads(Path('/tmp/ipinfo.json').read_text())
-          print(json.dumps({k: data.get(k) for k in ('ip', 'country', 'city', 'org')}, indent=2))
-          expected = '${{ env.VPN_EXPECTED_COUNTRY }}'
-          actual = str(data.get('country', '')).upper()
-          if expected and actual != expected.upper():
-              raise SystemExit(f'VPN country mismatch: expected {expected}, got {actual}')
-          PY
-
       - name: Binance Futures preflight
+        env:
+          BINANCE_HTTP_PROXY: http://127.0.0.1:18080
         shell: bash
         run: |
           set -euo pipefail
@@ -288,7 +278,9 @@ jobs:
             local out="$TMP_DIR/$3"
 
             echo "=== $name ==="
-            curl -fsS --max-time 15 --retry 1 --retry-delay 1 \
+            curl --fail --silent --show-error --noproxy "" \
+              --proxy "$BINANCE_HTTP_PROXY" \
+              --max-time 15 --retry 1 --retry-delay 1 \
               "$url" -o "$out"
           }
 
@@ -335,18 +327,36 @@ jobs:
           if price <= 0:
               raise SystemExit(f"Invalid BTCUSDT Futures ticker price: {ticker}")
 
-          print(f"Binance Futures preflight OK: active_usdt_perpetuals={len(active)}, BTCUSDT_1h_rows={len(klines)}, BTCUSDT_price={price}")
+          print(f"Binance Futures preflight OK via explicit proxy: active_usdt_perpetuals={len(active)}, BTCUSDT_1h_rows={len(klines)}, BTCUSDT_price={price}")
           PY
 
       - name: Run engine
+        env:
+          BINANCE_VPN_ENABLED: "true"
+          BINANCE_HTTP_PROXY: http://127.0.0.1:18080
         run: |
           python run_once.py
 
-      - name: Disconnect Proton WireGuard VPN
+      - name: Stop Binance WireProxy
         if: always()
         shell: bash
         run: |
-          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          set -euo pipefail
+          if [ -n "${VPN_DIR:-}" ] && [ -f "$VPN_DIR/wireproxy.pid" ]; then
+            pid="$(cat "$VPN_DIR/wireproxy.pid" || true)"
+            if [ -n "$pid" ]; then
+              kill "$pid" >/dev/null 2>&1 || true
+              for _ in $(seq 1 10); do
+                if ! kill -0 "$pid" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 1
+              done
+              kill -9 "$pid" >/dev/null 2>&1 || true
+            fi
+            cat "$VPN_DIR/wireproxy.log" || true
+            rm -rf "$VPN_DIR"
+          fi
 
       - name: Commit state
         if: always()
