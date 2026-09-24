@@ -53,7 +53,7 @@ except Exception:
 
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
-LIVE_PRICE_PATH = "/openApi/swap/v2/quote/price"
+LIVE_PRICE_PATH = "/openApi/swap/v1/ticker/price"
 ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
@@ -66,6 +66,17 @@ CACHE = {
 }
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
+
+# Live-price requests are used by the tracker and by execution sizing. A bad
+# symbol must never be allowed to fan out into repeated invalid requests that
+# trigger BingX's 109429 temporary restriction. Keep this protection local to
+# the current process; a fresh engine cycle re-validates the live endpoint.
+LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC", "900")))
+LIVE_PRICE_INVALID_BURST_LIMIT = max(1, int(os.environ.get("BINGX_LIVE_PRICE_INVALID_BURST_LIMIT", "3")))
+LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC", "900")))
+_LIVE_PRICE_INVALID_UNTIL: dict[str, float] = {}
+_LIVE_PRICE_INVALID_BURST_COUNT = 0
+_LIVE_PRICE_COOLDOWN_UNTIL = 0.0
 
 SESSION = requests.Session()
 # Fast-fail session used by reconciliation/health-sensitive GETs. It deliberately
@@ -1279,16 +1290,52 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     return _price_matches()
 
 
+def _parse_retry_after_ms(message: object) -> int | None:
+    import re
+
+    text = str(message or "")
+    match = re.search(r"retry\s+after\s+time\s*:\s*(\d{13})", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_price_in_cooldown(bx_symbol: str, now: float) -> bool:
+    global _LIVE_PRICE_INVALID_UNTIL, _LIVE_PRICE_COOLDOWN_UNTIL
+
+    if _LIVE_PRICE_COOLDOWN_UNTIL > now:
+        return True
+    until = float(_LIVE_PRICE_INVALID_UNTIL.get(bx_symbol, 0.0))
+    if until > now:
+        return True
+    if until:
+        _LIVE_PRICE_INVALID_UNTIL.pop(bx_symbol, None)
+    return False
+
+
 def get_live_price(symbol: str) -> float | None:
     """Return the current BingX execution/reference price from the live ticker.
 
     Signal-side candles remain closed-bar data. This function deliberately does
     not read klines, and malformed/API-error responses fail closed instead of
     fabricating a zero price.
+
+    The endpoint is the current BingX latest-price ticker. A 109425 response is
+    treated as a symbol-local quarantine; repeated 109425 responses trip a
+    process-local circuit breaker before BingX can escalate the burst to 109429.
     """
+    global _LIVE_PRICE_INVALID_BURST_COUNT, _LIVE_PRICE_COOLDOWN_UNTIL
+
     bx_symbol = to_bx_symbol(symbol)
     if not bx_symbol:
         log.warning("[BINGX] Live price unavailable: unknown symbol=%s", symbol)
+        return None
+
+    now = time.time()
+    if _live_price_in_cooldown(bx_symbol, now):
         return None
 
     try:
@@ -1308,6 +1355,36 @@ def get_live_price(symbol: str) -> float | None:
     except (TypeError, ValueError, AttributeError):
         log.warning("[BINGX] Malformed live-price response for %s: %r", bx_symbol, resp)
         return None
+
+    if code == 109425:
+        _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
+        _LIVE_PRICE_INVALID_BURST_COUNT += 1
+        log.warning(
+            "[BINGX] Live-price symbol rejected as unsupported: %s (109425); "
+            "quarantined %.0fs (%d/%d invalid symbols)",
+            bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC,
+            _LIVE_PRICE_INVALID_BURST_COUNT, LIVE_PRICE_INVALID_BURST_LIMIT,
+        )
+        if _LIVE_PRICE_INVALID_BURST_COUNT >= LIVE_PRICE_INVALID_BURST_LIMIT:
+            _LIVE_PRICE_COOLDOWN_UNTIL = now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC
+            log.error(
+                "[BINGX] Live-price circuit breaker opened for %.0fs after %d unsupported-symbol responses; "
+                "no further live-price HTTP requests will be sent in this process.",
+                LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC, _LIVE_PRICE_INVALID_BURST_COUNT,
+            )
+        return None
+
+    if code == 109429:
+        retry_after_ms = _parse_retry_after_ms(resp.get("msg"))
+        retry_until = (retry_after_ms / 1000.0) if retry_after_ms else (now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC)
+        _LIVE_PRICE_COOLDOWN_UNTIL = max(_LIVE_PRICE_COOLDOWN_UNTIL, retry_until)
+        log.error(
+            "[BINGX] Live-price API temporarily restricted (109429) for %s; "
+            "live-price HTTP requests paused until %.0f.",
+            bx_symbol, _LIVE_PRICE_COOLDOWN_UNTIL,
+        )
+        return None
+
     if code != 0:
         log.warning("[BINGX] Live-price API error for %s: code=%s msg=%s", bx_symbol, code, resp.get("msg"))
         return None
