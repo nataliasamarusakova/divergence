@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790381811590,
+  "updated_ts": 1790382092497,
   "events": [
     {
       "event_id": "EVT_9D134276D3E3A97C",
@@ -3091,6 +3091,56 @@
         "atr": 0.012220094572466053,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_0651B3AE7F2668F5",
+      "symbol": "LYN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1790373599999,
+        "pivot_2_ts": 1790380799999,
+        "detected_at_ts": 1790380799999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.04509,
+        "range_high": 0.04828,
+        "range_low": 0.04509,
+        "manipulation_depth_atr": 0.15346379946583336,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_72BD72A35817DC5E",
+      "symbol": "LYN",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1790265599999,
+        "pivot_2_ts": 1790380799999,
+        "detected_at_ts": 1790380799999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.0396,
+        "zone_high": 0.0396,
+        "zone_low": 0.03861,
+        "bos_level": 0.04017,
+        "ob_ts": 1790308799999,
+        "displacement_atr": 1.7514437776534244,
+        "volume_ratio": 4.302290162712122,
+        "body_fraction": 0.7882231404958675,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
