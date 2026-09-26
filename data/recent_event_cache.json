@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790445849220,
+  "updated_ts": 1790446279869,
   "events": [
     {
       "event_id": "EVT_EE9D1E7E3DB9000B",
@@ -2551,6 +2551,62 @@
         "mss_level": 0.3549,
         "broken_ts": 1790409599999,
         "bos_ts": 1790179199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_2F9A5A4BF03B46A4",
+      "symbol": "KAS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790445599999,
+        "pivot_2_ts": 1790445599999,
+        "detected_at_ts": 1790445599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04957,
+        "donchian_high": 0.04913,
+        "donchian_low": 0.04129,
+        "breakout_atr": 0.42105854828239314,
+        "volume_ratio": 3.572928989917687,
+        "adx": 60.891824056136834,
+        "ema200": 0.040336660506765626,
+        "compressed_recent": false,
+        "bb_width": 0.2064390010625934,
+        "trigger_level": 0.04913,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_47B99D7BCED1CB04",
+      "symbol": "KAS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1790398799999,
+        "pivot_2_ts": 1790445599999,
+        "detected_at_ts": 1790445599999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.04896,
+        "zone_high": 0.04896,
+        "zone_low": 0.04736,
+        "bos_level": 0.04413,
+        "ob_ts": 1790438399999,
+        "displacement_atr": 1.14834149531561,
+        "volume_ratio": 3.572928989917687,
+        "body_fraction": 0.7017543859649108,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
