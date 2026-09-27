@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790499233301,
+  "updated_ts": 1790499502395,
   "events": [
     {
       "event_id": "EVT_864FC6807C94D6DE",
@@ -5338,6 +5338,93 @@
         "trigger_level": 0.049,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_65A41D0A96372CF3",
+      "symbol": "TRIA",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1790351999999,
+        "pivot_2_ts": 1790467199999,
+        "detected_at_ts": 1790495999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.004655,
+        "p1_price": 0.00381,
+        "p2_price": 0.00408,
+        "p1_indicator": -0.307037852765729,
+        "p2_indicator": -0.3314984358766149,
+        "bars_between": 8,
+        "price_delta_atr": 0.9097520408361043,
+        "price_delta_pct": 7.086614173228353,
+        "volume_ratio_20": 1.318387421405024,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.005681529030589282,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_F8754E833B4BA350",
+      "symbol": "TRIA",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1790308799999,
+        "pivot_2_ts": 1790467199999,
+        "detected_at_ts": 1790495999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.004655,
+        "p1_price": 0.004088,
+        "p2_price": 0.005743,
+        "p1_indicator": -0.32288263817402246,
+        "p2_indicator": -0.3314984358766149,
+        "bars_between": 11,
+        "price_delta_atr": 5.576443065125005,
+        "price_delta_pct": 40.484344422700595,
+        "volume_ratio_20": 1.318387421405024,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.005681529030589282,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_920D2549DDCB1A72",
+      "symbol": "TRIA",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1790395199999,
+        "pivot_2_ts": 1790467199999,
+        "detected_at_ts": 1790495999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.004655,
+        "p1_price": 0.004307,
+        "p2_price": 0.005743,
+        "p1_indicator": -0.27516936926526,
+        "p2_indicator": -0.3314984358766149,
+        "bars_between": 5,
+        "price_delta_atr": 4.838533076446831,
+        "price_delta_pct": 33.34107267239377,
+        "volume_ratio_20": 1.318387421405024,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.005681529030589282,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
