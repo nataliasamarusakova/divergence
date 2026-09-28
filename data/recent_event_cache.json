@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790564011467,
+  "updated_ts": 1790564296990,
   "events": [
     {
       "event_id": "EVT_8298BB0B5841146B",
@@ -4056,6 +4056,64 @@
         "trigger_level": 0.014561,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4E3E421AED7201EE",
+      "symbol": "CC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_FR_OIW_Z",
+      "timestamps": {
+        "pivot_1_ts": 1790528399999,
+        "pivot_2_ts": 1790553599999,
+        "detected_at_ts": 1790560799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.1392,
+        "p1_price": 0.13206,
+        "p2_price": 0.13484,
+        "p1_indicator": -0.3272785424028691,
+        "p2_indicator": -0.7184617486082894,
+        "bars_between": 7,
+        "price_delta_atr": 1.2124289559501922,
+        "price_delta_pct": 2.1051037407238957,
+        "volume_ratio_20": 3.116775148135204,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.11548222400818939,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4BC5C25897BAF0F7",
+      "symbol": "CC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "HIDDEN_BULLISH_MFI",
+      "timestamps": {
+        "pivot_1_ts": 1790528399999,
+        "pivot_2_ts": 1790553599999,
+        "detected_at_ts": 1790560799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.1392,
+        "p1_price": 0.13206,
+        "p2_price": 0.13484,
+        "p1_indicator": 42.372122909062,
+        "p2_indicator": 40.747346299575106,
+        "bars_between": 7,
+        "price_delta_atr": 1.2124289559501922,
+        "price_delta_pct": 2.1051037407238957,
+        "volume_ratio_20": 3.116775148135204,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.11548222400818939,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
