@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790705016779,
+  "updated_ts": 1790705432304,
   "events": [
     {
       "event_id": "EVT_A7C025EB779F6300",
@@ -3289,6 +3289,32 @@
         "volume_ratio": 0.583403547513249,
         "requires_retest": true,
         "trigger_level": 4.191,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_3BCB5C09F68E8BFD",
+      "symbol": "EIGEN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790704799999,
+        "pivot_2_ts": 1790704799999,
+        "detected_at_ts": 1790704799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.2501,
+        "compression_ratio": 0.2850112287951168,
+        "ma_spread_atr": 0.2026490411846323,
+        "compression_threshold": 0.7110212535882529,
+        "breakout_atr": 0.8549803655095846,
+        "volume_ratio": 1.6611544759764163,
+        "requires_retest": true,
+        "trigger_level": 0.2523,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
         "market_data_source": "binance",
