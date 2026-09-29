@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790648155657,
+  "updated_ts": 1790648452090,
   "events": [
     {
       "event_id": "EVT_8FC8D0911366CE69",
@@ -4397,6 +4397,63 @@
         "compressed_recent": false,
         "bb_width": 0.0863307008914424,
         "trigger_level": 0.05084,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_D8763921D81BA3DA",
+      "symbol": "SPX",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKOUT_MOMENTUM",
+      "timestamps": {
+        "pivot_1_ts": 1790647199999,
+        "pivot_2_ts": 1790647199999,
+        "detected_at_ts": 1790647199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.4045,
+        "donchian_high": 0.4316,
+        "donchian_low": 0.4067,
+        "breakout_atr": 0.24290225837269416,
+        "bb_width": 0.05466795411785517,
+        "bb_width_threshold": 0.0471573871503994,
+        "volume_ratio": 2.030543698382049,
+        "adx": 40.49112245634363,
+        "requires_retest": true,
+        "trigger_level": 0.4067,
+        "engine": "BREAKOUT_MOMENTUM",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_ECF6E669D85F2296",
+      "symbol": "SPX",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790647199999,
+        "pivot_2_ts": 1790647199999,
+        "detected_at_ts": 1790647199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.4045,
+        "donchian_high": 0.4316,
+        "donchian_low": 0.4067,
+        "breakout_atr": 0.24290225837269416,
+        "volume_ratio": 2.030543698382049,
+        "adx": 40.49112245634363,
+        "ema200": 0.45460001710961834,
+        "compressed_recent": true,
+        "bb_width": 0.05466795411785517,
+        "trigger_level": 0.4067,
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
