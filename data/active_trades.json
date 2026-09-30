@@ -46,10 +46,10 @@
         "replaced_ts": 1790779303557
       }
     ],
-    "peak_pnl_pct": 9.592137592137584,
+    "peak_pnl_pct": 11.32186732186731,
     "mae_pct": -1.6117936117936142,
     "max_drawdown_pct": -8.68796068796069,
-    "current_pnl_pct": 9.700245700245691,
+    "current_pnl_pct": 10.515970515970505,
     "score": 80.0,
     "event_type": "VOLATILITY_SQUEEZE_RELEASE",
     "timeframe": "4h",
@@ -220,7 +220,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -228,7 +228,7 @@
     "last_exchange_avg_price": 0.10175,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 34.39,
-    "protection_last_updated_ts": 1790793188738
+    "protection_last_updated_ts": 1790793581258
   },
   "VP_820A2610C051F64D": {
     "trade_id": "TR_1E91F2E909236572D046786F",
@@ -280,7 +280,7 @@
     "peak_pnl_pct": 4.171011470281547,
     "mae_pct": -3.076120959332635,
     "max_drawdown_pct": -5.78727841501564,
-    "current_pnl_pct": 0.10427528675703868,
+    "current_pnl_pct": -0.20855057351407735,
     "score": 75.0,
     "event_type": "VOLUME_PROFILE_ACCUMULATION",
     "timeframe": "1h",
@@ -458,7 +458,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -466,202 +466,7 @@
     "last_exchange_avg_price": 1.918,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 3.91,
-    "protection_last_updated_ts": 1790793186447
-  },
-  "EVT_5F11001019515101": {
-    "trade_id": "TR_80F403B113C84690548419CC",
-    "event_id": "EVT_5F11001019515101",
-    "symbol": "LTC",
-    "name": "Litecoin",
-    "direction": "LONG",
-    "entry_price": 67.58,
-    "actual_entry_price": 67.58,
-    "requested_entry_price": 67.55,
-    "signal_reference_price": 67.58,
-    "pre_order_reference_price": 67.55,
-    "entry_slippage_pct": 0.04441154700222226,
-    "adverse_entry_slippage_pct": 0.04441154700222226,
-    "initial_qty": 0.1,
-    "initial_notional_usdt": 6.758,
-    "remaining_qty": 0.1,
-    "entry_ts": 1790651946712,
-    "tp_orders": [
-      {
-        "leg": "tp3",
-        "status": "already_exists",
-        "order_id": "2104772944349192192",
-        "price": 71.21,
-        "qty": 0.1
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2104772937088851968",
-      "stop_price": 66.13,
-      "qty": 0.1
-    },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
-    "be_required": false,
-    "be_last_error": null,
-    "sl_order_history": [],
-    "peak_pnl_pct": 2.51553714116603,
-    "mae_pct": -1.9976324356318353,
-    "max_drawdown_pct": -4.513169576797866,
-    "current_pnl_pct": -1.6720923350103514,
-    "score": 85.0,
-    "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-    "timeframe": "1h",
-    "research": {
-      "fr_oiw": 0.0098,
-      "pfr_oiw": 0.0104,
-      "liq_short24": 137200.0,
-      "liq_long24": 1200000.0,
-      "ls_accounts": 1.9,
-      "oi": 308100000.0,
-      "oi_chg24_pct": -8.05,
-      "oi_chg4h_pct": -3.72,
-      "oi_vol_ratio": 0.61,
-      "oi_mktcap_ratio": 0.059,
-      "volume24": 505200000.0,
-      "btc_corr7d": -0.59,
-      "cvd24": 0.0,
-      "lls24": 89.4501
-    },
-    "setup": {
-      "entry_reference": 67.58,
-      "invalidation_price": 66.1271424511936,
-      "target_price": 71.21214387201596,
-      "risk_pct": 2.1498336028505363,
-      "target_rr": 2.5,
-      "planned_weighted_rr": 1.6625,
-      "realized_rr": null,
-      "trigger_ok": true,
-      "trigger": {
-        "event_detected_at_ts": 1790650799999,
-        "trigger_observed_at_ts": 1790651896575,
-        "trigger_bar_close_ts": 1790651699999,
-        "trigger_price": 67.62,
-        "trigger_delay_min": 15.0,
-        "signal_to_trigger_drift_pct": 0.059189,
-        "volume_ratio": 1.61792
-      },
-      "signal_price": 67.58,
-      "entry_risk": {
-        "signal_to_trigger_drift_pct": 0.059189,
-        "oi_chg24_pct": -8.05,
-        "hot_oi_warning": false,
-        "short_defensive_mode": false,
-        "symbol_quarantine_until_ts": null
-      },
-      "event_timeframe": "1h",
-      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-      "entry_context": {
-        "btc_chg_1h_pct": -0.10346704953892569,
-        "btc_chg_4h_pct": -0.6928154818995139,
-        "btc_close": 82935.7,
-        "btc_available": true,
-        "fr_oiw": 0.0098,
-        "pfr_oiw": 0.0104,
-        "oi": 308100000.0,
-        "oi_chg24_pct": -8.05,
-        "oi_chg4h_pct": -3.72,
-        "volume24": 505200000.0,
-        "cvd24": 0.0,
-        "ls_accounts": 1.9,
-        "liq_long24": 1200000.0,
-        "liq_short24": 137200.0,
-        "btc_corr7d": -0.59,
-        "htf_trend": "UP",
-        "htf_trend_ok": null,
-        "context_source": null
-      },
-      "confluence_events": [],
-      "conflict_events": [],
-      "pre_order_reference_price": 67.55,
-      "tp_levels": [
-        {
-          "leg": "tp1",
-          "pnl_pct": 1.612375,
-          "close_fraction": 0.25
-        },
-        {
-          "leg": "tp2",
-          "pnl_pct": 3.22475,
-          "close_fraction": 0.4
-        },
-        {
-          "leg": "tp3",
-          "pnl_pct": 5.374584,
-          "close_fraction": 0.35
-        }
-      ],
-      "effective_tp_levels": [
-        {
-          "leg": "tp3",
-          "pnl_pct": 5.374584,
-          "close_fraction": 1.0,
-          "qty": 0.1
-        }
-      ],
-      "tp_mode": "single_tp",
-      "effective_weighted_rr": 2.4999999966851663
-    },
-    "planned_risk_pct": 2.1498336028505363,
-    "planned_target_rr": 2.5,
-    "planned_weighted_rr": 1.6625,
-    "planned_entry_reference": 67.58,
-    "planned_invalidation_price": 66.1271424511936,
-    "planned_target_price": 71.21214387201596,
-    "tp_levels": [
-      {
-        "leg": "tp1",
-        "pnl_pct": 1.612375,
-        "close_fraction": 0.25
-      },
-      {
-        "leg": "tp2",
-        "pnl_pct": 3.22475,
-        "close_fraction": 0.4
-      },
-      {
-        "leg": "tp3",
-        "pnl_pct": 5.374584,
-        "close_fraction": 0.35
-      }
-    ],
-    "effective_tp_levels": [
-      {
-        "leg": "tp3",
-        "pnl_pct": 5.374584,
-        "close_fraction": 1.0,
-        "qty": 0.1
-      }
-    ],
-    "tp_mode": "single_tp",
-    "effective_weighted_rr": 2.4999999966851663,
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null,
-    "last_close_exec_price": null,
-    "realized_pnl_pct": null,
-    "realized_rr": null,
-    "exit_price": null,
-    "exit_reason": null,
-    "closed_ts": null,
-    "duration_min": null,
-    "closed": false,
-    "last_observation_ts": 1790793146391,
-    "close_journal_pending": false,
-    "close_notification_pending": false,
-    "close_cleanup_pending": false,
-    "close_cleanup_last_error": null,
-    "last_exchange_avg_price": 67.58,
-    "current_price_source": "LIVE_TICKER",
-    "current_position_qty": 0.1,
-    "protection_last_updated_ts": 1790793192247
+    "protection_last_updated_ts": 1790793579472
   },
   "EVT_330585EC6111B40E": {
     "trade_id": "TR_71265696F30F4531FC2C4249",
@@ -713,7 +518,7 @@
     "peak_pnl_pct": 7.698462085518713,
     "mae_pct": -1.4312383322962043,
     "max_drawdown_pct": -6.489465730287132,
-    "current_pnl_pct": 3.306960618721655,
+    "current_pnl_pct": 2.8624766645924087,
     "score": 75.0,
     "event_type": "LIQUIDITY_SWEEP_RECLAIM",
     "timeframe": "1h",
@@ -884,7 +689,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -892,7 +697,7 @@
     "last_exchange_avg_price": 1.1249,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 3.0,
-    "protection_last_updated_ts": 1790793193410
+    "protection_last_updated_ts": 1790793584904
   },
   "EVT_AB94AD014D1308B3": {
     "trade_id": "TR_B49FB1CA4E1003E448D18DB4",
@@ -944,7 +749,7 @@
     "peak_pnl_pct": 4.145936981757881,
     "mae_pct": -2.1558872305140886,
     "max_drawdown_pct": -6.30182421227197,
-    "current_pnl_pct": 1.160862354892216,
+    "current_pnl_pct": 1.6030956329463868,
     "score": 80.0,
     "event_type": "BREAKER_BLOCK_BEARISH",
     "timeframe": "1h",
@@ -1114,7 +919,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -1122,7 +927,7 @@
     "last_exchange_avg_price": 0.1809,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 41.459,
-    "protection_last_updated_ts": 1790793193008
+    "protection_last_updated_ts": 1790793584368
   },
   "EVT_4DDA18A286A2C9B6": {
     "trade_id": "TR_2DC8F2A87CE5B86C247E20EB",
@@ -1174,7 +979,7 @@
     "peak_pnl_pct": 2.9135219462832636,
     "mae_pct": -2.2178184424674274,
     "max_drawdown_pct": -5.131340388750691,
-    "current_pnl_pct": 0.7926803558628894,
+    "current_pnl_pct": 1.1131256061053336,
     "score": 75.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -1352,7 +1157,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -1360,7 +1165,7 @@
     "last_exchange_avg_price": 2.3717,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 3.0,
-    "protection_last_updated_ts": 1790793188528
+    "protection_last_updated_ts": 1790793581011
   },
   "EVT_E045FBDBE4857378": {
     "trade_id": "TR_3061BAA913B2E47E94E8CEB9",
@@ -1412,7 +1217,7 @@
     "peak_pnl_pct": 1.4958794486353706,
     "mae_pct": -1.1911972541893818,
     "max_drawdown_pct": -2.6870767028247524,
-    "current_pnl_pct": -0.31018849916486624,
+    "current_pnl_pct": 0.0018354349062993786,
     "score": 80.0,
     "event_type": "BREAKER_BLOCK_BEARISH",
     "timeframe": "1h",
@@ -1582,7 +1387,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -1590,7 +1395,7 @@
     "last_exchange_avg_price": 544.83,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 0.013,
-    "protection_last_updated_ts": 1790793190950
+    "protection_last_updated_ts": 1790793582702
   },
   "EVT_C52A7EDEF9016E93": {
     "trade_id": "TR_9A930BB3E45A927A46A6EF82",
@@ -1642,7 +1447,7 @@
     "peak_pnl_pct": 5.2420598211532585,
     "mae_pct": -1.7267961763798936,
     "max_drawdown_pct": -6.2596361393771325,
-    "current_pnl_pct": 1.2025901942645745,
+    "current_pnl_pct": 0.5242059821153361,
     "score": 95.0,
     "event_type": "CRT_BULLISH",
     "timeframe": "1h",
@@ -1812,7 +1617,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -1820,7 +1625,7 @@
     "last_exchange_avg_price": 0.3243,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 23.13,
-    "protection_last_updated_ts": 1790793192800
+    "protection_last_updated_ts": 1790793583680
   },
   "HAR_ABF73999F19CC5D1": {
     "trade_id": "TR_5A605F48CA7CF1A84B113474",
@@ -1872,7 +1677,7 @@
     "peak_pnl_pct": 2.937576499388008,
     "mae_pct": -2.5336597307221473,
     "max_drawdown_pct": -5.201958384332924,
-    "current_pnl_pct": -1.8482252141982867,
+    "current_pnl_pct": -2.0195838433292486,
     "score": 85.0,
     "event_type": "HARMONIC_CYPHER_LONG",
     "timeframe": "1h",
@@ -2042,7 +1847,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -2050,7 +1855,7 @@
     "last_exchange_avg_price": 0.817,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 9.179,
-    "protection_last_updated_ts": 1790793187207
+    "protection_last_updated_ts": 1790793579968
   },
   "EVT_9759DB53F371861A": {
     "trade_id": "TR_16882928CA7A6C2AA61CFA6C",
@@ -2107,7 +1912,7 @@
     "peak_pnl_pct": 0.0,
     "mae_pct": -2.56190476190476,
     "max_drawdown_pct": -2.56190476190476,
-    "current_pnl_pct": -0.5809523809523804,
+    "current_pnl_pct": -0.48571428571429565,
     "score": 80.0,
     "event_type": "CRT_BEARISH",
     "timeframe": "1h",
@@ -2275,7 +2080,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -2283,7 +2088,7 @@
     "last_exchange_avg_price": 0.105,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 95.2,
-    "protection_last_updated_ts": 1790793189833
+    "protection_last_updated_ts": 1790793582208
   },
   "EVT_459AE3A26E93EC6F": {
     "trade_id": "TR_38460D6D6995943027C7348C",
@@ -2328,7 +2133,7 @@
     "peak_pnl_pct": 7.330677290836658,
     "mae_pct": -1.0889774236387844,
     "max_drawdown_pct": -8.047808764940248,
-    "current_pnl_pct": -0.07968127490039746,
+    "current_pnl_pct": -0.23904382470120392,
     "score": 80.0,
     "event_type": "BREAKER_BLOCK_BULLISH",
     "timeframe": "1h",
@@ -2486,7 +2291,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -2494,7 +2299,7 @@
     "last_exchange_avg_price": 0.003765,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 929.0,
-    "protection_last_updated_ts": 1790793188327
+    "protection_last_updated_ts": 1790793580766
   },
   "EVT_E4DD122505688998": {
     "trade_id": "TR_028DADAD882D5B912D486D29",
@@ -2546,7 +2351,7 @@
     "peak_pnl_pct": 2.809482001755918,
     "mae_pct": -2.0632133450395154,
     "max_drawdown_pct": -4.8726953467954335,
-    "current_pnl_pct": 0.3950834064969225,
+    "current_pnl_pct": 0.13169446883230748,
     "score": 85.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -2716,7 +2521,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -2724,7 +2529,7 @@
     "last_exchange_avg_price": 0.002278,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 3292.0,
-    "protection_last_updated_ts": 1790793191496
+    "protection_last_updated_ts": 1790793582946
   },
   "EVT_E5BC925A3E7DA83D": {
     "trade_id": "TR_F6147CEF1B04A28E7DD08670",
@@ -2773,10 +2578,10 @@
     "be_required": false,
     "be_last_error": null,
     "sl_order_history": [],
-    "peak_pnl_pct": 1.5757790368271987,
+    "peak_pnl_pct": 1.7705382436260637,
     "mae_pct": -1.5580736543909326,
     "max_drawdown_pct": -2.1777620396600597,
-    "current_pnl_pct": 1.4518413597733733,
+    "current_pnl_pct": 1.699716713881024,
     "score": 75.0,
     "event_type": "CRT_BEARISH",
     "timeframe": "1h",
@@ -2946,7 +2751,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -2954,7 +2759,7 @@
     "last_exchange_avg_price": 0.05648,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 132.79,
-    "protection_last_updated_ts": 1790793186993
+    "protection_last_updated_ts": 1790793579723
   },
   "EVT_6A0D896F473D641C": {
     "trade_id": "TR_E3E816CA53D7EFC15EBA9F5D",
@@ -3006,7 +2811,7 @@
     "peak_pnl_pct": 3.0942703553166377,
     "mae_pct": -1.4192998557755292,
     "max_drawdown_pct": -4.513570211092167,
-    "current_pnl_pct": -0.6129539792841237,
+    "current_pnl_pct": -1.1242952668152637,
     "score": 80.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -3184,7 +2989,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -3192,7 +2997,7 @@
     "last_exchange_avg_price": 305.08,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 0.02458,
-    "protection_last_updated_ts": 1790793187764
+    "protection_last_updated_ts": 1790793580295
   },
   "EVT_A4E7658112AE53BA": {
     "trade_id": "TR_2069F020D4D9F18E4D263DA6",
@@ -3235,7 +3040,7 @@
     "peak_pnl_pct": 2.1633718761656033,
     "mae_pct": -4.009697873927636,
     "max_drawdown_pct": -4.942185751585223,
-    "current_pnl_pct": 1.7903767251025753,
+    "current_pnl_pct": 1.6411786646773605,
     "score": 80.0,
     "event_type": "BREAKER_BLOCK_BULLISH",
     "timeframe": "1h",
@@ -3379,7 +3184,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -3387,7 +3192,7 @@
     "last_exchange_avg_price": 5.362,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 1.0,
-    "protection_last_updated_ts": 1790793193210
+    "protection_last_updated_ts": 1790793584619
   },
   "EVT_DE09E05D7002A1E8": {
     "trade_id": "TR_3E0F20B9E745D0C346E30C46",
@@ -3439,7 +3244,7 @@
     "peak_pnl_pct": 9.082353564943073,
     "mae_pct": -0.24389274021446028,
     "max_drawdown_pct": -6.133107113980095,
-    "current_pnl_pct": 7.047704889784347,
+    "current_pnl_pct": 8.556128467849899,
     "score": 90.0,
     "event_type": "BREAKOUT_MOMENTUM",
     "timeframe": "1h",
@@ -3618,7 +3423,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -3626,7 +3431,7 @@
     "last_exchange_avg_price": 0.75443,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 4.64,
-    "protection_last_updated_ts": 1790793193963
+    "protection_last_updated_ts": 1790793585289
   },
   "EVT_B377C121FC71EA78": {
     "trade_id": "TR_7B96A6698B390081BDC4861C",
@@ -3676,9 +3481,9 @@
     "be_last_error": null,
     "sl_order_history": [],
     "peak_pnl_pct": 4.305757135945824,
-    "mae_pct": -1.7900338655055545,
-    "max_drawdown_pct": -6.095791001451379,
-    "current_pnl_pct": -1.7900338655055545,
+    "mae_pct": -2.418964683115629,
+    "max_drawdown_pct": -6.724721819061453,
+    "current_pnl_pct": -2.322206095791001,
     "score": 80.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -3848,7 +3653,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -3856,7 +3661,7 @@
     "last_exchange_avg_price": 0.2067,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 36.32,
-    "protection_last_updated_ts": 1790793194525
+    "protection_last_updated_ts": 1790793585532
   },
   "EVT_D0B04C9244D855B2": {
     "trade_id": "TR_FFF7381434B34BB3D70E1360",
@@ -3908,7 +3713,7 @@
     "peak_pnl_pct": 3.711875405580801,
     "mae_pct": -0.7138221933809149,
     "max_drawdown_pct": -2.8293316028552944,
-    "current_pnl_pct": 2.2842310188189567,
+    "current_pnl_pct": 1.7910447761194077,
     "score": 80.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -4079,7 +3884,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -4087,7 +3892,7 @@
     "last_exchange_avg_price": 0.7705,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 4.543,
-    "protection_last_updated_ts": 1790793194741
+    "protection_last_updated_ts": 1790793585773
   },
   "EVT_C3F18F63BE67DA54": {
     "trade_id": "TR_6CB2BEAA83639DD96A547EB6",
@@ -4144,7 +3949,7 @@
     "peak_pnl_pct": 0.31508600121335273,
     "mae_pct": -0.15538487731070197,
     "max_drawdown_pct": -0.43809902908431875,
-    "current_pnl_pct": 0.174328404019853,
+    "current_pnl_pct": 0.17672631879317482,
     "score": 85.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -4312,7 +4117,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -4320,7 +4125,7 @@
     "last_exchange_avg_price": 4170.29,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 0.002397,
-    "protection_last_updated_ts": 1790793195286
+    "protection_last_updated_ts": 1790793586474
   },
   "EVT_6CF87BC084A4C33C": {
     "trade_id": "TR_34CCC7C817458002F479FC33",
@@ -4372,7 +4177,7 @@
     "peak_pnl_pct": 2.8433734939759048,
     "mae_pct": -1.108433734939764,
     "max_drawdown_pct": -2.8192771084337287,
-    "current_pnl_pct": 2.6506024096385463,
+    "current_pnl_pct": 2.1686746987951757,
     "score": 90.0,
     "event_type": "BREAKER_BLOCK_BULLISH",
     "timeframe": "1h",
@@ -4542,7 +4347,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -4550,7 +4355,7 @@
     "last_exchange_avg_price": 0.0415,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 180.766,
-    "protection_last_updated_ts": 1790793192042
+    "protection_last_updated_ts": 1790793583185
   },
   "EVT_7B594BD223AB302D": {
     "trade_id": "TR_D843428B9A83ABDD87D6B979",
@@ -4602,7 +4407,7 @@
     "peak_pnl_pct": 4.21381193913384,
     "mae_pct": -1.5216543113538663,
     "max_drawdown_pct": -5.735466250487706,
-    "current_pnl_pct": 0.03901677721421947,
+    "current_pnl_pct": -0.07803355442839563,
     "score": 80.0,
     "event_type": "MA_COMPRESSION_BREAKOUT",
     "timeframe": "1h",
@@ -4772,7 +4577,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -4780,7 +4585,7 @@
     "last_exchange_avg_price": 0.2563,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 29.27,
-    "protection_last_updated_ts": 1790793190394
+    "protection_last_updated_ts": 1790793582453
   },
   "EVT_646E85AECEFD1806": {
     "trade_id": "TR_A2594D756C5431945BF4E34E",
@@ -4834,10 +4639,10 @@
     "be_required": false,
     "be_last_error": null,
     "sl_order_history": [],
-    "peak_pnl_pct": 0.756335972400376,
+    "peak_pnl_pct": 0.9332566676987014,
     "mae_pct": -2.0611261002255636,
     "max_drawdown_pct": -2.808616037861014,
-    "current_pnl_pct": 0.3671104427440388,
+    "current_pnl_pct": 0.778451059312659,
     "score": 95.0,
     "event_type": "ORDER_BLOCK_BEARISH",
     "timeframe": "1h",
@@ -5005,7 +4810,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -5013,7 +4818,7 @@
     "last_exchange_avg_price": 0.022609,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 442.0,
-    "protection_last_updated_ts": 1790793195490
+    "protection_last_updated_ts": 1790793586716
   },
   "EVT_1C782C25377FF580": {
     "trade_id": "TR_F742670ACFFBB03F31F32878",
@@ -5065,7 +4870,7 @@
     "peak_pnl_pct": 4.042273026539841,
     "mae_pct": 0.0,
     "max_drawdown_pct": -4.041137875451226,
-    "current_pnl_pct": 1.811701137421395,
+    "current_pnl_pct": 1.2838558812177905,
     "score": 100.0,
     "event_type": "MACD_4H_BULLISH_CROSS",
     "timeframe": "4h",
@@ -5244,7 +5049,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -5252,7 +5057,7 @@
     "last_exchange_avg_price": 88.094,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 0.0397,
-    "protection_last_updated_ts": 1790793189287
+    "protection_last_updated_ts": 1790793581504
   },
   "EVT_26A43EC15EEF7690": {
     "trade_id": "TR_23B8A6390E45942332FFACBB",
@@ -5304,7 +5109,7 @@
     "peak_pnl_pct": 5.584340817501448,
     "mae_pct": -0.7196315486470933,
     "max_drawdown_pct": -5.382843983880268,
-    "current_pnl_pct": 4.029936672423723,
+    "current_pnl_pct": 1.0650546919977077,
     "score": 95.0,
     "event_type": "MACD_4H_BULLISH_CROSS",
     "timeframe": "4h",
@@ -5475,7 +5280,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -5483,7 +5288,7 @@
     "last_exchange_avg_price": 0.3474,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 10.0,
-    "protection_last_updated_ts": 1790793185906
+    "protection_last_updated_ts": 1790793579226
   },
   "EVT_2371E81959DADE6B": {
     "trade_id": "TR_ACB1B45AA3DF500ACE3946CD",
@@ -5537,10 +5342,10 @@
     "be_required": false,
     "be_last_error": null,
     "sl_order_history": [],
-    "peak_pnl_pct": 0.40955631399317943,
+    "peak_pnl_pct": 0.5915813424345827,
     "mae_pct": -0.2957906712172977,
     "max_drawdown_pct": -0.7053469852104771,
-    "current_pnl_pct": 0.04550625711034766,
+    "current_pnl_pct": 0.47781569965870097,
     "score": 70.0,
     "event_type": "CRT_BEARISH",
     "timeframe": "1h",
@@ -5708,7 +5513,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793146391,
+    "last_observation_ts": 1790793541486,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -5716,7 +5521,7 @@
     "last_exchange_avg_price": 0.4395,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 22.742,
-    "protection_last_updated_ts": 1790793196065
+    "protection_last_updated_ts": 1790793587423
   },
   "EVT_A943C27B35EC3C1B": {
     "trade_id": "TR_EB6587128E7C0D249522DA29",
@@ -5737,38 +5542,31 @@
     "entry_ts": 1790793385389,
     "tp_orders": [
       {
-        "leg": "tp1",
-        "status": "created",
-        "order_id": "2105366175600435200",
-        "client_order_id": null,
-        "price": 0.046556125000000004,
-        "qty": 51.7,
-        "pnl_pct": 3.75
+        "leg": "tp3",
+        "status": "already_exists",
+        "order_id": "2105366177529815040",
+        "price": 0.04232,
+        "qty": 72.3
       },
       {
         "leg": "tp2",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2105366176560930816",
-        "client_order_id": null,
-        "price": 0.044742250000000004,
-        "qty": 82.6,
-        "pnl_pct": 7.5
+        "price": 0.04474,
+        "qty": 82.6
       },
       {
-        "leg": "tp3",
-        "status": "created",
-        "order_id": "2105366177529815040",
-        "client_order_id": null,
-        "price": 0.04232375,
-        "qty": 72.3,
-        "pnl_pct": 12.5
+        "leg": "tp1",
+        "status": "already_exists",
+        "order_id": "2105366175600435200",
+        "price": 0.04656,
+        "qty": 51.7
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2105366172790251520",
-      "client_order_id": null,
-      "stop_price": 0.05078850000000001,
+      "stop_price": 0.05079,
       "qty": 206.6
     },
     "hit_legs": [],
@@ -5777,10 +5575,10 @@
     "be_required": false,
     "be_last_error": null,
     "sl_order_history": [],
-    "peak_pnl_pct": 0.0,
-    "mae_pct": 0.0,
-    "max_drawdown_pct": 0.0,
-    "current_pnl_pct": 0.0,
+    "peak_pnl_pct": 0.971676659086221,
+    "mae_pct": -0.12404382881951116,
+    "max_drawdown_pct": -1.0957204879057323,
+    "current_pnl_pct": 0.5581972296878361,
     "score": 75.0,
     "event_type": "DONCHIAN_RETEST_BREAKOUT",
     "timeframe": "1h",
@@ -5948,6 +5746,14 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790793387294
+    "last_observation_ts": 1790793541486,
+    "close_journal_pending": false,
+    "close_notification_pending": false,
+    "close_cleanup_pending": false,
+    "close_cleanup_last_error": null,
+    "last_exchange_avg_price": 0.04837,
+    "current_price_source": "LIVE_TICKER",
+    "current_position_qty": 206.6,
+    "protection_last_updated_ts": 1790793583429
   }
 }
