@@ -196,10 +196,10 @@ def evaluate_sr_room(
     """Evaluate opposing-zone room and supporting-zone context.
 
     Rule set:
-    - Opposing zone before/inside TP1 or TP2 => reject.
-    - Opposing zone between TP2 and TP3 => allow, but cap TP3 just before the zone.
-    - Opposing zone after TP3 => full room.
-    - Supporting zone is diagnostic context only; it does not add score or veto.
+    - Opposing zone before/inside TP1 => reject.
+    - Opposing zone after TP1 => allow; it never mutates the TP ladder.
+    - Supporting zone inside the entry is a directional confirmation only.
+    - Supporting context never adds arbitrary legacy-score points and never blocks entry.
     - If entry overlaps an opposing zone => reject.
     """
     d = str(direction).upper()
@@ -298,6 +298,8 @@ def evaluate_sr_room(
         "reject_reason": None,
         "tp3_capped": False,
         "effective_tp3_price": target_prices[2],
+        "supporting_zone_confirmation": False,
+        "directional_zone_alignment": None,
     }
 
     if nearest_support is not None:
@@ -305,11 +307,15 @@ def evaluate_sr_room(
             result["supporting_zone_distance_r"] = 0.0
             result["supporting_zone_near"] = True
             result["supporting_zone_context"] = "SUPPORTIVE_INSIDE"
+            result["supporting_zone_confirmation"] = True
+            result["directional_zone_alignment"] = "LONG_IN_DEMAND" if d == "LONG" else "SHORT_IN_SUPPLY"
         elif nearest_support.get("distance_from_entry") is not None:
             support_distance_r = float(nearest_support["distance_from_entry"]) / risk_distance
             result["supporting_zone_distance_r"] = support_distance_r
             result["supporting_zone_near"] = support_distance_r <= SR_SUPPORT_CONTEXT_MAX_R
             result["supporting_zone_context"] = "SUPPORTIVE_NEAR" if result["supporting_zone_near"] else "SUPPORTIVE_FAR"
+            result["supporting_zone_confirmation"] = False
+            result["directional_zone_alignment"] = None
         else:
             result["supporting_zone_distance_r"] = None
             result["supporting_zone_near"] = False
@@ -318,6 +324,8 @@ def evaluate_sr_room(
         result["supporting_zone_distance_r"] = None
         result["supporting_zone_near"] = False
         result["supporting_zone_context"] = "NONE"
+        result["supporting_zone_confirmation"] = False
+        result["directional_zone_alignment"] = None
 
     if nearest_opp is None:
         return result
@@ -337,47 +345,20 @@ def evaluate_sr_room(
     result["room_margin_to_tp2_r"] = distance_r - float(target_rrs[1])
     result["room_margin_to_tp3_r"] = distance_r - float(target_rrs[2])
 
-    # Need room through TP2. TP3 can be capped when the zone is between TP2 and TP3.
-    tp2 = target_prices[1]
-    tp3 = target_prices[2]
-    required_side = tp2 + buffer if d == "LONG" else tp2 - buffer
-    if (d == "LONG" and near_edge <= required_side) or (d == "SHORT" and near_edge >= required_side):
+    # The trading rule is intentionally literal: only an opposing zone that reaches
+    # the FIRST take-profit invalidates the entry. A safety buffer is reported for
+    # diagnostics but does not move the hard TP1 boundary. A zone after TP1 is not
+    # an entry veto and does not mutate the TP ladder.
+    tp1 = target_prices[0]
+    blocks_tp1 = (d == "LONG" and near_edge <= tp1) or (d == "SHORT" and near_edge >= tp1)
+    if blocks_tp1:
         result.update({
-            "room_status": "INSUFFICIENT_ROOM",
+            "room_status": "OPPOSING_ZONE_BEFORE_TP1",
             "reject": True,
-            "reject_reason": "OPPOSING_ZONE_BEFORE_TP2",
+            "reject_reason": "OPPOSING_ZONE_BEFORE_TP1",
         })
-        return result
-
-    tp3_blocked = (d == "LONG" and near_edge <= tp3 + buffer) or (d == "SHORT" and near_edge >= tp3 - buffer)
-    if tp3_blocked:
-        if d == "LONG":
-            capped_tp3 = near_edge - buffer
-            min_tp3 = tp2 + max(buffer, risk_distance * SR_MIN_PARTIAL_TP3_R)
-            if capped_tp3 <= min_tp3:
-                result.update({
-                    "room_status": "INSUFFICIENT_TP3_ROOM",
-                    "reject": True,
-                    "reject_reason": "OPPOSING_ZONE_LEAVES_NO_MEANINGFUL_TP3",
-                })
-                return result
-        else:
-            capped_tp3 = near_edge + buffer
-            min_tp3 = tp2 - max(buffer, risk_distance * SR_MIN_PARTIAL_TP3_R)
-            if capped_tp3 >= min_tp3:
-                result.update({
-                    "room_status": "INSUFFICIENT_TP3_ROOM",
-                    "reject": True,
-                    "reject_reason": "OPPOSING_ZONE_LEAVES_NO_MEANINGFUL_TP3",
-                })
-                return result
-        effective_rr = abs(capped_tp3 - entry_price) / risk_distance
-        result.update({
-            "room_status": "PARTIAL_ROOM",
-            "tp3_capped": True,
-            "effective_tp3_price": capped_tp3,
-            "effective_tp3_rr": effective_rr,
-        })
+    else:
+        result["room_status"] = "POST_TP1_OPPOSING_ZONE"
 
     return result
 
