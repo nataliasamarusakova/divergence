@@ -41,11 +41,9 @@ EARLY_LOSS_CUT_2H_PNL = float(os.environ.get("EARLY_LOSS_CUT_2H_PNL", "-1.50"))
 EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
 EARLY_LOSS_CUT_4H_PNL = float(os.environ.get("EARLY_LOSS_CUT_4H_PNL", "-2.50"))
 
-# Which realised TP leg moves the stop to break-even. build_tp_levels has always
-# documented "TP1 no BE, TP2 move to BE", but the tracker moved on TP1, so every
-# TP1 hit also armed BE (TP1-hit rate and BE rate match to the decimal in both
-# production windows). tp2 restores the documented policy; tp1 reproduces the
-# shipped behaviour for A/B.
+# Which realised TP leg moves the remaining stop to break-even. Keep tp2 as the
+# shipped v10.1.2 default until TP1 is validated by an independent replay/A-B test.
+# The value remains environment-configurable for controlled research.
 BE_AFTER_LEG = os.environ.get("BE_AFTER_LEG", "tp2").strip().lower()
 if BE_AFTER_LEG not in {"tp1", "tp2"}:
     BE_AFTER_LEG = "tp2"

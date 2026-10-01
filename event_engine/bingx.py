@@ -42,6 +42,7 @@ API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
 BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
+REQUIRE_MULTI_TP = os.environ.get("REQUIRE_MULTI_TP", os.environ.get("REJECT_SINGLE_TP", "false")).strip().lower() == "true"
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
 MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "10"))
 
@@ -474,23 +475,36 @@ def _query_order(symbol: str, *, order_id: str | int | None = None, client_order
     if not isinstance(order, dict):
         return {"status": "error", "error": "order response missing order object", "code": resp.get("code")}
 
-    avg_price_raw = order.get("avgPrice")
-    try:
-        avg_price = float(avg_price_raw) if avg_price_raw not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        avg_price = 0.0
-    try:
-        trigger_price = float(order.get("stopPrice", 0) or 0)
-    except (TypeError, ValueError):
-        trigger_price = 0.0
-    try:
-        executed_qty = float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0)
-    except (TypeError, ValueError):
-        executed_qty = 0.0
-    try:
-        orig_qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
-    except (TypeError, ValueError):
-        orig_qty = 0.0
+    def _first_float(*keys: str) -> float:
+        for key in keys:
+            raw = order.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return 0.0
+
+    def _first_positive_float(*keys: str) -> float:
+        for key in keys:
+            raw = order.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return value
+        return 0.0
+
+    executed_qty = _first_positive_float("executedQty", "cumQty", "stopExecutedQty", "executedQuantity", "cumulatedQuantity")
+    avg_price = _first_positive_float("avgPrice", "avgFillPrice", "fillAvgPrice", "averagePrice", "executedAvgPrice")
+    trigger_price = _first_float("stopPrice", "triggerPrice", "activationPrice")
+    orig_qty = _first_positive_float("origQty", "quantity", "qty")
 
     return {
         "status": "ok",
@@ -596,8 +610,19 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
-    # Never silently increase leverage. A $1-class position may legitimately
-    # be too small to support all TP legs at the exchange minQty.
+    # Never silently increase leverage. A small position must be large enough for
+    # every configured TP leg to clear exchange minQty after the intended split.
+    # The smallest shipped normal leg is 25%, so 4*minQty is the conservative
+    # pre-order bound that guarantees a 25% leg can meet minQty. The protection
+    # allocator remains the final precision-aware check after the real fill.
+    if REQUIRE_MULTI_TP and min_qty > 0 and qty < min_qty * 4:
+        return {
+            "status": "error",
+            "error": f"multi_tp_not_supported: qty={qty} < 4*min_qty={min_qty * 4} at configured leverage={leverage}",
+            "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "leverage": leverage, "sizing_price": sizing_price, "tp_mode": "multi_tp_required",
+        }
+
     if qty <= 0 or qty < min_qty:
         return {
             "status": "error",
@@ -1861,8 +1886,21 @@ def ensure_directional_protection(
 
     tp_mode = "multi_tp"
     if min_qty > 0 and position_qty < min_qty * len(tp_levels_norm):
-        # Expected micro-position behavior: one farthest TP when the exchange
-        # cannot support three independently-sized legs.
+        if REQUIRE_MULTI_TP:
+            return {
+                "status": "PROTECTION_FAILED",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "direction": direction,
+                "avg_price": avg_price,
+                "qty": position_qty,
+                "sl_result": sl_result,
+                "tp_orders": [],
+                "error": f"multi_tp_not_supported_after_fill: qty={position_qty} < {len(tp_levels_norm)}*min_qty={min_qty}",
+                "rolled_back": False,
+            }
+        # Legacy compatibility when multi-TP is explicitly not required: one
+        # farthest TP may be used for a micro-position.
         tp_levels_norm = [{"leg": tp_levels_norm[-1]["leg"], "pnl_pct": tp_levels_norm[-1]["pnl_pct"], "close_fraction": 1.0}]
         tp_mode = "single_tp"
 
