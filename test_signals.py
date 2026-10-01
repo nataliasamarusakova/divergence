@@ -3042,6 +3042,8 @@ def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypat
     monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
     monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
     monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    # No network calls belong in this deterministic tracker regression test.
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
     monkeypatch.setattr(
         tr,
         "get_order",

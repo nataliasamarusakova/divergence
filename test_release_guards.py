@@ -13,6 +13,10 @@ def test_clean_release_uses_divergence_shadow_mode():
 
 def test_clean_release_has_pre_order_drift_retry_budget():
     assert 'MAX_PRE_ORDER_DRIFT_REJECTIONS: "3"' in _workflow()
+    assert 'ENTRY_QUALITY_GATE_ENABLED: "true"' in _workflow()
+    assert 'ENTRY_QUALITY_MODE: "shadow"' in _workflow()
+    assert 'REQUIRE_MULTI_TP: "true"' in _workflow()
+    assert 'REJECT_ATR_RISK_CLIP: "true"' in _workflow()
 
 
 def test_shadow_flag_is_actually_reachable():
@@ -59,6 +63,33 @@ def test_kline_rate_limit_circuit_breaker_settings():
     assert 'BINGX_KLINE_SCAN_MIN_INTERVAL_SEC: "1.25"' in workflow
     assert 'BINGX_KLINE_RETRY_ATTEMPTS: "3"' in workflow
     assert 'BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC: "900"' in workflow
+
+
+def test_release_enables_lazy_ajay_sr_room_using_spot():
+    workflow = _workflow()
+    assert 'AJAY_SR_ROOM_ENABLED: "true"' in workflow
+    assert 'AJAY_SR_ROOM_MODE: "enforce"' in workflow
+    assert 'AJAY_SR_REQUIRE_DATA: "true"' in workflow
+    assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
+    assert 'AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"' in workflow
+    assert 'AJAY_SR_KLINE_LIMIT_1H: "1000"' in workflow
+    assert 'AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"' in workflow
+    assert 'AJAY_SR_RB: "10"' in workflow
+    assert 'AJAY_SR_PRD: "284"' in workflow
+
+
+def test_pine_sr_manual_diagnostic_workflow_is_spot_only():
+    wf = Path('.github/workflows/pine-sr-diagnostic.yml').read_text(encoding='utf-8')
+    assert 'workflow_dispatch' in wf
+    assert 'pine_sr_diagnostic.py' in wf
+    assert 'BTC-USDT' in wf
+
+
+def test_release_documents_futures_as_future_sr_source():
+    notes = Path('V10_2_SR_NOTES.md').read_text(encoding='utf-8')
+    assert 'Binance SPOT 1H' in notes
+    assert 'Futures' in notes and 'add' in notes
+    assert 'get_cached_sr_snapshot()' in notes
 
 
 def test_release_uses_binance_for_signal_market_data_and_bingx_for_execution():

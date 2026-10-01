@@ -69,6 +69,11 @@ from event_engine.signals import (
     validate_strategy_htf_context,
     _atr as canonical_atr,
 )
+from event_engine.sr_context import (
+    get_cached_sr_snapshot,
+    evaluate_sr_room,
+    apply_sr_tp3_cap,
+)
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
 from event_engine.tracker import (
@@ -132,10 +137,45 @@ MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
 MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "2.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "85"))
+
+# Entry-quality policy is intentionally separate from the legacy diagnostic score.
+# It can be rolled back via environment variables without changing event detectors
+# or the research portfolio-cap policy.
+ENTRY_QUALITY_GATE_ENABLED = os.environ.get("ENTRY_QUALITY_GATE_ENABLED", "false").lower() == "true"
+ENTRY_QUALITY_MODE = os.environ.get("ENTRY_QUALITY_MODE", "shadow").strip().lower()
+if ENTRY_QUALITY_MODE not in {"off", "shadow", "enforce"}:
+    ENTRY_QUALITY_MODE = "shadow"
+ENTRY_WEAK_ENGINE_BLOCK_ENABLED = os.environ.get("ENTRY_WEAK_ENGINE_BLOCK_ENABLED", "false").lower() == "true"
+ENTRY_BLOCKED_EVENT_TYPES = {
+    x.strip().upper()
+    for x in os.environ.get(
+        "ENTRY_BLOCKED_EVENT_TYPES",
+        "MA_COMPRESSION_BREAKOUT,CRT_BULLISH,CRT_BEARISH,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH",
+    ).split(",")
+    if x.strip()
+}
+SHORT_OI_VETO_ENABLED = os.environ.get("SHORT_OI_VETO_ENABLED", "false").lower() == "true"
+SHORT_OI_VETO_PCT = float(os.environ.get("SHORT_OI_VETO_PCT", "-5.0"))
+COMPOUND_CVD_LIQ_VETO_ENABLED = os.environ.get("COMPOUND_CVD_LIQ_VETO_ENABLED", "false").lower() == "true"
+COMPOUND_CVD_MAX = float(os.environ.get("COMPOUND_CVD_MAX", "25"))
+COMPOUND_LIQ_LONG_MIN = float(os.environ.get("COMPOUND_LIQ_LONG_MIN", "150000"))
+SYMBOL_LOSS_COOLDOWN_MIN = float(os.environ.get("SYMBOL_LOSS_COOLDOWN_MIN", "0"))
+REJECT_ATR_RISK_CLIP = os.environ.get("REJECT_ATR_RISK_CLIP", "false").lower() == "true"
+MAX_ENTRY_RISK_PCT = float(os.environ.get("MAX_ENTRY_RISK_PCT", "5.0"))
 MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
 HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
+
+# Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
+# Current source is Binance SPOT 1H. Futures can be added later without changing
+# the room/gate logic; see V10_2_SR_NOTES.md.
+AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
+AJAY_SR_ROOM_MODE = os.environ.get("AJAY_SR_ROOM_MODE", "shadow").strip().lower()
+if AJAY_SR_ROOM_MODE not in {"off", "shadow", "enforce"}:
+    AJAY_SR_ROOM_MODE = "shadow"
+AJAY_SR_REQUIRE_DATA = os.environ.get("AJAY_SR_REQUIRE_DATA", "false").lower() == "true"
+
 # Research/VST mode deliberately disables entry-cap throttles so valid signals can be
 # observed and statistically evaluated. Live-like modes keep the production limits.
 _EXECUTION_MODE_HINT = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst")).strip().lower()
@@ -972,6 +1012,14 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "rejected_funding": 0,
         "rejected_cvd": 0,
         "rejected_score": 0,
+        "rejected_entry_quality": 0,
+        "rejected_weak_engine": 0,
+        "rejected_short_oi": 0,
+        "rejected_cvd_liq": 0,
+        "rejected_recent_loss": 0,
+        "rejected_risk_too_wide": 0,
+        "rejected_single_tp": 0,
+        "entry_quality_shadow_flags": 0,
         "rejected_entry_drift": 0,
         "rejected_trigger_stale": 0,
         "rejected_portfolio_cap": 0,
@@ -1281,6 +1329,110 @@ def _load_symbol_quarantines(path: Path, now_ms: int, max_consecutive_losses: in
 def _symbol_on_quarantine(symbol: str, quarantines: dict[str, int], now_ms: int) -> bool:
     until = int(quarantines.get(str(symbol).strip().upper(), 0) or 0)
     return until > now_ms
+
+
+def _load_recent_symbol_losses(path: Path) -> dict[str, int]:
+    """Return the latest confirmed LOSS close timestamp per symbol.
+
+    DATA_ERROR/missing PnL is deliberately ignored: unknown results must never
+    trigger the repeat-entry safety rule.
+    """
+    if not path.exists():
+        return {}
+    latest: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("record_type") != "TRADE_CLOSE":
+                continue
+            pnl = obj.get("realized_pnl_pct")
+            if not isinstance(pnl, (int, float)):
+                continue
+            if not math.isfinite(float(pnl)) or float(pnl) >= 0:
+                continue
+            symbol = str(obj.get("symbol") or "").strip().upper()
+            try:
+                closed_ts = int(obj.get("closed_ts") or 0)
+            except (TypeError, ValueError):
+                closed_ts = 0
+            if symbol and closed_ts > 0:
+                latest[symbol] = max(latest.get(symbol, 0), closed_ts)
+    except Exception as exc:
+        log.warning("[RISK] recent-loss state read failed: %s", exc)
+    return latest
+
+
+def _entry_quality_gate(
+    *,
+    ev: dict[str, Any],
+    row: Any,
+    direction: str,
+    now_ms: int,
+    recent_loss_ts: dict[str, int],
+) -> tuple[bool, list[str], bool]:
+    """Evaluate targeted entry vetoes without relying on the legacy score.
+
+    Returns (allowed, reasons, terminal). Temporary recent-loss cooldowns are
+    non-terminal so the event can be retried after the cooldown window.
+    """
+    if not ENTRY_QUALITY_GATE_ENABLED:
+        return True, [], False
+
+    event_type = str(ev.get("event_type", "")).upper()
+    symbol = str(ev.get("symbol", "")).strip().upper()
+    d = str(direction).upper()
+    try:
+        oi24 = float(getattr(row, "oi_chg24_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        oi24 = 0.0
+    cvd24 = None
+    try:
+        raw_cvd24 = getattr(row, "cvd24", None)
+        value = float(raw_cvd24) if raw_cvd24 not in (None, "") else float("nan")
+        if math.isfinite(value):
+            cvd24 = value
+    except (TypeError, ValueError):
+        pass
+    liq_long24 = None
+    try:
+        raw_liq_long24 = getattr(row, "liq_long24", None)
+        value = float(raw_liq_long24) if raw_liq_long24 not in (None, "") else float("nan")
+        if math.isfinite(value):
+            liq_long24 = value
+    except (TypeError, ValueError):
+        pass
+
+    reasons: list[str] = []
+    temporary_reasons: list[str] = []
+    if ENTRY_WEAK_ENGINE_BLOCK_ENABLED and event_type in ENTRY_BLOCKED_EVENT_TYPES:
+        reasons.append(f"WEAK_EVENT_TYPE:{event_type}")
+    if SHORT_OI_VETO_ENABLED and d == "SHORT" and oi24 < SHORT_OI_VETO_PCT:
+        reasons.append(f"SHORT_OI:{oi24:.2f}%<{SHORT_OI_VETO_PCT:.2f}%")
+    if (
+        COMPOUND_CVD_LIQ_VETO_ENABLED
+        and cvd24 is not None
+        and liq_long24 is not None
+        and cvd24 < COMPOUND_CVD_MAX
+        and liq_long24 >= COMPOUND_LIQ_LONG_MIN
+    ):
+        reasons.append(f"CVD_LIQ:cvd={cvd24:.2f}<{COMPOUND_CVD_MAX:.2f},liq_long24={liq_long24:.0f}>={COMPOUND_LIQ_LONG_MIN:.0f}")
+    if SYMBOL_LOSS_COOLDOWN_MIN > 0 and symbol:
+        last_loss_ts = int(recent_loss_ts.get(symbol, 0) or 0)
+        age_min = (now_ms - last_loss_ts) / 60_000.0 if last_loss_ts > 0 else None
+        if age_min is not None and 0 <= age_min <= SYMBOL_LOSS_COOLDOWN_MIN:
+            reason = f"RECENT_SYMBOL_LOSS:{age_min:.1f}m<{SYMBOL_LOSS_COOLDOWN_MIN:.1f}m"
+            reasons.append(reason)
+            temporary_reasons.append(reason)
+    # Only a pure recent-loss cooldown is temporary. Any permanent veto that
+    # accompanies it must still terminalize the event in enforce mode; otherwise
+    # the same permanently invalid event can be retried on every later cycle.
+    terminal = bool(reasons) and not temporary_reasons or (bool(reasons) and len(temporary_reasons) < len(reasons))
+    return not reasons, reasons, terminal
 
 
 def _entry_drift_pct(signal_price: float, trigger_price: float, direction: str) -> float | None:
@@ -1659,7 +1811,12 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
     if not (float("-inf") < risk_pct_raw < float("inf")):
         raise ValueError("Invalid ATR-derived risk")
 
-    risk_pct = max(0.50, min(risk_pct_raw, 5.00))
+    max_entry_risk_pct = max(0.50, float(MAX_ENTRY_RISK_PCT))
+    if REJECT_ATR_RISK_CLIP and risk_pct_raw > max_entry_risk_pct:
+        raise ValueError(
+            f"ENTRY_RISK_TOO_WIDE: raw_atr_risk_pct={risk_pct_raw:.6f}% > max_entry_risk_pct={max_entry_risk_pct:.6f}%"
+        )
+    risk_pct = max(0.50, min(risk_pct_raw, max_entry_risk_pct))
 
     ev_type = str(ev.get("event_type", "")).upper()
     is_squeeze = _is_squeeze_event(ev_type)
@@ -1679,6 +1836,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         "invalidation_price": invalidation,
         "target_price": target,
         "risk_pct": risk_pct,
+        "risk_pct_raw": risk_pct_raw,
+        "risk_was_clipped": bool(risk_pct_raw > max_entry_risk_pct),
         "target_rr": target_rr,
         "planned_weighted_rr": planned_weighted_rr,
         "realized_rr": None,
@@ -1721,10 +1880,10 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         planned_weighted_rr = 2.05
         target_rr = 3.0
     else:
-        # Normal divergence cascade: take a small early partial, protect only
-        # after TP2, and keep enough size for the higher-R move.
-        # TP1: 0.75R -> 25% (no BE)
-        # TP2: 1.50R -> 40% (move SL to BE; tracker.BE_AFTER_LEG must agree)
+        # Normal divergence cascade: take a small early partial, then protect
+        # the remaining position after TP1 under the shipped research policy.
+        # TP1: 0.75R -> 25% (move SL to BE; tracker.BE_AFTER_LEG must agree)
+        # TP2: 1.50R -> 40%
         # TP3: 2.50R -> 35%
         # Weighted RR = 0.25*0.75 + 0.40*1.50 + 0.35*2.50 = 1.6625R
         tp_levels = [
@@ -2384,6 +2543,102 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "execution_quality": {"signal_to_pre_order_drift_pct": pre_order_drift, "trigger_to_pre_order_drift_pct": trigger_live_drift, "pre_order_price": live_reference, "drift_limit_pct": drift_limit},
         }
 
+    # Final, lazy S/R room check: only now, for a candidate that survived all
+    # previous gates and has a current BingX price. The S/R source is deliberately
+    # Binance SPOT 1H for now; the rest of the execution path remains unchanged.
+    sr_result: dict[str, Any] | None = None
+    sr_snapshot: dict[str, Any] | None = None
+    if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off":
+        try:
+            sr_snapshot = get_cached_sr_snapshot(symbol)
+            sr_setup = dict(setup)
+            sr_setup["entry_reference"] = float(live_reference)
+            risk_pct_for_sr = float(setup.get("risk_pct", 0) or 0)
+            if risk_pct_for_sr <= 0:
+                raise ValueError("invalid planned risk_pct for SR room")
+            # Rebuild the same ladder used by protection code from the current
+            # pre-order reference price. Recompute invalidation at that reference
+            # so the R multipliers stay exactly 0.75/1.50/2.50 (or 1/2/3 for
+            # squeeze events), even if the signal price has drifted.
+            if direction == "LONG":
+                sr_setup["invalidation_price"] = float(live_reference) * (1.0 - risk_pct_for_sr / 100.0)
+            else:
+                sr_setup["invalidation_price"] = float(live_reference) * (1.0 + risk_pct_for_sr / 100.0)
+            sl_pct_preview, preview_tp_levels = build_tp_levels(
+                sr_setup, direction, event_type=event_type_for_risk
+            )
+            tp_rrs = tuple(
+                float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct_preview), 1e-12)
+                for level in preview_tp_levels
+            )
+            if len(tp_rrs) != 3 or any(rr <= 0 for rr in tp_rrs):
+                raise ValueError("invalid TP ladder for SR room")
+            sr_result = evaluate_sr_room(
+                sr_snapshot,
+                entry_price=float(live_reference),
+                direction=direction,
+                risk_pct=risk_pct_for_sr,
+                target_rrs=(float(tp_rrs[0]), float(tp_rrs[1]), float(tp_rrs[2])),
+            )
+            setup["sr_context"] = sr_result
+            if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "enforce":
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type_for_risk,
+                    "execution_status": "SR_ROOM_REJECTED",
+                    "sr_room": sr_result,
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+                return {
+                    "status": "SR_ROOM_REJECTED",
+                    "mode": EXECUTION_MODE,
+                    "order_id": None,
+                    "position": {},
+                    "error": str(sr_result.get("reject_reason") or "SR_ROOM_REJECTED"),
+                    "sr_room": sr_result,
+                }
+            if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "shadow":
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type_for_risk,
+                    "execution_status": "SR_ROOM_SHADOW_FLAGGED",
+                    "sr_room": sr_result,
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+                log.info("[SR_ROOM_SHADOW] %s %s rejected geometry=%s but NOT blocked", direction, symbol, sr_result.get("room_status"))
+            elif AJAY_SR_ROOM_MODE == "shadow":
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type_for_risk,
+                    "execution_status": "SR_ROOM_CHECKED",
+                    "sr_room": sr_result,
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+        except Exception as exc:
+            if AJAY_SR_REQUIRE_DATA and AJAY_SR_ROOM_MODE == "enforce":
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type_for_risk,
+                    "execution_status": "SR_DATA_UNAVAILABLE",
+                    "error": str(exc),
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+                return {
+                    "status": "SR_DATA_UNAVAILABLE",
+                    "mode": EXECUTION_MODE,
+                    "order_id": None,
+                    "position": {},
+                    "error": str(exc),
+                }
+            log.warning("[SR_ROOM] %s %s S/R unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
+            record_action({
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "event_type": event_type_for_risk,
+                "execution_status": "SR_DATA_UNAVAILABLE",
+                "error": str(exc),
+                "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+            })
+
     try:
         opened = open_market(symbol, direction, price, trade_id)
     except Exception as exc:
@@ -2544,6 +2799,67 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     try:
         sl_pct, tp_levels = build_tp_levels(setup_for_fill, direction, event_type=ev_type)
+
+        # The pre-order SR check protects the decision to submit the market order.
+        # Re-evaluate once on the confirmed average fill so a materially different
+        # fill price cannot make TP2 unreachable or leave a stale TP3 cap in place.
+        # This uses the already-fetched closed-1H snapshot, so it adds no network call.
+        if (
+            AJAY_SR_ROOM_MODE == "enforce"
+            and sr_snapshot is not None
+            and sr_result is not None
+        ):
+            actual_tp_rrs = tuple(
+                float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct), 1e-12)
+                for level in tp_levels
+            )
+            if len(actual_tp_rrs) != 3 or any(rr <= 0 for rr in actual_tp_rrs):
+                raise ValueError("invalid actual-fill TP ladder for SR recheck")
+            post_fill_sr = evaluate_sr_room(
+                sr_snapshot,
+                entry_price=float(actual_avg_price),
+                direction=direction,
+                risk_pct=float(sl_pct),
+                target_rrs=actual_tp_rrs,
+            )
+            sr_result = post_fill_sr
+            setup_for_fill["sr_context"] = post_fill_sr
+            if post_fill_sr.get("reject"):
+                rollback = emergency_close_position(
+                    symbol, direction, actual_qty, reason_token=f"SRPOSTFAIL:{trade_id}"
+                )
+                flattened = rollback.get("status") == "closed"
+                return {
+                    "status": "SR_ROOM_POST_FILL_REJECTED",
+                    "mode": EXECUTION_MODE,
+                    "order_id": order_id,
+                    "position": ({**position, "positionAmt": 0.0} if flattened else {**position, "positionAmt": actual_qty}),
+                    "open_result": opened,
+                    "execution_quality": execution_quality,
+                    "error": str(post_fill_sr.get("reject_reason") or "SR_ROOM_POST_FILL_REJECTED"),
+                    "sr_room": post_fill_sr,
+                    "emergency_close": rollback,
+                    "rolled_back": flattened,
+                }
+
+        # TP3 capping is a real execution mutation and is therefore allowed only
+        # when SR enforcement is active. Shadow mode must remain observational.
+        if (
+            AJAY_SR_ROOM_MODE == "enforce"
+            and sr_result
+            and sr_result.get("tp3_capped")
+        ):
+            tp_levels, effective_target_rr = apply_sr_tp3_cap(
+                setup_for_fill,
+                direction=direction,
+                tp_levels=tp_levels,
+                sr_result=sr_result,
+                actual_entry_price=actual_avg_price,
+            )
+            log.info(
+                "[SR_ROOM] %s %s PARTIAL_ROOM: TP3 capped at %.8g (%.3fR)",
+                direction, symbol, float(sr_result.get("effective_tp3_price") or 0), effective_target_rr,
+            )
     except Exception as exc:
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}")
         return {
@@ -2665,6 +2981,14 @@ def main() -> None:
         "trigger_direction_failed": 0,
         "rejected_score": 0,
         "rejected_short_score": 0,
+        "rejected_entry_quality": 0,
+        "rejected_weak_engine": 0,
+        "rejected_short_oi": 0,
+        "rejected_cvd_liq": 0,
+        "rejected_recent_loss": 0,
+        "rejected_risk_too_wide": 0,
+        "rejected_single_tp": 0,
+        "entry_quality_shadow_flags": 0,
         "rejected_entry_drift": 0,
         "rejected_trigger_stale": 0,
         "rejected_portfolio_cap": 0,
@@ -2792,6 +3116,7 @@ def main() -> None:
     symbol_quarantines = _load_symbol_quarantines(
         TRADES, now_ms, SYMBOL_MAX_CONSECUTIVE_LOSSES, SYMBOL_QUARANTINE_MIN
     )
+    recent_symbol_losses = _load_recent_symbol_losses(TRADES)
 
     telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
     telegram_attempted_this_cycle = send_pending_open_trade_notifications(
@@ -3131,9 +3456,63 @@ def main() -> None:
 
             oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", 0.0), 0.0)
 
-            # High OI growth is treated as a score/risk-quality signal, not as a
-            # blanket hard reject. The prior 75% hard gate removed exactly the
-            # momentum instruments we still want to evaluate.
+            entry_allowed, entry_quality_reasons, entry_quality_terminal = _entry_quality_gate(
+                ev=ev, row=r, direction=direction, now_ms=now_ms, recent_loss_ts=recent_symbol_losses
+            )
+            ev.setdefault("event_fact", {})["entry_quality_gate_enabled"] = bool(ENTRY_QUALITY_GATE_ENABLED)
+            ev["event_fact"]["entry_quality_mode"] = ENTRY_QUALITY_MODE
+            ev["event_fact"]["entry_quality_allowed"] = bool(entry_allowed)
+            ev["event_fact"]["entry_quality_reasons"] = list(entry_quality_reasons)
+            if not entry_allowed:
+                if ENTRY_QUALITY_MODE == "shadow":
+                    stats["entry_quality_shadow_flags"] += 1
+                    tf_stats["entry_quality_shadow_flags"] = tf_stats.get("entry_quality_shadow_flags", 0) + 1
+                    log.info("[ENTRY_QUALITY_SHADOW] %s %s (%s/%s) flagged but NOT rejected: %s", direction, symbol, tf, event_type, ";".join(entry_quality_reasons))
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type, "execution_status": "ENTRY_QUALITY_SHADOW_FLAGGED",
+                        "entry_quality_reasons": list(entry_quality_reasons),
+                        "entry_quality_terminal": bool(entry_quality_terminal),
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                elif ENTRY_QUALITY_MODE == "enforce":
+                    stats["rejected_entry_quality"] += 1
+                    tf_stats["rejected_entry_quality"] = tf_stats.get("rejected_entry_quality", 0) + 1
+                    if any(x.startswith("WEAK_EVENT_TYPE:") for x in entry_quality_reasons):
+                        stats["rejected_weak_engine"] += 1
+                        tf_stats["rejected_weak_engine"] = tf_stats.get("rejected_weak_engine", 0) + 1
+                    if any(x.startswith("SHORT_OI:") for x in entry_quality_reasons):
+                        stats["rejected_short_oi"] += 1
+                        tf_stats["rejected_short_oi"] = tf_stats.get("rejected_short_oi", 0) + 1
+                    if any(x.startswith("CVD_LIQ:") for x in entry_quality_reasons):
+                        stats["rejected_cvd_liq"] += 1
+                        tf_stats["rejected_cvd_liq"] = tf_stats.get("rejected_cvd_liq", 0) + 1
+                    if any(x.startswith("RECENT_SYMBOL_LOSS:") for x in entry_quality_reasons):
+                        stats["rejected_recent_loss"] += 1
+                        tf_stats["rejected_recent_loss"] = tf_stats.get("rejected_recent_loss", 0) + 1
+                    log.info("[ENTRY_QUALITY] %s %s (%s/%s) rejected: %s", direction, symbol, tf, event_type, ";".join(entry_quality_reasons))
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type, "execution_status": "ENTRY_QUALITY_REJECTED",
+                        "entry_quality_reasons": list(entry_quality_reasons),
+                        "entry_quality_terminal": bool(entry_quality_terminal),
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    if entry_quality_terminal:
+                        terminal_event_ids.add(event_id)
+                        executed_event_ids.add(event_id)
+                        record_trade({
+                            "record_type": "EVENT_TERMINAL", "event_id": event_id,
+                            "symbol": symbol, "direction": direction, "event_type": event_type,
+                            "reason": "ENTRY_QUALITY_REJECTED",
+                            "entry_quality_reasons": list(entry_quality_reasons),
+                            "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                        })
+                    continue
+                else:
+                    log.info("[ENTRY_QUALITY_OFF] %s %s (%s/%s) ignored: %s", direction, symbol, tf, event_type, ";".join(entry_quality_reasons))
+
+            # High OI growth remains diagnostic context; it is not a universal veto.
             score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
             # Score is diagnostic/ranking metadata, not a universal entry veto.
             # Each engine's structural validation is the actual admission criterion.
@@ -3159,6 +3538,23 @@ def main() -> None:
             try:
                 setup = build_event_setup(ev=ev, df_1h=risk_1h_cache[symbol], entry_price=signal_price)
             except (TypeError, ValueError, KeyError) as exc:
+                if "ENTRY_RISK_TOO_WIDE" in str(exc):
+                    stats["rejected_risk_too_wide"] += 1
+                    tf_stats["rejected_risk_too_wide"] = tf_stats.get("rejected_risk_too_wide", 0) + 1
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type, "execution_status": "ENTRY_RISK_TOO_WIDE",
+                        "error": str(exc), "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    terminal_event_ids.add(event_id)
+                    executed_event_ids.add(event_id)
+                    record_trade({
+                        "record_type": "EVENT_TERMINAL", "event_id": event_id,
+                        "symbol": symbol, "direction": direction, "event_type": event_type,
+                        "reason": "ENTRY_RISK_TOO_WIDE",
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    continue
                 stats["trigger_data_failed"] += 1
                 log.warning("[RISK] Invalid setup for %s %s (%s/%s): %s", direction, symbol, tf, event_type, exc)
                 continue
@@ -3406,6 +3802,10 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif status_now in {"SR_ROOM_REJECTED", "SR_ROOM_POST_FILL_REJECTED"}:
+                    terminal_reason = status_now
+                    stats["rejected_sr_room"] = stats.get("rejected_sr_room", 0) + 1
+                    log.info("[SR_ROOM] %s (%s) rejected by opposing-zone room: %s", symbol, direction, execution_result.get("error"))
                 elif _market_entry_outcome_unknown(execution_result):
                     # A MARKET entry whose exchange outcome is genuinely UNKNOWN
                     # must never be retried as a fresh signal on a later cycle: the
@@ -3427,6 +3827,10 @@ def main() -> None:
                 elif execution_result.get("bingx_code") == 101400 and "suspend" in err_str:
                     terminal_reason = "SYMBOL_SUSPENDED"
                     log.warning("[EXECUTION] %s (%s) pair suspended on exchange; terminalizing event %s.", symbol, direction, event_id)
+                elif "multi_tp_not_supported" in err_str:
+                    terminal_reason = "MULTI_TP_NOT_REACHABLE"
+                    stats["rejected_single_tp"] += 1
+                    log.warning("[EXECUTION] %s (%s) cannot support three TP legs at configured leverage; terminalizing event %s.", symbol, direction, event_id)
                 elif "min_qty" in err_str:
                     terminal_reason = "MIN_QTY_NOT_REACHABLE"
                     log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)

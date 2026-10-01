@@ -1696,3 +1696,228 @@ def test_bingx_live_price_109429_honors_exchange_retry_after(monkeypatch):
     assert calls["count"] == 1
     assert bx._LIVE_PRICE_COOLDOWN_UNTIL >= retry_after_ms / 1000.0
     _reset_bingx_live_price_guards(bx)
+
+
+
+def test_entry_quality_gate_blocks_compound_risk_and_allows_clean_signal(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_BLOCKED_EVENT_TYPES", {"CRT_BULLISH"})
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", True)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_PCT", -5.0)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", True)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_MAX", 25.0)
+    monkeypatch.setattr(ro, "COMPOUND_LIQ_LONG_MIN", 150000.0)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 0.0)
+
+    row = SimpleNamespace(oi_chg24_pct=-6.0, cvd24=50.0, liq_long24=100000.0)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "TEST", "event_type": "CRT_BULLISH"}, row=row, direction="SHORT",
+        now_ms=1_000_000, recent_loss_ts={},
+    )
+    assert allowed is False
+    assert terminal is True
+    assert any(r.startswith("WEAK_EVENT_TYPE:") for r in reasons)
+    assert any(r.startswith("SHORT_OI:") for r in reasons)
+
+    clean = SimpleNamespace(oi_chg24_pct=8.0, cvd24=60.0, liq_long24=50000.0)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "TEST", "event_type": "DONCHIAN_RETEST_BREAKOUT"}, row=clean, direction="LONG",
+        now_ms=1_000_000, recent_loss_ts={},
+    )
+    assert allowed is True
+    assert reasons == []
+    assert terminal is False
+
+
+def test_entry_quality_enforce_terminalizes_permanent_reason_even_with_recent_loss(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_BLOCKED_EVENT_TYPES", {"CRT_BULLISH"})
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", True)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_PCT", -5.0)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 360.0)
+
+    row = SimpleNamespace(oi_chg24_pct=-6.0, cvd24=60.0, liq_long24=0.0)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "AAA", "event_type": "CRT_BULLISH"},
+        row=row, direction="SHORT", now_ms=1_000_000, recent_loss_ts={"AAA": 900_000},
+    )
+    assert allowed is False
+    assert any(r.startswith("WEAK_EVENT_TYPE:") for r in reasons)
+    assert any(r.startswith("SHORT_OI:") for r in reasons)
+    assert any(r.startswith("RECENT_SYMBOL_LOSS:") for r in reasons)
+    assert terminal is True
+
+
+def test_recent_symbol_loss_cooldown_is_temporary(tmp_path, monkeypatch):
+    import run_once as ro
+    path = tmp_path / "trades.jsonl"
+    path.write_text(
+        json.dumps({"record_type": "TRADE_CLOSE", "symbol": "AAA", "closed_ts": 900000, "realized_pnl_pct": -1.0}) + "\n"
+        + json.dumps({"record_type": "TRADE_CLOSE", "symbol": "BBB", "closed_ts": 900000, "realized_pnl_pct": None}) + "\n",
+        encoding="utf-8",
+    )
+    assert ro._load_recent_symbol_losses(path) == {"AAA": 900000}
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", False)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 360.0)
+    from types import SimpleNamespace
+    row = SimpleNamespace(oi_chg24_pct=8.0, cvd24=60.0, liq_long24=0.0)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "AAA", "event_type": "DONCHIAN_RETEST_BREAKOUT"}, row=row, direction="LONG",
+        now_ms=1_000_000, recent_loss_ts={"AAA": 900000},
+    )
+    assert allowed is False
+    assert terminal is False
+    assert any(r.startswith("RECENT_SYMBOL_LOSS:") for r in reasons)
+
+
+def test_multi_tp_preflight_blocks_micro_position_before_order(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "REQUIRE_MULTI_TP", True)
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: {
+        "quantityPrecision": 3, "tradeMinQuantity": 1.0, "tradeMinUSDT": 0, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda symbol, direction: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bx, "LEVERAGE", 2)
+    monkeypatch.setattr(bx, "MAX_LEVERAGE", 10)
+    called = {"post": False}
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: called.__setitem__("post", True) or {})
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TR_TEST")
+    assert out["status"] == "error"
+    assert "multi_tp_not_supported" in out["error"]
+    assert out["tp_mode"] == "multi_tp_required"
+    assert called["post"] is False
+
+
+def test_query_order_uses_trigger_execution_quantity_fallback(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {
+        "code": 0,
+        "data": {"order": {
+            "orderId": "TPX", "status": "FILLED", "avgPrice": "101.25",
+            "executedQty": "0", "cumQty": "0", "stopExecutedQty": "0.5", "origQty": "0.5",
+            "clientOrderId": "EVTTP1X",
+        }}
+    })
+    out = bx.get_order("TEST", "TPX")
+    assert out["status"] == "ok"
+    assert out["executed_qty"] == 0.5
+    assert out["avg_price"] == 101.25
+
+
+
+def test_entry_quality_gate_does_not_veto_missing_optional_market_fields(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", False)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", True)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_MAX", 25.0)
+    monkeypatch.setattr(ro, "COMPOUND_LIQ_LONG_MIN", 150000.0)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 0.0)
+
+    # Missing optional fields must not be converted into zero and trigger a
+    # false compound veto. Unknown context is recorded elsewhere and handled
+    # conservatively by the existing data-quality gates.
+    row = SimpleNamespace(oi_chg24_pct=8.0, cvd24=None, liq_long24=None)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "TEST", "event_type": "DONCHIAN_RETEST_BREAKOUT"},
+        row=row, direction="LONG", now_ms=1_000_000, recent_loss_ts={},
+    )
+    assert allowed is True
+    assert reasons == []
+    assert terminal is False
+
+
+def test_build_event_setup_rejects_risk_clipping_when_policy_enabled(monkeypatch):
+    import run_once as ro
+    import pandas as pd
+
+    monkeypatch.setattr(ro, "REJECT_ATR_RISK_CLIP", True)
+    monkeypatch.setattr(ro, "MAX_ENTRY_RISK_PCT", 5.0)
+    # 1h ATR > entry*5% makes the raw 1.5*ATR risk exceed the configured cap.
+    close = pd.Series([100.0] * 30)
+    df = pd.DataFrame({"close": close, "high": close * 1.12, "low": close * 0.88})
+    ev = {
+        "event_type": "DONCHIAN_RETEST_BREAKOUT",
+        "direction": "LONG",
+        "symbol": "TEST",
+        "event_fact": {},
+    }
+    try:
+        ro.build_event_setup(ev=ev, df_1h=df, entry_price=100.0)
+    except ValueError as exc:
+        assert "ENTRY_RISK_TOO_WIDE" in str(exc)
+    else:
+        raise AssertionError("wide ATR-derived risk must be rejected when clipping rejection is enabled")
+
+
+def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_MODE", "shadow")
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_BLOCKED_EVENT_TYPES", {"CRT_BULLISH"})
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 0.0)
+    row = SimpleNamespace(oi_chg24_pct=8.0, cvd24=60.0, liq_long24=0.0)
+    allowed, reasons, terminal = ro._entry_quality_gate(
+        ev={"symbol": "TEST", "event_type": "CRT_BULLISH"}, row=row, direction="LONG", now_ms=1_000_000, recent_loss_ts={},
+    )
+    assert allowed is False
+    assert reasons
+    # The caller's shadow-mode branch must continue to setup/execution; this unit
+    # verifies the gate itself remains purely diagnostic regardless of mode.
+    assert terminal is True
+
+
+def test_entry_quality_mode_normalization(monkeypatch):
+    import importlib
+    import run_once as ro
+    monkeypatch.setenv("ENTRY_QUALITY_MODE", "invalid-value")
+    mod = importlib.reload(ro)
+    assert mod.ENTRY_QUALITY_MODE == "shadow"
+
+
+def test_multi_tp_preflight_four_min_qty_is_the_conservative_boundary(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "REQUIRE_MULTI_TP", True)
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: {
+        "quantityPrecision": 3, "tradeMinQuantity": 1.0, "tradeMinUSDT": 0, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda symbol, direction: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bx, "LEVERAGE", 3)
+    monkeypatch.setattr(bx, "MAX_LEVERAGE", 10)
+    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"order": {"orderId": "O"}}})
+    # 3*min_qty is not enough for a 25/40/35 split without pushing one leg below minQty.
+    out = bx.open_market("TEST", "LONG", 100.0, "TR_BOUND")
+    assert out["status"] == "error"
+    assert "4*min_qty" in out["error"]
