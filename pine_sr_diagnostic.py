@@ -3,7 +3,7 @@
 
 The diagnostic intentionally does not import the trading engine. It uses Binance
 SPOT 1H data for the current cross-check. Futures support is deliberately not
-selected yet; see ``V10_2_SR_NOTES.md`` for the migration note.
+selected yet; see ``V10_3_SR_NOTES.md`` for the migration note.
 """
 from __future__ import annotations
 

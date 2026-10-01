@@ -451,16 +451,13 @@ def test_telegram_message_contains_trigger_fields():
     assert "single_tp" in msg
 
 
-def test_build_event_setup_uses_wilder_atr():
+def test_build_event_setup_uses_fixed_seven_percent_stop():
     import run_once as ro
     df = _generate_synthetic_candles(80)
     setup = ro.build_event_setup({"direction": "LONG"}, df, 100.0)
-    prev = df["close"].shift(1)
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - prev).abs(), (df["low"] - prev).abs()], axis=1).max(axis=1)
-    expected_atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1]
-    expected_risk = max(0.50, min(expected_atr * 1.5 / 100.0 * 100.0, 5.00))
-    assert setup["risk_pct"] == pytest.approx(expected_risk)
-
+    assert setup["risk_pct"] == pytest.approx(7.0)
+    assert setup["invalidation_price"] == pytest.approx(93.0)
+    assert setup["stop_loss_policy"] == "fixed"
 
 def test_single_tp_mode_effective_rr_is_not_1_05():
     from event_engine.tracker import _extract_setup_metrics

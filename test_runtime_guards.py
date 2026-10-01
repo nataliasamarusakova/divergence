@@ -1850,28 +1850,60 @@ def test_entry_quality_gate_does_not_veto_missing_optional_market_fields(monkeyp
     assert terminal is False
 
 
-def test_build_event_setup_rejects_risk_clipping_when_policy_enabled(monkeypatch):
+def test_build_event_setup_uses_fixed_seven_percent_stop(monkeypatch):
     import run_once as ro
     import pandas as pd
 
+    monkeypatch.setattr(ro, "FIXED_STOP_LOSS_PCT", 7.0)
+    close = pd.Series([100.0] * 30)
+    # Very wide ATR is deliberately irrelevant to the fixed-stop policy.
+    df = pd.DataFrame({"close": close, "high": close * 1.12, "low": close * 0.88})
+    ev = {"event_type": "DONCHIAN_RETEST_BREAKOUT", "direction": "LONG", "symbol": "TEST", "event_fact": {}}
+    setup = ro.build_event_setup(ev=ev, df_1h=df, entry_price=100.0)
+    assert setup["risk_pct"] == pytest.approx(7.0)
+    assert setup["invalidation_price"] == pytest.approx(93.0)
+    assert setup["stop_loss_policy"] == "fixed"
+
+
+def test_fixed_seven_percent_stop_ignores_atr_clip_flag(monkeypatch):
+    import run_once as ro
+    import pandas as pd
+
+    monkeypatch.setattr(ro, "FIXED_STOP_LOSS_PCT", 7.0)
     monkeypatch.setattr(ro, "REJECT_ATR_RISK_CLIP", True)
     monkeypatch.setattr(ro, "MAX_ENTRY_RISK_PCT", 5.0)
-    # 1h ATR > entry*5% makes the raw 1.5*ATR risk exceed the configured cap.
-    close = pd.Series([100.0] * 30)
+    close = pd.Series([100.0] * 40)
     df = pd.DataFrame({"close": close, "high": close * 1.12, "low": close * 0.88})
-    ev = {
-        "event_type": "DONCHIAN_RETEST_BREAKOUT",
-        "direction": "LONG",
-        "symbol": "TEST",
-        "event_fact": {},
-    }
-    try:
-        ro.build_event_setup(ev=ev, df_1h=df, entry_price=100.0)
-    except ValueError as exc:
-        assert "ENTRY_RISK_TOO_WIDE" in str(exc)
-    else:
-        raise AssertionError("wide ATR-derived risk must be rejected when clipping rejection is enabled")
+    setup = ro.build_event_setup({"direction": "SHORT", "event_type": "CRT_BEARISH"}, df, 100.0)
+    assert setup["risk_pct"] == pytest.approx(7.0)
+    assert setup["invalidation_price"] == pytest.approx(107.0)
 
+
+def test_fixed_seven_percent_stop_does_not_require_positive_atr():
+    import run_once as ro
+    import pandas as pd
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(ro, "FIXED_STOP_LOSS_PCT", 7.0)
+    close = pd.Series([100.0] * 40)
+    df = pd.DataFrame({"close": close, "high": close, "low": close})
+    setup = ro.build_event_setup({"direction": "LONG"}, df, 100.0)
+    assert setup["risk_pct"] == pytest.approx(7.0)
+    assert setup["risk_pct_raw"] is None or setup["risk_pct_raw"] >= 0
+    monkeypatch.undo()
+
+
+def test_build_tp_levels_reflect_fixed_seven_percent_stop():
+    from run_once import build_tp_levels
+    setup = {
+        "entry_reference": 100.0,
+        "invalidation_price": 93.0,
+        "target_price": 117.5,
+        "risk_pct": 7.0,
+    }
+    sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
+    assert sl_pct == pytest.approx(7.0)
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([5.25, 10.5, 17.5])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro

@@ -160,8 +160,12 @@ COMPOUND_CVD_LIQ_VETO_ENABLED = os.environ.get("COMPOUND_CVD_LIQ_VETO_ENABLED", 
 COMPOUND_CVD_MAX = float(os.environ.get("COMPOUND_CVD_MAX", "25"))
 COMPOUND_LIQ_LONG_MIN = float(os.environ.get("COMPOUND_LIQ_LONG_MIN", "150000"))
 SYMBOL_LOSS_COOLDOWN_MIN = float(os.environ.get("SYMBOL_LOSS_COOLDOWN_MIN", "0"))
+FIXED_STOP_LOSS_PCT = float(os.environ.get("FIXED_STOP_LOSS_PCT", "7.0"))
+if not (0.0 < FIXED_STOP_LOSS_PCT < 100.0):
+    FIXED_STOP_LOSS_PCT = 7.0
+# Kept as compatibility/telemetry knobs; new entries use the fixed stop above.
 REJECT_ATR_RISK_CLIP = os.environ.get("REJECT_ATR_RISK_CLIP", "false").lower() == "true"
-MAX_ENTRY_RISK_PCT = float(os.environ.get("MAX_ENTRY_RISK_PCT", "5.0"))
+MAX_ENTRY_RISK_PCT = float(os.environ.get("MAX_ENTRY_RISK_PCT", str(FIXED_STOP_LOSS_PCT)))
 MAX_HOT_OI_CHG24_PCT = float(os.environ.get("MAX_HOT_OI_CHG24_PCT", "50"))
 HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
@@ -169,7 +173,7 @@ SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
 # Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
 # Current source is Binance SPOT 1H. Futures can be added later without changing
-# the room/gate logic; see V10_2_SR_NOTES.md.
+# the room/gate logic; see V10_3_SR_NOTES.md.
 AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
 AJAY_SR_ROOM_MODE = os.environ.get("AJAY_SR_ROOM_MODE", "shadow").strip().lower()
 if AJAY_SR_ROOM_MODE not in {"off", "shadow", "enforce"}:
@@ -1800,23 +1804,18 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
     if df[["high", "low", "close"]].isna().any().any():
         raise ValueError("invalid OHLC data")
 
+    # Stop-loss is intentionally fixed for all new entries. ATR is retained only
+    # as diagnostic telemetry when available; it no longer determines or vetoes
+    # the entry risk. This makes the requested 7% stop deterministic across engines.
     atr = canonical_atr(df, 14).iloc[-1]
-    if pd.isna(atr) or float(atr) <= 0:
-        raise ValueError("ATR unavailable")
+    risk_pct_raw = None
+    if pd.notna(atr) and float(atr) > 0:
+        atr = float(atr)
+        raw = (atr * 1.5) / entry_price * 100.0
+        if float("-inf") < raw < float("inf"):
+            risk_pct_raw = raw
 
-    atr = float(atr)
-    sl_atr_multiplier = 1.5
-    risk_pct_raw = (atr * sl_atr_multiplier) / entry_price * 100.0
-
-    if not (float("-inf") < risk_pct_raw < float("inf")):
-        raise ValueError("Invalid ATR-derived risk")
-
-    max_entry_risk_pct = max(0.50, float(MAX_ENTRY_RISK_PCT))
-    if REJECT_ATR_RISK_CLIP and risk_pct_raw > max_entry_risk_pct:
-        raise ValueError(
-            f"ENTRY_RISK_TOO_WIDE: raw_atr_risk_pct={risk_pct_raw:.6f}% > max_entry_risk_pct={max_entry_risk_pct:.6f}%"
-        )
-    risk_pct = max(0.50, min(risk_pct_raw, max_entry_risk_pct))
+    risk_pct = float(FIXED_STOP_LOSS_PCT)
 
     ev_type = str(ev.get("event_type", "")).upper()
     is_squeeze = _is_squeeze_event(ev_type)
@@ -1837,7 +1836,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
         "target_price": target,
         "risk_pct": risk_pct,
         "risk_pct_raw": risk_pct_raw,
-        "risk_was_clipped": bool(risk_pct_raw > max_entry_risk_pct),
+        "risk_was_clipped": False,
+        "stop_loss_policy": "fixed",
         "target_rr": target_rr,
         "planned_weighted_rr": planned_weighted_rr,
         "realized_rr": None,
@@ -2347,20 +2347,9 @@ def reconcile_all_open_positions() -> None:
 
         sl_pct = _safe_float(matched_trade.get("planned_risk_pct"), 0.0) if matched_trade else 0.0
         if sl_pct <= 0:
-            sl_pct = 2.0
-        try:
-            k1 = _fetch_market_klines_scan(bx_symbol, "1h", limit=30)
-            if not matched_trade and len(k1) >= 20:
-                df1 = pd.DataFrame(k1)
-                for col in ("high", "low", "close"):
-                    df1[col] = pd.to_numeric(df1[col], errors="coerce")
-
-                atr = canonical_atr(df1, 14).iloc[-1]
-                if pd.notna(atr) and float(atr) > 0:
-                    risk_pct = max(0.50, min(float(atr) * 1.5 / avg_price * 100.0, 5.00))
-                    sl_pct = risk_pct
-        except Exception as exc:
-            log.error("[RECONCILIATION] ATR error for %s: %s", bx_symbol, exc)
+            # For an orphan/unmatched current position, use the shipped fixed stop
+            # policy rather than inventing a legacy ATR-based risk profile.
+            sl_pct = float(FIXED_STOP_LOSS_PCT)
 
         tp_levels = []
         if matched_trade and isinstance(matched_trade.get("effective_tp_levels"), list) and matched_trade.get("effective_tp_levels"):
@@ -2467,7 +2456,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
 
-    log.info("[EXECUTION] Opening market position: %s %s at ref price %.8g...", direction, symbol, price)
+    log.info("[EXECUTION] Preparing market entry: %s %s at ref price %.8g...", direction, symbol, price)
 
     # Hard pre-order drift guard against price movement while the opportunity
     # was being evaluated. The old implementation only compared trigger/event
@@ -2581,6 +2570,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 target_rrs=(float(tp_rrs[0]), float(tp_rrs[1]), float(tp_rrs[2])),
             )
             setup["sr_context"] = sr_result
+            if sr_result.get("supporting_zone_confirmation"):
+                log.info("[SR_ROOM] %s %s supportive directional-zone confirmation: %s", direction, symbol, sr_result.get("directional_zone_alignment"))
             if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "enforce":
                 record_action({
                     "event_id": event_id, "symbol": symbol, "direction": direction,
@@ -2639,6 +2630,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
             })
 
+    log.info("[EXECUTION] Opening market position after all pre-order gates: %s %s at ref price %.8g...", direction, symbol, live_reference)
     try:
         opened = open_market(symbol, direction, price, trade_id)
     except Exception as exc:
@@ -2842,24 +2834,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     "rolled_back": flattened,
                 }
 
-        # TP3 capping is a real execution mutation and is therefore allowed only
-        # when SR enforcement is active. Shadow mode must remain observational.
-        if (
-            AJAY_SR_ROOM_MODE == "enforce"
-            and sr_result
-            and sr_result.get("tp3_capped")
-        ):
-            tp_levels, effective_target_rr = apply_sr_tp3_cap(
-                setup_for_fill,
-                direction=direction,
-                tp_levels=tp_levels,
-                sr_result=sr_result,
-                actual_entry_price=actual_avg_price,
-            )
-            log.info(
-                "[SR_ROOM] %s %s PARTIAL_ROOM: TP3 capped at %.8g (%.3fR)",
-                direction, symbol, float(sr_result.get("effective_tp3_price") or 0), effective_target_rr,
-            )
+        # Opposing zones after TP1 do not alter the target ladder. The entry gate
+        # only rejects when TP1 itself is blocked; post-TP1 zones are recorded for
+        # research/management context without changing the planned targets.
     except Exception as exc:
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}")
         return {
