@@ -174,3 +174,9 @@ def test_release_has_manual_vpn_test_workflow():
     assert 'Cross-exchange live price drift >1%' in text
     assert 'latest returned candle' not in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"' in text
+
+
+def test_pytest_isolates_production_sr_environment(monkeypatch):
+    """CI's workflow env must not force S/R onto unrelated unit tests."""
+    import conftest
+    assert hasattr(conftest, "isolate_production_entry_gates")
