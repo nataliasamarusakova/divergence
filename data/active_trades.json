@@ -54,7 +54,7 @@
     "peak_pnl_pct": 0.4124009695040443,
     "mae_pct": -0.5136924356979983,
     "max_drawdown_pct": -0.9260934052020426,
-    "current_pnl_pct": -0.30749195094599624,
+    "current_pnl_pct": -0.14831964692687694,
     "score": 65.0,
     "event_type": "CRT_BEARISH",
     "timeframe": "1h",
@@ -267,7 +267,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790860319278,
+    "last_observation_ts": 1790860605302,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -275,6 +275,283 @@
     "last_exchange_avg_price": 0.27643,
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 36.171,
-    "protection_last_updated_ts": 1790860322212
+    "protection_last_updated_ts": 1790860608087
+  },
+  "EVT_60E793FDAF7A356A": {
+    "trade_id": "TR_43075A6C7309B6BCD299A5D9",
+    "event_id": "EVT_60E793FDAF7A356A",
+    "symbol": "ZEN",
+    "name": "Horizen",
+    "direction": "SHORT",
+    "entry_price": 7.111,
+    "actual_entry_price": 7.111,
+    "requested_entry_price": 7.113,
+    "signal_reference_price": 7.19,
+    "pre_order_reference_price": 7.113,
+    "entry_slippage_pct": -0.02811753128076294,
+    "adverse_entry_slippage_pct": 0.02811753128076294,
+    "initial_qty": 1.4,
+    "initial_notional_usdt": 9.9554,
+    "remaining_qty": 1.4,
+    "entry_ts": 1790860713649,
+    "tp_orders": [
+      {
+        "leg": "tp1",
+        "status": "created",
+        "order_id": "2105648571965071360",
+        "client_order_id": null,
+        "price": 6.978035677599999,
+        "qty": 0.3,
+        "pnl_pct": 1.86984
+      },
+      {
+        "leg": "tp2",
+        "status": "created",
+        "order_id": "2105648573168836608",
+        "client_order_id": null,
+        "price": 6.84507128409,
+        "qty": 0.6,
+        "pnl_pct": 3.739681
+      },
+      {
+        "leg": "tp3",
+        "status": "created",
+        "order_id": "2105648574414544896",
+        "client_order_id": null,
+        "price": 6.66778552089,
+        "qty": 0.5,
+        "pnl_pct": 6.232801
+      }
+    ],
+    "sl_order": {
+      "status": "created",
+      "order_id": "2105648566810271744",
+      "client_order_id": null,
+      "stop_price": 7.28828580276152,
+      "qty": 1.4
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "sl_order_history": [],
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": 0.0,
+    "score": 85.0,
+    "event_type": "MA_COMPRESSION_BREAKOUT",
+    "timeframe": "1h",
+    "research": {
+      "fr_oiw": 0.0096,
+      "pfr_oiw": 0.0081,
+      "liq_short24": 17100.0,
+      "liq_long24": 54400.0,
+      "ls_accounts": 1.04,
+      "oi": 17700000.0,
+      "oi_chg24_pct": -10.54,
+      "oi_chg4h_pct": -3.75,
+      "oi_vol_ratio": 0.568,
+      "oi_mktcap_ratio": null,
+      "volume24": 31100000.0,
+      "btc_corr7d": 0.7,
+      "cvd24": 0.0,
+      "lls24": 87.9369
+    },
+    "setup": {
+      "entry_reference": 7.111,
+      "invalidation_price": 7.28828580276152,
+      "target_price": 6.667785493096201,
+      "risk_pct": 2.493120556342566,
+      "risk_pct_raw": 2.4931205563425642,
+      "risk_was_clipped": false,
+      "target_rr": 2.5,
+      "planned_weighted_rr": 1.6625,
+      "realized_rr": null,
+      "trigger_ok": true,
+      "trigger": {
+        "event_detected_at_ts": 1790859599999,
+        "trigger_observed_at_ts": 1790860695453,
+        "trigger_bar_close_ts": 1790860499999,
+        "trigger_price": 7.122,
+        "trigger_delay_min": 15.0,
+        "signal_to_trigger_drift_pct": 0.945758,
+        "volume_ratio": 3.635178
+      },
+      "signal_price": 7.19,
+      "entry_risk": {
+        "signal_to_trigger_drift_pct": 0.945758,
+        "oi_chg24_pct": -10.54,
+        "hot_oi_warning": false,
+        "short_defensive_mode": true,
+        "symbol_quarantine_until_ts": null
+      },
+      "event_timeframe": "1h",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "entry_context": {
+        "btc_chg_1h_pct": -0.204105476750809,
+        "btc_chg_4h_pct": 0.21777884731654815,
+        "btc_close": 83707.0,
+        "btc_available": true,
+        "fr_oiw": 0.0096,
+        "pfr_oiw": 0.0081,
+        "oi": 17700000.0,
+        "oi_chg24_pct": -10.54,
+        "oi_chg4h_pct": -3.75,
+        "volume24": 31100000.0,
+        "cvd24": 0.0,
+        "ls_accounts": 1.04,
+        "liq_long24": 54400.0,
+        "liq_short24": 17100.0,
+        "btc_corr7d": 0.7,
+        "htf_trend": "DOWN",
+        "htf_trend_ok": null,
+        "context_source": null
+      },
+      "confluence_events": [],
+      "conflict_events": [],
+      "sr_context": {
+        "source": "binance_spot",
+        "source_symbol": "ZENUSDT",
+        "snapshot_latest_closed_timestamp": 1790856000000,
+        "snapshot_latest_closed_age_min": 18.537179911295574,
+        "cwidth": 0.18800000000000008,
+        "zone_scale": 1.0,
+        "entry_price": 7.111,
+        "direction": "SHORT",
+        "risk_pct": 2.493120556342566,
+        "risk_distance": 0.17728580276151987,
+        "tp_rrs": [
+          0.7499998326366836,
+          1.5000000663771154,
+          2.499999843226027
+        ],
+        "tp_prices": [
+          6.978035677599999,
+          6.845071284089999,
+          6.66778552089
+        ],
+        "buffer_price": 0.017728580276151987,
+        "entry_buffer_price": 0.0035555000000000005,
+        "nearest_opposing_zone": null,
+        "nearest_supporting_zone": {
+          "center": 7.12,
+          "lower": 6.932,
+          "upper": 7.308,
+          "kind": "H",
+          "points": 3,
+          "countpp": 2,
+          "cluster_width": 0.18800000000000008,
+          "entry_overlap": "supporting"
+        },
+        "room_status": "FULL_ROOM",
+        "reject": false,
+        "reject_reason": null,
+        "tp3_capped": false,
+        "effective_tp3_price": 6.66778552089,
+        "supporting_zone_distance_r": 0.0,
+        "supporting_zone_near": true,
+        "supporting_zone_context": "SUPPORTIVE_INSIDE"
+      },
+      "pre_order_reference_price": 7.113,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 1.86984,
+          "close_fraction": 0.25
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 3.739681,
+          "close_fraction": 0.4
+        },
+        {
+          "leg": "tp3",
+          "pnl_pct": 6.232801,
+          "close_fraction": 0.35
+        }
+      ],
+      "effective_tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 1.86984,
+          "close_fraction": 0.2142857142857143,
+          "qty": 0.3
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 3.739681,
+          "close_fraction": 0.4285714285714286,
+          "qty": 0.6
+        },
+        {
+          "leg": "tp3",
+          "pnl_pct": 6.232801,
+          "close_fraction": 0.35714285714285715,
+          "qty": 0.5
+        }
+      ],
+      "tp_mode": "multi_tp",
+      "effective_weighted_rr": 1.6964285080216341
+    },
+    "planned_risk_pct": 2.493120556342566,
+    "planned_target_rr": 2.5,
+    "planned_weighted_rr": 1.6625,
+    "planned_entry_reference": 7.111,
+    "planned_invalidation_price": 7.28828580276152,
+    "planned_target_price": 6.667785493096201,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 1.86984,
+        "close_fraction": 0.25
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 3.739681,
+        "close_fraction": 0.4
+      },
+      {
+        "leg": "tp3",
+        "pnl_pct": 6.232801,
+        "close_fraction": 0.35
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 1.86984,
+        "close_fraction": 0.2142857142857143,
+        "qty": 0.3
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 3.739681,
+        "close_fraction": 0.4285714285714286,
+        "qty": 0.6
+      },
+      {
+        "leg": "tp3",
+        "pnl_pct": 6.232801,
+        "close_fraction": 0.35714285714285715,
+        "qty": 0.5
+      }
+    ],
+    "tp_mode": "multi_tp",
+    "effective_weighted_rr": 1.6964285080216341,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1790860715973
   }
 }
