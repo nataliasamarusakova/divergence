@@ -298,7 +298,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.3875)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 3
@@ -308,7 +308,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.3875)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 3
@@ -394,7 +394,7 @@ def test_execute_new_position_defines_pre_order_price(monkeypatch):
         "effective_tp_levels": [{"leg": "tp3", "pnl_pct": 1.75, "close_fraction": 1.0, "qty": 0.1}],
         "effective_weighted_rr": 1.75,
     })
-    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.6625, "entry_reference": 99.0, "target_rr": 2.50}
+    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.3875, "entry_reference": 99.0, "target_rr": 2.00}
     out = execute_new_position("TEST", "LONG", 99.0, setup, "EVT_TEST")
     assert out["status"] == "opened_protected"
     assert out["open_result"]["order_reference_price"] == 100.0
@@ -1435,6 +1435,59 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     assert attempts[-1] == ("B",)
 
 
+def test_be_activation_is_not_sent_to_telegram(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    tr.NOTIFICATIONS_PATH = tmp_path / "notifications.json"
+    tr.ACTIVE_TRADES_PATH = tmp_path / "active_trades.json"
+    tr.TRADES_PATH = tmp_path / "trades.jsonl"
+    tr.BE_AFTER_LEG = "tp1"
+    record = _be_trade_record([])
+    record["event_id"] = "EVT_BE_TG_OFF"
+    record["tp_orders"] = [{"leg": "tp1", "order_id": "TP1", "qty": 3.0}]
+    tr.ACTIVE_TRADES_PATH.write_text(json.dumps({"EVT_BE_TG_OFF": record}), encoding="utf-8")
+
+    queued = []
+    monkeypatch.setattr(tr, "_queue_notification", lambda *args, **kwargs: queued.append(kwargs))
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.0", "avgPrice": "100.0"})
+    monkeypatch.setattr(tr, "get_live_price", lambda s: 101.0)
+    monkeypatch.setattr(tr, "fetch_klines", lambda s, tf, limit=60: [{"close": 100.0}])
+    monkeypatch.setattr(tr, "get_order", lambda s, oid: {
+        "order_status": "FILLED", "executed_qty": "3.0", "avg_price": "101.0"
+    })
+    monkeypatch.setattr(tr, "_move_sl_to_break_even", lambda *a, **k: {"status": "created", "order_id": "NEW_BE"})
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+
+    tr.update_active_trades()
+    assert any(item.get("kind") == "TP_HIT" for item in queued)
+    assert not any(item.get("kind") == "BE_ACTIVATED" for item in queued)
+
+
+def test_legacy_be_activation_notification_is_suppressed_on_retry(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    tr.NOTIFICATIONS_PATH = tmp_path / "notifications.json"
+    legacy_id = tr._notification_id("EVT_OLD_BE", "BE_ACTIVATED")
+    tr.NOTIFICATIONS_PATH.write_text(json.dumps({
+        legacy_id: {
+            "notification_id": legacy_id,
+            "event_id": "EVT_OLD_BE",
+            "kind": "BE_ACTIVATED",
+            "resolved": False,
+            "chats": {"A": {"sent": False, "attempts": 0}},
+            "text": "legacy BE message",
+        }
+    }), encoding="utf-8")
+
+    delivered = []
+    monkeypatch.setattr(tr, "_deliver_notification", lambda *args, **kwargs: delivered.append(args) or True)
+    tr._retry_pending_notifications()
+    saved = json.loads(tr.NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
+    assert delivered == []
+    assert saved[legacy_id]["resolved"] is True
+    assert saved[legacy_id]["suppressed"] is True
+
+
 def test_tp_leg_identity_works_without_client_order_id():
     from event_engine import bingx as bx
     order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.00", "origQty": "1"}
@@ -1633,28 +1686,28 @@ def test_check_funding_filter_only_blocks_aggressive_squeeze_funding():
     assert check_funding_filter(SimpleNamespace(fr_oiw="bad"), "SHORT", event_type="LONG_SQUEEZE")[0] is True
 
 
-def test_squeeze_tp_levels_are_wider_than_divergence():
+def test_tighter_tp_levels_are_consistent_for_normal_and_squeeze():
     from run_once import build_event_setup, build_tp_levels
     df = _generate_synthetic_candles(60)
 
     # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
-    assert div_setup["target_rr"] == 2.50
-    assert div_setup["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert div_setup["target_rr"] == 2.00
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.3875)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
     assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.75)
-    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.50)
-    assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 2.50)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.25)
+    assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 2.00)
     assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.40, 0.35])
 
     # Squeeze setup
     sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
-    assert sq_setup["target_rr"] == 3.0
-    assert sq_setup["planned_weighted_rr"] == 2.05
+    assert sq_setup["target_rr"] == 2.0
+    assert sq_setup["planned_weighted_rr"] == 1.525
     sl_pct_sq, tp_sq = build_tp_levels(sq_setup, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
     assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.00)
-    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 2.00)
-    assert tp_sq[2]["pnl_pct"] == pytest.approx(sl_pct_sq * 3.00)
+    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.50)
+    assert tp_sq[2]["pnl_pct"] == pytest.approx(sl_pct_sq * 2.00)
     assert tp_sq[0]["close_fraction"] == 0.30
     assert tp_sq[1]["close_fraction"] == 0.35
     assert tp_sq[2]["close_fraction"] == 0.35
@@ -3634,3 +3687,21 @@ def test_funding_policy_keeps_normal_extreme_and_squeeze_thresholds(monkeypatch)
 def test_production_workflow_declares_funding_required_policy():
     text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert 'FUNDING_REQUIRED: "false"' in text
+
+
+def test_tracker_live_pnl_extrema_includes_live_ticker_observation():
+    from event_engine.tracker import _update_live_pnl_extrema
+    trade = {"peak_pnl_pct": 0.08595, "mae_pct": -0.02865, "max_drawdown_pct": -0.1146}
+    _update_live_pnl_extrema(trade, 0.12415)
+    assert trade["peak_pnl_pct"] == pytest.approx(0.12415)
+    assert trade["mae_pct"] == pytest.approx(-0.02865)
+    assert trade["max_drawdown_pct"] == pytest.approx(-0.1146)
+
+
+def test_tracker_live_pnl_extrema_updates_mae_and_drawdown():
+    from event_engine.tracker import _update_live_pnl_extrema
+    trade = {"peak_pnl_pct": 2.0, "mae_pct": -0.5, "max_drawdown_pct": -1.0}
+    _update_live_pnl_extrema(trade, -1.5)
+    assert trade["peak_pnl_pct"] == pytest.approx(2.0)
+    assert trade["mae_pct"] == pytest.approx(-1.5)
+    assert trade["max_drawdown_pct"] == pytest.approx(-3.5)

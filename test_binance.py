@@ -133,3 +133,53 @@ def test_binance_price_rejects_unknown_symbol(monkeypatch):
     monkeypatch.setattr(client, "resolve_symbol", lambda symbol: None)
     with pytest.raises(bx.BinanceSymbolUnavailableError):
         client.fetch_price("NOTREAL")
+
+
+
+def test_binance_kline_refreshes_exchange_info_once_after_http_400(monkeypatch):
+    client = bx.BinanceMarketClient()
+    calls = []
+    resolve_calls = iter(["OLDUSDT", "NEWUSDT"])
+    monkeypatch.setattr(client, "resolve_symbol", lambda symbol: next(resolve_calls))
+    refreshes = []
+    monkeypatch.setattr(client, "refresh_exchange_info", lambda **kwargs: refreshes.append(kwargs) or {})
+
+    def request(path, params=None):
+        calls.append(dict(params or {}))
+        if len(calls) == 1:
+            raise bx.BinanceHTTPError("[BINANCE] HTTP 400: old symbol no longer exists")
+        return [[
+            1_700_000_000_000,
+            "1.0", "1.1", "0.9", "1.05", "10",
+            1_700_003_599_999, "10.5", "1", "5", "5.25", "0",
+        ]]
+
+    monkeypatch.setattr(client, "_request_json", request)
+    monkeypatch.setattr(bx.time, "time", lambda: 1_700_003_600.0)
+    rows = client.fetch_klines("OLD-USDT", "1h", 1)
+
+    assert len(rows) == 1
+    assert calls[0]["symbol"] == "OLDUSDT"
+    assert calls[1]["symbol"] == "NEWUSDT"
+    assert refreshes == [{"force": True}]
+
+
+def test_binance_price_refreshes_exchange_info_once_after_http_400(monkeypatch):
+    client = bx.BinanceMarketClient()
+    calls = []
+    resolve_calls = iter(["OLDUSDT", "NEWUSDT"])
+    monkeypatch.setattr(client, "resolve_symbol", lambda symbol: next(resolve_calls))
+    refreshes = []
+    monkeypatch.setattr(client, "refresh_exchange_info", lambda **kwargs: refreshes.append(kwargs) or {})
+
+    def request(path, params=None):
+        calls.append(dict(params or {}))
+        if len(calls) == 1:
+            raise bx.BinanceHTTPError("[BINANCE] HTTP 400: old symbol no longer exists")
+        return {"symbol": "NEWUSDT", "price": "101.25"}
+
+    monkeypatch.setattr(client, "_request_json", request)
+    assert client.fetch_price("OLD-USDT") == pytest.approx(101.25)
+    assert calls[0]["symbol"] == "OLDUSDT"
+    assert calls[1]["symbol"] == "NEWUSDT"
+    assert refreshes == [{"force": True}]

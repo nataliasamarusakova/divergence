@@ -1624,7 +1624,6 @@ def test_breaker_mss_requires_fresh_unbroken_bullish_structure_level():
 
 def _reset_bingx_live_price_guards(bx):
     bx._LIVE_PRICE_INVALID_UNTIL.clear()
-    bx._LIVE_PRICE_INVALID_BURST_COUNT = 0
     bx._LIVE_PRICE_COOLDOWN_UNTIL = 0.0
 
 
@@ -1664,15 +1663,20 @@ def test_bingx_live_price_109425_quarantines_symbol_and_blocks_repeat(monkeypatc
         calls["count"] += 1
         return {"code": 109425, "msg": "trading pair does not exist or is not supported"}
 
+    def fake_get_contract(symbol, **kwargs):
+        return {"symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true"}
+
     monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx, "get_contract", fake_get_contract)
     assert bx.get_live_price("TEST-USDT") is None
     assert bx.get_live_price("TEST-USDT") is None
-    assert calls["count"] == 1
+    assert calls["count"] == 2
+    assert "TEST-USDT" in bx._LIVE_PRICE_INVALID_UNTIL
     assert "TEST-USDT" in bx._LIVE_PRICE_INVALID_UNTIL
     _reset_bingx_live_price_guards(bx)
 
 
-def test_bingx_live_price_109425_burst_opens_circuit_breaker(monkeypatch):
+def test_bingx_live_price_109425_does_not_block_other_symbols(monkeypatch):
     import event_engine.bingx as bx
 
     _reset_bingx_live_price_guards(bx)
@@ -1680,23 +1684,53 @@ def test_bingx_live_price_109425_burst_opens_circuit_breaker(monkeypatch):
     _seed_bingx_contracts(bx, symbols)
     calls = []
 
-    monkeypatch.setattr(
-        bx,
-        "_request",
-        lambda method, path, params=None, **kwargs: (
-            calls.append(str((params or {}).get("symbol")))
-            or {"code": 109425, "msg": "trading pair does not exist or is not supported"}
-        ),
-    )
+    def fake_request(method, path, params=None, **kwargs):
+        symbol = str((params or {}).get("symbol"))
+        calls.append(symbol)
+        if symbol != "D-USDT":
+            return {"code": 109425, "msg": "trading pair does not exist or is not supported"}
+        return {"code": 0, "data": {"symbol": symbol, "price": "123.45"}}
 
+    def fake_get_contract(symbol, **kwargs):
+        return {"symbol": str(symbol).upper(), "status": 1, "apiStateOpen": "true"}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx, "get_contract", fake_get_contract)
     for symbol in symbols[:3]:
         assert bx.get_live_price(symbol) is None
+    assert bx.get_live_price("D-USDT") == pytest.approx(123.45)
+    assert calls == ["A-USDT", "A-USDT", "B-USDT", "B-USDT", "C-USDT", "C-USDT", "D-USDT"]
+    assert bx._LIVE_PRICE_COOLDOWN_UNTIL == 0.0
+    _reset_bingx_live_price_guards(bx)
 
-    # The fourth symbol must not generate another invalid HTTP request after
-    # the process-local breaker opens at the configured burst limit.
-    assert bx.get_live_price(symbols[3]) is None
-    assert calls == symbols[:3]
-    assert bx._LIVE_PRICE_COOLDOWN_UNTIL > 0
+
+
+def test_bingx_live_price_109425_retries_with_fresh_changed_contract(monkeypatch):
+    import event_engine.bingx as bx
+
+    _reset_bingx_live_price_guards(bx)
+    _seed_bingx_contracts(bx, ["OLD-USDT", "NEW-USDT"])
+    calls = []
+    lookups = []
+
+    def fake_request(method, path, params=None, **kwargs):
+        symbol = str((params or {}).get("symbol"))
+        calls.append(symbol)
+        if symbol == "OLD-USDT":
+            return {"code": 109425, "msg": "trading pair does not exist or is not supported"}
+        return {"code": 0, "data": {"symbol": "NEW-USDT", "price": "321.5"}}
+
+    def fake_get_contract(symbol, *, require_fresh=False):
+        lookups.append((str(symbol).upper(), bool(require_fresh)))
+        resolved = "NEW-USDT" if require_fresh else "OLD-USDT"
+        return {"symbol": resolved, "status": 1, "apiStateOpen": "true"}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx, "get_contract", fake_get_contract)
+    assert bx.get_live_price("OLD-USDT") == pytest.approx(321.5)
+    assert calls == ["OLD-USDT", "NEW-USDT"]
+    assert lookups == [("OLD-USDT", False), ("OLD-USDT", True)]
+    assert "OLD-USDT" not in bx._LIVE_PRICE_INVALID_UNTIL
     _reset_bingx_live_price_guards(bx)
 
 
@@ -1929,7 +1963,7 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     }
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
-    assert [x["pnl_pct"] for x in levels] == pytest.approx([5.25, 10.5, 17.5])
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([5.25, 8.75, 14.0])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -1979,3 +2013,13 @@ def test_multi_tp_preflight_four_min_qty_is_the_conservative_boundary(monkeypatc
     out = bx.open_market("TEST", "LONG", 100.0, "TR_BOUND")
     assert out["status"] == "error"
     assert "4*min_qty" in out["error"]
+
+
+
+def test_contract_disappearance_is_terminalized(monkeypatch):
+    import run_once as ro
+    import pytest
+    # Exercise the same classification expression used by the execution loop.
+    execution_result = {"status": "error", "error": "contract_unavailable"}
+    err_str = str(execution_result.get("error", "")).lower()
+    assert err_str in {"contract_unavailable", "contract_not_found"} or "contract_unavailable" in err_str

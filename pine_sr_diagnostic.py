@@ -1,90 +1,19 @@
 #!/usr/bin/env python3
 """Read-only diagnostic for the visible Ajay R5.41 Pine S/R values.
 
-The diagnostic intentionally does not import the trading engine. It uses Binance
-SPOT 1H data for the current cross-check. Futures support is deliberately not
-selected yet; see ``V10_3_SR_NOTES.md`` for the migration note.
+The diagnostic intentionally uses the exact production S/R provider and symbol
+resolver: Binance SPOT 1H. This prevents the manual tool from reintroducing a
+symbol-specific assumption that is absent from production.
 """
 from __future__ import annotations
 
 import argparse
 import sys
-import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
-import requests
-
-from pine_r541_sr import Candle, compute_current_sr
-
-BASE_URL = "https://data-api.binance.vision"
-KLINES_URL = f"{BASE_URL}/api/v3/klines"
-EXCHANGE_INFO_URL = f"{BASE_URL}/api/v3/exchangeInfo"
-
-
-def normalize_symbol(symbol: str) -> str:
-    s = symbol.strip().upper().replace("/", "-")
-    if s.endswith("-USDT"):
-        s = s[:-5] + "USDT"
-    return s.replace("-", "")
-
-
-def _get(url: str, params: dict[str, Any], timeout: float = 15.0) -> Any:
-    response = requests.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def fetch_1h(symbol: str, limit: int = 1000) -> list[Candle]:
-    payload = _get(
-        KLINES_URL,
-        {
-            "symbol": normalize_symbol(symbol),
-            "interval": "1h",
-            "limit": max(300, min(int(limit), 1000)),
-        },
-    )
-    if not isinstance(payload, list):
-        raise ValueError("Binance klines response is not a list")
-
-    now_ms = int(time.time() * 1000)
-    candles: list[Candle] = []
-    for row in payload:
-        if not isinstance(row, list) or len(row) < 6:
-            continue
-        open_time = int(row[0])
-        close_time = int(row[6]) if len(row) > 6 else open_time + 3_599_999
-        if close_time > now_ms:
-            continue
-        candles.append(
-            Candle(
-                ts=open_time,
-                open=float(row[1]),
-                high=float(row[2]),
-                low=float(row[3]),
-                close=float(row[4]),
-                volume=float(row[5]),
-            )
-        )
-    if len(candles) < 300:
-        raise ValueError(f"Only {len(candles)} closed 1H candles available")
-    return candles
-
-
-def fetch_tick_size(symbol: str) -> float | None:
-    try:
-        payload = _get(EXCHANGE_INFO_URL, {"symbol": normalize_symbol(symbol)}, timeout=10.0)
-        rows = payload.get("symbols", []) if isinstance(payload, dict) else []
-        if not rows:
-            return None
-        for item in rows[0].get("filters", []):
-            if item.get("filterType") == "PRICE_FILTER":
-                value = item.get("tickSize")
-                if value is not None and float(value) > 0:
-                    return float(value)
-    except Exception:
-        return None
-    return None
+from event_engine.sr_context import get_cached_sr_snapshot
+from event_engine.sr_context import resolve_spot_symbol
 
 
 def format_price(value: float | None, tick_size: float | None) -> str:
@@ -98,21 +27,42 @@ def format_price(value: float | None, tick_size: float | None) -> str:
             return f"{rounded:.{places}f}"
         except (InvalidOperation, ValueError):
             pass
-    text = f"{float(value):.8f}".rstrip("0").rstrip(".")
+    text = f"{float(value):.12f}".rstrip("0").rstrip(".")
     return text or "0"
+
+
+def _source_tick_size(resolved: dict[str, Any]) -> float | None:
+    """Read the source Spot tick size without creating another symbol resolver."""
+    try:
+        # Keep this import private so this diagnostic still treats sr_context as
+        # the single source of truth for symbol resolution and transport.
+        import event_engine.sr_context as sr
+        row = sr._spot_symbol_catalog().get(str(resolved["source_symbol"]).upper())
+        for item in (row or {}).get("filters", []):
+            if isinstance(item, dict) and item.get("filterType") == "PRICE_FILTER":
+                tick = float(item.get("tickSize", 0) or 0)
+                if tick > 0:
+                    return tick * float(resolved.get("source_price_scale", 1.0))
+    except Exception:
+        return None
+    return None
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ajay R5.41 visible Pine SR value diagnostic")
-    parser.add_argument("--symbol", required=True, help="e.g. BTC-USDT")
+    parser.add_argument("--symbol", required=True, help="e.g. BTC-USDT or 1000SHIB")
     parser.add_argument("--limit", type=int, default=1000, help="closed 1H bars, 300-1000")
     args = parser.parse_args()
 
-    candles = fetch_1h(args.symbol, args.limit)
-    state = compute_current_sr(candles)
-    tick_size = fetch_tick_size(args.symbol)
+    resolved = resolve_spot_symbol(args.symbol)
+    state = get_cached_sr_snapshot(args.symbol, limit=args.limit)
+    tick_size = _source_tick_size(resolved)
 
-    print(f"AJAY R5.41 | {normalize_symbol(args.symbol)} | SOURCE=BINANCE_SPOT")
+    print(f"AJAY R5.41 | REQUESTED={resolved['requested_symbol']} | SOURCE=BINANCE_SPOT")
+    print(f"SOURCE_SYMBOL={resolved['source_symbol']}")
+    print(f"ALIAS_KIND={resolved['source_alias_kind']}")
+    print(f"PRICE_SCALE={resolved['source_price_scale']}")
+    print(f"VOLUME_SCALE={resolved['source_volume_scale']}")
     print(f"HIGH LEVEL: {format_price(state['highestph'], tick_size)}")
     print("SR LEVELS:")
     for level in state["levels"]:

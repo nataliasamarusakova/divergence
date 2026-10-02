@@ -72,6 +72,7 @@ from event_engine.signals import (
 from event_engine.sr_context import (
     get_cached_sr_snapshot,
     evaluate_sr_room,
+    SRSymbolUnavailableError,
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
@@ -170,6 +171,15 @@ HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
+# Current TP ladder: closer milestones while preserving staged partial exits.
+# These RR values are used consistently for new entries and restart fallback.
+NORMAL_TP_RR = (0.75, 1.25, 2.00)
+NORMAL_TP_FRACTIONS = (0.25, 0.40, 0.35)
+NORMAL_PLANNED_WEIGHTED_RR = 1.3875
+SQUEEZE_TP_RR = (1.00, 1.50, 2.00)
+SQUEEZE_TP_FRACTIONS = (0.30, 0.35, 0.35)
+SQUEEZE_PLANNED_WEIGHTED_RR = 1.525
+
 # Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
 # Current source is Binance SPOT 1H. Futures can be added later without changing
 # the room/gate logic; see V10_3_SR_NOTES.md.
@@ -223,6 +233,7 @@ DIVERGENCE_SHADOW_ONLY = os.environ.get("DIVERGENCE_SHADOW_ONLY", "false").lower
 DIVERGENCE_SHADOW_STATE = DATA / "divergence_shadow_trades.json"
 MAX_PRE_ORDER_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_PRE_ORDER_DRIFT_REJECTIONS", "3")))
 MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS", "3")))
+MAX_SR_DATA_REJECTIONS = max(1, int(os.environ.get("MAX_SR_DATA_REJECTIONS", "3")))
 CROSS_EXCHANGE_PRICE_GUARD_ENABLED = os.environ.get("CROSS_EXCHANGE_PRICE_GUARD_ENABLED", "true").lower() == "true"
 MAX_CROSS_EXCHANGE_DRIFT_PCT = float(os.environ.get("MAX_CROSS_EXCHANGE_DRIFT_PCT", "1.00"))
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
@@ -1190,6 +1201,30 @@ def load_pre_order_drift_failure_counts(path: Path, terminal_ids: set[str] | Non
     return counts
 
 
+def load_sr_data_failure_counts(path: Path, terminal_ids: set[str] | None = None) -> dict[str, int]:
+    """Count persisted retryable S/R data failures per event."""
+    if not path.exists():
+        return {}
+    terminal_ids = terminal_ids or set()
+    counts: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("record_type") != "EXECUTION_ATTEMPT":
+            continue
+        event_id = str(obj.get("event_id") or "")
+        if not event_id or event_id in terminal_ids:
+            continue
+        result = obj.get("result") or {}
+        if isinstance(result, dict) and str(result.get("status", "")).upper() == "SR_DATA_UNAVAILABLE":
+            counts[event_id] = counts.get(event_id, 0) + 1
+    return counts
+
+
 def load_cross_exchange_drift_failure_counts(path: Path, terminal_ids: set[str] | None = None) -> dict[str, int]:
     """Count repeated cross-exchange drift rejections per event.
 
@@ -1855,8 +1890,8 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
 
     ev_type = str(ev.get("event_type", "")).upper()
     is_squeeze = _is_squeeze_event(ev_type)
-    target_rr = 3.0 if is_squeeze else 2.50
-    planned_weighted_rr = 2.05 if is_squeeze else 1.6625
+    target_rr = SQUEEZE_TP_RR[-1] if is_squeeze else NORMAL_TP_RR[-1]
+    planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR if is_squeeze else NORMAL_PLANNED_WEIGHTED_RR
 
     # TP3 (финальная цель) ставится на target_rr
     if direction == "LONG":
@@ -1903,32 +1938,21 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
     is_squeeze = _is_squeeze_event(ev_type)
 
     if is_squeeze:
-        # Для сквизов тейки шире (импульсный потенциал и защита от преждевременного выбивания по БУ):
-        # TP1: 1.00 * SL (30% объема + перевод в БУ после взятия 1.0R)
-        # TP2: 2.00 * SL (35% объема)
-        # TP3: 3.00 * SL (35% объема)
-        # Взвешенный R:R: 0.30 * 1.0 + 0.35 * 2.0 + 0.35 * 3.0 = 2.05
+        # Tighter squeeze cascade: 1.00R / 1.50R / 2.00R.
         tp_levels = [
-            {"leg": "tp1", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.30},
-            {"leg": "tp2", "pnl_pct": round(sl_pct * 2.00, 6), "close_fraction": 0.35},
-            {"leg": "tp3", "pnl_pct": round(sl_pct * 3.00, 6), "close_fraction": 0.35},
+            {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
+            for i, (rr, fraction) in enumerate(zip(SQUEEZE_TP_RR, SQUEEZE_TP_FRACTIONS), start=1)
         ]
-        planned_weighted_rr = 2.05
-        target_rr = 3.0
+        planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR
+        target_rr = SQUEEZE_TP_RR[-1]
     else:
-        # Normal divergence cascade: take a small early partial, then protect
-        # the remaining position after TP1 under the shipped research policy.
-        # TP1: 0.75R -> 25% (move SL to BE; tracker.BE_AFTER_LEG must agree)
-        # TP2: 1.50R -> 40%
-        # TP3: 2.50R -> 35%
-        # Weighted RR = 0.25*0.75 + 0.40*1.50 + 0.35*2.50 = 1.6625R
+        # Tighter normal cascade: 0.75R / 1.25R / 2.00R.
         tp_levels = [
-            {"leg": "tp1", "pnl_pct": round(sl_pct * 0.75, 6), "close_fraction": 0.25},
-            {"leg": "tp2", "pnl_pct": round(sl_pct * 1.50, 6), "close_fraction": 0.40},
-            {"leg": "tp3", "pnl_pct": round(sl_pct * 2.50, 6), "close_fraction": 0.35},
+            {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
+            for i, (rr, fraction) in enumerate(zip(NORMAL_TP_RR, NORMAL_TP_FRACTIONS), start=1)
         ]
-        planned_weighted_rr = 1.6625
-        target_rr = 2.50
+        planned_weighted_rr = NORMAL_PLANNED_WEIGHTED_RR
+        target_rr = NORMAL_TP_RR[-1]
 
     setup["risk_pct"] = sl_pct
     setup["target_rr"] = target_rr
@@ -2288,10 +2312,10 @@ def reconcile_all_open_positions() -> None:
                                 "close_fraction": _safe_float(tp.get("qty"), 0.0) / max(qty, 1e-12),
                             })
                         if not inferred_levels:
-                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * 2.50, "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
                         total_fraction = sum(max(_safe_float(x.get("close_fraction"), 0.0), 0.0) for x in inferred_levels)
                         if total_fraction <= 0:
-                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * 2.50, "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
                         else:
                             for level in inferred_levels:
                                 level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
@@ -2409,20 +2433,19 @@ def reconcile_all_open_positions() -> None:
         if not tp_levels:
             if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))):
                 default_levels = [
-                    {"leg": "tp1", "pnl_pct": round(sl_pct * 1.00, 6), "close_fraction": 0.30},
-                    {"leg": "tp2", "pnl_pct": round(sl_pct * 2.00, 6), "close_fraction": 0.35},
-                    {"leg": "tp3", "pnl_pct": round(sl_pct * 3.00, 6), "close_fraction": 0.35},
+                    {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
+                    for i, (rr, fraction) in enumerate(zip(SQUEEZE_TP_RR, SQUEEZE_TP_FRACTIONS), start=1)
                 ]
             else:
                 default_levels = [
-                    {"leg": "tp1", "pnl_pct": round(sl_pct * 0.75, 6), "close_fraction": 0.25},
-                    {"leg": "tp2", "pnl_pct": round(sl_pct * 1.50, 6), "close_fraction": 0.40},
-                    {"leg": "tp3", "pnl_pct": round(sl_pct * 2.50, 6), "close_fraction": 0.35},
+                    {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
+                    for i, (rr, fraction) in enumerate(zip(NORMAL_TP_RR, NORMAL_TP_FRACTIONS), start=1)
                 ]
             tp_levels.extend([x for x in default_levels if x["leg"] not in hit_legs])
 
         if not tp_levels:
-            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * (3.00 if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else 2.50), 6), "close_fraction": 1.0}]
+            final_rr = SQUEEZE_TP_RR[-1] if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else NORMAL_TP_RR[-1]
+            tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * final_rr, 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
@@ -2583,7 +2606,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 raise ValueError("invalid planned risk_pct for SR room")
             # Rebuild the same ladder used by protection code from the current
             # pre-order reference price. Recompute invalidation at that reference
-            # so the R multipliers stay exactly 0.75/1.50/2.50 (or 1/2/3 for
+            # so the R multipliers stay on the current centralized TP ladder.
             # squeeze events), even if the signal price has drifted.
             if direction == "LONG":
                 sr_setup["invalidation_price"] = float(live_reference) * (1.0 - risk_pct_for_sr / 100.0)
@@ -2641,23 +2664,18 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     "sr_room": sr_result,
                     "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                 })
-        except Exception as exc:
+        except SRSymbolUnavailableError as exc:
+            record_action({
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "event_type": event_type_for_risk,
+                "execution_status": "SR_SYMBOL_UNAVAILABLE",
+                "error": str(exc),
+                "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+            })
             if AJAY_SR_REQUIRE_DATA and AJAY_SR_ROOM_MODE == "enforce":
-                record_action({
-                    "event_id": event_id, "symbol": symbol, "direction": direction,
-                    "event_type": event_type_for_risk,
-                    "execution_status": "SR_DATA_UNAVAILABLE",
-                    "error": str(exc),
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                })
-                return {
-                    "status": "SR_DATA_UNAVAILABLE",
-                    "mode": EXECUTION_MODE,
-                    "order_id": None,
-                    "position": {},
-                    "error": str(exc),
-                }
-            log.warning("[SR_ROOM] %s %s S/R unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
+                return {"status": "SR_SYMBOL_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
+            log.warning("[SR_ROOM] %s %s S/R symbol unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
+        except Exception as exc:
             record_action({
                 "event_id": event_id, "symbol": symbol, "direction": direction,
                 "event_type": event_type_for_risk,
@@ -2665,6 +2683,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "error": str(exc),
                 "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
             })
+            if AJAY_SR_REQUIRE_DATA and AJAY_SR_ROOM_MODE == "enforce":
+                return {"status": "SR_DATA_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
+            log.warning("[SR_ROOM] %s %s S/R unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
 
     log.info("[EXECUTION] Opening market position after all pre-order gates: %s %s at ref price %.8g...", direction, symbol, live_reference)
     try:
@@ -2795,8 +2816,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
         ev_type = str(setup.get("event_type", "")).upper()
         is_squeeze = _is_squeeze_event(ev_type)
-        target_rr = 3.0 if is_squeeze else 2.50
-        planned_weighted_rr = 2.05 if is_squeeze else 1.6625
+        target_rr = SQUEEZE_TP_RR[-1] if is_squeeze else NORMAL_TP_RR[-1]
+        planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR if is_squeeze else NORMAL_PLANNED_WEIGHTED_RR
 
         if direction == "LONG":
             invalidation = actual_avg_price * (1.0 - planned_risk_pct / 100.0)
@@ -3008,6 +3029,8 @@ def main() -> None:
         "rejected_portfolio_cap": 0,
         "rejected_hot_oi": 0,
         "rejected_symbol_quarantine": 0,
+        "rejected_bingx_contract": 0,
+        "rejected_binance_contract": 0,
         "conflict_rejected": 0,
         "valid_signals": 0,
         "execution_attempts": 0,
@@ -3095,12 +3118,14 @@ def main() -> None:
     except Exception as exc:
         log.error("[FUNDING_HISTORY] Snapshot record error: %s", exc)
 
+    bingx_contract_catalog_fresh = False
     try:
         contracts = refresh_contracts()
+        bingx_contract_catalog_fresh = True
         log.info("[BINGX] Refreshed %d active perpetual contracts.", len(contracts))
     except Exception as exc:
         _record_scan_error(stats, "bingx_contract_refresh")
-        log.error("[BINGX] Contracts refresh error: %s", exc)
+        log.error("[BINGX] Contracts refresh error: %s; NEW ENTRIES BLOCKED for this cycle.", exc)
 
     now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     current_open_positions: dict[tuple[str, str], bool] = {}
@@ -3160,14 +3185,19 @@ def main() -> None:
                 continue
 
             stats["liquidity_candidates"] += 1
+            if not bingx_contract_catalog_fresh:
+                stats["rejected_bingx_contract"] += 1
+                continue
             if not bingx_contract_exists(r.symbol):
                 # A symbol may remain visible in cached/Coinalyze universe data
                 # while BingX has paused trading. Never create a candidate that
                 # can only fail later at execution time.
+                stats["rejected_bingx_contract"] += 1
                 continue
             if MARKET_DATA_SOURCE == "binance":
                 try:
                     if not binance_contract_exists(r.symbol):
+                        stats["rejected_binance_contract"] += 1
                         continue
                 except BinanceRateLimitError as exc:
                     _set_binance_rate_limit_cooldown(exc)
@@ -3175,6 +3205,7 @@ def main() -> None:
                     log.error("[BINANCE] exchangeInfo rate limit reached while building candidate universe; stopping candidate build: %s", exc)
                     break
                 except BinanceSymbolUnavailableError:
+                    stats["rejected_binance_contract"] += 1
                     continue
 
             stats["contract_candidates"] += 1
@@ -3195,11 +3226,16 @@ def main() -> None:
     terminal_event_ids = load_terminal_event_ids(TRADES)
     pre_order_drift_fail_counts = load_pre_order_drift_failure_counts(TRADES, terminal_event_ids)
     cross_exchange_drift_fail_counts = load_cross_exchange_drift_failure_counts(TRADES, terminal_event_ids)
+    sr_data_fail_counts = load_sr_data_failure_counts(TRADES, terminal_event_ids)
     # Older state files may already contain an exhausted cross-exchange retry budget
     # without an EVENT_TERMINAL marker. Retire those events on restart so the next
     # scan cannot issue one more fresh MARKET-entry attempt for the same event.
     for exhausted_event_id, failure_count in cross_exchange_drift_fail_counts.items():
         if failure_count >= MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS:
+            terminal_event_ids.add(exhausted_event_id)
+            executed_event_ids.add(exhausted_event_id)
+    for exhausted_event_id, failure_count in sr_data_fail_counts.items():
+        if failure_count >= MAX_SR_DATA_REJECTIONS:
             terminal_event_ids.add(exhausted_event_id)
             executed_event_ids.add(exhausted_event_id)
     best_opportunities_map: dict[tuple[str, str], dict] = {}
@@ -3840,6 +3876,19 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif status_now == "SR_SYMBOL_UNAVAILABLE":
+                    terminal_reason = "SR_SYMBOL_UNAVAILABLE"
+                    stats["rejected_sr_symbol"] = stats.get("rejected_sr_symbol", 0) + 1
+                    log.warning("[SR_ROOM] %s (%s) no unambiguous Binance Spot source; terminalizing event %s: %s", symbol, direction, event_id, execution_result.get("error"))
+                elif status_now == "SR_DATA_UNAVAILABLE":
+                    current_fail_count = sr_data_fail_counts.get(event_id, 0) + 1
+                    sr_data_fail_counts[event_id] = current_fail_count
+                    stats["rejected_sr_data"] = stats.get("rejected_sr_data", 0) + 1
+                    if current_fail_count >= MAX_SR_DATA_REJECTIONS:
+                        terminal_reason = "SR_DATA_EXHAUSTED"
+                        log.warning("[SR_ROOM] %s (%s) S/R data failure %d/%d; terminalizing event %s.", symbol, direction, current_fail_count, MAX_SR_DATA_REJECTIONS, event_id)
+                    else:
+                        log.info("[SR_ROOM] %s (%s) S/R data failure %d/%d; event remains retryable.", symbol, direction, current_fail_count, MAX_SR_DATA_REJECTIONS)
                 elif status_now in {"SR_ROOM_REJECTED", "SR_ROOM_POST_FILL_REJECTED"}:
                     terminal_reason = status_now
                     stats["rejected_sr_room"] = stats.get("rejected_sr_room", 0) + 1
@@ -3856,6 +3905,10 @@ def main() -> None:
                         "[EXECUTION] %s (%s) MARKET entry outcome is UNKNOWN; terminalizing event %s to prevent a duplicate entry. ",
                         symbol, direction, event_id,
                     )
+                elif err_str in {"contract_unavailable", "contract_not_found"} or "contract_unavailable" in err_str:
+                    terminal_reason = "BINGX_CONTRACT_UNAVAILABLE"
+                    stats["rejected_bingx_contract"] = stats.get("rejected_bingx_contract", 0) + 1
+                    log.warning("[EXECUTION] %s (%s) BingX contract disappeared/closed after preflight; terminalizing event %s.", symbol, direction, event_id)
                 elif execution_result.get("bingx_code") == 101481 or "clientorderid unique check failed" in err_str or "clientorderid has already been used" in err_str:
                     terminal_reason = "CLIENT_ORDER_ID_ALREADY_USED"
                     log.warning("[EXECUTION] %s (%s) clientOrderId already used on exchange; terminalizing event %s.", symbol, direction, event_id)

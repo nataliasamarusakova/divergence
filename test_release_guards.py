@@ -211,3 +211,37 @@ def test_pytest_isolates_production_sr_environment(monkeypatch):
     """CI's workflow env must not force S/R onto unrelated unit tests."""
     import conftest
     assert hasattr(conftest, "isolate_production_entry_gates")
+
+
+def test_release_has_live_spot_symbol_resolver_and_persisted_sr_budget():
+    workflow = _workflow()
+    assert 'AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"' in workflow
+    assert 'MAX_SR_DATA_REJECTIONS: "3"' in workflow
+    source = Path('event_engine/sr_context.py').read_text(encoding='utf-8')
+    assert 'def resolve_spot_symbol' in source
+    assert 'SRSymbolUnavailableError' in source
+    assert 'source_price_scale' in source
+    assert 'source_volume_scale' in source
+
+
+def test_release_does_not_use_direct_spot_klines_normalization_in_diagnostic():
+    source = Path('pine_sr_diagnostic.py').read_text(encoding='utf-8')
+    assert 'resolve_spot_symbol' in source
+    assert 'get_cached_sr_snapshot' in source
+    assert 'KLINES_URL' not in source
+    assert 'normalize_symbol' not in source
+
+
+def test_new_entries_fail_closed_when_bingx_catalog_refresh_fails():
+    source = Path('run_once.py').read_text(encoding='utf-8')
+    assert 'bingx_contract_catalog_fresh = False' in source
+    assert 'NEW ENTRIES BLOCKED for this cycle' in source
+    assert 'if not bingx_contract_catalog_fresh:' in source
+    assert 'stats["rejected_bingx_contract"]' in source
+
+
+def test_release_cleans_test_generated_state_before_always_commit():
+    workflow = _workflow()
+    assert 'Clean test-generated runtime state' in workflow
+    assert 'rm -rf data .pytest_cache __pycache__ event_engine/__pycache__' in workflow
+    assert workflow.index('Run tests') < workflow.index('Clean test-generated runtime state') < workflow.index('Commit state')

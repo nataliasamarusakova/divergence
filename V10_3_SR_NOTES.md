@@ -1,4 +1,4 @@
-# v10.3 Fixed 7% SL + Ajay R5.41 S/R room integration
+# v10.3.8 Audited: fixed 7% SL + Ajay R5.41 S/R room integration
 
 ## Current behavior
 
@@ -38,12 +38,25 @@ the same levels must be compared against the TradingView instrument/feed to ensu
   market-data path in the VST workflow.
 - Spot S/R requests use the same explicit HTTP proxy as the Binance Futures market-data path
   in the VST workflow; the provider is kept isolated so it can later be replaced with Futures.
+- Spot symbols are resolved from live Binance Spot `exchangeInfo`, not by a hard-coded cross-venue
+  alias table. Exact active `USDT` Spot symbols win; known quantity-prefixed logical symbols such as
+  `1000SHIB`, `1000PEPE`, `1000BONK` and similar quantity-prefixed Binance perpetual symbols may
+  use the corresponding unprefixed Spot pair when that pair exists. The numeric prefix changes the
+  contract/index unit: for `1000SHIBUSDT`, Binance defines a 1,000-SHIB contract and its index/quoted
+  price is 1,000x the SHIB/USDT Spot index. Therefore the Spot source uses `price_scale=1000` and
+  `volume_scale=0.001` so S/R levels are in the same logical price/quantity unit as the signal/execution
+  instrument. Ambiguous
+  or missing Spot sources fail closed as `SR_SYMBOL_UNAVAILABLE`. A Spot HTTP 400 causes one fresh
+  `exchangeInfo` resolution and one retry; the BingX execution catalog is never used as an S/R alias source.
 
 ## Safety / fallback
 
 `AJAY_SR_REQUIRE_DATA=true` in the shipped VST workflow. If the SPOT S/R snapshot cannot be
 obtained or is stale, only that candidate is blocked and logged as `SR_DATA_UNAVAILABLE`; the
-whole engine is not stopped. The S/R gate is therefore fail-closed for each candidate rather
+whole engine is not stopped. Retryable provider/data failures are persisted in `trades.jsonl`
+and exhausted after three attempts for the same event, so a workflow restart cannot reset the
+budget. An unambiguous missing/ambiguous Spot symbol is terminal immediately as
+`SR_SYMBOL_UNAVAILABLE`. The S/R gate is therefore fail-closed for each candidate rather
 than silently bypassed. The Spot provider uses the same Binance WireProxy as the Futures
 market-data path in the GitHub Actions workflow.
 
@@ -74,8 +87,9 @@ entry reference. ATR remains available only as diagnostic telemetry; it no longe
 determines the new-entry stop and does not clip/reject the 7% policy. Orphan-position
 reconciliation also falls back to the same 7% stop when no historical trade profile exists.
 
-The 7% stop means the normal target ladder is 5.25% / 10.50% / 17.50% (0.75R / 1.50R /
-2.50R) and squeeze targets are 7% / 14% / 21% (1R / 2R / 3R).
+The 7% stop means the current normal target ladder is 5.25% / 8.75% / 14.00%
+(0.75R / 1.25R / 2.00R) and squeeze targets are 7% / 10.50% / 14.00%
+(1R / 1.5R / 2R). The partial-exit fractions are unchanged.
 
 ## Cross-exchange drift retry guard
 
@@ -83,3 +97,24 @@ A `CROSS_EXCHANGE_DRIFT_EXCEEDED` pre-order rejection is retryable for up to 3
 rejections of the same event. After the third rejection the event is terminalized
 with `CROSS_EXCHANGE_DRIFT_EXHAUSTED`, and the persisted `EXECUTION_ATTEMPT` history
 prevents a workflow restart from resetting that budget.
+
+## v10.3.8 final audit and execution-notification correction
+
+A quantity-prefixed perpetual such as `1000SHIBUSDT` uses the numeric prefix as a contract quantity multiplier.
+For the Binance 1000-contract index, the corresponding quoted price is 1,000x the unprefixed Spot pair;
+therefore a Spot `SHIBUSDT` source is converted with `price_scale=1000` and `volume_scale=0.001` so the S/R snapshot is expressed in the logical 1000SHIB unit.
+
+The Binance Futures client refreshes its live symbol catalog once and retries after an HTTP 400 that can indicate a stale symbol mapping.
+
+The VST workflow removes test-generated runtime/cache state before the unconditional state-commit step, preventing future CI test artifacts from entering persistent runtime telemetry.
+
+A BingX contract that disappears or becomes unavailable after the candidate preflight is terminalized as `BINGX_CONTRACT_UNAVAILABLE` rather than retried blindly.
+
+
+## v10.3.8 TP and Telegram policy
+
+New entries use the tighter TP ladder defined centrally in `run_once.py`: normal 0.75R/1.25R/2.00R
+and squeeze 1.00R/1.50R/2.00R, with existing partial-exit fractions preserved. Restart/reconciliation fallback
+uses the same current ladder only when no persisted TP profile exists; persisted historical TP profiles are preserved.
+BE remains an execution/risk-management mechanism, but the successful `BE_ACTIVATED` transition is no longer
+queued for Telegram. Local `[TRACKER_BE_ACTIVATED]` logging and `BE_FAILED` Telegram alerts remain intact.
