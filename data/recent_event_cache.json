@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790966519751,
+  "updated_ts": 1790966833139,
   "events": [
     {
       "event_id": "EVT_779716E9C5631915",
@@ -2716,6 +2716,32 @@
         "atr": 0.06040964758327302,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_0C7269158FD008DB",
+      "symbol": "KAITO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790963999999,
+        "pivot_2_ts": 1790963999999,
+        "detected_at_ts": 1790963999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.344,
+        "compression_ratio": 0.237791023447291,
+        "ma_spread_atr": 0.1266685099621045,
+        "compression_threshold": 0.5326883585670001,
+        "breakout_atr": 0.6340998003897943,
+        "volume_ratio": 1.126032069422543,
+        "requires_retest": true,
+        "trigger_level": 0.3458,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
