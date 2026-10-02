@@ -205,6 +205,25 @@ jobs:
         run: |
           playwright install --with-deps chromium
 
+      # Persisted data/ is part of the trading state and must survive every
+      # repository_dispatch run. Tests are allowed to create or mutate runtime files,
+      # so snapshot the checked-out state and restore it after tests instead of deleting
+      # the real data directory.
+      - name: Backup persisted runtime state before tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          BACKUP_DIR="$RUNNER_TEMP/event-engine-data-backup"
+          rm -rf "$BACKUP_DIR"
+          if [ -d data ]; then
+            cp -a data "$BACKUP_DIR"
+            echo "EVENT_ENGINE_DATA_BACKUP=$BACKUP_DIR" >> "$GITHUB_ENV"
+            echo "Persisted data backed up before tests"
+          else
+            echo "EVENT_ENGINE_DATA_BACKUP=" >> "$GITHUB_ENV"
+            echo "No persisted data directory present before tests"
+          fi
+
       - name: Syntax check
         run: |
           python -m compileall -q event_engine run_once.py
@@ -213,10 +232,21 @@ jobs:
         run: |
           python -m pytest -q
 
-      - name: Clean test-generated runtime state
+      - name: Clean test-generated runtime state (preserve persisted data)
         if: always()
+        shell: bash
         run: |
-          rm -rf data .pytest_cache __pycache__ event_engine/__pycache__
+          set -euo pipefail
+          BACKUP_DIR="${EVENT_ENGINE_DATA_BACKUP:-}"
+          if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR/data" ]; then
+            rm -rf data
+            cp -a "$BACKUP_DIR/data" data
+            echo "Persisted data restored after tests"
+          else
+            rm -rf data
+            echo "No persisted data existed before tests; removed test-generated data"
+          fi
+          rm -rf .pytest_cache __pycache__ event_engine/__pycache__
 
       # Binance uses a userspace WireGuard HTTP proxy only. The proxy is scoped to
       # BinanceMarketClient; BingX, Coinalyze, Telegram, GitHub and git remain direct.
