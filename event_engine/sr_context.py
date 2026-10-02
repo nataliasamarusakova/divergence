@@ -32,7 +32,6 @@ SR_ZONE_SCALE = max(0.0, float(os.environ.get("AJAY_SR_ZONE_SCALE", "1.0")))
 SR_ENTRY_BUFFER_PCT = max(0.0, float(os.environ.get("AJAY_SR_ENTRY_BUFFER_PCT", "0.05")))
 SR_TARGET_BUFFER_PCT = max(0.0, float(os.environ.get("AJAY_SR_TARGET_BUFFER_PCT", "0.05")))
 SR_TARGET_BUFFER_R = max(0.0, float(os.environ.get("AJAY_SR_TARGET_BUFFER_R", "0.10")))
-SR_MIN_PARTIAL_TP3_R = max(0.0, float(os.environ.get("AJAY_SR_MIN_PARTIAL_TP3_R", "0.25")))
 SR_SUPPORT_CONTEXT_MAX_R = max(0.0, float(os.environ.get("AJAY_SR_SUPPORT_CONTEXT_MAX_R", "3.0")))
 SR_HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("AJAY_SR_HTTP_TIMEOUT_SEC", "5")))
 SR_REQUEST_MIN_INTERVAL_SEC = max(0.0, float(os.environ.get("AJAY_SR_REQUEST_MIN_INTERVAL_SEC", "0.10")))
@@ -361,40 +360,3 @@ def evaluate_sr_room(
         result["room_status"] = "POST_TP1_OPPOSING_ZONE"
 
     return result
-
-
-def apply_sr_tp3_cap(
-    setup: dict[str, Any],
-    *,
-    direction: str,
-    tp_levels: list[dict[str, Any]],
-    sr_result: dict[str, Any],
-    actual_entry_price: float,
-) -> tuple[list[dict[str, Any]], float]:
-    """Apply a previously validated partial-room TP3 cap after the real fill."""
-    if not sr_result.get("tp3_capped"):
-        return tp_levels, float(setup.get("target_rr", 2.5) or 2.5)
-    if len(tp_levels) < 3:
-        raise ValueError("SR TP3 cap requires three TP levels")
-    cap_price = _safe_price(sr_result.get("effective_tp3_price"))
-    if cap_price is None or actual_entry_price <= 0:
-        raise ValueError("invalid SR TP3 cap price")
-    risk_pct = float(setup.get("risk_pct", 0) or 0)
-    if risk_pct <= 0:
-        raise ValueError("invalid risk_pct for SR TP3 cap")
-    if str(direction).upper() == "LONG":
-        pnl_pct = (cap_price - actual_entry_price) / actual_entry_price * 100.0
-    else:
-        pnl_pct = (actual_entry_price - cap_price) / actual_entry_price * 100.0
-    tp2_pnl = float(tp_levels[1].get("pnl_pct", 0) or 0)
-    if pnl_pct <= tp2_pnl:
-        raise ValueError("SR TP3 cap became unreachable after fill")
-    adjusted = [dict(x) for x in tp_levels]
-    adjusted[2]["pnl_pct"] = round(pnl_pct, 6)
-    effective_target_rr = round(pnl_pct / risk_pct, 9)
-    adjusted_weighted_rr = round(sum(float(x.get("close_fraction", 0) or 0) * (float(x.get("pnl_pct", 0) or 0) / risk_pct) for x in adjusted), 9)
-    setup["target_price"] = cap_price
-    setup["target_rr"] = effective_target_rr
-    setup["planned_weighted_rr"] = adjusted_weighted_rr
-    setup["sr_tp3_capped"] = True
-    return adjusted, effective_target_rr
