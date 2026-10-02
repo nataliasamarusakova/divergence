@@ -240,8 +240,11 @@ def test_new_entries_fail_closed_when_bingx_catalog_refresh_fails():
     assert 'stats["rejected_bingx_contract"]' in source
 
 
-def test_release_cleans_test_generated_state_before_always_commit():
+def test_release_preserves_persisted_data_while_cleaning_test_state_before_always_commit():
     workflow = _workflow()
-    assert 'Clean test-generated runtime state' in workflow
-    assert 'rm -rf data .pytest_cache __pycache__ event_engine/__pycache__' in workflow
-    assert workflow.index('Run tests') < workflow.index('Clean test-generated runtime state') < workflow.index('Commit state')
+    assert 'Clean test-generated runtime state (preserve persisted data)' in workflow
+    assert 'Backup persisted runtime state before tests' in workflow
+    assert 'cp -a data "$BACKUP_DIR"' in workflow
+    assert 'cp -a "$BACKUP_DIR/data" data' in workflow
+    assert workflow.index('Backup persisted runtime state before tests') < workflow.index('Run tests') < workflow.index('Clean test-generated runtime state (preserve persisted data)') < workflow.index('Commit state')
+    assert 'rm -rf data .pytest_cache __pycache__ event_engine/__pycache__' not in workflow
