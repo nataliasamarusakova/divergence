@@ -1,3 +1,9 @@
+import json
+
+
+def json_clone(value):
+    return json.loads(json.dumps(value))
+
 import run_once
 
 
@@ -65,3 +71,207 @@ def test_timeframe_scan_state_unsupported_version_is_explicitly_empty(tmp_path, 
     state = run_once._load_timeframe_scan_state()
 
     assert state == {"version": 2, "symbols": {}}
+
+
+def test_scan_buckets_replays_contiguous_missing_closed_buckets():
+    state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
+    available = {96, 97, 98, 99, 100}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [99, 100]
+
+
+def test_scan_buckets_never_jumps_over_missing_bucket():
+    state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
+    available = {98, 100}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == []
+
+
+def test_new_symbol_still_scans_only_current_completed_bucket():
+    state = {"version": 2, "symbols": {}}
+    available = {98, 99, 100}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [100]
+
+
+def test_cached_events_are_recovered_from_durable_event_journal(tmp_path, monkeypatch):
+    now_ms = 1_800_000_000_000
+    events_path = tmp_path / "events.jsonl"
+    cache_path = tmp_path / "recent_event_cache.json"
+    event = {
+        "event_id": "EVT_RECOVER",
+        "event_type": "SFP_BULLISH",
+        "symbol": "BTC",
+        "direction": "LONG",
+        "timeframe": "1h",
+        "timestamps": {"detected_at_ts": now_ms - 60_000},
+        "event_fact": {"requires_retest": True},
+    }
+    events_path.write_text(__import__("json").dumps(event) + "\n", encoding="utf-8")
+    cache_path.write_text('{"updated_ts": 0, "events": []}', encoding="utf-8")
+    monkeypatch.setattr(run_once, "EVENTS", events_path)
+    monkeypatch.setattr(run_once, "EVENT_CACHE", cache_path)
+
+    recovered = run_once._load_cached_events(now_ms, set())
+
+    assert [ev["event_id"] for ev in recovered] == ["EVT_RECOVER"]
+
+
+def test_cached_event_recovery_excludes_terminal_events(tmp_path, monkeypatch):
+    now_ms = 1_800_000_000_000
+    events_path = tmp_path / "events.jsonl"
+    cache_path = tmp_path / "recent_event_cache.json"
+    event = {
+        "event_id": "EVT_TERMINAL",
+        "event_type": "SFP_BULLISH",
+        "symbol": "BTC",
+        "direction": "LONG",
+        "timeframe": "1h",
+        "timestamps": {"detected_at_ts": now_ms - 60_000},
+        "event_fact": {"requires_retest": True},
+    }
+    events_path.write_text(__import__("json").dumps(event) + "\n", encoding="utf-8")
+    cache_path.write_text('{"updated_ts": 0, "events": []}', encoding="utf-8")
+    monkeypatch.setattr(run_once, "EVENTS", events_path)
+    monkeypatch.setattr(run_once, "EVENT_CACHE", cache_path)
+
+    assert run_once._load_cached_events(now_ms, {"EVT_TERMINAL"}) == []
+
+
+def test_emit_event_returns_false_when_durable_journal_write_fails(monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(run_once, "append_jsonl", fail)
+    assert run_once.emit_event({"event_id": "EVT_FAIL"}) is False
+
+
+def test_refresh_timeframe_events_replays_each_missing_bucket_without_detector_changes(tmp_path, monkeypatch):
+    interval = 3_600_000
+    now_ms = 101 * interval + 120_000
+    rows = [
+        {
+            "open_time": b * interval,
+            "close_time": b * interval + interval - 1,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0 + b * 0.01,
+            "volume": 1.0,
+        }
+        for b in range(20, 101)
+    ]
+    events_path = tmp_path / "events.jsonl"
+    state_path = tmp_path / "timeframe_scan_state.json"
+    monkeypatch.setattr(run_once, "EVENTS", events_path)
+    monkeypatch.setattr(run_once, "TIMEFRAME_STATE", state_path)
+    monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(run_once, "_load_oi_history", lambda: {})
+    monkeypatch.setattr(run_once, "_load_funding_history", lambda: {})
+    monkeypatch.setattr(run_once, "add_cvd", lambda df: df)
+    monkeypatch.setattr(run_once, "attach_oi_series", lambda df, _: df)
+    monkeypatch.setattr(run_once, "attach_funding_series", lambda df, _: df)
+
+    calls = []
+
+    def fake_divergence(df, symbol, timeframe):
+        bucket = int(df["close_time"].iloc[-1]) // interval
+        calls.append(bucket)
+        return [{
+            "event_id": f"EVT_{bucket}",
+            "event_type": "REGULAR_BULLISH_RSI",
+            "symbol": symbol,
+            "direction": "LONG",
+            "timeframe": timeframe,
+            "timestamps": {"detected_at_ts": int(df["close_time"].iloc[-1])},
+            "event_fact": {"engine": "DIVERGENCE"},
+        }]
+
+    monkeypatch.setattr(run_once, "detect_divergences", fake_divergence)
+    for name in (
+        "detect_volume_profile_divergence", "detect_harmonic_patterns",
+        "detect_squeeze_release", "detect_liquidation_squeeze", "detect_macd_4h",
+        "detect_ma_compression_breakout", "detect_breakout_momentum",
+        "detect_donchian_retest", "detect_liquidity_sweep_reclaim",
+        "detect_ema_pullback_continuation", "detect_order_block", "detect_breaker_block",
+        "detect_mitigation_block", "detect_sfp", "detect_liquidation_cascade_fvg", "detect_crt",
+    ):
+        monkeypatch.setattr(run_once, name, lambda *args, **kwargs: [])
+
+    scan_state = {"version": 2, "symbols": {"BTC-USDT": {"1h": 98}}}
+    stats = {"events_total": 0, "divergence_events": 0, "squeeze_events": 0, "scan_errors": 0}
+    candidates = [type("Candidate", (), {"symbol": "BTC-USDT"})()]
+
+    fresh = run_once._refresh_timeframe_events(
+        candidates, "1h", 400, now_ms, set(), stats, scan_state, 100, {}
+    )
+
+    assert calls == [99, 100]
+    assert scan_state["symbols"]["BTC-USDT"]["1h"] == 100
+    assert len(fresh) == 1
+    journal = [__import__("json").loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["event_id"] for row in journal] == ["EVT_99", "EVT_100"]
+
+
+def test_watermark_stops_before_bucket_with_failed_event_persistence(tmp_path, monkeypatch):
+    interval = 3_600_000
+    now_ms = 101 * interval + 120_000
+    rows = [
+        {
+            "open_time": b * interval,
+            "close_time": b * interval + interval - 1,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0 + b * 0.01,
+            "volume": 1.0,
+        }
+        for b in range(20, 101)
+    ]
+    state_path = tmp_path / "timeframe_scan_state.json"
+    monkeypatch.setattr(run_once, "TIMEFRAME_STATE", state_path)
+    monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(run_once, "_load_oi_history", lambda: {})
+    monkeypatch.setattr(run_once, "_load_funding_history", lambda: {})
+    monkeypatch.setattr(run_once, "add_cvd", lambda df: df)
+    monkeypatch.setattr(run_once, "attach_oi_series", lambda df, _: df)
+    monkeypatch.setattr(run_once, "attach_funding_series", lambda df, _: df)
+
+    def fake_divergence(df, symbol, timeframe):
+        bucket = int(df["close_time"].iloc[-1]) // interval
+        return [{
+            "event_id": f"EVT_{bucket}",
+            "event_type": "REGULAR_BULLISH_RSI",
+            "symbol": symbol,
+            "direction": "LONG",
+            "timeframe": timeframe,
+            "timestamps": {"detected_at_ts": int(df["close_time"].iloc[-1])},
+            "event_fact": {"engine": "DIVERGENCE"},
+        }]
+
+    monkeypatch.setattr(run_once, "detect_divergences", fake_divergence)
+    for name in (
+        "detect_volume_profile_divergence", "detect_harmonic_patterns",
+        "detect_squeeze_release", "detect_liquidation_squeeze", "detect_macd_4h",
+        "detect_ma_compression_breakout", "detect_breakout_momentum",
+        "detect_donchian_retest", "detect_liquidity_sweep_reclaim",
+        "detect_ema_pullback_continuation", "detect_order_block", "detect_breaker_block",
+        "detect_mitigation_block", "detect_sfp", "detect_liquidation_cascade_fvg", "detect_crt",
+    ):
+        monkeypatch.setattr(run_once, name, lambda *args, **kwargs: [])
+
+    persisted = []
+    monkeypatch.setattr(run_once, "_save_timeframe_scan_state", lambda state: persisted.append(json_clone(state)))
+
+    def emit_with_one_failure(ev):
+        return ev.get("event_id") != "EVT_100"
+
+    monkeypatch.setattr(run_once, "emit_event", emit_with_one_failure)
+
+    scan_state = {"version": 2, "symbols": {"BTC-USDT": {"1h": 98}}}
+    stats = {"events_total": 0, "divergence_events": 0, "squeeze_events": 0, "scan_errors": 0}
+    candidates = [type("Candidate", (), {"symbol": "BTC-USDT"})()]
+
+    run_once._refresh_timeframe_events(
+        candidates, "1h", 400, now_ms, set(), stats, scan_state, 100, {}
+    )
+
+    assert scan_state["symbols"]["BTC-USDT"]["1h"] == 99
+    assert persisted and persisted[-1]["symbols"]["BTC-USDT"]["1h"] == 99

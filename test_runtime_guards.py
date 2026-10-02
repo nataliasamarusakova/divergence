@@ -669,7 +669,7 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
     monkeypatch.setattr(run_once, "_save_json_atomic", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_once, "_save_timeframe_scan_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_once, "_load_timeframe_scan_state", lambda: {})
-    monkeypatch.setattr(run_once, "_load_cached_events", lambda: [])
+    monkeypatch.setattr(run_once, "_load_cached_events", lambda *args, **kwargs: [])
     monkeypatch.setattr(run_once, "load_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(run_once, "load_successful_trade_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(run_once, "load_terminal_event_ids", lambda *args, **kwargs: set())

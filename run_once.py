@@ -112,6 +112,10 @@ TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
 EVENT_CACHE = DATA / "recent_event_cache.json"
 KLINE_RATE_LIMIT_STATE = DATA / "bingx_kline_rate_limit.json"
 BINANCE_RATE_LIMIT_STATE = DATA / "binance_market_rate_limit.json"
+
+
+class EventJournalPersistenceError(RuntimeError):
+    """Raised when a newly detected event cannot be durably journaled."""
 _KLINE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
 _BINANCE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
 MARKET_DATA_SOURCE = os.environ.get("MARKET_DATA_SOURCE", "binance").strip().lower()
@@ -317,10 +321,37 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json_atomic(path: Path, obj: Any) -> None:
+    """Durably replace a JSON state file.
+
+    Scheduler state and the event cache are recovery state.  Write the complete
+    temporary file, flush it to disk, atomically replace the destination, then
+    fsync the parent directory so the rename itself is durable as well.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    payload = json.dumps(obj, ensure_ascii=False, indent=2)
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is an additional durability barrier.  The atomic
+            # rename above remains the portability baseline on systems where
+            # opening/fsyncing the directory is unavailable.
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _completed_bucket(interval_ms: int, now_ms: int, grace_min: float) -> int:
@@ -555,10 +586,42 @@ def _divergence_post_confirmation_age(ev: dict, now_ms: int) -> tuple[bool, floa
     return valid, formation_age, post_confirmation_age, confirmation_lag
 
 
-def _load_cached_events() -> list[dict]:
+def _load_cached_events(now_ms: int | None = None, terminal_ids: set[str] | None = None) -> list[dict]:
+    """Load live event cache and reconcile it from the durable event journal.
+
+    The journal is the source of truth; the JSON cache is only a derived working
+    set.  Reconciliation makes a crash after journal append but before cache save
+    recoverable on the next run.
+    """
     data = _load_json(EVENT_CACHE, {})
-    events = data.get("events", []) if isinstance(data, dict) else []
-    return [e for e in events if isinstance(e, dict) and e.get("event_id")]
+    cached = data.get("events", []) if isinstance(data, dict) else []
+    events = [e for e in cached if isinstance(e, dict) and e.get("event_id")]
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    terminal_ids = {str(x) for x in (terminal_ids or set()) if x}
+
+    recovered: list[dict] = []
+    if EVENTS.exists():
+        try:
+            with EVENTS.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    eid = ev.get("event_id")
+                    if not eid or str(eid) in terminal_ids:
+                        continue
+                    if _event_is_fresh(ev, now_ms, _event_max_age_min(ev)):
+                        recovered.append(ev)
+        except OSError as exc:
+            log.warning("[EVENT_CACHE] Journal reconciliation read failed: %s", exc)
+
+    return _merge_event_cache(events, recovered)
 
 
 def _load_timeframe_scan_state() -> dict:
@@ -1078,8 +1141,80 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
     return rec
 
 
-def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: int, seen_ids: set[str], stats: dict, scan_state: dict, completed_bucket: int, scan_klines_cache: dict[tuple[str, str], list[dict]] | None = None) -> list[dict]:
+def _timeframe_interval_ms(timeframe: str) -> int:
+    value = str(timeframe or "").lower().strip()
+    intervals = {"1h": 3_600_000, "4h": 14_400_000}
+    try:
+        return intervals[value]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported scan timeframe: {timeframe!r}") from exc
+
+
+def _scan_buckets_to_process(
+    scan_state: dict,
+    symbol: str,
+    timeframe: str,
+    completed_bucket: int,
+    available_buckets: set[int],
+) -> list[int]:
+    """Return contiguous closed buckets that can be replayed safely.
+
+    A new symbol/timeframe keeps the existing behaviour and scans only the latest
+    completed bar.  An already-known symbol replays every missing completed bucket
+    for which the fetched history is available.  We never jump over a missing
+    bucket because doing so would make that candle permanently invisible to the
+    detector while advancing the checkpoint past it.
+    """
+    symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
+    rec = symbols.get(symbol) if isinstance(symbols, dict) else None
+    if not isinstance(rec, dict) or rec.get(timeframe) in (None, ""):
+        eligible = [bucket for bucket in available_buckets if bucket <= completed_bucket]
+        return [max(eligible)] if eligible else []
+
+    try:
+        last_bucket = int(rec.get(timeframe))
+    except (TypeError, ValueError):
+        return [completed_bucket] if completed_bucket in available_buckets else []
+
+    if last_bucket >= completed_bucket:
+        return []
+
+    targets: list[int] = []
+    for bucket in range(last_bucket + 1, completed_bucket + 1):
+        if bucket not in available_buckets:
+            break
+        targets.append(bucket)
+    return targets
+
+
+def _frame_through_bucket(klines: list[dict], timeframe: str, bucket: int) -> list[dict]:
+    """Keep only closed candles through one exact timeframe bucket."""
+    interval_ms = _timeframe_interval_ms(timeframe)
+    out: list[dict] = []
+    for row in klines:
+        try:
+            close_ts = int(row.get("close_time"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if close_ts // interval_ms <= bucket:
+            out.append(row)
+    return out
+
+
+def _refresh_timeframe_events(
+    candidates,
+    timeframe: str,
+    limit: int,
+    now_ms: int,
+    seen_ids: set[str],
+    stats: dict,
+    scan_state: dict,
+    completed_bucket: int,
+    scan_klines_cache: dict[tuple[str, str], list[dict]] | None = None,
+) -> list[dict]:
+    """Scan each symbol's newly completed buckets without changing detector math."""
     fresh: list[dict] = []
+    interval_ms = _timeframe_interval_ms(timeframe)
     for r in candidates:
         symbol = str(r.symbol).upper()
         if not _symbol_scan_due(scan_state, symbol, timeframe, completed_bucket):
@@ -1092,71 +1227,129 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
             if len(klines) < 60:
                 log.warning("[SIGNALS] %s %s returned only %d candles; watermark deferred.", timeframe.upper(), symbol, len(klines))
                 continue
-            d = add_cvd(pd.DataFrame(klines))
-            # Audit fix B2: attach the accumulated OI snapshot history so
-            # detect_divergences can emit Price-vs-OI divergence when coverage
-            # is sufficient (no events until enough buckets are recorded).
-            d = attach_oi_series(d, _load_oi_history().get(symbol))
-            d = attach_funding_series(d, _load_funding_history().get(symbol))
-            divs = detect_divergences(d, symbol, timeframe)
-            vp_events = detect_volume_profile_divergence(d, symbol, timeframe) if ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE else []
-            harmonic_events = detect_harmonic_patterns(d, symbol, timeframe) if ENABLE_HARMONIC_PATTERN_ENGINE else []
-            sqs = detect_squeeze_release(d, symbol, timeframe, min_squeeze_bars=3, release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")))
-            # Forced-liquidation squeeze is an opt-in research engine until local
-            # liquidation time-series coverage is available; the code remains intact.
-            liqs = detect_liquidation_squeeze(r, d, symbol, timeframe) if ENABLE_LIQUIDATION_SQUEEZE_ENGINE else []
-            strategy_events: list[dict] = []
-            if timeframe.lower() == "4h" and ENABLE_MACD_4H_ENGINE:
-                strategy_events.extend(detect_macd_4h(d, symbol, timeframe))
-            if timeframe.lower() == "1h" and ENABLE_MA_COMPRESSION_ENGINE:
-                strategy_events.extend(detect_ma_compression_breakout(d, symbol, timeframe))
-            if ENABLE_BREAKOUT_MOMENTUM_ENGINE:
-                strategy_events.extend(detect_breakout_momentum(d, symbol, timeframe))
-            if ENABLE_DONCHIAN_RETEST_ENGINE:
-                strategy_events.extend(detect_donchian_retest(d, symbol, timeframe))
-            if ENABLE_LIQUIDITY_SWEEP_ENGINE:
-                strategy_events.extend(detect_liquidity_sweep_reclaim(d, symbol, timeframe))
-            if ENABLE_EMA_PULLBACK_ENGINE:
-                strategy_events.extend(detect_ema_pullback_continuation(d, symbol, timeframe))
-            if ENABLE_ORDER_BLOCK_ENGINE:
-                strategy_events.extend(detect_order_block(d, symbol, timeframe))
-            if ENABLE_BREAKER_BLOCK_ENGINE:
-                strategy_events.extend(detect_breaker_block(d, symbol, timeframe))
-            if ENABLE_MITIGATION_BLOCK_ENGINE:
-                mitigation_events = detect_mitigation_block(d, symbol, timeframe)
-                if not ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE:
-                    mitigation_events = [ev for ev in mitigation_events if str(ev.get("event_type", "")).upper() != "MITIGATION_BLOCK_BULLISH"]
-                strategy_events.extend(mitigation_events)
-            if ENABLE_SFP_ENGINE:
-                strategy_events.extend(detect_sfp(d, symbol, timeframe))
-            if ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE:
-                strategy_events.extend(detect_liquidation_cascade_fvg(r, d, symbol, timeframe))
-            if ENABLE_CRT_ENGINE:
-                strategy_events.extend(detect_crt(d, symbol, timeframe))
-            tf_stats["scanned"] += 1
-            stats["divergence_events"] += len(divs)
-            stats["squeeze_events"] += len(sqs) + len(liqs)
-            tf_stats["divergence_events"] += len(divs)
-            tf_stats["squeeze_events"] += len(sqs) + len(liqs)
-            stats["events_total"] += len(divs) + len(vp_events) + len(harmonic_events) + len(sqs) + len(liqs) + len(strategy_events)
-            for ev in divs + vp_events + harmonic_events + sqs + liqs + strategy_events:
-                ev.setdefault("event_fact", {})["market_data_source"] = MARKET_DATA_SOURCE
-                ev["event_fact"]["execution_exchange"] = "BingX"
-                if not _event_is_fresh(ev, now_ms, MAX_AGE):
-                    continue
-                fresh.append(ev)
-                eid = ev.get("event_id")
-                if eid and eid not in seen_ids:
-                    emit_event(ev)
-                    seen_ids.add(eid)
 
-            # Persist the watermark only AFTER event emission succeeded. If the
-            # journal write or state write fails, this symbol remains due for a
-            # later run instead of being silently skipped forever. Persisting
-            # after every successfully scanned symbol also preserves progress
-            # across workflow timeout/interruption.
-            _mark_symbol_scanned(scan_state, symbol, timeframe, completed_bucket)
-            _save_timeframe_scan_state(scan_state)
+            valid_close_ts: list[int] = []
+            for row in klines:
+                try:
+                    close_ts = int(row.get("close_time"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if close_ts > now_ms:
+                    continue
+                valid_close_ts.append(close_ts)
+            available_buckets = {ts // interval_ms for ts in valid_close_ts}
+            targets = _scan_buckets_to_process(
+                scan_state, symbol, timeframe, completed_bucket, available_buckets,
+            )
+            if not targets:
+                if _symbol_scan_due(scan_state, symbol, timeframe, completed_bucket):
+                    log.warning(
+                        "[SCAN_STATE] %s %s has no contiguous closed bucket available through %d; watermark deferred.",
+                        symbol, timeframe.upper(), completed_bucket,
+                    )
+                continue
+
+            symbol_scanned_any = False
+            for bucket in targets:
+                frame_rows = _frame_through_bucket(klines, timeframe, bucket)
+                if len(frame_rows) < 60:
+                    log.warning(
+                        "[SIGNALS] %s %s bucket=%d has only %d historical candles; watermark deferred at prior bucket.",
+                        timeframe.upper(), symbol, bucket, len(frame_rows),
+                    )
+                    break
+
+                d = add_cvd(pd.DataFrame(frame_rows))
+                # Audit fix B2: attach the accumulated OI snapshot history so
+                # detect_divergences can emit Price-vs-OI divergence when coverage
+                # is sufficient (no events until enough buckets are recorded).
+                d = attach_oi_series(d, _load_oi_history().get(symbol))
+                d = attach_funding_series(d, _load_funding_history().get(symbol))
+                divs = detect_divergences(d, symbol, timeframe)
+                vp_events = detect_volume_profile_divergence(d, symbol, timeframe) if ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE else []
+                harmonic_events = detect_harmonic_patterns(d, symbol, timeframe) if ENABLE_HARMONIC_PATTERN_ENGINE else []
+                sqs = detect_squeeze_release(
+                    d, symbol, timeframe,
+                    min_squeeze_bars=3,
+                    release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")),
+                )
+                # Forced-liquidation squeeze is an opt-in research engine until local
+                # liquidation time-series coverage is available; the code remains intact.
+                liqs = detect_liquidation_squeeze(r, d, symbol, timeframe) if ENABLE_LIQUIDATION_SQUEEZE_ENGINE else []
+                strategy_events: list[dict] = []
+                if timeframe.lower() == "4h" and ENABLE_MACD_4H_ENGINE:
+                    strategy_events.extend(detect_macd_4h(d, symbol, timeframe))
+                if timeframe.lower() == "1h" and ENABLE_MA_COMPRESSION_ENGINE:
+                    strategy_events.extend(detect_ma_compression_breakout(d, symbol, timeframe))
+                if ENABLE_BREAKOUT_MOMENTUM_ENGINE:
+                    strategy_events.extend(detect_breakout_momentum(d, symbol, timeframe))
+                if ENABLE_DONCHIAN_RETEST_ENGINE:
+                    strategy_events.extend(detect_donchian_retest(d, symbol, timeframe))
+                if ENABLE_LIQUIDITY_SWEEP_ENGINE:
+                    strategy_events.extend(detect_liquidity_sweep_reclaim(d, symbol, timeframe))
+                if ENABLE_EMA_PULLBACK_ENGINE:
+                    strategy_events.extend(detect_ema_pullback_continuation(d, symbol, timeframe))
+                if ENABLE_ORDER_BLOCK_ENGINE:
+                    strategy_events.extend(detect_order_block(d, symbol, timeframe))
+                if ENABLE_BREAKER_BLOCK_ENGINE:
+                    strategy_events.extend(detect_breaker_block(d, symbol, timeframe))
+                if ENABLE_MITIGATION_BLOCK_ENGINE:
+                    mitigation_events = detect_mitigation_block(d, symbol, timeframe)
+                    if not ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE:
+                        mitigation_events = [
+                            ev for ev in mitigation_events
+                            if str(ev.get("event_type", "")).upper() != "MITIGATION_BLOCK_BULLISH"
+                        ]
+                    strategy_events.extend(mitigation_events)
+                if ENABLE_SFP_ENGINE:
+                    strategy_events.extend(detect_sfp(d, symbol, timeframe))
+                if ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE:
+                    strategy_events.extend(detect_liquidation_cascade_fvg(r, d, symbol, timeframe))
+                if ENABLE_CRT_ENGINE:
+                    strategy_events.extend(detect_crt(d, symbol, timeframe))
+
+                symbol_scanned_any = True
+                tf_stats["scanned_buckets"] = int(tf_stats.get("scanned_buckets", 0)) + 1
+                all_events = divs + vp_events + harmonic_events + sqs + liqs + strategy_events
+                stats["events_total"] += len(all_events)
+                stats["divergence_events"] += len(divs)
+                stats["squeeze_events"] += len(sqs) + len(liqs)
+                tf_stats["divergence_events"] += len(divs)
+                tf_stats["squeeze_events"] += len(sqs) + len(liqs)
+
+                for ev in all_events:
+                    ev.setdefault("event_fact", {})["market_data_source"] = MARKET_DATA_SOURCE
+                    ev["event_fact"]["execution_exchange"] = "BingX"
+                    eid = ev.get("event_id")
+                    if eid and eid not in seen_ids:
+                        if not emit_event(ev):
+                            raise EventJournalPersistenceError(
+                                f"event journal write failed for {symbol}/{timeframe} bucket={bucket} event_id={eid}"
+                            )
+                        seen_ids.add(str(eid))
+                    elif not eid:
+                        log.warning(
+                            "[EVENT_JOURNAL] detector emitted event without event_id symbol=%s timeframe=%s bucket=%s; not persisted",
+                            symbol, timeframe.upper(), bucket,
+                        )
+
+                    # Only live/fresh events are eligible for the entry pipeline.
+                    # Older recovered events remain in events.jsonl for audit but do
+                    # not get promoted back into the trade cache after their expiry.
+                    if _event_is_fresh(ev, now_ms, _event_max_age_min(ev)):
+                        fresh.append(ev)
+
+                # The checkpoint advances only after this bucket's detector run AND
+                # every newly detected event has been durably appended to the journal.
+                _mark_symbol_scanned(scan_state, symbol, timeframe, bucket)
+                _save_timeframe_scan_state(scan_state)
+
+            if symbol_scanned_any:
+                tf_stats["scanned"] += 1
+        except EventJournalPersistenceError as exc:
+            _record_scan_error(stats, f"timeframe_{timeframe.lower()}_event_persistence", tf_stats)
+            log.error("[SIGNALS] %s %s persistence failure; watermark remains before failed bucket: %s", timeframe.upper(), symbol, exc)
+            continue
         except (BinanceRateLimitError, BingXRateLimitError) as exc:
             _record_scan_error(stats, f"timeframe_{timeframe.lower()}_rate_limit", tf_stats)
             venue = "BINANCE" if MARKET_DATA_SOURCE == "binance" else "BINGX"
@@ -1590,14 +1783,26 @@ def load_successful_trade_ids(path: Path) -> set[str]:
     return ids
 
 
-def append_jsonl(path: Path, obj: dict) -> None:
+def append_jsonl(path: Path, obj: dict, *, durable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        if durable:
+            os.fsync(f.fileno())
 
 
-def emit_event(ev: dict) -> None:
-    append_jsonl(EVENTS, ev)
+def emit_event(ev: dict) -> bool:
+    """Append one event to the durable source-of-truth journal.
+
+    The caller must not advance scheduler state if this returns False.
+    """
+    try:
+        append_jsonl(EVENTS, ev, durable=True)
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        log.error("[EVENT_JOURNAL] durable write failed event_id=%s error=%s", ev.get("event_id"), exc)
+        return False
 
 
 def record_trade(obj: dict) -> None:
@@ -3276,7 +3481,7 @@ def main() -> None:
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     scan_state = _load_timeframe_scan_state()
-    event_cache = _load_cached_events()
+    event_cache = _load_cached_events(now_ms, terminal_event_ids)
 
     completed_1h = _completed_bucket(3_600_000, now_ms, BAR_CLOSE_GRACE_MIN)
     completed_4h = _completed_bucket(14_400_000, now_ms, BAR_CLOSE_GRACE_MIN)
@@ -3299,7 +3504,6 @@ def main() -> None:
         candidates, "4h", int(os.environ.get("KLINE_LIMIT_4H", "250")),
         now_ms, seen_events, stats, scan_state, completed_4h, scan_klines_cache,
     )
-    _save_timeframe_scan_state(scan_state)
     _scan_state_symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
     log.info(
         "[SCAN_STATE] persisted symbols=%d scanned_1h=%d scanned_4h=%d cache_frames=%d",

@@ -557,8 +557,8 @@ def test_successful_scan_persists_watermark_after_event_emission(monkeypatch, tm
         [SimpleNamespace(symbol="TEST-USDT")], "1h", 250, 2_000_000_000, set(), stats, state, 123
     )
 
-    assert state["symbols"]["TEST-USDT"]["1h"] == 123
-    assert saved and saved[-1]["symbols"]["TEST-USDT"]["1h"] == 123
+    assert state["symbols"]["TEST-USDT"]["1h"] == 79
+    assert saved and saved[-1]["symbols"]["TEST-USDT"]["1h"] == 79
 
 
 def test_incomplete_kline_response_defers_watermark(monkeypatch):
