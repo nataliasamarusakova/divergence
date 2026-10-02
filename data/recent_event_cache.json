@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790966208236,
+  "updated_ts": 1790966519751,
   "events": [
     {
       "event_id": "EVT_779716E9C5631915",
@@ -2690,6 +2690,32 @@
         "trigger_level": 0.0021464,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "VP_1B709B1E2955E809",
+      "symbol": "ORDI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLUME_PROFILE_ACCUMULATION",
+      "timestamps": {
+        "detected_at_ts": 1790963999999
+      },
+      "event_fact": {
+        "detection_close_price": 4.687,
+        "hvn_center": 4.7288125,
+        "hvn_bin": 19,
+        "hvn_volume": 835684.8,
+        "baseline_hvn_volume_projected": 126024.32500000001,
+        "recent_hvn_volume": 331587.5,
+        "hvn_growth_ratio": 2.6311388694206452,
+        "distance_from_hvn_bins": 2.40647482014387,
+        "price_left_hvn": true,
+        "atr": 0.06040964758327302,
+        "volume_profile_method": "ohlcv_typical_price_proxy",
+        "engine": "VOLUME_PROFILE_DIVERGENCE",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
