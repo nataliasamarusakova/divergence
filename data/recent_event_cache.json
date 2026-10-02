@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790900832421,
+  "updated_ts": 1790901157522,
   "events": [
     {
       "event_id": "EVT_42CDC8C7E8CCFE38",
@@ -482,34 +482,6 @@
         "requires_retest": true,
         "trigger_level": 4.285,
         "engine": "MA_COMPRESSION",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_DA48C311118A973F",
-      "symbol": "LSK",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1790895599999,
-        "pivot_2_ts": 1790895599999,
-        "detected_at_ts": 1790895599999
-      },
-      "event_fact": {
-        "detection_close_price": 0.30339,
-        "donchian_high": 0.29809,
-        "donchian_low": 0.2704,
-        "breakout_atr": 0.8181517778149845,
-        "bb_width": 0.10653550019397218,
-        "bb_width_threshold": 0.06563283351315302,
-        "volume_ratio": 2.5431982311101002,
-        "adx": 34.63287275543911,
-        "requires_retest": true,
-        "trigger_level": 0.29809,
-        "engine": "BREAKOUT_MOMENTUM",
         "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
@@ -2031,6 +2003,52 @@
         "range_high": 0.0591,
         "range_low": 0.05632,
         "manipulation_depth_atr": 0.6209313705430434,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_B7CA177962EFEF45",
+      "symbol": "SKY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1790891999999,
+        "pivot_2_ts": 1790899199999,
+        "detected_at_ts": 1790899199999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.08324,
+        "range_high": 0.08493,
+        "range_low": 0.08324,
+        "manipulation_depth_atr": 0.3760706954528621,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_DF4394AF982A4DCC",
+      "symbol": "SKY",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "MACD_4H_BULLISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1790899199999,
+        "pivot_2_ts": 1790899199999,
+        "detected_at_ts": 1790899199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.08442,
+        "macd": 0.0009669923281476894,
+        "macd_signal": 0.0008128025293068938,
+        "macd_hist": 0.0001541897988407956,
+        "ema200": 0.07014968811198598,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
