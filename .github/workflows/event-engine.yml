@@ -180,6 +180,41 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Synchronize persistent scheduler state before tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # repository_dispatch runs may have been queued while a previous engine run
+          # was still active. Force-refresh origin/main and restore the scheduler state
+          # from the remote branch, rather than trusting a possibly stale checkout.
+          git fetch --prune origin main
+          echo "[PERSISTENCE_PRECHECK] checkout_head=$(git rev-parse HEAD)"
+          echo "[PERSISTENCE_PRECHECK] origin_main=$(git rev-parse origin/main)"
+
+          mkdir -p data
+          state_ref="origin/main:data/timeframe_scan_state.json"
+          if git cat-file -e "$state_ref" 2>/dev/null; then
+            git show "$state_ref" > "$RUNNER_TEMP/timeframe_scan_state.remote.json"
+            STATE_REMOTE_FILE="$RUNNER_TEMP/timeframe_scan_state.remote.json" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          p = Path(os.environ["STATE_REMOTE_FILE"])
+          raw = json.loads(p.read_text(encoding="utf-8"))
+          symbols = raw.get("symbols") if isinstance(raw, dict) else None
+          if not isinstance(symbols, dict):
+              raise SystemExit("[PERSISTENCE_PRECHECK] remote scheduler state has no symbols object")
+          if raw.get("version") != 2:
+              raise SystemExit(f"[PERSISTENCE_PRECHECK] unsupported scheduler state version: {raw.get('version')!r}")
+          p2 = Path("data/timeframe_scan_state.json")
+          p2.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+          print(f"[PERSISTENCE_PRECHECK] restored remote scheduler state symbols={len(symbols)} sha256_pending")
+          PY
+            sha256sum data/timeframe_scan_state.json
+          else
+            echo "[PERSISTENCE_PRECHECK] origin/main has no scheduler state yet; first-run bootstrap"
+          fi
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -443,22 +478,45 @@ jobs:
           git config user.name "actions-user"
           git config user.email "actions@github.com"
 
+          echo "=== LOCAL RUNTIME STATE BEFORE COMMIT ==="
           git status --short
-          # Per-symbol timeframe watermarks are required persistent runtime state.
-          # Stage this file explicitly so a future ignore/glob change cannot silently
-          # cause the engine to rescan the entire universe on every dispatch.
-          if [ -f data/timeframe_scan_state.json ]; then
-            git add -f data/timeframe_scan_state.json
-            echo "[COMMIT_STATE] timeframe_scan_state.json staged"
-          else
-            echo "[COMMIT_STATE] WARNING: timeframe_scan_state.json is missing" >&2
+
+          if [ ! -s data/timeframe_scan_state.json ]; then
+            echo "[COMMIT_STATE] ERROR: timeframe_scan_state.json is missing or empty" >&2
+            exit 1
           fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("data/timeframe_scan_state.json")
+          raw = json.loads(p.read_text(encoding="utf-8"))
+          symbols = raw.get("symbols") if isinstance(raw, dict) else None
+          if raw.get("version") != 2 or not isinstance(symbols, dict):
+              raise SystemExit("[COMMIT_STATE] ERROR: invalid scheduler state schema")
+          print(f"[COMMIT_STATE] local scheduler state version=2 symbols={len(symbols)}")
+          PY
+          local_sha="$(sha256sum data/timeframe_scan_state.json | awk '{print $1}')"
+          echo "[COMMIT_STATE] local_sha256=$local_sha"
+
+          # Per-symbol timeframe watermarks are required persistent runtime state.
+          # Stage this file explicitly so an ignore/glob change cannot silently
+          # cause a full-universe rescan on the next dispatch.
+          git add -f data/timeframe_scan_state.json
           git add data/*.jsonl data/*.json 2>/dev/null || true
+          echo "[COMMIT_STATE] staged scheduler state"
           echo "=== STAGED RUNTIME STATE ==="
           git diff --cached --name-only | sed -n '1,120p'
 
           if git diff --cached --quiet; then
             echo "No state changes"
+            # Even with no local diff, prove that the remote branch contains a valid state.
+            git fetch --prune origin main
+            if ! git cat-file -e origin/main:data/timeframe_scan_state.json 2>/dev/null; then
+              echo "[COMMIT_STATE] ERROR: local state unchanged but origin/main has no scheduler state" >&2
+              exit 1
+            fi
+            echo "[COMMIT_STATE] remote scheduler state exists; no commit required"
             exit 0
           fi
 
@@ -466,7 +524,7 @@ jobs:
 
           max_attempts=5
           for attempt in $(seq 1 "$max_attempts"); do
-            git fetch origin main
+            git fetch --prune origin main
 
             if [ -n "$(git status --porcelain)" ]; then
               git add -A
@@ -477,7 +535,27 @@ jobs:
 
             if git rebase origin/main; then
               if git push origin HEAD:main; then
-                echo "State pushed successfully"
+                git fetch --prune origin main
+                if ! git cat-file -e origin/main:data/timeframe_scan_state.json 2>/dev/null; then
+                  echo "[COMMIT_STATE] ERROR: push succeeded but remote scheduler state is absent" >&2
+                  exit 1
+                fi
+                remote_sha="$(git show origin/main:data/timeframe_scan_state.json | sha256sum | awk '{print $1}')"
+                echo "[COMMIT_STATE] remote_sha256=$remote_sha"
+                if [ "$remote_sha" != "$local_sha" ]; then
+                  echo "[COMMIT_STATE] ERROR: remote scheduler state hash differs from local state" >&2
+                  exit 1
+                fi
+                python - <<'PY'
+          import json
+          import subprocess
+          raw = json.loads(subprocess.check_output(["git", "show", "origin/main:data/timeframe_scan_state.json"], text=True))
+          symbols = raw.get("symbols") if isinstance(raw, dict) else None
+          if raw.get("version") != 2 or not isinstance(symbols, dict):
+              raise SystemExit("[COMMIT_STATE] ERROR: remote scheduler state schema invalid after push")
+          print(f"[COMMIT_STATE] remote verified version=2 symbols={len(symbols)}")
+          PY
+                echo "State pushed and verified successfully"
                 exit 0
               fi
             else
@@ -489,4 +567,5 @@ jobs:
             fi
           done
 
+          echo "[COMMIT_STATE] ERROR: failed to push persistent runtime state after $max_attempts attempts" >&2
           exit 1
