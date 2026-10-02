@@ -72,7 +72,6 @@ from event_engine.signals import (
 from event_engine.sr_context import (
     get_cached_sr_snapshot,
     evaluate_sr_room,
-    apply_sr_tp3_cap,
 )
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
@@ -223,6 +222,7 @@ ENABLE_DIVERGENCE_ENGINE = os.environ.get("ENABLE_DIVERGENCE_ENGINE", "true").lo
 DIVERGENCE_SHADOW_ONLY = os.environ.get("DIVERGENCE_SHADOW_ONLY", "false").lower() == "true"
 DIVERGENCE_SHADOW_STATE = DATA / "divergence_shadow_trades.json"
 MAX_PRE_ORDER_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_PRE_ORDER_DRIFT_REJECTIONS", "3")))
+MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS = max(1, int(os.environ.get("MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS", "3")))
 CROSS_EXCHANGE_PRICE_GUARD_ENABLED = os.environ.get("CROSS_EXCHANGE_PRICE_GUARD_ENABLED", "true").lower() == "true"
 MAX_CROSS_EXCHANGE_DRIFT_PCT = float(os.environ.get("MAX_CROSS_EXCHANGE_DRIFT_PCT", "1.00"))
 ENABLE_MACD_4H_ENGINE = os.environ.get("ENABLE_MACD_4H_ENGINE", "true").lower() == "true"
@@ -1188,6 +1188,42 @@ def load_pre_order_drift_failure_counts(path: Path, terminal_ids: set[str] | Non
         if isinstance(result, dict) and str(result.get("status", "")) == "PRE_ORDER_DRIFT_EXCEEDED":
             counts[event_id] = counts.get(event_id, 0) + 1
     return counts
+
+
+def load_cross_exchange_drift_failure_counts(path: Path, terminal_ids: set[str] | None = None) -> dict[str, int]:
+    """Count repeated cross-exchange drift rejections per event.
+
+    The count is persisted in ``trades.jsonl`` via EXECUTION_ATTEMPT records so a
+    workflow restart cannot reset the retry budget and retry the same stale or
+    inconsistent cross-exchange event forever.
+    """
+    if not path.exists():
+        return {}
+    terminal_ids = terminal_ids or set()
+    counts: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("record_type") != "EXECUTION_ATTEMPT":
+            continue
+        event_id = str(obj.get("event_id") or "")
+        if not event_id or event_id in terminal_ids:
+            continue
+        result = obj.get("result") or {}
+        if isinstance(result, dict) and str(result.get("status", "")) == "CROSS_EXCHANGE_DRIFT_EXCEEDED":
+            counts[event_id] = counts.get(event_id, 0) + 1
+    return counts
+
+
+def _register_cross_exchange_drift_failure(event_id: str, failure_counts: dict[str, int]) -> tuple[int, bool]:
+    """Record one cross-exchange drift rejection and report whether it is exhausted."""
+    current_fail_count = failure_counts.get(event_id, 0) + 1
+    failure_counts[event_id] = current_fail_count
+    return current_fail_count, current_fail_count >= MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS
 
 
 def load_successful_telegram_ids(path: Path) -> set[str]:
@@ -2794,7 +2830,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
         # The pre-order SR check protects the decision to submit the market order.
         # Re-evaluate once on the confirmed average fill so a materially different
-        # fill price cannot make TP2 unreachable or leave a stale TP3 cap in place.
+        # fill price cannot make TP1 unreachable. The TP ladder itself is never
+        # mutated by this S/R check.
         # This uses the already-fetched closed-1H snapshot, so it adds no network call.
         if (
             AJAY_SR_ROOM_MODE == "enforce"
@@ -3157,6 +3194,14 @@ def main() -> None:
     executed_event_ids = load_successful_trade_ids(TRADES)
     terminal_event_ids = load_terminal_event_ids(TRADES)
     pre_order_drift_fail_counts = load_pre_order_drift_failure_counts(TRADES, terminal_event_ids)
+    cross_exchange_drift_fail_counts = load_cross_exchange_drift_failure_counts(TRADES, terminal_event_ids)
+    # Older state files may already contain an exhausted cross-exchange retry budget
+    # without an EVENT_TERMINAL marker. Retire those events on restart so the next
+    # scan cannot issue one more fresh MARKET-entry attempt for the same event.
+    for exhausted_event_id, failure_count in cross_exchange_drift_fail_counts.items():
+        if failure_count >= MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS:
+            terminal_event_ids.add(exhausted_event_id)
+            executed_event_ids.add(exhausted_event_id)
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     scan_state = _load_timeframe_scan_state()
@@ -3610,7 +3655,8 @@ def main() -> None:
     for i, opp in enumerate(opportunities[:5], start=1):
         log.info("  [RANKING] #%d: %s %s | Score: %.0f (not ranked on) | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
-    trades_this_cycle = 0
+    execution_attempts_this_cycle = 0
+    opened_trades_this_cycle = 0
 
     for opp in opportunities:
         evidence = list(opp.get("confluence_events", []))
@@ -3746,11 +3792,11 @@ def main() -> None:
                     "setup_used_for_protection": (active_trade or {}).get("setup", {}) if active_trade else setup,
                 }
                 log.info("[EXECUTION] %s (%s) - Already open/executed or blocked by cooldown.", symbol, direction)
-            elif MAX_TRADES <= 0 or trades_this_cycle < MAX_TRADES:
+            elif MAX_TRADES <= 0 or execution_attempts_this_cycle < MAX_TRADES:
                 stats["execution_attempts"] += 1
-                trades_this_cycle += 1
+                execution_attempts_this_cycle += 1
                 attempt_limit = "unlimited" if MAX_TRADES <= 0 else str(MAX_TRADES)
-                log.info("[EXECUTION] Attempt #%d/%s: %s %s (Score: %.0f, Ref: %.8g)...", trades_this_cycle, attempt_limit, direction, symbol, score, price)
+                log.info("[EXECUTION] Attempt #%d/%s: %s %s (Score: %.0f, Ref: %.8g)...", execution_attempts_this_cycle, attempt_limit, direction, symbol, score, price)
                 execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
                 actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
                 actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
@@ -3775,6 +3821,21 @@ def main() -> None:
                         log.info(
                             "[EXECUTION] %s (%s) pre-order drift rejection %d/%d for event %s; keeping event retryable.",
                             symbol, direction, current_fail_count, MAX_PRE_ORDER_DRIFT_REJECTIONS, event_id,
+                        )
+                elif status_now == "CROSS_EXCHANGE_DRIFT_EXCEEDED":
+                    current_fail_count, exhausted = _register_cross_exchange_drift_failure(
+                        event_id, cross_exchange_drift_fail_counts
+                    )
+                    if exhausted:
+                        terminal_reason = "CROSS_EXCHANGE_DRIFT_EXHAUSTED"
+                        log.warning(
+                            "[EXECUTION] %s (%s) cross-exchange drift rejected %d times; terminalizing event %s.",
+                            symbol, direction, current_fail_count, event_id,
+                        )
+                    else:
+                        log.info(
+                            "[EXECUTION] %s (%s) cross-exchange drift rejection %d/%d for event %s; keeping event retryable.",
+                            symbol, direction, current_fail_count, MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS, event_id,
                         )
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
@@ -3892,6 +3953,7 @@ def main() -> None:
                 if status in {"opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
                     if status in {"opened_protected", "opened_protection_check_required"} or actual_qty_for_state > 0:
                         stats["trades"] += 1
+                        opened_trades_this_cycle += 1
     
                     try:
                         protection = execution_result.get("protection", {})
@@ -3916,7 +3978,7 @@ def main() -> None:
                         log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
             else:
                 execution_result = {"status": "TRADE_LIMIT_REACHED", "mode": EXECUTION_MODE, "order_id": None}
-                log.info("[EXECUTION] %s %s skipped: cycle limit reached (%d/%d).", direction, symbol, trades_this_cycle, MAX_TRADES)
+                log.info("[EXECUTION] %s %s skipped: execution-attempt cycle limit reached (%d/%d).", direction, symbol, execution_attempts_this_cycle, MAX_TRADES)
     
         elif not EXECUTION_ENABLED:
             execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
@@ -3982,8 +4044,8 @@ def main() -> None:
 
     summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
     log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)
-    log.info("[SUMMARY] [ENGINE_SUMMARY] trades_this_cycle=%d %s", trades_this_cycle, summary_str)
-    log.info("========== [ENGINE] CYCLE END: trades_this_cycle=%d ==========", trades_this_cycle)
+    log.info("[SUMMARY] [ENGINE_SUMMARY] opened_trades_this_cycle=%d execution_attempts_this_cycle=%d %s", opened_trades_this_cycle, execution_attempts_this_cycle, summary_str)
+    log.info("========== [ENGINE] CYCLE END: opened_trades_this_cycle=%d execution_attempts_this_cycle=%d ==========", opened_trades_this_cycle, execution_attempts_this_cycle)
 
 
 if __name__ == "__main__":

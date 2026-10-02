@@ -130,6 +130,32 @@ def test_repeated_pre_order_drift_failures_are_counted(tmp_path, monkeypatch):
     assert run_once.load_pre_order_drift_failure_counts(path) == {"EVT_A": 2}
 
 
+def test_repeated_cross_exchange_drift_failures_are_counted(tmp_path):
+    import run_once
+
+    path = tmp_path / "trades.jsonl"
+    rows = [
+        {"record_type": "EXECUTION_ATTEMPT", "event_id": "EVT_A", "result": {"status": "CROSS_EXCHANGE_DRIFT_EXCEEDED"}},
+        {"record_type": "EXECUTION_ATTEMPT", "event_id": "EVT_A", "result": {"status": "CROSS_EXCHANGE_DRIFT_EXCEEDED"}},
+        {"record_type": "EXECUTION_ATTEMPT", "event_id": "EVT_A", "result": {"status": "OPEN_FAILED"}},
+        {"record_type": "EXECUTION_ATTEMPT", "event_id": "EVT_B", "result": {"status": "CROSS_EXCHANGE_DRIFT_EXCEEDED"}},
+    ]
+    path.write_text("\n".join(json.dumps(x) for x in rows), encoding="utf-8")
+    assert run_once.load_cross_exchange_drift_failure_counts(path) == {"EVT_A": 2, "EVT_B": 1}
+    assert run_once.load_cross_exchange_drift_failure_counts(path, {"EVT_A"}) == {"EVT_B": 1}
+
+
+def test_cross_exchange_drift_retry_budget_exhausts_on_third_rejection(monkeypatch):
+    import run_once
+
+    monkeypatch.setattr(run_once, "MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS", 3)
+    counts = {}
+    assert run_once._register_cross_exchange_drift_failure("EVT_A", counts) == (1, False)
+    assert run_once._register_cross_exchange_drift_failure("EVT_A", counts) == (2, False)
+    assert run_once._register_cross_exchange_drift_failure("EVT_A", counts) == (3, True)
+    assert run_once._register_cross_exchange_drift_failure("EVT_B", counts) == (1, False)
+
+
 def test_terminal_event_ids_are_loaded(tmp_path):
     import run_once
 

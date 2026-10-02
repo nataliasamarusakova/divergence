@@ -163,22 +163,10 @@ def test_opposing_zone_behind_entry_does_not_block():
     assert out["nearest_opposing_zone"] is None
 
 
-def test_apply_sr_tp3_cap_remains_backward_compatible_for_explicit_call():
+def test_current_sr_policy_has_no_tp3_cap_helper():
     import event_engine.sr_context as sr
-    setup = {"risk_pct": 2.0, "target_rr": 2.5, "planned_weighted_rr": 1.6625}
-    tp_levels = [
-        {"leg": "tp1", "pnl_pct": 1.5, "close_fraction": 0.25},
-        {"leg": "tp2", "pnl_pct": 3.0, "close_fraction": 0.40},
-        {"leg": "tp3", "pnl_pct": 5.0, "close_fraction": 0.35},
-    ]
-    sr_result = {"tp3_capped": True, "effective_tp3_price": 103.8}
-    adjusted, rr = sr.apply_sr_tp3_cap(
-        setup, direction="LONG", tp_levels=tp_levels, sr_result=sr_result, actual_entry_price=100.0
-    )
-    assert adjusted[2]["pnl_pct"] == 3.8
-    assert abs(rr - 1.9) < 1e-9
-    assert setup["target_rr"] == 1.9
-    assert setup["sr_tp3_capped"] is True
+    assert not hasattr(sr, "apply_sr_tp3_cap")
+
 
 def test_execute_new_position_blocks_before_order_when_sr_room_fails(monkeypatch):
     import run_once as ro

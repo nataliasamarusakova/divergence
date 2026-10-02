@@ -8,9 +8,9 @@ It is requested only after a symbol has already survived the existing event, HTF
 BingX market order path.
 
 The current source is **Binance SPOT 1H** (`https://data-api.binance.vision`) through the
-existing Binance WireProxy in the VST workflow. This is a deliberate temporary choice. The signal engine itself still uses Binance Futures
-for market data. Before switching the SR source to futures, the same levels must be
-compared against the TradingView instrument/feed to ensure the source is correct.
+existing Binance WireProxy in the VST workflow. This is a deliberate temporary choice. The signal
+engine itself still uses Binance Futures for market data. Before switching the SR source to futures,
+the same levels must be compared against the TradingView instrument/feed to ensure the source is correct.
 
 ## SR geometry policy
 
@@ -24,7 +24,6 @@ compared against the TradingView instrument/feed to ensure the source is correct
 - SHORT: support/demand below is the opposing zone; resistance/supply above is
   supporting context.
 - Entry inside an opposing zone is rejected.
-- Entry inside an opposing zone is rejected.
 - An opposing zone that reaches or crosses TP1 is rejected.
 - An opposing zone after TP1 is allowed; it does not block the entry and does not mutate
   TP2/TP3. This intentionally follows the current rule: only failure to have room for
@@ -32,8 +31,6 @@ compared against the TradingView instrument/feed to ensure the source is correct
 - A supporting zone aligned with the trade direction is recorded as confirmation context
   only: LONG inside Demand/Support and SHORT inside Supply/Resistance. It never adds
   arbitrary legacy-score points and never overrides other entry conditions.
-- Supporting zones never add arbitrary legacy-score points. They are recorded as
-  context only so their real forward value can be measured later.
 - Multiple candidate events for one symbol reuse one cached SR snapshot per latest
   closed 1H bar.
 - S/R data is based only on closed 1H candles; no developing candle is used.
@@ -64,9 +61,9 @@ TradingView levels, then run shadow, then enforce.
 
 When SR enforcement is active, the same closed-1H snapshot is evaluated again after the
 confirmed BingX average fill and before protective orders are installed. If the worse fill
-makes TP2 unreachable, the candidate is flattened and terminalized. If the fill remains valid, the existing TP ladder is preserved. The current shipped room
-rule does not cap TP3; post-TP1 opposing zones are diagnostic context only. Shadow mode
-remains observational and never mutates the TP ladder.
+makes TP1 unreachable, the candidate is flattened and terminalized. An opposing zone that
+starts after TP1 remains allowed, and the existing TP ladder is preserved without capping TP3.
+Shadow mode remains observational and never mutates the TP ladder.
 ## Regression-audit note
 The final release also isolates the tracker SL-fill regression test from the live BingX price endpoint; tests must remain deterministic and read-only.
 
@@ -79,3 +76,10 @@ reconciliation also falls back to the same 7% stop when no historical trade prof
 
 The 7% stop means the normal target ladder is 5.25% / 10.50% / 17.50% (0.75R / 1.50R /
 2.50R) and squeeze targets are 7% / 14% / 21% (1R / 2R / 3R).
+
+## Cross-exchange drift retry guard
+
+A `CROSS_EXCHANGE_DRIFT_EXCEEDED` pre-order rejection is retryable for up to 3
+rejections of the same event. After the third rejection the event is terminalized
+with `CROSS_EXCHANGE_DRIFT_EXHAUSTED`, and the persisted `EXECUTION_ATTEMPT` history
+prevents a workflow restart from resetting that budget.

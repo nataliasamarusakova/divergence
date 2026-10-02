@@ -13,11 +13,28 @@ def test_clean_release_uses_divergence_shadow_mode():
 
 def test_clean_release_has_pre_order_drift_retry_budget():
     assert 'MAX_PRE_ORDER_DRIFT_REJECTIONS: "3"' in _workflow()
+    assert 'MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS: "3"' in _workflow()
     assert 'ENTRY_QUALITY_GATE_ENABLED: "true"' in _workflow()
     assert 'ENTRY_QUALITY_MODE: "shadow"' in _workflow()
     assert 'REQUIRE_MULTI_TP: "true"' in _workflow()
     assert 'REJECT_ATR_RISK_CLIP: "false"' in _workflow()
     assert 'FIXED_STOP_LOSS_PCT: "7.00"' in _workflow()
+
+
+def test_vst_research_release_keeps_portfolio_and_cycle_caps_off():
+    workflow = _workflow()
+    assert 'EXECUTION_MODE: vst' in workflow
+    assert 'PORTFOLIO_CAP_ENABLED: "false"' in workflow
+    assert 'MAX_TRADES_PER_CYCLE: "0"' in workflow
+
+
+def test_release_telemetry_uses_attempts_and_opened_trades_separately():
+    import run_once
+    source = Path(run_once.__file__).read_text(encoding="utf-8")
+    assert "ENGINE_SUMMARY] trades_this_cycle=" not in source
+    assert "CYCLE END: trades_this_cycle=" not in source
+    assert "opened_trades_this_cycle=" in source
+    assert "execution_attempts_this_cycle=" in source
 
 
 def test_shadow_flag_is_actually_reachable():
@@ -71,6 +88,12 @@ def test_release_uses_fixed_seven_percent_stop():
     assert 'FIXED_STOP_LOSS_PCT: "7.00"' in workflow
     assert 'MAX_ENTRY_RISK_PCT: "7.00"' in workflow
     assert 'REJECT_ATR_RISK_CLIP: "false"' in workflow
+
+
+def test_release_has_no_legacy_sr_tp3_cap_setting():
+    workflow = _workflow()
+    assert "AJAY_SR_MIN_PARTIAL_TP3_R" not in workflow
+    assert "apply_sr_tp3_cap" not in workflow
 
 
 def test_release_enables_lazy_ajay_sr_room_using_spot():
