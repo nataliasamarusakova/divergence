@@ -562,16 +562,49 @@ def _load_cached_events() -> list[dict]:
 
 
 def _load_timeframe_scan_state() -> dict:
-    """Load per-symbol/per-timeframe scan state, migrating old global buckets."""
-    raw = _load_json(TIMEFRAME_STATE, {})
+    """Load per-symbol/per-timeframe scan state with explicit failure telemetry.
+
+    A missing or malformed state file is fail-safe for trading, but it must never
+    be silent: returning ``symbols={}`` causes a full universe rescan. The caller
+    therefore gets a structured empty state plus a log explaining why the state
+    was not reusable.
+    """
+    if not TIMEFRAME_STATE.exists():
+        log.warning("[SCAN_STATE] missing file path=%s; starting with empty state", TIMEFRAME_STATE)
+        return {"version": 2, "symbols": {}}
+
+    try:
+        raw = json.loads(TIMEFRAME_STATE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        log.error("[SCAN_STATE] invalid JSON path=%s line=%d col=%d; starting empty state",
+                  TIMEFRAME_STATE, exc.lineno, exc.colno)
+        return {"version": 2, "symbols": {}}
+    except OSError as exc:
+        log.error("[SCAN_STATE] read failed path=%s error=%s; starting empty state",
+                  TIMEFRAME_STATE, exc)
+        return {"version": 2, "symbols": {}}
+
     if not isinstance(raw, dict):
-        return {"symbols": {}}
+        log.error("[SCAN_STATE] invalid root type=%s path=%s; starting empty state",
+                  type(raw).__name__, TIMEFRAME_STATE)
+        return {"version": 2, "symbols": {}}
+
+    if raw.get("version") != 2:
+        log.warning("[SCAN_STATE] unsupported version=%r path=%s; rebuilding per-symbol state",
+                    raw.get("version"), TIMEFRAME_STATE)
+        return {"version": 2, "symbols": {}}
+
     symbols = raw.get("symbols")
     if isinstance(symbols, dict):
+        # Copy only the fields the scheduler owns; malformed per-symbol records
+        # are handled individually by _symbol_scan_due and never suppress a scan.
         return {"version": 2, "symbols": symbols}
+
     # Legacy format used one bucket for the whole universe. Do not copy it to
     # symbols: doing so would hide newly discovered symbols. Start them from
     # scratch once, then persist their own last-scanned closed bar.
+    log.warning("[SCAN_STATE] unsupported/legacy schema path=%s keys=%s; rebuilding per-symbol state",
+                TIMEFRAME_STATE, sorted(str(k) for k in raw.keys())[:20])
     return {"version": 2, "symbols": {}}
 
 

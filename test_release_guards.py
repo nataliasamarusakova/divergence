@@ -28,6 +28,23 @@ def test_vst_research_release_keeps_portfolio_and_cycle_caps_off():
     assert 'MAX_TRADES_PER_CYCLE: "0"' in workflow
 
 
+def test_scheduler_state_is_force_refreshed_before_engine():
+    workflow = _workflow()
+    assert 'Synchronize persistent scheduler state before tests' in workflow
+    assert 'git fetch --prune origin main' in workflow
+    assert 'origin/main:data/timeframe_scan_state.json' in workflow
+    assert '[PERSISTENCE_PRECHECK] restored remote scheduler state' in workflow
+
+
+def test_scheduler_state_push_is_verified_on_remote():
+    workflow = _workflow()
+    assert '[COMMIT_STATE] local scheduler state version=2 symbols=' in workflow
+    assert 'git add -f data/timeframe_scan_state.json' in workflow
+    assert 'remote_sha256=' in workflow
+    assert 'remote verified version=2 symbols=' in workflow
+    assert 'State pushed and verified successfully' in workflow
+
+
 def test_release_telemetry_uses_attempts_and_opened_trades_separately():
     import run_once
     source = Path(run_once.__file__).read_text(encoding="utf-8")

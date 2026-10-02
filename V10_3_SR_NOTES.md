@@ -136,3 +136,16 @@ Runtime telemetry: event `Age` is measured from the event's `detected_at_ts`, wh
 for the latest-bar strategy engines is the close time of the same latest completed
 candle. Multiple events derived from that candle therefore legitimately share the
 same age; subsequent cycles should show that age increasing until the event expires.
+
+
+## v10.4.1 scheduler persistence hardening
+
+The workflow now force-refreshes `origin/main` before tests and restores the remote
+`data/timeframe_scan_state.json` into the runner workspace before the engine starts.
+The engine emits explicit missing/invalid-state diagnostics instead of silently
+turning every persistence failure into `symbols=0`.
+
+The runtime-state commit step now validates the scheduler state schema before staging,
+force-stages the state file, pushes with retry/rebase handling, then fetches `origin/main`
+and verifies that the pushed scheduler-state hash and symbol count match the local state.
+This keeps per-symbol 1H/4H watermarks persistent without changing detector or S/R logic.
