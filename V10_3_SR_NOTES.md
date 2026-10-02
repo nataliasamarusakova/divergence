@@ -118,3 +118,21 @@ and squeeze 1.00R/1.50R/2.00R, with existing partial-exit fractions preserved. R
 uses the same current ladder only when no persisted TP profile exists; persisted historical TP profiles are preserved.
 BE remains an execution/risk-management mechanism, but the successful `BE_ACTIVATED` transition is no longer
 queued for Telegram. Local `[TRACKER_BE_ACTIVATED]` logging and `BE_FAILED` Telegram alerts remain intact.
+
+## v10.4.0 runtime-scan audit note
+
+The 2026-10-02 second run showed a full 1H+4H universe rescan again. With the
+production `BAR_CLOSE_GRACE_MIN=2`, the 13:02 and 13:12 UTC cycles should map to
+the same completed 1H/4H buckets. Therefore a second full rescan proves that the
+persisted per-symbol `timeframe_scan_state.json` was not available/matched at the
+start of that run; the engine did not intentionally need to rescan those buckets.
+
+Additional same-cycle optimization: when a 1H/4H frame has already been fetched
+for event detection in the current cycle, its raw candles are reused for the
+same-cycle risk/HTF checks instead of issuing a duplicate Binance kline request.
+This does not change detector logic or closed-bar selection.
+
+Runtime telemetry: event `Age` is measured from the event's `detected_at_ts`, which
+for the latest-bar strategy engines is the close time of the same latest completed
+candle. Multiple events derived from that candle therefore legitimately share the
+same age; subsequent cycles should show that age increasing until the event expires.

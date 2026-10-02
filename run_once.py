@@ -1045,7 +1045,7 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
     return rec
 
 
-def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: int, seen_ids: set[str], stats: dict, scan_state: dict, completed_bucket: int) -> list[dict]:
+def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: int, seen_ids: set[str], stats: dict, scan_state: dict, completed_bucket: int, scan_klines_cache: dict[tuple[str, str], list[dict]] | None = None) -> list[dict]:
     fresh: list[dict] = []
     for r in candidates:
         symbol = str(r.symbol).upper()
@@ -1054,6 +1054,8 @@ def _refresh_timeframe_events(candidates, timeframe: str, limit: int, now_ms: in
         tf_stats = _tf_stats(stats, timeframe)
         try:
             klines = _fetch_market_klines_scan(symbol, timeframe, limit)
+            if scan_klines_cache is not None:
+                scan_klines_cache[(symbol, timeframe.lower())] = list(klines or [])
             if len(klines) < 60:
                 log.warning("[SIGNALS] %s %s returned only %d candles; watermark deferred.", timeframe.upper(), symbol, len(klines))
                 continue
@@ -3245,17 +3247,33 @@ def main() -> None:
 
     completed_1h = _completed_bucket(3_600_000, now_ms, BAR_CLOSE_GRACE_MIN)
     completed_4h = _completed_bucket(14_400_000, now_ms, BAR_CLOSE_GRACE_MIN)
+    _scan_state_symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
+    log.info(
+        "[SCAN_STATE] loaded symbols=%d completed_1h_bucket=%d completed_4h_bucket=%d grace_min=%.2f",
+        len(_scan_state_symbols) if isinstance(_scan_state_symbols, dict) else 0,
+        completed_1h, completed_4h, BAR_CLOSE_GRACE_MIN,
+    )
 
     # Per-symbol watermarks preserve the existing event math while ensuring that a
     # symbol entering the liquidity universe late is scanned immediately for its
     # latest completed bar. Failures do not advance the watermark.
+    scan_klines_cache: dict[tuple[str, str], list[dict]] = {}
     new_1h = _refresh_timeframe_events(
         candidates, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")),
-        now_ms, seen_events, stats, scan_state, completed_1h,
+        now_ms, seen_events, stats, scan_state, completed_1h, scan_klines_cache,
     )
     new_4h = _refresh_timeframe_events(
         candidates, "4h", int(os.environ.get("KLINE_LIMIT_4H", "250")),
-        now_ms, seen_events, stats, scan_state, completed_4h,
+        now_ms, seen_events, stats, scan_state, completed_4h, scan_klines_cache,
+    )
+    _save_timeframe_scan_state(scan_state)
+    _scan_state_symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
+    log.info(
+        "[SCAN_STATE] persisted symbols=%d scanned_1h=%d scanned_4h=%d cache_frames=%d",
+        len(_scan_state_symbols) if isinstance(_scan_state_symbols, dict) else 0,
+        int(_tf_stats(stats, "1h").get("scanned", 0)),
+        int(_tf_stats(stats, "4h").get("scanned", 0)),
+        len(scan_klines_cache),
     )
     event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
     event_cache = [ev for ev in event_cache if _event_is_fresh(ev, now_ms, _event_max_age_min(ev))]
@@ -3411,7 +3429,9 @@ def main() -> None:
                 htf_context = htf_context_cache.get(cache_key)
                 if htf_context is None or (htf_context.get("error") and not htf_context.get("rate_limited")):
                     try:
-                        kctx = _fetch_market_klines_scan(symbol, context_tf, context_limit)
+                        kctx = scan_klines_cache.get((symbol, context_tf))
+                        if kctx is None:
+                            kctx = _fetch_market_klines_scan(symbol, context_tf, context_limit)
                         cdf = pd.DataFrame(kctx)
                         if len(kctx) >= 60:
                             cdf = add_cvd(cdf)
@@ -3583,7 +3603,9 @@ def main() -> None:
 
             if symbol not in risk_1h_cache:
                 try:
-                    k1_risk = _fetch_market_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
+                    k1_risk = scan_klines_cache.get((symbol, "1h"))
+                    if k1_risk is None:
+                        k1_risk = _fetch_market_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
                     if len(k1_risk) < 20:
                         stats["trigger_data_failed"] += 1
                         continue
