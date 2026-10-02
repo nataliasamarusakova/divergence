@@ -444,7 +444,18 @@ jobs:
           git config user.email "actions@github.com"
 
           git status --short
+          # Per-symbol timeframe watermarks are required persistent runtime state.
+          # Stage this file explicitly so a future ignore/glob change cannot silently
+          # cause the engine to rescan the entire universe on every dispatch.
+          if [ -f data/timeframe_scan_state.json ]; then
+            git add -f data/timeframe_scan_state.json
+            echo "[COMMIT_STATE] timeframe_scan_state.json staged"
+          else
+            echo "[COMMIT_STATE] WARNING: timeframe_scan_state.json is missing" >&2
+          fi
           git add data/*.jsonl data/*.json 2>/dev/null || true
+          echo "=== STAGED RUNTIME STATE ==="
+          git diff --cached --name-only | sed -n '1,120p'
 
           if git diff --cached --quiet; then
             echo "No state changes"
