@@ -64,7 +64,9 @@ jobs:
       AJAY_SR_SUPPORT_CONTEXT_MAX_R: "3.0"
       AJAY_SR_HTTP_TIMEOUT_SEC: "5"
       AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"
+      AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"
       AJAY_SR_MAX_DATA_AGE_MIN: "130"
+      MAX_SR_DATA_REJECTIONS: "3"
       ENTRY_WEAK_ENGINE_BLOCK_ENABLED: "true"
       ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,CRT_BULLISH,CRT_BEARISH,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH"
       SHORT_OI_VETO_ENABLED: "true"
@@ -210,6 +212,11 @@ jobs:
       - name: Run tests
         run: |
           python -m pytest -q
+
+      - name: Clean test-generated runtime state
+        if: always()
+        run: |
+          rm -rf data .pytest_cache __pycache__ event_engine/__pycache__
 
       # Binance uses a userspace WireGuard HTTP proxy only. The proxy is scoped to
       # BinanceMarketClient; BingX, Coinalyze, Telegram, GitHub and git remain direct.
