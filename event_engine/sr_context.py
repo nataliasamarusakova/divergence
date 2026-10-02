@@ -36,9 +36,17 @@ SR_SUPPORT_CONTEXT_MAX_R = max(0.0, float(os.environ.get("AJAY_SR_SUPPORT_CONTEX
 SR_HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("AJAY_SR_HTTP_TIMEOUT_SEC", "5")))
 SR_REQUEST_MIN_INTERVAL_SEC = max(0.0, float(os.environ.get("AJAY_SR_REQUEST_MIN_INTERVAL_SEC", "0.10")))
 SR_MAX_DATA_AGE_MIN = max(30.0, float(os.environ.get("AJAY_SR_MAX_DATA_AGE_MIN", "130")))
+SR_SPOT_EXCHANGE_INFO_TTL_SEC = max(30.0, float(os.environ.get("AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC", "900")))
+SR_SPOT_EXCHANGE_INFO_URL = f"{SR_SPOT_BASE_URL}/api/v3/exchangeInfo"
+# Quantity-prefixed Binance perpetuals (e.g. 1000SHIBUSDT) can use the
+# underlying Spot pair for 1H S/R. Keep the prefix vocabulary deliberately
+# narrow so ordinary symbols such as 1INCH are never treated as multipliers.
+SR_NUMERIC_PREFIXES: tuple[int, ...] = (1_000_000, 100_000, 10_000, 1_000)
 
 _CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
+_SPOT_INFO_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": {}}
+_SPOT_INFO_LOCK = threading.Lock()
 _SESSION = requests.Session()
 _LAST_REQUEST_MONOTONIC = 0.0
 _REQUEST_LOCK = threading.Lock()
@@ -57,7 +65,151 @@ def normalize_spot_symbol(symbol: str) -> str:
     return value
 
 
-def _fetch_closed_1h_spot(symbol: str) -> list[Candle]:
+class SRSymbolUnavailableError(RuntimeError):
+    """The requested logical symbol has no unambiguous active Binance Spot source."""
+
+
+def _spot_symbol_catalog(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    global _LAST_REQUEST_MONOTONIC
+    now = time.monotonic()
+    with _SPOT_INFO_LOCK:
+        if not force_refresh and _SPOT_INFO_CACHE["symbols"] and now - float(_SPOT_INFO_CACHE["ts"]) < SR_SPOT_EXCHANGE_INFO_TTL_SEC:
+            return dict(_SPOT_INFO_CACHE["symbols"])
+
+    with _REQUEST_LOCK:
+        now_req = time.monotonic()
+        wait = SR_REQUEST_MIN_INTERVAL_SEC - (now_req - _LAST_REQUEST_MONOTONIC)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_MONOTONIC = time.monotonic()
+    response = _SESSION.get(SR_SPOT_EXCHANGE_INFO_URL, timeout=SR_HTTP_TIMEOUT_SEC)
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("symbols") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("Binance SPOT exchangeInfo response has no symbols list")
+
+    symbols: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol", "")).strip().upper()
+        if not sym:
+            continue
+        if str(row.get("status", "")).strip().upper() != "TRADING":
+            continue
+        if str(row.get("quoteAsset", "")).strip().upper() != "USDT":
+            continue
+        if row.get("isSpotTradingAllowed") is False:
+            continue
+        symbols[sym] = row
+
+    with _SPOT_INFO_LOCK:
+        _SPOT_INFO_CACHE["ts"] = time.monotonic()
+        _SPOT_INFO_CACHE["symbols"] = dict(symbols)
+    return symbols
+
+
+def clear_spot_symbol_cache() -> None:
+    with _SPOT_INFO_LOCK:
+        _SPOT_INFO_CACHE["ts"] = 0.0
+        _SPOT_INFO_CACHE["symbols"] = {}
+
+
+def _logical_base(symbol: str) -> str:
+    normalized = normalize_spot_symbol(symbol)
+    return normalized[:-4]
+
+
+def _numeric_prefix_candidate(base: str) -> tuple[int, str] | None:
+    # Longest first, so a future 1000000TOKEN cannot be mistaken for 1000TOKEN.
+    for multiplier in sorted(SR_NUMERIC_PREFIXES, reverse=True):
+        prefix = str(multiplier)
+        if base.startswith(prefix) and len(base) > len(prefix):
+            underlying = base[len(prefix):]
+            return multiplier, underlying
+    return None
+
+
+def resolve_spot_symbol(symbol: str, *, force_refresh: bool = False) -> dict[str, Any]:
+    """Resolve a logical engine symbol to an active Binance Spot USDT symbol.
+
+    Resolution is venue-local and data-driven:
+    1. exact Spot symbol wins;
+    2. a known quantity-prefixed logical symbol may use its unprefixed Spot pair;
+    3. an unprefixed logical asset may use exactly one matching numeric-prefixed
+       Spot source; a numeric prefix on Binance USDⓈ-M contracts changes the
+       contract's underlying quantity/index scaling, so the Spot source must be
+       converted into the logical futures price unit;
+    4. ambiguity or absence fails closed.
+
+    For quantity-prefixed Binance perpetuals such as 1000SHIBUSDT, the contract
+    represents 1,000 SHIB and its quoted/index price is 1,000x the SHIB/USDT
+    Spot index. Therefore a Spot alias such as SHIBUSDT uses price_scale=1000
+    and volume_scale=0.001 to express the snapshot in the logical 1000SHIB unit.
+    No BingX contract is consulted here and no cross-venue alias is inferred.
+    """
+    requested = normalize_spot_symbol(symbol)
+    base = requested[:-4]
+    catalog = _spot_symbol_catalog(force_refresh=force_refresh)
+
+    exact = catalog.get(requested)
+    if exact is not None:
+        return {
+            "requested_symbol": requested,
+            "source_symbol": requested,
+            "underlying_asset": str(exact.get("baseAsset") or base).upper(),
+            "source_price_scale": 1.0,
+            "source_volume_scale": 1.0,
+            "source_contract_multiplier": 1.0,
+            "source_alias_kind": "EXACT",
+        }
+
+    pref = _numeric_prefix_candidate(base)
+    if pref is not None:
+        multiplier, underlying = pref
+        source = f"{underlying}USDT"
+        row = catalog.get(source)
+        if row is not None:
+            scale = float(multiplier)
+            return {
+                "requested_symbol": requested,
+                "source_symbol": source,
+                "underlying_asset": str(row.get("baseAsset") or underlying).upper(),
+                "source_price_scale": scale,
+                "source_volume_scale": 1.0 / scale,
+                "source_contract_multiplier": scale,
+                "source_alias_kind": "NUMERIC_PREFIX_UNDERLYING",
+            }
+
+    prefixed_sources: list[tuple[int, str, dict[str, Any]]] = []
+    for multiplier in SR_NUMERIC_PREFIXES:
+        source = f"{multiplier}{base}USDT"
+        row = catalog.get(source)
+        if row is not None:
+            prefixed_sources.append((multiplier, source, row))
+    if len(prefixed_sources) == 1:
+        multiplier, source, row = prefixed_sources[0]
+        scale = 1.0 / float(multiplier)
+        return {
+            "requested_symbol": requested,
+            "source_symbol": source,
+            "underlying_asset": str(row.get("baseAsset") or base).upper(),
+            "source_price_scale": scale,
+            "source_volume_scale": float(multiplier),
+            "source_contract_multiplier": float(multiplier),
+            "source_alias_kind": "PLAIN_NUMERIC_PREFIX_SOURCE",
+        }
+    if len(prefixed_sources) > 1:
+        names = ", ".join(item[1] for item in prefixed_sources)
+        raise SRSymbolUnavailableError(
+            f"Ambiguous Binance Spot source for {requested}: multiple numeric-prefix pairs: {names}"
+        )
+
+    raise SRSymbolUnavailableError(f"No active Binance Spot USDT source for logical symbol {requested}")
+
+
+def _rate_limit_before_request() -> None:
     global _LAST_REQUEST_MONOTONIC
     with _REQUEST_LOCK:
         now = time.monotonic()
@@ -65,51 +217,89 @@ def _fetch_closed_1h_spot(symbol: str) -> list[Candle]:
         if wait > 0:
             time.sleep(wait)
         _LAST_REQUEST_MONOTONIC = time.monotonic()
-    payload = _SESSION.get(
-        SR_SPOT_KLINES_URL,
-        params={"symbol": normalize_spot_symbol(symbol), "interval": "1h", "limit": SR_KLINE_LIMIT},
-        timeout=SR_HTTP_TIMEOUT_SEC,
-    )
-    payload.raise_for_status()
-    rows = payload.json()
-    if not isinstance(rows, list):
-        raise ValueError("Binance SPOT klines response is not a list")
-    now_ms = int(time.time() * 1000)
-    candles: list[Candle] = []
-    for row in rows:
-        if not isinstance(row, list) or len(row) < 6:
+
+
+def _fetch_closed_1h_spot(
+    symbol: str,
+    *,
+    resolved: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> tuple[list[Candle], dict[str, Any]]:
+    resolved = dict(resolved or resolve_spot_symbol(symbol))
+    kline_limit = SR_KLINE_LIMIT if limit is None else max(300, min(1000, int(limit)))
+    for attempt in range(2):
+        _rate_limit_before_request()
+        payload_response = _SESSION.get(
+            SR_SPOT_KLINES_URL,
+            params={"symbol": resolved["source_symbol"], "interval": "1h", "limit": kline_limit},
+            timeout=SR_HTTP_TIMEOUT_SEC,
+        )
+        if payload_response.status_code == 400 and attempt == 0:
+            clear_spot_symbol_cache()
+            resolved = resolve_spot_symbol(symbol, force_refresh=True)
             continue
-        open_time = int(row[0])
-        close_time = int(row[6]) if len(row) > 6 else open_time + 3_599_999
-        if close_time > now_ms:
-            continue
-        try:
-            candles.append(
-                Candle(
-                    ts=open_time,
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=float(row[5]),
+        payload_response.raise_for_status()
+        rows = payload_response.json()
+        if not isinstance(rows, list):
+            raise ValueError("Binance SPOT klines response is not a list")
+        now_ms = int(time.time() * 1000)
+        candles: list[Candle] = []
+        price_scale = float(resolved.get("source_price_scale", 1.0))
+        volume_scale = float(resolved.get("source_volume_scale", 1.0))
+        if not math.isfinite(price_scale) or price_scale <= 0 or not math.isfinite(volume_scale) or volume_scale <= 0:
+            raise ValueError(f"Invalid Spot source scales for {resolved}")
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            try:
+                open_time = int(row[0])
+                close_time = int(row[6]) if len(row) > 6 else open_time + 3_599_999
+                if close_time > now_ms:
+                    continue
+                candles.append(
+                    Candle(
+                        ts=open_time,
+                        open=float(row[1]) * price_scale,
+                        high=float(row[2]) * price_scale,
+                        low=float(row[3]) * price_scale,
+                        close=float(row[4]) * price_scale,
+                        volume=float(row[5]) * volume_scale,
+                    )
                 )
-            )
-        except (TypeError, ValueError):
-            continue
-    if len(candles) < SR_PRD + SR_RB + 2:
-        raise ValueError(f"Only {len(candles)} closed SPOT 1H candles available")
-    return candles
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if len(candles) < SR_PRD + SR_RB + 2:
+            raise ValueError(f"Only {len(candles)} closed SPOT 1H candles available from {resolved['source_symbol']}")
+        return candles, resolved
+    raise RuntimeError(f"Spot kline retry exhausted for {symbol}")
 
 
-def get_cached_sr_snapshot(symbol: str) -> dict[str, Any]:
-    """Fetch and cache the current Pine SR state once per symbol in one engine cycle."""
+def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str, Any]:
+    """Fetch/cache the current Pine SR state; a custom limit is diagnostic-only and uncached."""
     key = normalize_spot_symbol(symbol)
-    with _CACHE_LOCK:
-        cached = _CACHE.get(key)
-        if cached is not None:
-            return dict(cached)
+    use_cache = limit is None
+    if use_cache:
+        with _CACHE_LOCK:
+            cached = _CACHE.get(key)
+            if cached is not None:
+                return dict(cached)
 
-    candles = _fetch_closed_1h_spot(symbol)
+    fetched = _fetch_closed_1h_spot(symbol, limit=limit) if limit is not None else _fetch_closed_1h_spot(symbol)
+    if isinstance(fetched, tuple) and len(fetched) == 2:
+        candles, resolved = fetched
+    else:
+        # Backward-compatible test seam: older tests may stub the fetcher with
+        # a candle list. Production always returns (candles, resolver metadata).
+        candles = fetched
+        resolved = {
+            "requested_symbol": normalize_spot_symbol(symbol),
+            "source_symbol": normalize_spot_symbol(symbol),
+            "underlying_asset": _logical_base(symbol),
+            "source_price_scale": 1.0,
+            "source_volume_scale": 1.0,
+            "source_contract_multiplier": 1.0,
+            "source_alias_kind": "EXACT_TEST_STUB",
+        }
     latest_ts = candles[-1].ts
     state = compute_current_sr(
         candles,
@@ -125,17 +315,23 @@ def get_cached_sr_snapshot(symbol: str) -> dict[str, Any]:
     snapshot = dict(state)
     snapshot.update({
         "source": "binance_spot",
-        "source_symbol": normalize_spot_symbol(symbol),
+        "source_symbol": resolved["source_symbol"],
+        "source_symbol_requested": resolved["requested_symbol"],
+        "source_price_scale": resolved["source_price_scale"],
+        "source_volume_scale": resolved["source_volume_scale"],
+        "source_contract_multiplier": resolved["source_contract_multiplier"],
+        "source_alias_kind": resolved["source_alias_kind"],
+        "underlying_asset": resolved["underlying_asset"],
         "latest_closed_timestamp": latest_ts,
         "latest_closed_age_min": latest_age_min,
         "zone_scale": SR_ZONE_SCALE,
     })
-    with _CACHE_LOCK:
-        _CACHE[key] = dict(snapshot)
-        # Keep only recent cache rows to avoid accidental growth if reused by tests.
-        if len(_CACHE) > 128:
-            for old_key in list(_CACHE)[:-64]:
-                _CACHE.pop(old_key, None)
+    if use_cache:
+        with _CACHE_LOCK:
+            _CACHE[key] = dict(snapshot)
+            if len(_CACHE) > 128:
+                for old_key in list(_CACHE)[:-64]:
+                    _CACHE.pop(old_key, None)
     return snapshot
 
 
@@ -222,49 +418,49 @@ def evaluate_sr_room(
         lower = float(zone["lower"])
         upper = float(zone["upper"])
         center = float(zone["center"])
+        kind = str(zone.get("kind", "")).upper()
         if d == "LONG":
-            if lower <= entry_price <= upper:
-                # If price is inside a pivot-derived zone, use the zone origin
-                # (H=resistance/supply, L=support/demand) rather than the zone
-                # center. The center can legitimately sit on the opposite side
-                # of entry when the cluster is wide. Unknown kind falls back to
-                # geometry and is never silently treated as a supporting zone.
-                kind = str(zone.get("kind", "")).upper()
-                if kind == "H" or (kind not in {"H", "L"} and center >= entry_price):
+            # Ajay semantics: H is resistance, L is support. Geometry decides
+            # whether that level is actionable relative to entry; kind decides
+            # direction. An H below LONG entry is not silently re-labelled
+            # as support, and unknown kinds are neutral.
+            if kind == "H":
+                if lower <= entry_price <= upper:
                     zone["entry_overlap"] = "opposing"
                     opposing.append(zone)
-                else:
+                elif lower > entry_price:
+                    zone["distance_from_entry"] = lower - entry_price
+                    if zone["distance_from_entry"] <= entry_buffer:
+                        zone["near_entry"] = "opposing"
+                    opposing.append(zone)
+            elif kind == "L":
+                if lower <= entry_price <= upper:
                     zone["entry_overlap"] = "supporting"
                     supporting.append(zone)
-            elif center > entry_price and lower > entry_price:
-                zone["distance_from_entry"] = lower - entry_price
-                if zone["distance_from_entry"] <= entry_buffer:
-                    zone["near_entry"] = "opposing"
-                opposing.append(zone)
-            elif center < entry_price and upper < entry_price:
-                zone["distance_from_entry"] = entry_price - upper
-                if zone["distance_from_entry"] <= entry_buffer:
-                    zone["near_entry"] = "supporting"
-                supporting.append(zone)
+                elif upper < entry_price:
+                    zone["distance_from_entry"] = entry_price - upper
+                    if zone["distance_from_entry"] <= entry_buffer:
+                        zone["near_entry"] = "supporting"
+                    supporting.append(zone)
         else:
-            if lower <= entry_price <= upper:
-                kind = str(zone.get("kind", "")).upper()
-                if kind == "L" or (kind not in {"H", "L"} and center <= entry_price):
+            if kind == "L":
+                if lower <= entry_price <= upper:
                     zone["entry_overlap"] = "opposing"
                     opposing.append(zone)
-                else:
+                elif upper < entry_price:
+                    zone["distance_from_entry"] = entry_price - upper
+                    if zone["distance_from_entry"] <= entry_buffer:
+                        zone["near_entry"] = "opposing"
+                    opposing.append(zone)
+            elif kind == "H":
+                if lower <= entry_price <= upper:
                     zone["entry_overlap"] = "supporting"
                     supporting.append(zone)
-            elif center < entry_price and upper < entry_price:
-                zone["distance_from_entry"] = entry_price - upper
-                if zone["distance_from_entry"] <= entry_buffer:
-                    zone["near_entry"] = "opposing"
-                opposing.append(zone)
-            elif center > entry_price and lower > entry_price:
-                zone["distance_from_entry"] = lower - entry_price
-                if zone["distance_from_entry"] <= entry_buffer:
-                    zone["near_entry"] = "supporting"
-                supporting.append(zone)
+                elif lower > entry_price:
+                    zone["distance_from_entry"] = lower - entry_price
+                    if zone["distance_from_entry"] <= entry_buffer:
+                        zone["near_entry"] = "supporting"
+                    supporting.append(zone)
 
     if d == "LONG":
         opposing.sort(key=lambda z: float(z["lower"]) - entry_price if float(z["lower"]) > entry_price else 0.0)
@@ -278,6 +474,12 @@ def evaluate_sr_room(
     result: dict[str, Any] = {
         "source": snapshot.get("source", "binance_spot"),
         "source_symbol": snapshot.get("source_symbol"),
+        "source_symbol_requested": snapshot.get("source_symbol_requested"),
+        "source_price_scale": snapshot.get("source_price_scale", 1.0),
+        "source_volume_scale": snapshot.get("source_volume_scale", 1.0),
+        "source_contract_multiplier": snapshot.get("source_contract_multiplier", 1.0),
+        "source_alias_kind": snapshot.get("source_alias_kind"),
+        "underlying_asset": snapshot.get("underlying_asset"),
         "snapshot_latest_closed_timestamp": snapshot.get("latest_closed_timestamp"),
         "snapshot_latest_closed_age_min": snapshot.get("latest_closed_age_min"),
         "cwidth": snapshot.get("cwidth"),

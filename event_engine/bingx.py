@@ -73,10 +73,8 @@ SERVER_TIME_OFFSET_MS = 0
 # trigger BingX's 109429 temporary restriction. Keep this protection local to
 # the current process; a fresh engine cycle re-validates the live endpoint.
 LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC", "900")))
-LIVE_PRICE_INVALID_BURST_LIMIT = max(1, int(os.environ.get("BINGX_LIVE_PRICE_INVALID_BURST_LIMIT", "3")))
 LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC", "900")))
 _LIVE_PRICE_INVALID_UNTIL: dict[str, float] = {}
-_LIVE_PRICE_INVALID_BURST_COUNT = 0
 _LIVE_PRICE_COOLDOWN_UNTIL = 0.0
 
 SESSION = requests.Session()
@@ -206,44 +204,47 @@ def refresh_contracts() -> dict[str, Any]:
     return data
 
 
-def contracts() -> dict[str, dict]:
-    if CACHE["data"] and time.time() - CACHE["ts"] < TTL:
+def contracts(*, require_fresh: bool = False) -> dict[str, dict]:
+    cache_fresh = bool(CACHE["data"]) and time.time() - CACHE["ts"] < TTL
+    if cache_fresh and not require_fresh:
         return CACHE["data"]
     try:
         return refresh_contracts()
     except Exception:
-        return CACHE["data"]
+        return {} if require_fresh else CACHE["data"]
 
 
-def get_contract(symbol: str) -> dict | None:
+def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
     s = (symbol or "").strip().upper()
     if not s:
         return None
 
+    catalog = contracts(require_fresh=require_fresh)
     mapped = SYMBOL_MAP.get(s)
     if mapped:
-        c = contracts().get(str(mapped).strip().upper())
+        c = catalog.get(str(mapped).strip().upper())
         if c:
             return c
 
     direct = s if s.endswith("-USDT") else f"{s.replace('-', '')}-USDT"
-    c = contracts().get(direct)
+    c = catalog.get(direct)
     if c:
         return c
 
     base = s.replace("-USDT", "").replace("-", "")
-    for c in CACHE["data"].values():
+    for c in catalog.values():
         cs = str(c.get("symbol", "")).upper()
         if cs == f"{base}-USDT" or cs == base:
             return c
 
     norm_base = base.replace("-", "").replace("/", "").replace(" ", "")
-    for c in CACHE["data"].values():
+    for c in catalog.values():
         name = str(c.get("displayName", "")).upper().replace("-", "").replace("/", "").replace(" ", "")
         if name == f"{norm_base}USDT" or name == norm_base:
             return c
 
-    return CACHE["by_display_name"].get(f"{base}-USDT")
+    return {str(c.get("displayName", "")).strip().upper(): c for c in catalog.values() if c.get("displayName")}.get(f"{base}-USDT")
+
 
 
 def to_bx_symbol(symbol: str) -> str | None:
@@ -1342,18 +1343,13 @@ def _live_price_in_cooldown(bx_symbol: str, now: float) -> bool:
 
 
 def get_live_price(symbol: str) -> float | None:
-    """Return the current BingX execution/reference price from the live ticker.
+    """Return the current BingX live ticker price, failing closed on errors.
 
-    Signal-side candles remain closed-bar data. This function deliberately does
-    not read klines, and malformed/API-error responses fail closed instead of
-    fabricating a zero price.
-
-    The endpoint is the current BingX latest-price ticker. A 109425 response is
-    treated as a symbol-local quarantine; repeated 109425 responses trip a
-    process-local circuit breaker before BingX can escalate the burst to 109429.
+    A 109425 response triggers one fresh contract-catalog lookup and one ticker
+    retry when BingX still exposes a valid contract. Confirmed-invalid symbols are
+    quarantined locally. There is no global invalid-symbol breaker, so an
+    unrelated bad contract cannot disable all valid live-price requests.
     """
-    global _LIVE_PRICE_INVALID_BURST_COUNT, _LIVE_PRICE_COOLDOWN_UNTIL
-
     bx_symbol = to_bx_symbol(symbol)
     if not bx_symbol:
         log.warning("[BINGX] Live price unavailable: unknown symbol=%s", symbol)
@@ -1363,81 +1359,75 @@ def get_live_price(symbol: str) -> float | None:
     if _live_price_in_cooldown(bx_symbol, now):
         return None
 
-    try:
-        resp = _request(
-            "GET",
-            LIVE_PRICE_PATH,
-            {"symbol": bx_symbol},
-            signed=False,
-            retryable=False,
-        )
-    except Exception as exc:
-        log.warning("[BINGX] Failed to read live price for %s: %s", bx_symbol, exc)
-        return None
+    global _LIVE_PRICE_COOLDOWN_UNTIL
+    for attempt in range(2):
+        try:
+            resp = _request("GET", LIVE_PRICE_PATH, {"symbol": bx_symbol}, signed=False, retryable=False)
+        except Exception as exc:
+            log.warning("[BINGX] Failed to read live price for %s: %s", bx_symbol, exc)
+            return None
 
-    try:
-        code = int(resp.get("code"))
-    except (TypeError, ValueError, AttributeError):
-        log.warning("[BINGX] Malformed live-price response for %s: %r", bx_symbol, resp)
-        return None
+        try:
+            code = int(resp.get("code"))
+        except (TypeError, ValueError, AttributeError):
+            log.warning("[BINGX] Malformed live-price response for %s: %r", bx_symbol, resp)
+            return None
 
-    if code == 109425:
-        _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
-        _LIVE_PRICE_INVALID_BURST_COUNT += 1
-        log.warning(
-            "[BINGX] Live-price symbol rejected as unsupported: %s (109425); "
-            "quarantined %.0fs (%d/%d invalid symbols)",
-            bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC,
-            _LIVE_PRICE_INVALID_BURST_COUNT, LIVE_PRICE_INVALID_BURST_LIMIT,
-        )
-        if _LIVE_PRICE_INVALID_BURST_COUNT >= LIVE_PRICE_INVALID_BURST_LIMIT:
-            _LIVE_PRICE_COOLDOWN_UNTIL = now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC
-            log.error(
-                "[BINGX] Live-price circuit breaker opened for %.0fs after %d unsupported-symbol responses; "
-                "no further live-price HTTP requests will be sent in this process.",
-                LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC, _LIVE_PRICE_INVALID_BURST_COUNT,
-            )
-        return None
+        if code == 109425:
+            # A contract can disappear between the cycle-level catalog refresh and
+            # this ticker request. Re-resolve once from a fresh catalog; if BingX
+            # maps the logical symbol to a different active contract, retry it once.
+            if attempt == 0:
+                try:
+                    fresh_contract = get_contract(symbol, require_fresh=True)
+                except Exception:
+                    fresh_contract = None
+                fresh_symbol = str((fresh_contract or {}).get("symbol", "")).strip().upper()
+                if fresh_symbol and fresh_symbol != bx_symbol:
+                    bx_symbol = fresh_symbol
+                elif fresh_symbol == bx_symbol:
+                    pass
+                else:
+                    _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
+                    log.warning("[BINGX] Live-price symbol unsupported after fresh catalog check: %s (109425); symbol quarantined %.0fs", bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC)
+                    return None
+                continue
+            _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
+            log.warning("[BINGX] Live-price symbol unsupported: %s (109425); symbol quarantined %.0fs", bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC)
+            return None
 
-    if code == 109429:
-        retry_after_ms = _parse_retry_after_ms(resp.get("msg"))
-        retry_until = (retry_after_ms / 1000.0) if retry_after_ms else (now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC)
-        _LIVE_PRICE_COOLDOWN_UNTIL = max(_LIVE_PRICE_COOLDOWN_UNTIL, retry_until)
-        log.error(
-            "[BINGX] Live-price API temporarily restricted (109429) for %s; "
-            "live-price HTTP requests paused until %.0f.",
-            bx_symbol, _LIVE_PRICE_COOLDOWN_UNTIL,
-        )
-        return None
+        if code == 109429:
+            retry_after_ms = _parse_retry_after_ms(resp.get("msg"))
+            retry_until = (retry_after_ms / 1000.0) if retry_after_ms else (now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC)
+            _LIVE_PRICE_COOLDOWN_UNTIL = max(_LIVE_PRICE_COOLDOWN_UNTIL, retry_until)
+            log.error("[BINGX] Live-price API temporarily restricted (109429) for %s; live-price HTTP requests paused until %.0f.", bx_symbol, _LIVE_PRICE_COOLDOWN_UNTIL)
+            return None
 
-    if code != 0:
-        log.warning("[BINGX] Live-price API error for %s: code=%s msg=%s", bx_symbol, code, resp.get("msg"))
-        return None
+        if code != 0:
+            log.warning("[BINGX] Live-price API error for %s: code=%s msg=%s", bx_symbol, code, resp.get("msg"))
+            return None
 
-    data = resp.get("data")
-    if isinstance(data, list):
-        row = next((item for item in data if isinstance(item, dict) and str(item.get("symbol", "")).upper() == bx_symbol), None)
-        row = row or (data[0] if data and isinstance(data[0], dict) else None)
-    elif isinstance(data, dict):
-        row = data
-    else:
-        row = None
-
-    if not isinstance(row, dict):
-        log.warning("[BINGX] Live-price response has no data row for %s", bx_symbol)
-        return None
-
-    try:
-        price = float(row.get("price"))
-    except (TypeError, ValueError):
-        log.warning("[BINGX] Invalid live price for %s: %r", bx_symbol, row.get("price"))
-        return None
-
-    if not math.isfinite(price) or price <= 0:
-        log.warning("[BINGX] Non-positive live price for %s: %r", bx_symbol, price)
-        return None
-    return price
-
+        data = resp.get("data")
+        if isinstance(data, list):
+            row = next((item for item in data if isinstance(item, dict) and str(item.get("symbol", "")).upper() == bx_symbol), None)
+            row = row or (data[0] if data and isinstance(data[0], dict) else None)
+        elif isinstance(data, dict):
+            row = data
+        else:
+            row = None
+        if not isinstance(row, dict):
+            log.warning("[BINGX] Live-price response has no data row for %s", bx_symbol)
+            return None
+        try:
+            price = float(row.get("price"))
+        except (TypeError, ValueError):
+            log.warning("[BINGX] Invalid live price for %s: %r", bx_symbol, row.get("price"))
+            return None
+        if not math.isfinite(price) or price <= 0:
+            log.warning("[BINGX] Non-positive live price for %s: %r", bx_symbol, row.get("price"))
+            return None
+        return price
+    return None
 
 def _current_close_price(symbol: str) -> float | None:
     """Backward-compatible name for the live execution/reference price."""

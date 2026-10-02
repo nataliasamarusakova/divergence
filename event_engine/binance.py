@@ -200,10 +200,23 @@ class BinanceMarketClient:
         # discard any still-open candle while preserving the requested number
         # of closed bars whenever the exchange returns enough history.
         api_limit = min(1500, requested_limit + 1)
-        rows = self._request_json(
-            KLINE_PATH,
-            {"symbol": resolved, "interval": interval, "limit": api_limit},
-        )
+        params = {"symbol": resolved, "interval": interval, "limit": api_limit}
+        try:
+            rows = self._request_json(KLINE_PATH, params)
+        except BinanceHTTPError as exc:
+            if "HTTP 400" not in str(exc):
+                raise
+            # A symbol can disappear/change while the cached exchangeInfo is still fresh.
+            # Refresh once and retry only this request; other HTTP failures keep their normal semantics.
+            self.refresh_exchange_info(force=True)
+            refreshed = self.resolve_symbol(symbol)
+            if not refreshed:
+                raise BinanceSymbolUnavailableError(
+                    f"[BINANCE] no active USDT perpetual contract for {symbol} after refresh",
+                    symbol=str(symbol),
+                ) from exc
+            params["symbol"] = refreshed
+            rows = self._request_json(KLINE_PATH, params)
         if not isinstance(rows, list):
             raise BinanceHTTPError(f"[BINANCE] Klines response for {resolved}/{interval} is not a list")
 
@@ -265,7 +278,21 @@ class BinanceMarketClient:
                 f"[BINANCE] no active USDT perpetual contract for {symbol}",
                 symbol=str(symbol),
             )
-        payload = self._request_json(TICKER_PRICE_PATH, {"symbol": resolved})
+        params = {"symbol": resolved}
+        try:
+            payload = self._request_json(TICKER_PRICE_PATH, params)
+        except BinanceHTTPError as exc:
+            if "HTTP 400" not in str(exc):
+                raise
+            self.refresh_exchange_info(force=True)
+            refreshed = self.resolve_symbol(symbol)
+            if not refreshed:
+                raise BinanceSymbolUnavailableError(
+                    f"[BINANCE] no active USDT perpetual contract for {symbol} after refresh",
+                    symbol=str(symbol),
+                ) from exc
+            params["symbol"] = refreshed
+            payload = self._request_json(TICKER_PRICE_PATH, params)
         if not isinstance(payload, dict):
             raise BinanceHTTPError(f"[BINANCE] ticker response for {resolved} is not an object")
         try:

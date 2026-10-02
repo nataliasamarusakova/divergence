@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import time
 import uuid
@@ -148,15 +149,26 @@ def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbo
 
 def _retry_pending_notifications() -> None:
     notifications = _load_notifications()
+    changed = False
     pending = [
         (nid, item) for nid, item in notifications.items()
         if isinstance(item, dict) and not bool(item.get("resolved"))
     ]
     for nid, item in pending:
+        # BE activation is intentionally local-only. Suppress any legacy queued
+        # record as well, so a restart cannot resend an old BE_ACTIVATED alert.
+        if str(item.get("kind", "")).upper() == "BE_ACTIVATED":
+            item["resolved"] = True
+            item["suppressed"] = True
+            notifications[nid] = item
+            changed = True
+            continue
         try:
             _deliver_notification(nid, item)
         except Exception as exc:
             log.warning("[TELEGRAM] Pending notification retry failed %s: %s", nid, exc)
+    if changed:
+        _save_notifications(notifications)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -312,7 +324,7 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         "planned_target_rr": _safe_float(setup.get("target_rr"), 0.0) if setup.get("target_rr") is not None else None,
         "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.6625), 1.6625),
         "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
-        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.6625)), 1.6625),
+        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.3875)), 1.3875),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "entry_reference": _safe_float(setup.get("entry_reference"), 0.0) if setup.get("entry_reference") is not None else None,
         "invalidation_price": _safe_float(setup.get("invalidation_price"), 0.0) if setup.get("invalidation_price") is not None else None,
@@ -845,6 +857,30 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
     trade["mae_pct"] = mae
     trade["max_drawdown_pct"] = drawdown
 
+def _update_live_pnl_extrema(trade: dict, current_pnl_pct: float | None) -> None:
+    """Fold the live ticker observation into MFE/MAE telemetry.
+
+    ``_update_mfe_mae`` scans only closed candles, while current PnL comes from
+    the live ticker. Without this fold, a live price above the last closed-bar
+    high could leave ``current_pnl_pct > peak_pnl_pct`` and make MFE incomplete.
+    This function is telemetry-only and does not affect exit decisions.
+    """
+    if current_pnl_pct is None or not math.isfinite(float(current_pnl_pct)):
+        return
+    current = float(current_pnl_pct)
+    peak = _safe_float(trade.get("peak_pnl_pct", 0.0))
+    mae = _safe_float(trade.get("mae_pct", 0.0))
+    drawdown = _safe_float(trade.get("max_drawdown_pct", 0.0))
+    prior_peak = peak
+    peak = max(peak, current)
+    mae = min(mae, current)
+    live_drawdown = current - max(prior_peak, current)
+    drawdown = min(drawdown, live_drawdown)
+    trade["peak_pnl_pct"] = peak
+    trade["mae_pct"] = mae
+    trade["max_drawdown_pct"] = drawdown
+
+
 def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
     if not sl_order_id:
         return None, None
@@ -1039,6 +1075,7 @@ def update_active_trades() -> None:
             current_pnl = (_calc_trade_pnl_pct(entry_price, cur_price, direction)
                            if cur_price is not None else None)
             trade["current_pnl_pct"] = current_pnl
+            _update_live_pnl_extrema(trade, current_pnl)
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
@@ -1209,16 +1246,6 @@ def update_active_trades() -> None:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
-                            try:
-                                nid = _notification_id(str(event_id), "BE_ACTIVATED")
-                                _queue_notification(
-                                    nid, event_id=str(event_id), kind="BE_ACTIVATED", symbol=symbol, direction=direction,
-                                    text=f"✅ <b>BE activated ({trade.get('name', symbol)} {symbol})</b>\n"
-                                         f"После {str(leg).upper()} стоп перенесён на <code>{entry_price:.8g}</code>.\n"
-                                         f"Остаток позиции: <code>{rem_qty:.8f}</code>"
-                                )
-                            except Exception as exc:
-                                log.error("[TELEGRAM] BE activation notification queue error %s: %s", event_id, exc)
                             log.info(
                                 "[TRACKER_BE_ACTIVATED] %s (%s) %s milestone reached. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, leg.upper(), entry_price
