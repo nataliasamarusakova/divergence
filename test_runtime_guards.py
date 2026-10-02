@@ -48,11 +48,11 @@ def test_event_workflow_uses_binance_only_userspace_vpn_transport():
     assert "wireproxy_linux_amd64.tar.gz" in workflow
     assert "e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" in workflow
     assert "--configtest" in workflow
-    assert "--proxy \"$BINANCE_HTTP_PROXY\"" in workflow
+    assert '--proxy "http://127.0.0.1:18080"' in workflow
     assert "--noproxy \"\"" in workflow
     assert "Run engine" in workflow
     assert "Stop Binance WireProxy" in workflow
-    assert workflow.index("Binance Futures preflight") < workflow.index("Run engine")
+    assert "Binance Futures preflight" not in workflow
     assert workflow.index("Run engine") < workflow.index("Stop Binance WireProxy")
     assert workflow.index("Stop Binance WireProxy") < workflow.index("Commit state")
     assert "wg-quick up wg0" not in workflow

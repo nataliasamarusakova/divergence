@@ -28,20 +28,23 @@ def test_vst_research_release_keeps_portfolio_and_cycle_caps_off():
     assert 'MAX_TRADES_PER_CYCLE: "0"' in workflow
 
 
-def test_scheduler_state_is_force_refreshed_before_engine():
+def test_scheduler_state_uses_v9_style_persistent_data_without_pre_run_cleanup():
     workflow = _workflow()
-    assert 'Synchronize persistent scheduler state before tests' in workflow
+    assert 'data/timeframe_scan_state.json' in workflow
+    assert 'recent_event_cache.json' not in workflow  # runtime path is owned by run_once.py
+    assert 'git add -f data/timeframe_scan_state.json' in workflow
     assert 'git fetch --prune origin main' in workflow
-    assert 'origin/main:data/timeframe_scan_state.json' in workflow
-    assert '[PERSISTENCE_PRECHECK] restored remote scheduler state' in workflow
+    assert 'merged scheduler state' in workflow
+    assert 'Synchronize persistent scheduler state before tests' not in workflow
+    assert 'Backup persisted runtime state before tests' not in workflow
+    assert 'Clean test-generated runtime state' not in workflow
 
 
 def test_scheduler_state_push_is_verified_on_remote():
     workflow = _workflow()
-    assert '[COMMIT_STATE] local scheduler state version=2 symbols=' in workflow
-    assert 'git add -f data/timeframe_scan_state.json' in workflow
+    assert '[COMMIT_STATE] scheduler state version=2 symbols=' in workflow
     assert 'remote_sha256=' in workflow
-    assert 'remote verified version=2 symbols=' in workflow
+    assert 'remote scheduler state verified symbols=' in workflow
     assert 'State pushed and verified successfully' in workflow
 
 
@@ -173,19 +176,22 @@ def test_release_pins_runner_and_installs_userspace_wireproxy():
     assert "sudo wg" not in workflow
 
 
-def test_release_has_binance_proxy_preflight_before_engine_and_cleanup_before_commit():
+def test_release_keeps_only_required_binance_proxy_stage_and_no_redundant_futures_preflight():
     workflow = _workflow()
     assert "Start Binance-only WireProxy" in workflow
-    assert "Binance Futures preflight" in workflow
-    assert '"$BASE/fapi/v1/exchangeInfo"' in workflow
-    assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=10"' in workflow
-    assert '"$BASE/fapi/v1/ticker/price?symbol=BTCUSDT"' in workflow
+    assert "Binance Futures preflight" not in workflow
     assert "Stop Binance WireProxy" in workflow
     assert 'BINANCE_VPN_ENABLED: "true"' in workflow
     assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
-    assert workflow.index("Start Binance-only WireProxy") < workflow.index("Binance Futures preflight")
-    assert workflow.index("Binance Futures preflight") < workflow.index("Run engine")
+    assert workflow.index("Start Binance-only WireProxy") < workflow.index("Run engine")
+    assert workflow.index("Run engine") < workflow.index("Stop Binance WireProxy")
     assert workflow.index("Stop Binance WireProxy") < workflow.index("Commit state")
+
+
+def test_release_removes_per_cycle_test_and_compile_stages():
+    workflow = _workflow()
+    assert "- name: Run tests" not in workflow
+    assert "- name: Syntax check" not in workflow
 
 
 def test_release_requires_wireguard_secret_and_country_guard():
@@ -257,11 +263,10 @@ def test_new_entries_fail_closed_when_bingx_catalog_refresh_fails():
     assert 'stats["rejected_bingx_contract"]' in source
 
 
-def test_release_preserves_persisted_data_while_cleaning_test_state_before_always_commit():
+def test_release_never_deletes_persistent_data_between_engine_runs():
     workflow = _workflow()
-    assert 'Clean test-generated runtime state (preserve persisted data)' in workflow
-    assert 'Backup persisted runtime state before tests' in workflow
-    assert 'cp -a data "$BACKUP_DIR"' in workflow
-    assert 'cp -a "$BACKUP_DIR/data" data' in workflow
-    assert workflow.index('Backup persisted runtime state before tests') < workflow.index('Run tests') < workflow.index('Clean test-generated runtime state (preserve persisted data)') < workflow.index('Commit state')
-    assert 'rm -rf data .pytest_cache __pycache__ event_engine/__pycache__' not in workflow
+    assert 'rm -rf data' not in workflow
+    assert 'Backup persisted runtime state before tests' not in workflow
+    assert 'Clean test-generated runtime state (preserve persisted data)' not in workflow
+    assert 'Run tests' not in workflow
+    assert workflow.index('Checkout') < workflow.index('Run engine') < workflow.index('Commit state')

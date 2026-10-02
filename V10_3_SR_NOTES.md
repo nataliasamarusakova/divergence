@@ -1,3 +1,7 @@
+## v10.4.2
+
+Scheduler persistence restored to the v9 model: `recent_event_cache.json` and `timeframe_scan_state.json` remain in `data/` across runs. Workflow no longer deletes runtime data or runs per-cycle test/preflight stages. Commit step merges remote/local scheduler watermarks to protect against queued-run races.
+
 # v10.3.8 Audited: fixed 7% SL + Ajay R5.41 S/R room integration
 
 ## Current behavior
