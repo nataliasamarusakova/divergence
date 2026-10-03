@@ -43,12 +43,12 @@ EARLY_LOSS_CUT_2H_PNL = float(os.environ.get("EARLY_LOSS_CUT_2H_PNL", "-1.50"))
 EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
 EARLY_LOSS_CUT_4H_PNL = float(os.environ.get("EARLY_LOSS_CUT_4H_PNL", "-2.50"))
 
-# Which realised TP leg moves the remaining stop to break-even. Keep tp2 as the
-# shipped v10.1.2 default until TP1 is validated by an independent replay/A-B test.
-# The value remains environment-configurable for controlled research.
-BE_AFTER_LEG = os.environ.get("BE_AFTER_LEG", "tp2").strip().lower()
+# For the normal two-TP profile, move the remaining stop to break-even after TP1.
+# A single-TP micro-position is terminal and therefore arms BE only at TP3 via
+# _be_milestone_reached(). The value remains environment-configurable for research.
+BE_AFTER_LEG = os.environ.get("BE_AFTER_LEG", "tp1").strip().lower()
 if BE_AFTER_LEG not in {"tp1", "tp2"}:
-    BE_AFTER_LEG = "tp2"
+    BE_AFTER_LEG = "tp1"
 
 
 def _be_milestone_reached(hit_legs: set[str], is_single_tp: bool) -> bool:

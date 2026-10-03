@@ -611,18 +611,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
-    # Never silently increase leverage. A small position must be large enough for
-    # every configured TP leg to clear exchange minQty after the intended split.
-    # The smallest shipped normal leg is 25%, so 4*minQty is the conservative
-    # pre-order bound that guarantees a 25% leg can meet minQty. The protection
-    # allocator remains the final precision-aware check after the real fill.
-    if REQUIRE_MULTI_TP and min_qty > 0 and qty < min_qty * 4:
-        return {
-            "status": "error",
-            "error": f"multi_tp_not_supported: qty={qty} < 4*min_qty={min_qty * 4} at configured leverage={leverage}",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "leverage": leverage, "sizing_price": sizing_price, "tp_mode": "multi_tp_required",
-        }
+    # TP count is selected after the confirmed fill from the actual position
+    # quantity. Do not reject a valid market entry merely because the position
+    # cannot support the historical 3-leg TP ladder. The protection layer will
+    # safely choose 2 legs or 1 terminal TP3 leg according to exchange limits.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -1183,6 +1175,46 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
     if trade_id:
         return f"EVTSL{_trade_digest(trade_id)}"
     return "EVTSL"
+
+
+def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
+    """Select the largest safe TP profile supported by the filled position.
+
+    The shipped ladder is still calculated as three milestones, but execution
+    uses at most two conditional TP orders as requested:
+      2 legs -> TP1/TP2
+      1 leg  -> TP3 (terminal target)
+
+    This keeps the normal first two milestones for a position that can support
+    two orders, while the existing single-TP micro-position policy preserves
+    the farthest TP3 target.
+
+    Capacity is based on the exchange minimum executable quantity after the
+    position has actually filled, including quantity precision.
+    """
+    if not tp_levels_norm or position_qty <= 0:
+        return []
+
+    try:
+        step = Decimal(1).scaleb(-int(precision)) if int(precision) >= 0 else Decimal("1")
+        min_leg = max(step, Decimal(str(max(float(min_qty or 0.0), 0.0))))
+        position = Decimal(str(position_qty))
+    except (TypeError, ValueError, ArithmeticError):
+        # Internal callers pass validated numeric values. If malformed data ever
+        # reaches this helper, keep the hard two-TP ceiling rather than restoring
+        # an unbounded TP profile.
+        return list(tp_levels_norm[:2])
+
+    count = min(len(tp_levels_norm), 2)
+    supported = 1
+    for candidate_count in range(count, 0, -1):
+        if position >= min_leg * candidate_count:
+            supported = candidate_count
+            break
+
+    if supported >= 2:
+        return list(tp_levels_norm[:2])
+    return [dict(tp_levels_norm[-1])]
 
 
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
@@ -1874,25 +1906,33 @@ def ensure_directional_protection(
             "emergency_close": rollback,
         }
 
-    tp_mode = "multi_tp"
-    if min_qty > 0 and position_qty < min_qty * len(tp_levels_norm):
-        if REQUIRE_MULTI_TP:
-            return {
-                "status": "PROTECTION_FAILED",
-                "symbol": symbol,
-                "bx_symbol": bx_symbol,
-                "direction": direction,
-                "avg_price": avg_price,
-                "qty": position_qty,
-                "sl_result": sl_result,
-                "tp_orders": [],
-                "error": f"multi_tp_not_supported_after_fill: qty={position_qty} < {len(tp_levels_norm)}*min_qty={min_qty}",
-                "rolled_back": False,
-            }
-        # Legacy compatibility when multi-TP is explicitly not required: one
-        # farthest TP may be used for a micro-position.
-        tp_levels_norm = [{"leg": tp_levels_norm[-1]["leg"], "pnl_pct": tp_levels_norm[-1]["pnl_pct"], "close_fraction": 1.0}]
-        tp_mode = "single_tp"
+    # Adapt the TP profile to the confirmed exchange position size. A position
+    # that cannot support 3 independent legs still gets 2 legs when possible,
+    # or one terminal TP3 leg when necessary. This is intentionally independent
+    # of REQUIRE_MULTI_TP: a valid entry must not be discarded only because the
+    # account is too small for the historical 3-leg profile.
+    tp_levels_norm = _select_supported_tp_levels(
+        tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
+    )
+    if not tp_levels_norm:
+        return {
+            "status": "PROTECTION_FAILED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "sl_result": sl_result,
+            "tp_orders": [],
+            "error": "no TP profile can be supported by the filled position quantity",
+            "rolled_back": False,
+        }
+    tp_mode = "single_tp" if len(tp_levels_norm) == 1 else ("two_tp" if len(tp_levels_norm) == 2 else "multi_tp")
+    log.info(
+        "[BINGX] %s %s TP profile selected: mode=%s legs=%s qty=%s min_qty=%s",
+        symbol, direction, tp_mode, ",".join(str(x.get("leg", "")).upper() for x in tp_levels_norm),
+        _format_qty(position_qty, precision), _format_qty(min_qty, precision) if min_qty > 0 else "0",
+    )
 
     try:
         desired_qtys = _allocate_tp_quantities(
