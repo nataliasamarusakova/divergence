@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1790986617699,
+  "updated_ts": 1790986916571,
   "events": [
     {
       "event_id": "EVT_F3D6E34E7927743F",
@@ -2280,6 +2280,78 @@
         "mss_level": 0.006241,
         "broken_ts": 1790956799999,
         "bos_ts": 1790582399999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_1EB627F5ABFD9489",
+      "symbol": "PYTH",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1790985599999,
+        "pivot_2_ts": 1790985599999,
+        "detected_at_ts": 1790985599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.0787,
+        "compression_ratio": 0.2095859314375689,
+        "ma_spread_atr": 0.10425086182739793,
+        "compression_threshold": 0.4974134528607518,
+        "breakout_atr": 0.5744894204602524,
+        "volume_ratio": 0.5765606540823002,
+        "requires_retest": true,
+        "trigger_level": 0.07818,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4A3BBE55246D3C33",
+      "symbol": "PYTH",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "MACD_4H_BULLISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1790985599999,
+        "pivot_2_ts": 1790985599999,
+        "detected_at_ts": 1790985599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.0787,
+        "macd": -3.443569093895815e-05,
+        "macd_signal": -0.00013651537178876612,
+        "macd_hist": 0.00010207968084980797,
+        "ema200": 0.06369419604612248,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_B7D7E5258F51046F",
+      "symbol": "PYTH",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1790956799999,
+        "pivot_2_ts": 1790985599999,
+        "detected_at_ts": 1790985599999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.07772,
+        "range_high": 0.08078,
+        "range_low": 0.07772,
+        "manipulation_depth_atr": 1.1298127744606974,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
