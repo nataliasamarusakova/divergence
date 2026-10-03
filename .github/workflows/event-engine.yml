@@ -44,12 +44,15 @@ jobs:
       REQUIRE_CVD_CONFIRMATION: "false"
       ENTRY_QUALITY_GATE_ENABLED: "true"
       ENTRY_QUALITY_MODE: "shadow"
+      MIN_SETUP_SCORE: "60"
+      MIN_SHORT_SETUP_SCORE: "75"
       # Ajay R5.41 S/R room is checked only for final trade candidates, immediately
       # before order placement. SPOT is kept for now; futures can be added later
       # after feed-to-TradingView validation.
       AJAY_SR_ROOM_ENABLED: "true"
       AJAY_SR_ROOM_MODE: "enforce"
-      AJAY_SR_REQUIRE_DATA: "true"
+      # Missing Binance Spot S/R source/data is diagnostic only; it must not veto an otherwise valid entry.
+      AJAY_SR_REQUIRE_DATA: "false"
       AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"
       AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"
       AJAY_SR_KLINE_LIMIT_1H: "1000"
@@ -75,8 +78,9 @@ jobs:
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
       SYMBOL_LOSS_COOLDOWN_MIN: "360"
-      REJECT_SINGLE_TP: "true"
-      REQUIRE_MULTI_TP: "true"
+      # TP count adapts to the filled position size: 2 legs when supported, otherwise one terminal TP3.
+      REJECT_SINGLE_TP: "false"
+      REQUIRE_MULTI_TP: "false"
       FIXED_STOP_LOSS_PCT: "7.00"
       REJECT_ATR_RISK_CLIP: "false"
       MAX_ENTRY_RISK_PCT: "7.00"
@@ -90,7 +94,7 @@ jobs:
       MAX_TRIGGER_TO_ORDER_DELAY_MIN: "8"
       MAX_DIVERGENCE_FORMATION_AGE_MIN: "45"
       MAX_DIVERGENCE_POST_CONFIRM_AGE_MIN: "45"
-      DIVERGENCE_SHADOW_ONLY: "true"
+      DIVERGENCE_SHADOW_ONLY: "false"
       MAX_PRE_ORDER_DRIFT_REJECTIONS: "3"
       MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS: "3"
       MA_COMPRESSION_RETEST_MAX_DELAY_MIN: "120"
@@ -125,7 +129,7 @@ jobs:
       EXTREME_SHORT_FUNDING: "-0.50"
       EXTREME_LONG_FUNDING: "0.50"
       FUNDING_REQUIRED: "false"
-      BE_AFTER_LEG: "tp2"
+      BE_AFTER_LEG: "tp1"
       EARLY_LOSS_CUT_ENABLED: "false"
       EARLY_LOSS_CUT_2H_MIN: "120"
       EARLY_LOSS_CUT_2H_PNL: "-1.50"
