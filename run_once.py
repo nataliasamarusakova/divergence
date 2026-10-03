@@ -4039,7 +4039,10 @@ def main() -> None:
                 tp_price = tp_price_from_pnl(setup.get("entry_reference"), direction, tp_pct)
                 risk_for_rr = _safe_float(setup.get("risk_pct"), 0.0)
                 rr_text = format_rr(tp_pct / risk_for_rr) if risk_for_rr > 0 and tp_pct > 0 else "—"
-                tp_log_parts.append(f"{str(level.get('leg', 'TP')).upper()}={format_price(tp_price)} ({format_number(tp_pct, decimals=2) + "%"} {rr_text})")
+                tp_pct_text = f"{format_number(tp_pct, decimals=2)}%"
+                tp_log_parts.append(
+                    f"{str(level.get('leg', 'TP')).upper()}={format_price(tp_price)} ({tp_pct_text} {rr_text})"
+                )
             tp_log_text = " | ".join(tp_log_parts) if tp_log_parts else f"TP3={format_price(setup.get('target_price'))}"
             log.info(
                 "[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %s | SL: %s (-%s) | %s",
