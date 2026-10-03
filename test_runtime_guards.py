@@ -1843,13 +1843,13 @@ def test_recent_symbol_loss_cooldown_is_temporary(tmp_path, monkeypatch):
     assert any(r.startswith("RECENT_SYMBOL_LOSS:") for r in reasons)
 
 
-def test_multi_tp_preflight_blocks_micro_position_before_order(monkeypatch):
+def test_micro_position_no_longer_blocked_by_three_tp_requirement(monkeypatch):
     from event_engine import bingx as bx
 
     monkeypatch.setattr(bx, "REQUIRE_MULTI_TP", True)
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {
-        "quantityPrecision": 3, "tradeMinQuantity": 1.0, "tradeMinUSDT": 0, "maxLeverage": 10,
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001, "tradeMinUSDT": 0, "maxLeverage": 10,
     })
     monkeypatch.setattr(bx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bx, "has_open_position", lambda symbol, direction: False)
@@ -1857,13 +1857,19 @@ def test_multi_tp_preflight_blocks_micro_position_before_order(monkeypatch):
     monkeypatch.setattr(bx, "LEVERAGE", 2)
     monkeypatch.setattr(bx, "MAX_LEVERAGE", 10)
     called = {"post": False}
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: called.__setitem__("post", True) or {})
+    monkeypatch.setattr(bx, "_set_leverage", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        bx, "_request",
+        lambda *args, **kwargs: called.__setitem__("post", True) or {
+            "code": 0, "data": {"order": {"orderId": "O1"}}
+        },
+    )
 
+    # qty=2 meets minQty but cannot support the historical 3-leg ladder. The market
+    # entry must still be allowed; protection will adapt after the confirmed fill.
     out = bx.open_market("TEST", "LONG", 100.0, "TR_TEST")
-    assert out["status"] == "error"
-    assert "multi_tp_not_supported" in out["error"]
-    assert out["tp_mode"] == "multi_tp_required"
-    assert called["post"] is False
+    assert out["status"] == "opened"
+    assert called["post"] is True
 
 
 def test_query_order_uses_trigger_execution_quantity_fallback(monkeypatch):
@@ -1963,7 +1969,7 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     }
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
-    assert [x["pnl_pct"] for x in levels] == pytest.approx([5.25, 8.75, 14.0])
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 8.75, 14.0])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -1995,7 +2001,43 @@ def test_entry_quality_mode_normalization(monkeypatch):
     assert mod.ENTRY_QUALITY_MODE == "shadow"
 
 
-def test_multi_tp_preflight_four_min_qty_is_the_conservative_boundary(monkeypatch):
+def test_score_thresholds_are_real_admission_gates(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "MIN_SCORE", 60.0)
+    monkeypatch.setattr(ro, "MIN_SHORT_SCORE", 75.0)
+
+    assert ro._score_gate_passed(59.99, "LONG") is False
+    assert ro._score_gate_passed(60.0, "LONG") is True
+    assert ro._score_gate_passed(74.99, "SHORT") is False
+    assert ro._score_gate_passed(75.0, "SHORT") is True
+
+
+def test_sr_geometry_error_blocks_entry_when_data_is_optional(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", True)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "enforce")
+    monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", False)
+    monkeypatch.setattr(ro, "MARKET_DATA_SOURCE", "binance")
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: {"accepted": [], "cwidth": 1.0})
+    monkeypatch.setattr(ro, "evaluate_sr_room", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("SR geometry bug")))
+    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("unexpected SR evaluation errors must block entry"))
+
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 2.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"},
+        "EVT_SR_EVAL_FAIL",
+    )
+    assert out["status"] == "SR_EVALUATION_FAILED"
+    assert "SR geometry bug" in out["error"]
+
+
+def test_market_entry_still_respects_exchange_min_qty(monkeypatch):
     from event_engine import bingx as bx
 
     monkeypatch.setattr(bx, "REQUIRE_MULTI_TP", True)
@@ -2008,12 +2050,14 @@ def test_multi_tp_preflight_four_min_qty_is_the_conservative_boundary(monkeypatc
     monkeypatch.setattr(bx, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(bx, "LEVERAGE", 3)
     monkeypatch.setattr(bx, "MAX_LEVERAGE", 10)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *args, **kwargs: True)
     monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"order": {"orderId": "O"}}})
-    # 3*min_qty is not enough for a 25/40/35 split without pushing one leg below minQty.
-    out = bx.open_market("TEST", "LONG", 100.0, "TR_BOUND")
-    assert out["status"] == "error"
-    assert "4*min_qty" in out["error"]
 
+    # qty=0.03 is below the actual exchange minQty=1.0, so the normal exchange
+    # safety gate must still reject the order. This is not a TP-count rejection.
+    out = bx.open_market("TEST", "LONG", 100.0, "TR_MINQ")
+    assert out["status"] == "error"
+    assert "min_qty" in out["error"]
 
 
 def test_contract_disappearance_is_terminalized(monkeypatch):

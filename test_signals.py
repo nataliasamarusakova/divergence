@@ -213,6 +213,20 @@ def test_get_contract_displayName_with_hyphen():
     assert c["symbol"] == "ETH-USDT"
 
 
+def test_select_supported_tp_levels_adapts_to_position_size():
+    from event_engine import bingx as bx
+
+    levels = [
+        {"leg": "tp1", "pnl_pct": 5.0, "close_fraction": 0.25},
+        {"leg": "tp2", "pnl_pct": 8.0, "close_fraction": 0.40},
+        {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
+    ]
+
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 2.0, 0, 1.0)] == ["tp1", "tp2"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)] == ["tp3"]
+
+
 def test_allocate_tp_quantities_exact_sum():
     # 1. Standard precision and min_qty
     qtys = _allocate_tp_quantities(
@@ -298,7 +312,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == pytest.approx(1.3875)
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.3625)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 3
@@ -308,7 +322,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == pytest.approx(1.3875)
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.3625)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 3
@@ -394,7 +408,7 @@ def test_execute_new_position_defines_pre_order_price(monkeypatch):
         "effective_tp_levels": [{"leg": "tp3", "pnl_pct": 1.75, "close_fraction": 1.0, "qty": 0.1}],
         "effective_weighted_rr": 1.75,
     })
-    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.3875, "entry_reference": 99.0, "target_rr": 2.00}
+    setup = {"risk_pct": 1.0, "planned_weighted_rr": 1.3625, "entry_reference": 99.0, "target_rr": 2.00}
     out = execute_new_position("TEST", "LONG", 99.0, setup, "EVT_TEST")
     assert out["status"] == "opened_protected"
     assert out["open_result"]["order_reference_price"] == 100.0
@@ -438,7 +452,7 @@ def test_telegram_message_uses_clean_setup_values_and_directional_confirmation()
             "target_price": 0.7900200000000001,
             "risk_pct": 7.0,
             "tp_levels": [
-                {"leg": "tp1", "pnl_pct": 5.25, "close_fraction": 0.25},
+                {"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 0.25},
                 {"leg": "tp2", "pnl_pct": 8.75, "close_fraction": 0.40},
                 {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
             ],
@@ -451,8 +465,8 @@ def test_telegram_message_uses_clean_setup_values_and_directional_confirmation()
     )
     assert "Entry: <code>0.693</code>" in msg
     assert "SL: <code>0.64449</code>" in msg
-    assert "TP1: <code>0.7293825</code>" in msg
-    assert "+5.25%" in msg and "0.75R" in msg
+    assert "TP1: <code>0.7245315</code>" in msg
+    assert "+4.55%" in msg and "0.65R" in msg
     assert "TP2: <code>0.7536375</code>" in msg
     assert "TP3: <code>0.79002</code>" in msg
     assert "+14%" in msg and "2R" in msg
@@ -1744,9 +1758,9 @@ def test_tighter_tp_levels_are_consistent_for_normal_and_squeeze():
     # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
     assert div_setup["target_rr"] == 2.00
-    assert div_setup["planned_weighted_rr"] == pytest.approx(1.3875)
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.3625)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
-    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.75)
+    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.65)
     assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.25)
     assert tp_div[2]["pnl_pct"] == pytest.approx(sl_pct_div * 2.00)
     assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.40, 0.35])
@@ -1805,15 +1819,15 @@ def _run_be_case(monkeypatch, tmp_path, hit_legs, be_after_leg, tp_mode=None):
     return be_calls, saved["EVT_TEST"]
 
 
-def test_be_default_policy_waits_for_tp2(monkeypatch, tmp_path):
-    """Documented policy: TP1 takes a partial, TP2 removes the risk."""
+def test_be_default_policy_moves_after_tp1(monkeypatch, tmp_path):
+    """Normal two-TP positions protect the remainder at break-even after TP1."""
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp1")
+    assert len(be_calls) == 1
+    assert trade["be_activated"] is True
+
     be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp2")
     assert be_calls == []
     assert trade["be_activated"] is False
-
-    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1", "tp2"], "tp2")
-    assert len(be_calls) == 1
-    assert trade["be_activated"] is True
 
 
 def test_be_tp1_policy_is_still_selectable(monkeypatch, tmp_path):
@@ -2386,7 +2400,8 @@ def test_short_defensive_score_is_stricter():
     ev = {"direction": "SHORT", "event_type": "REGULAR_BEARISH_MACD", "event_fact": {"price_delta_atr": 1.0}}
     score = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
     assert score > 0
-    assert ro.MIN_SHORT_SCORE == 85.0
+    assert ro.MIN_SCORE == 60.0
+    assert ro.MIN_SHORT_SCORE == 75.0
 
 
 def test_hot_oi_penalty_applies_to_score():

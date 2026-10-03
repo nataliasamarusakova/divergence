@@ -7,8 +7,8 @@ def _workflow() -> str:
     return WORKFLOW.read_text(encoding='utf-8')
 
 
-def test_clean_release_uses_divergence_shadow_mode():
-    assert 'DIVERGENCE_SHADOW_ONLY: "true"' in _workflow()
+def test_clean_release_executes_divergence_events():
+    assert 'DIVERGENCE_SHADOW_ONLY: "false"' in _workflow()
 
 
 def test_clean_release_has_pre_order_drift_retry_budget():
@@ -16,7 +16,10 @@ def test_clean_release_has_pre_order_drift_retry_budget():
     assert 'MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS: "3"' in _workflow()
     assert 'ENTRY_QUALITY_GATE_ENABLED: "true"' in _workflow()
     assert 'ENTRY_QUALITY_MODE: "shadow"' in _workflow()
-    assert 'REQUIRE_MULTI_TP: "true"' in _workflow()
+    assert 'REQUIRE_MULTI_TP: "false"' in _workflow()
+    assert 'REJECT_SINGLE_TP: "false"' in _workflow()
+    assert 'MIN_SETUP_SCORE: "60"' in _workflow()
+    assert 'MIN_SHORT_SETUP_SCORE: "75"' in _workflow()
     assert 'REJECT_ATR_RISK_CLIP: "false"' in _workflow()
     assert 'FIXED_STOP_LOSS_PCT: "7.00"' in _workflow()
 
@@ -57,16 +60,15 @@ def test_release_telemetry_uses_attempts_and_opened_trades_separately():
     assert "execution_attempts_this_cycle=" in source
 
 
-def test_shadow_flag_is_actually_reachable():
+def test_divergence_predicate_is_reachable_for_real_execution():
     """A config guard is worthless unless the flag can fire.
 
-    DIVERGENCE_SHADOW_ONLY shipped as "true" for a full week while the branch
-    guarding it compared event_type to the literal "DIVERGENCE", which no
-    detector emits. Assert the predicate, not the YAML string.
+    Divergence events are recognised through their engine/event semantics rather
+    than a literal event_type equal to "DIVERGENCE".
     """
     import run_once
 
-    assert 'DIVERGENCE_SHADOW_ONLY: "true"' in _workflow()
+    assert 'DIVERGENCE_SHADOW_ONLY: "false"' in _workflow()
     assert run_once._is_divergence_event(
         {"event_type": "REGULAR_BULLISH_RSI", "event_fact": {"engine": "DIVERGENCE"}}
     )
@@ -80,8 +82,8 @@ def test_mitigation_engine_is_disabled():
 def test_break_even_policy_matches_documented_ladder():
     import event_engine.tracker as tracker
 
-    assert 'BE_AFTER_LEG: "tp2"' in _workflow()
-    assert tracker.BE_AFTER_LEG == "tp2"
+    assert 'BE_AFTER_LEG: "tp1"' in _workflow()
+    assert tracker.BE_AFTER_LEG == "tp1"
 
 
 def test_liquidity_sweep_has_a_retest_window():
@@ -120,7 +122,7 @@ def test_release_enables_lazy_ajay_sr_room_using_spot():
     workflow = _workflow()
     assert 'AJAY_SR_ROOM_ENABLED: "true"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "enforce"' in workflow
-    assert 'AJAY_SR_REQUIRE_DATA: "true"' in workflow
+    assert 'AJAY_SR_REQUIRE_DATA: "false"' in workflow
     assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
     assert 'AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"' in workflow
     assert 'AJAY_SR_KLINE_LIMIT_1H: "1000"' in workflow

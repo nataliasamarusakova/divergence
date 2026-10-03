@@ -204,7 +204,7 @@ MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "30"))
 MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
 MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "2.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
-MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "85"))
+MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "75"))
 
 # Entry-quality policy is intentionally separate from the legacy diagnostic score.
 # It can be rolled back via environment variables without changing event detectors
@@ -241,9 +241,9 @@ SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
 # Current TP ladder: closer milestones while preserving staged partial exits.
 # These RR values are used consistently for new entries and restart fallback.
-NORMAL_TP_RR = (0.75, 1.25, 2.00)
+NORMAL_TP_RR = (0.65, 1.25, 2.00)
 NORMAL_TP_FRACTIONS = (0.25, 0.40, 0.35)
-NORMAL_PLANNED_WEIGHTED_RR = 1.3875
+NORMAL_PLANNED_WEIGHTED_RR = 1.3625
 SQUEEZE_TP_RR = (1.00, 1.50, 2.00)
 SQUEEZE_TP_FRACTIONS = (0.30, 0.35, 0.35)
 SQUEEZE_PLANNED_WEIGHTED_RR = 1.525
@@ -2058,6 +2058,13 @@ def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[
     return kept, rejected
 
 
+def _score_gate_passed(score: float, direction: str) -> bool:
+    """Return whether the setup meets the configured directional score threshold."""
+    value = _safe_float(score, 0.0)
+    threshold = MIN_SHORT_SCORE if str(direction).upper() == "SHORT" else MIN_SCORE
+    return threshold <= 0 or value >= threshold
+
+
 def calculate_setup_score(
     ev: dict,
     coinalyze_row: Any,
@@ -2273,7 +2280,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR
         target_rr = SQUEEZE_TP_RR[-1]
     else:
-        # Tighter normal cascade: 0.75R / 1.25R / 2.00R.
+        # Tighter normal cascade: 0.65R / 1.25R / 2.00R.
         tp_levels = [
             {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
             for i, (rr, fraction) in enumerate(zip(NORMAL_TP_RR, NORMAL_TP_FRACTIONS), start=1)
@@ -2924,73 +2931,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     sr_result: dict[str, Any] | None = None
     sr_snapshot: dict[str, Any] | None = None
     if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off":
+        # Data retrieval is the only part of the S/R path that may be bypassed
+        # when AJAY_SR_REQUIRE_DATA=false. Geometry/evaluation errors are fail-safe: they
+        # must never silently turn into an unvalidated market entry.
         try:
             sr_snapshot = get_cached_sr_snapshot(symbol)
-            sr_setup = dict(setup)
-            sr_setup["entry_reference"] = float(live_reference)
-            risk_pct_for_sr = float(setup.get("risk_pct", 0) or 0)
-            if risk_pct_for_sr <= 0:
-                raise ValueError("invalid planned risk_pct for SR room")
-            # Rebuild the same ladder used by protection code from the current
-            # pre-order reference price. Recompute invalidation at that reference
-            # so the R multipliers stay on the current centralized TP ladder.
-            # squeeze events), even if the signal price has drifted.
-            if direction == "LONG":
-                sr_setup["invalidation_price"] = float(live_reference) * (1.0 - risk_pct_for_sr / 100.0)
-            else:
-                sr_setup["invalidation_price"] = float(live_reference) * (1.0 + risk_pct_for_sr / 100.0)
-            sl_pct_preview, preview_tp_levels = build_tp_levels(
-                sr_setup, direction, event_type=event_type_for_risk
-            )
-            tp_rrs = tuple(
-                float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct_preview), 1e-12)
-                for level in preview_tp_levels
-            )
-            if len(tp_rrs) != 3 or any(rr <= 0 for rr in tp_rrs):
-                raise ValueError("invalid TP ladder for SR room")
-            sr_result = evaluate_sr_room(
-                sr_snapshot,
-                entry_price=float(live_reference),
-                direction=direction,
-                risk_pct=risk_pct_for_sr,
-                target_rrs=(float(tp_rrs[0]), float(tp_rrs[1]), float(tp_rrs[2])),
-            )
-            setup["sr_context"] = sr_result
-            if sr_result.get("supporting_zone_confirmation"):
-                log.info("[SR_ROOM] %s %s supportive directional-zone confirmation: %s", direction, symbol, sr_result.get("directional_zone_alignment"))
-            if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "enforce":
-                record_action({
-                    "event_id": event_id, "symbol": symbol, "direction": direction,
-                    "event_type": event_type_for_risk,
-                    "execution_status": "SR_ROOM_REJECTED",
-                    "sr_room": sr_result,
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                })
-                return {
-                    "status": "SR_ROOM_REJECTED",
-                    "mode": EXECUTION_MODE,
-                    "order_id": None,
-                    "position": {},
-                    "error": str(sr_result.get("reject_reason") or "SR_ROOM_REJECTED"),
-                    "sr_room": sr_result,
-                }
-            if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "shadow":
-                record_action({
-                    "event_id": event_id, "symbol": symbol, "direction": direction,
-                    "event_type": event_type_for_risk,
-                    "execution_status": "SR_ROOM_SHADOW_FLAGGED",
-                    "sr_room": sr_result,
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                })
-                log.info("[SR_ROOM_SHADOW] %s %s rejected geometry=%s but NOT blocked", direction, symbol, sr_result.get("room_status"))
-            elif AJAY_SR_ROOM_MODE == "shadow":
-                record_action({
-                    "event_id": event_id, "symbol": symbol, "direction": direction,
-                    "event_type": event_type_for_risk,
-                    "execution_status": "SR_ROOM_CHECKED",
-                    "sr_room": sr_result,
-                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                })
         except SRSymbolUnavailableError as exc:
             record_action({
                 "event_id": event_id, "symbol": symbol, "direction": direction,
@@ -3001,8 +2946,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             })
             if AJAY_SR_REQUIRE_DATA and AJAY_SR_ROOM_MODE == "enforce":
                 return {"status": "SR_SYMBOL_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
-            log.warning("[SR_ROOM] %s %s S/R symbol unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
-        except Exception as exc:
+            log.warning("[SR_ROOM] %s %s S/R symbol unavailable; continuing without S/R geometry: %s", direction, symbol, exc)
+            sr_snapshot = None
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
             record_action({
                 "event_id": event_id, "symbol": symbol, "direction": direction,
                 "event_type": event_type_for_risk,
@@ -3012,7 +2958,84 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             })
             if AJAY_SR_REQUIRE_DATA and AJAY_SR_ROOM_MODE == "enforce":
                 return {"status": "SR_DATA_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
-            log.warning("[SR_ROOM] %s %s S/R unavailable; AJAY_SR_REQUIRE_DATA=%s: %s", direction, symbol, AJAY_SR_REQUIRE_DATA, exc)
+            log.warning("[SR_ROOM] %s %s S/R data unavailable; continuing without S/R geometry: %s", direction, symbol, exc)
+            sr_snapshot = None
+
+        if sr_snapshot is not None:
+            try:
+                sr_setup = dict(setup)
+                sr_setup["entry_reference"] = float(live_reference)
+                risk_pct_for_sr = float(setup.get("risk_pct", 0) or 0)
+                if risk_pct_for_sr <= 0:
+                    raise ValueError("invalid planned risk_pct for SR room")
+                if direction == "LONG":
+                    sr_setup["invalidation_price"] = float(live_reference) * (1.0 - risk_pct_for_sr / 100.0)
+                else:
+                    sr_setup["invalidation_price"] = float(live_reference) * (1.0 + risk_pct_for_sr / 100.0)
+                sl_pct_preview, preview_tp_levels = build_tp_levels(
+                    sr_setup, direction, event_type=event_type_for_risk
+                )
+                tp_rrs = tuple(
+                    float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct_preview), 1e-12)
+                    for level in preview_tp_levels
+                )
+                if len(tp_rrs) != 3 or any(rr <= 0 for rr in tp_rrs):
+                    raise ValueError("invalid TP ladder for SR room")
+                sr_result = evaluate_sr_room(
+                    sr_snapshot,
+                    entry_price=float(live_reference),
+                    direction=direction,
+                    risk_pct=risk_pct_for_sr,
+                    target_rrs=(float(tp_rrs[0]), float(tp_rrs[1]), float(tp_rrs[2])),
+                )
+                setup["sr_context"] = sr_result
+                if sr_result.get("supporting_zone_confirmation"):
+                    log.info("[SR_ROOM] %s %s supportive directional-zone confirmation: %s", direction, symbol, sr_result.get("directional_zone_alignment"))
+                if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "enforce":
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type_for_risk,
+                        "execution_status": "SR_ROOM_REJECTED",
+                        "sr_room": sr_result,
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    return {
+                        "status": "SR_ROOM_REJECTED",
+                        "mode": EXECUTION_MODE,
+                        "order_id": None,
+                        "position": {},
+                        "error": str(sr_result.get("reject_reason") or "SR_ROOM_REJECTED"),
+                        "sr_room": sr_result,
+                    }
+                if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "shadow":
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type_for_risk,
+                        "execution_status": "SR_ROOM_SHADOW_FLAGGED",
+                        "sr_room": sr_result,
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    log.info("[SR_ROOM_SHADOW] %s %s rejected geometry=%s but NOT blocked", direction, symbol, sr_result.get("room_status"))
+                elif AJAY_SR_ROOM_MODE == "shadow":
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type_for_risk, "execution_status": "SR_ROOM_CHECKED",
+                        "sr_room": sr_result, "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+            except Exception as exc:
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type_for_risk, "execution_status": "SR_EVALUATION_FAILED",
+                    "error": str(exc), "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+                log.exception("[SR_ROOM] %s %s S/R evaluation failed; market entry blocked: %s", direction, symbol, exc)
+                return {
+                    "status": "SR_EVALUATION_FAILED",
+                    "mode": EXECUTION_MODE,
+                    "order_id": None,
+                    "position": {},
+                    "error": str(exc),
+                }
 
     log.info("[EXECUTION] Opening market position after all pre-order gates: %s %s at ref price %.8g...", direction, symbol, live_reference)
     try:
@@ -3935,16 +3958,32 @@ def main() -> None:
                 else:
                     log.info("[ENTRY_QUALITY_OFF] %s %s (%s/%s) ignored: %s", direction, symbol, tf, event_type, ";".join(entry_quality_reasons))
 
-            # High OI growth remains diagnostic context; it is not a universal veto.
+            # High OI growth remains diagnostic context, but the configured directional
+            # score thresholds are now real admission gates. A signal below the threshold
+            # is skipped for this trigger evaluation without terminalizing the parent event,
+            # because trigger-side diagnostics can legitimately change on a later closed bar.
             score = calculate_setup_score(ev=ev, coinalyze_row=r, df_15m=d15, trigger_diagnostic=trigger_diag)
-            # Score is diagnostic/ranking metadata, not a universal entry veto.
-            # Each engine's structural validation is the actual admission criterion.
-            # Keep the configured directional thresholds for observability/analytics.
             min_score_for_direction = MIN_SHORT_SCORE if direction == "SHORT" else MIN_SCORE
-            score_gate_passed = (min_score_for_direction <= 0) or score >= min_score_for_direction
+            score_gate_passed = _score_gate_passed(score, direction)
             ev.setdefault("event_fact", {})["score"] = score
             ev["event_fact"]["score_gate_threshold"] = min_score_for_direction
             ev["event_fact"]["score_gate_passed"] = bool(score_gate_passed)
+            if not score_gate_passed:
+                stats["rejected_score"] += 1
+                tf_stats["rejected_score"] = tf_stats.get("rejected_score", 0) + 1
+                if direction == "SHORT":
+                    stats["rejected_short_score"] += 1
+                log.info(
+                    "[SCORE] %s %s (%s/%s) rejected: score=%.2f < threshold=%.2f",
+                    direction, symbol, tf, event_type, score, min_score_for_direction,
+                )
+                record_action({
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "event_type": event_type, "execution_status": "SCORE_REJECTED",
+                    "score": score, "score_gate_threshold": min_score_for_direction,
+                    "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                })
+                continue
 
             if symbol not in risk_1h_cache:
                 try:

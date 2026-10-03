@@ -290,6 +290,32 @@ def test_enforced_sr_data_failure_blocks_candidate_without_sending_order(monkeyp
     assert out["status"] == "SR_DATA_UNAVAILABLE"
 
 
+def test_sr_data_failure_does_not_block_entry_when_data_is_optional(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", True)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "enforce")
+    monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", False)
+    monkeypatch.setattr(ro, "MARKET_DATA_SOURCE", "binance")
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("spot unavailable")))
+    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
+    called = {"open": 0}
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: called.__setitem__("open", called["open"] + 1) or {
+        "status": "error", "error": "TEST_STOP_AFTER_OPEN_CALL"
+    })
+
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 2.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"},
+        "EVT_SR_DATA_OPTIONAL",
+    )
+    assert called["open"] == 1
+    assert out["status"] != "SR_DATA_UNAVAILABLE"
+
+
 def test_post_fill_sr_recheck_allows_zone_after_tp1(monkeypatch):
     import run_once as ro
 
@@ -328,7 +354,7 @@ def test_post_fill_sr_recheck_allows_zone_after_tp1(monkeypatch):
         "EVT_SR_POST_FILL_ALLOWED",
     )
     assert out["status"] == "opened_protected"
-    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.5)
+    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
     assert captured["tp_levels"][2]["pnl_pct"] == pytest.approx(4.0)
 
 def test_post_fill_sr_does_not_mutate_tp3_when_zone_is_after_tp1(monkeypatch):
@@ -367,7 +393,7 @@ def test_post_fill_sr_does_not_mutate_tp3_when_zone_is_after_tp1(monkeypatch):
         "EVT_SR_POST_FILL_NO_MUTATION",
     )
     assert out["status"] == "opened_protected"
-    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.5)
+    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
     assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(2.5)
     assert captured["tp_levels"][2]["pnl_pct"] == pytest.approx(4.0)
 
