@@ -422,15 +422,64 @@ def test_default_setup_rr_is_v2_1_05():
     assert metrics["effective_weighted_rr"] == pytest.approx(1.6625)
 
 
-def test_telegram_message_uses_effective_rr_and_tp_mode():
+def test_telegram_message_uses_clean_setup_values_and_directional_confirmation():
     from event_engine.telegram import format_signal
     msg = format_signal(
-        {"direction": "LONG", "symbol": "TEST", "event_type": "X", "event_fact": {}, "timestamps": {}},
-        setup={"entry_reference": 100, "invalidation_price": 95, "target_price": 108.75, "effective_weighted_rr": 1.75, "tp_mode": "single_tp"},
-        score=65,
+        {
+            "direction": "LONG",
+            "symbol": "ETHFI",
+            "event_type": "VOLUME_PROFILE_ACCUMULATION",
+            "event_fact": {},
+            "timestamps": {},
+        },
+        setup={
+            "entry_reference": 0.693,
+            "invalidation_price": 0.6444899999999999,
+            "target_price": 0.7900200000000001,
+            "risk_pct": 7.0,
+            "tp_levels": [
+                {"leg": "tp1", "pnl_pct": 5.25, "close_fraction": 0.25},
+                {"leg": "tp2", "pnl_pct": 8.75, "close_fraction": 0.40},
+                {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
+            ],
+            "effective_weighted_rr": 1.387456687456686,
+            "tp_mode": "multi_tp",
+            "sr_context": {"directional_zone_alignment": "LONG_IN_DEMAND"},
+            "trigger": {"trigger_price": 0.6929, "trigger_delay_min": 15.0},
+        },
+        score=80,
     )
-    assert "1.75" in msg
-    assert "single_tp" in msg
+    assert "Entry: <code>0.693</code>" in msg
+    assert "SL: <code>0.64449</code>" in msg
+    assert "TP1: <code>0.7293825</code>" in msg
+    assert "+5.25%" in msg and "0.75R" in msg
+    assert "TP2: <code>0.7536375</code>" in msg
+    assert "TP3: <code>0.79002</code>" in msg
+    assert "+14%" in msg and "2R" in msg
+    assert "CONFIRMATION:" in msg
+    assert "2/2" in msg
+    assert "VOLUME_PROFILE_ACCUMULATION + <b>DEMAND</b>" in msg
+    assert "R:R (Effective Weighted)" not in msg
+    assert "R:R: <code>1.387456687456686</code>" in msg
+    assert "TP Mode: <code>multi_tp</code>" in msg
+
+
+def test_telegram_directional_confirmation_is_not_2_of_2_without_in_zone_support():
+    from event_engine.telegram import format_signal
+    msg = format_signal(
+        {"direction": "SHORT", "symbol": "TEST", "event_type": "VOLUME_PROFILE_DISTRIBUTION", "event_fact": {}, "timestamps": {}},
+        setup={
+            "entry_reference": 100.0,
+            "invalidation_price": 107.0,
+            "risk_pct": 7.0,
+            "tp_levels": [{"leg": "tp1", "pnl_pct": 5.25, "close_fraction": 1.0}],
+            "sr_context": {"supporting_zone_context": "SUPPORTIVE_NEAR"},
+        },
+        score=80,
+    )
+    assert "1/2" in msg
+    assert "SHORT VOLUME_PROFILE_DISTRIBUTION + SUPPLY nearby" in msg
+    assert "2/2" not in msg
 
 
 def test_score_call_source_is_trigger_diagnostic():
@@ -444,11 +493,13 @@ def test_telegram_message_contains_trigger_fields():
     from event_engine.telegram import format_signal
     msg = format_signal(
         {"direction": "LONG", "symbol": "TEST", "event_type": "X", "event_fact": {}, "timestamps": {}},
-        setup={"entry_reference": 100, "invalidation_price": 99, "target_price": 101.75, "effective_weighted_rr": 1.75, "tp_mode": "single_tp", "trigger": {"trigger_price": 100.5, "trigger_delay_min": 15.0}},
+        setup={"entry_reference": 100, "invalidation_price": 99, "target_price": 101.75, "risk_pct": 1.0, "tp_levels": [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0}], "trigger": {"trigger_price": 100.5, "trigger_delay_min": 15.0}},
         score=65,
     )
     assert "Trigger Price" in msg and "100.5" in msg
-    assert "single_tp" in msg
+    assert "TP1" in msg
+    assert "R:R:" in msg
+    assert "TP Mode: <code>multi_tp</code>" in msg
 
 
 def test_build_event_setup_uses_fixed_seven_percent_stop():
@@ -2895,14 +2946,23 @@ def test_oi_history_cache_updates_immediately(tmp_path, monkeypatch):
     assert "TEST" in ro._load_oi_history()
 
 
+def test_display_formatting_removes_float_artifacts_and_formats_rr():
+    from event_engine.formatting import format_number, format_price, format_rr
+    assert format_price(0.7900200000000001) == "0.79002"
+    assert format_price(0.6444899999999999) == "0.64449"
+    assert format_number(15.0000001, decimals=2) == "15"
+    assert format_rr(1.387456687456686) == "1.39R"
+
+
 def test_tracker_trade_closed_log_format_has_all_arguments():
     import logging
-    fmt = "[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min"
-    args = ("💚", "NAME", "TEST", 1.25, "1.000", 1.6625, 101.25, "TP_FULL", 12.0)
+    fmt = "[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %s | Exit: %s (%s) | Duration: %.1f min"
+    args = ("💚", "NAME", "TEST", "+1.25%", "1.39R", "1.66R", "101.25", "TP_FULL", 12.0)
     record = logging.LogRecord("tracker", logging.INFO, __file__, 1, fmt, args, None)
     rendered = record.getMessage()
     assert "TEST" in rendered
     assert "PnL: +1.25%" in rendered
+    assert "Realized R:R: 1.39R" in rendered
     assert "Duration: 12.0 min" in rendered
 
 

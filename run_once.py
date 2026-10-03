@@ -75,6 +75,7 @@ from event_engine.sr_context import (
     SRSymbolUnavailableError,
 )
 from event_engine.telegram import send as send_tg, format_signal
+from event_engine.formatting import format_number, format_price, format_rr, tp_price_from_pnl
 from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
 from event_engine.tracker import (
     update_active_trades,
@@ -95,6 +96,65 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return x if pd.notna(x) and abs(x) != float("inf") else default
     except (TypeError, ValueError):
         return default
+
+
+def _format_execution_ts(ts_ms: float | int | None) -> str:
+    """Render an execution/trigger timestamp compactly in UTC logs."""
+    ts = _safe_float(ts_ms, 0.0)
+    if ts <= 0:
+        return "n/a"
+    try:
+        return pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return "n/a"
+
+
+def _log_execution_skip(
+    *,
+    symbol: str,
+    direction: str,
+    event_id: str,
+    execution_result: dict[str, Any],
+    trigger_age_min: float | None = None,
+    trigger_bar_ts: float = 0.0,
+) -> None:
+    """Emit one explicit, machine-searchable reason for a non-opened candidate."""
+    if not isinstance(execution_result, dict):
+        return
+    status = str(execution_result.get("status", "")).strip()
+    if not status or status in {
+        "opened_protected",
+        "opened",
+        "opened_protection_check_required",
+        "opened_protection_failed",
+        "ALREADY_EXECUTED_WITH_POSITION",
+        "DIVERGENCE_SHADOW",
+    }:
+        return
+
+    error = str(execution_result.get("error", "")).strip()
+    if status == "TRIGGER_STALE":
+        age_text = f"{trigger_age_min:.2f}m" if trigger_age_min is not None else "n/a"
+        log.info(
+            "[EXECUTION] %s %s skipped: TRIGGER_STALE age=%s limit=%.2fm trigger_bar_close_ts=%s event=%s.",
+            direction,
+            symbol,
+            age_text,
+            MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+            _format_execution_ts(trigger_bar_ts),
+            event_id,
+        )
+        return
+
+    reason = error if error else status
+    log.info(
+        "[EXECUTION] %s %s skipped: %s reason=%s event=%s.",
+        direction,
+        symbol,
+        status,
+        reason,
+        event_id,
+    )
 
 
 def _coinalyze_rows_for_new_entries(rows: list[Any], complete: bool) -> list[Any]:
@@ -3971,7 +4031,23 @@ def main() -> None:
                     cand["confluence_events"] = existing.get("confluence_events", [])
                     best_opportunities_map[key] = cand
 
-            log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g", direction, symbol, score, tf, event_type, signal_price, setup["invalidation_price"], setup["target_price"])
+            tp_log_parts = []
+            for level in (setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else [])[:3]:
+                if not isinstance(level, dict):
+                    continue
+                tp_pct = _safe_float(level.get("pnl_pct"), 0.0)
+                tp_price = tp_price_from_pnl(setup.get("entry_reference"), direction, tp_pct)
+                risk_for_rr = _safe_float(setup.get("risk_pct"), 0.0)
+                rr_text = format_rr(tp_pct / risk_for_rr) if risk_for_rr > 0 and tp_pct > 0 else "—"
+                tp_log_parts.append(f"{str(level.get('leg', 'TP')).upper()}={format_price(tp_price)} ({format_number(tp_pct, decimals=2) + "%"} {rr_text})")
+            tp_log_text = " | ".join(tp_log_parts) if tp_log_parts else f"TP3={format_price(setup.get('target_price'))}"
+            log.info(
+                "[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %s | SL: %s (-%s) | %s",
+                direction, symbol, score, tf, event_type, format_price(signal_price),
+                format_price(setup["invalidation_price"]),
+                format_number(setup.get("risk_pct"), decimals=2),
+                tp_log_text,
+            )
 
     opportunities = list(best_opportunities_map.values())
     for opp in opportunities:
@@ -4098,6 +4174,10 @@ def main() -> None:
             record_action({"event_id": event_id, "symbol": symbol, "direction": direction,
                            "score": score, "event_type": ev.get("event_type"),
                            "execution_status": "TRIGGER_STALE",
+                           "trigger_age_min": trigger_age_min,
+                           "trigger_bar_close_ts": trigger_bar_ts,
+                           "trigger_bar_close_utc": _format_execution_ts(trigger_bar_ts),
+                           "trigger_freshness_limit_min": MAX_TRIGGER_TO_ORDER_DELAY_MIN,
                            "ts": int(pd.Timestamp.utcnow().timestamp() * 1000)})
         elif EXECUTION_ENABLED:
             active_total = sum(1 for p in current_open_positions.values() if p)
@@ -4344,6 +4424,15 @@ def main() -> None:
         elif not EXECUTION_ENABLED:
             execution_result = {"status": "DISABLED", "mode": EXECUTION_MODE, "order_id": None}
             log.info("[EXECUTION] %s %s skipped: EXECUTION_ENABLED is false.", direction, symbol)
+
+        _log_execution_skip(
+            symbol=symbol,
+            direction=direction,
+            event_id=event_id,
+            execution_result=execution_result,
+            trigger_age_min=trigger_age_min,
+            trigger_bar_ts=trigger_bar_ts,
+        )
 
         telegram_setup = execution_result.get("setup_used_for_protection") if isinstance(execution_result, dict) else None
         if not isinstance(telegram_setup, dict):

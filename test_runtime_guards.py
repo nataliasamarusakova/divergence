@@ -2023,3 +2023,42 @@ def test_contract_disappearance_is_terminalized(monkeypatch):
     execution_result = {"status": "error", "error": "contract_unavailable"}
     err_str = str(execution_result.get("error", "")).lower()
     assert err_str in {"contract_unavailable", "contract_not_found"} or "contract_unavailable" in err_str
+
+
+def test_execution_skip_log_formats_trigger_stale(caplog):
+    import run_once
+    import logging
+
+    caplog.set_level(logging.INFO, logger="event_engine")
+    run_once._log_execution_skip(
+        symbol="AVAX",
+        direction="LONG",
+        event_id="EVT_TEST_STALE",
+        execution_result={"status": "TRIGGER_STALE", "error": "trigger_age=8.37m > limit=8.00m"},
+        trigger_age_min=8.37,
+        trigger_bar_ts=1_760_000_000_000,
+    )
+
+    text = caplog.text
+    assert "[EXECUTION] LONG AVAX skipped: TRIGGER_STALE" in text
+    assert "age=8.37m" in text
+    assert "limit=8.00m" in text
+    assert "trigger_bar_close_ts=" in text
+    assert "EVT_TEST_STALE" in text
+
+
+def test_execution_skip_log_reports_non_stale_reason(caplog):
+    import run_once
+    import logging
+
+    caplog.set_level(logging.INFO, logger="event_engine")
+    run_once._log_execution_skip(
+        symbol="ATH",
+        direction="LONG",
+        event_id="EVT_TEST_SR",
+        execution_result={"status": "SR_SYMBOL_UNAVAILABLE", "error": "No active Binance Spot USDT source"},
+    )
+
+    assert "[EXECUTION] LONG ATH skipped: SR_SYMBOL_UNAVAILABLE" in caplog.text
+    assert "No active Binance Spot USDT source" in caplog.text
+    assert "EVT_TEST_SR" in caplog.text
