@@ -85,10 +85,18 @@ def test_scan_buckets_never_jumps_over_missing_bucket():
     assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == []
 
 
-def test_new_symbol_still_scans_only_current_completed_bucket():
+def test_new_symbol_replays_only_bounded_recent_contiguous_buckets(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 120.0)
     state = {"version": 2, "symbols": {}}
-    available = {98, 99, 100}
-    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [100]
+    available = {97, 98, 99, 100}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [99, 100]
+
+
+def test_new_symbol_backfill_stops_at_recent_history_gap(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 180.0)
+    state = {"version": 2, "symbols": {}}
+    available = {96, 98, 99, 100}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [98, 99, 100]
 
 
 def test_cached_events_are_recovered_from_durable_event_journal(tmp_path, monkeypatch):
@@ -275,3 +283,31 @@ def test_watermark_stops_before_bucket_with_failed_event_persistence(tmp_path, m
 
     assert scan_state["symbols"]["BTC-USDT"]["1h"] == 99
     assert persisted and persisted[-1]["symbols"]["BTC-USDT"]["1h"] == 99
+
+
+def test_trigger_age_uses_closed_trigger_bar_not_observation_time(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once.time, "time", lambda: 1_200.0)
+    meta = {"trigger_observed_at_ts": 1_180_000, "trigger_bar_close_ts": 1_000_000}
+    assert run_once._trigger_age_min(meta) == 3.3333333333333335
+
+
+def test_trigger_age_returns_none_without_closed_bar_timestamp():
+    import run_once
+    assert run_once._trigger_age_min({"trigger_observed_at_ts": 1_000_000}, 2_000_000) is None
+
+
+def test_same_direction_candidate_prefers_newer_event_even_with_lower_score():
+    import run_once
+    older = {"event": {"timestamps": {"detected_at_ts": 1_000}}, "score": 95.0}
+    newer = {"event": {"timestamps": {"detected_at_ts": 2_000}}, "score": 60.0}
+    assert run_once._candidate_is_newer(newer, older) is True
+    assert run_once._candidate_is_newer(older, newer) is False
+
+
+def test_htf_context_frame_excludes_future_candles():
+    import run_once
+    import pandas as pd
+    df = pd.DataFrame({"close_time": [100, 200, 300], "close": [1.0, 2.0, 3.0]})
+    out = run_once._frame_through_event_ts(df, 200)
+    assert list(out["close_time"]) == [100, 200]

@@ -122,6 +122,10 @@ MARKET_DATA_SOURCE = os.environ.get("MARKET_DATA_SOURCE", "binance").strip().low
 # Binance is the signal/market-data venue; BingX remains the execution venue.
 # Coinalyze remains an independent context/derivatives source.
 BAR_CLOSE_GRACE_MIN = float(os.environ.get("BAR_CLOSE_GRACE_MIN", "2"))
+# On first sight of a symbol/timeframe, replay only a bounded recent window.
+# This recovers fresh events that formed before the symbol entered the liquidity
+# universe, without turning first-seen symbols into unrestricted historical replays.
+NEW_SYMBOL_BACKFILL_MIN = float(os.environ.get("NEW_SYMBOL_BACKFILL_MIN", "120"))
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "25000000"))
@@ -1159,17 +1163,30 @@ def _scan_buckets_to_process(
 ) -> list[int]:
     """Return contiguous closed buckets that can be replayed safely.
 
-    A new symbol/timeframe keeps the existing behaviour and scans only the latest
-    completed bar.  An already-known symbol replays every missing completed bucket
-    for which the fetched history is available.  We never jump over a missing
-    bucket because doing so would make that candle permanently invisible to the
-    detector while advancing the checkpoint past it.
+    A new symbol/timeframe replays a bounded, contiguous recent window so a fresh
+    event formed before the symbol entered the universe is still recoverable.
+    An already-known symbol replays every missing completed bucket for which the
+    fetched history is available. We never jump over a missing bucket.
     """
     symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
     rec = symbols.get(symbol) if isinstance(symbols, dict) else None
     if not isinstance(rec, dict) or rec.get(timeframe) in (None, ""):
-        eligible = [bucket for bucket in available_buckets if bucket <= completed_bucket]
-        return [max(eligible)] if eligible else []
+        eligible = {bucket for bucket in available_buckets if bucket <= completed_bucket}
+        if not eligible:
+            return []
+        # Replay only a bounded recent window, moving backwards from the newest
+        # available bucket and stopping at the first historical gap. This keeps
+        # first-seen symbols causal and bounded while covering the configured
+        # fresh-event/retest lifetime.
+        max_buckets = max(1, int(math.ceil(NEW_SYMBOL_BACKFILL_MIN / (_timeframe_interval_ms(timeframe) / 60_000.0))))
+        latest = max(eligible)
+        targets_rev: list[int] = [latest]
+        while len(targets_rev) < max_buckets:
+            prev = targets_rev[-1] - 1
+            if prev not in eligible:
+                break
+            targets_rev.append(prev)
+        return list(reversed(targets_rev))
 
     try:
         last_bucket = int(rec.get(timeframe))
@@ -1199,6 +1216,16 @@ def _frame_through_bucket(klines: list[dict], timeframe: str, bucket: int) -> li
         if close_ts // interval_ms <= bucket:
             out.append(row)
     return out
+
+
+def _frame_through_event_ts(df: pd.DataFrame | None, event_ts: int) -> pd.DataFrame:
+    """Return only HTF candles that had closed by the event timestamp."""
+    if not isinstance(df, pd.DataFrame) or not event_ts or "close_time" not in df.columns:
+        return pd.DataFrame()
+    out = df.copy()
+    close_ts = pd.to_numeric(out["close_time"], errors="coerce")
+    out = out.loc[close_ts <= int(event_ts)].copy()
+    return out.sort_values("close_time").reset_index(drop=True)
 
 
 def _refresh_timeframe_events(
@@ -3207,6 +3234,23 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     }
 
 
+def _candidate_is_newer(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
+    """Prefer the newest same-direction event; score breaks exact timestamp ties."""
+    candidate_ts = int(candidate.get("event", {}).get("timestamps", {}).get("detected_at_ts", 0) or 0)
+    existing_ts = int(existing.get("event", {}).get("timestamps", {}).get("detected_at_ts", 0) or 0)
+    return (candidate_ts, float(candidate.get("score", 0.0))) > (existing_ts, float(existing.get("score", 0.0)))
+
+
+def _trigger_age_min(trigger_meta: dict[str, Any] | None, now_ms: int | None = None) -> float | None:
+    """Return trigger age from the actual closed 15M bar, never observation time."""
+    meta = trigger_meta if isinstance(trigger_meta, dict) else {}
+    trigger_bar_ts = _safe_float(meta.get("trigger_bar_close_ts"), 0.0)
+    if trigger_bar_ts <= 0:
+        return None
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    return max(0.0, (current_ms - trigger_bar_ts) / 60_000.0)
+
+
 def main() -> None:
     log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
 
@@ -3689,7 +3733,11 @@ def main() -> None:
                         # Do not cache ordinary transient errors; a later event/cycle may succeed.
                         htf_context_cache.pop(cache_key, None)
 
-                ctx_df = (htf_context or {}).get("df") if isinstance(htf_context, dict) else None
+                raw_ctx_df = (htf_context or {}).get("df") if isinstance(htf_context, dict) else None
+                # Historical/recovered events must see only HTF candles that had
+                # actually closed by the event timestamp. This removes future HTF
+                # information without changing the validator or detector formulas.
+                ctx_df = _frame_through_event_ts(raw_ctx_df, detected_at)
                 if requires_div_context:
                     valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(ev, ctx_df, context_timeframe=context_tf)
                 else:
@@ -3919,8 +3967,8 @@ def main() -> None:
             else:
                 existing = best_opportunities_map[key]
                 existing.setdefault("confluence_events", []).append(evidence)
-                if score > existing["score"]:
-                    cand["confluence_events"] = existing["confluence_events"]
+                if _candidate_is_newer(cand, existing):
+                    cand["confluence_events"] = existing.get("confluence_events", [])
                     best_opportunities_map[key] = cand
 
             log.info("[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %.8g | SL: %.8g | TP: %.8g", direction, symbol, score, tf, event_type, signal_price, setup["invalidation_price"], setup["target_price"])
@@ -3990,10 +4038,7 @@ def main() -> None:
         # list may contain many signals, and earlier trades can consume enough time
         # for a previously-valid trigger to become stale before this order is sent.
         execution_now_ms = int(time.time() * 1000)
-        trigger_age_min = ((execution_now_ms - trigger_observed_ts) / 60_000.0) if trigger_observed_ts > 0 else (
-            ((execution_now_ms - trigger_bar_ts) / 60_000.0) if trigger_bar_ts > 0 else 0.0
-        )
-        trigger_age_min = max(0.0, trigger_age_min)
+        trigger_age_min = _trigger_age_min(trigger_meta, execution_now_ms)
         if EXECUTION_ENABLED and _is_divergence_event(ev) and DIVERGENCE_SHADOW_ONLY:
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
             trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)
@@ -4044,7 +4089,7 @@ def main() -> None:
                     "error": str(exc),
                 }
                 log.exception("[SHADOW] Failed to record divergence paper trade for %s %s (%s)", direction, symbol, event_id)
-        elif EXECUTION_ENABLED and trigger_observed_ts > 0 and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
+        elif EXECUTION_ENABLED and trigger_age_min is not None and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
             stats["rejected_trigger_stale"] += 1
             execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
                                 "error": f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"}
@@ -4201,7 +4246,11 @@ def main() -> None:
                         "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                     })
     
-                actual_entry = float(actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0) or price)
+                actual_entry_raw = _safe_float(
+                    actual_position.get("avgPrice", 0) or actual_position.get("entryPrice", 0),
+                    0.0,
+                )
+                actual_entry = actual_entry_raw if actual_entry_raw > 0 else None
                 actual_qty = actual_position.get("positionAmt")
                 execution_quality = execution_result.get("execution_quality", {}) if isinstance(execution_result, dict) else {}
     
