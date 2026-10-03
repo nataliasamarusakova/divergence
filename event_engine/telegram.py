@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 import requests
 
+from .formatting import format_number, format_percent, format_price, format_rr, tp_price_from_pnl
+
 
 def _chat_ids() -> list[str]:
     raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TG_CHAT_ID") or ""
@@ -121,7 +123,7 @@ def format_signal(
             lines.append(f"⚠️ <b>CONFLICT:</b> {' + '.join(labels)}")
 
     lines.extend([
-        f"Price: <code>{esc(price)}</code>",
+        f"Price: <code>{esc(format_price(price))}</code>",
         f"Detected: <code>{esc(detected_ts)}</code>",
     ])
 
@@ -129,8 +131,8 @@ def format_signal(
         lines.extend([
             "",
             "<b>Divergence</b>",
-            f"P1: <code>{esc(fact.get('p1_price'))}</code>",
-            f"P2: <code>{esc(fact.get('p2_price'))}</code>",
+            f"P1: <code>{esc(format_price(fact.get('p1_price')))}</code>",
+            f"P2: <code>{esc(format_price(fact.get('p2_price')))}</code>",
             f"Price Δ / ATR: <code>{esc(round(float(fact.get('price_delta_atr', 0)), 3))}</code>",
         ])
     elif "squeeze_duration_bars" in fact:
@@ -158,19 +160,74 @@ def format_signal(
         ])
 
     if setup:
-        rr = setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", setup.get("realized_rr", setup.get("target_rr", 1.6625))))
-        tp_mode = setup.get("tp_mode")
         trigger = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
+        entry_reference = setup.get("entry_reference")
+        invalidation_price = setup.get("invalidation_price")
+        risk_pct = setup.get("risk_pct")
+
+        tp_levels = setup.get("effective_tp_levels")
+        if not isinstance(tp_levels, list) or not tp_levels:
+            tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else []
+
         lines.extend([
             "",
             "<b>SETUP</b>",
-            f"Entry: <code>{esc(setup.get('entry_reference'))}</code>",
-            f"SL: <code>{esc(setup.get('invalidation_price'))}</code>",
-            f"TP: <code>{esc(setup.get('target_price'))}</code>",
-            f"R:R (Effective Weighted): <code>{esc(rr)}</code>",
-            f"TP Mode: <code>{esc(tp_mode or 'multi_tp')}</code>",
-            f"Trigger Price: <code>{esc(trigger.get('trigger_price'))}</code>",
-            f"Trigger Delay: <code>{esc(trigger.get('trigger_delay_min'))} min</code>",
+            f"Entry: <code>{esc(format_price(entry_reference))}</code>",
+            f"SL: <code>{esc(format_price(invalidation_price))}</code> <code>({esc(format_percent(-abs(float(risk_pct)), decimals=2, signed=True)) if risk_pct is not None else '—'})</code>",
+        ])
+
+        for index, level in enumerate(tp_levels[:3], start=1):
+            if not isinstance(level, dict):
+                continue
+            pnl_pct = level.get("pnl_pct")
+            tp_price = tp_price_from_pnl(entry_reference, direction, pnl_pct)
+            fraction = level.get("close_fraction")
+            fraction_text = ""
+            try:
+                fraction_text = f" · {float(fraction) * 100:.0f}%" if fraction is not None else ""
+            except (TypeError, ValueError):
+                fraction_text = ""
+            rr_text = ""
+            try:
+                if risk_pct is not None and float(risk_pct) > 0 and pnl_pct is not None:
+                    rr_text = f" · {esc(format_rr(float(pnl_pct) / float(risk_pct))) }"
+            except (TypeError, ValueError):
+                rr_text = ""
+            lines.append(
+                f"TP{index}: <code>{esc(format_price(tp_price))}</code> <code>({esc(format_percent(pnl_pct, decimals=2, signed=True))}{rr_text}{fraction_text})</code>"
+            )
+
+        if not tp_levels:
+            target_price = setup.get("target_price")
+            lines.append(f"TP3: <code>{esc(format_price(target_price))}</code>")
+
+        rr_value = setup.get("effective_weighted_rr")
+        if rr_value is None:
+            rr_value = setup.get("planned_weighted_rr")
+        if rr_value is None:
+            rr_value = setup.get("realized_rr")
+        tp_mode = setup.get("tp_mode") or "multi_tp"
+        lines.extend([
+            f"R:R: <code>{esc(str(rr_value))}</code>",
+            f"TP Mode: <code>{esc(tp_mode)}</code>",
+        ])
+
+        sr_context = setup.get("sr_context") if isinstance(setup.get("sr_context"), dict) else {}
+        alignment = str(sr_context.get("directional_zone_alignment") or "").upper()
+        if alignment == "LONG_IN_DEMAND":
+            confirmation = f"🟢 <b>2/2</b> — {direction} {event_type} + <b>DEMAND</b>"
+        elif alignment == "SHORT_IN_SUPPLY":
+            confirmation = f"🔴 <b>2/2</b> — {direction} {event_type} + <b>SUPPLY</b>"
+        elif str(sr_context.get("supporting_zone_context") or "").upper().startswith("SUPPORTIVE_"):
+            zone_kind = "DEMAND" if direction == "LONG" else "SUPPLY"
+            confirmation = f"🟡 <b>1/2</b> — {direction} {event_type} + {zone_kind} nearby"
+        else:
+            confirmation = f"⚪ <b>1/2</b> — {direction} {event_type} only"
+
+        lines.extend([
+            f"<b>CONFIRMATION:</b> {confirmation}",
+            f"Trigger Price: <code>{esc(format_price(trigger.get('trigger_price')))}</code>",
+            f"Trigger Delay: <code>{esc(format_number(trigger.get('trigger_delay_min'), decimals=2))} min</code>",
         ])
 
     if execution:

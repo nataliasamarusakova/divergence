@@ -28,6 +28,7 @@ from event_engine.bingx import (
     emergency_close_position,
 )
 from event_engine.telegram import send_detailed
+from event_engine.formatting import format_price, format_rr
 
 log = logging.getLogger("event_engine.tracker")
 
@@ -459,7 +460,7 @@ def format_tp_hit_message(
         f"💰 <b>{name} ({symbol})</b>\n\n"
         f"Leg: <b>{leg}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
-        f"Цена исполнения: <code>{exec_price:.8g}</code>\n"
+        f"Цена исполнения: <code>{format_price(exec_price)}</code>\n"
         f"Закрыто: <code>{closed_qty:.8f}</code>\n"
         f"Осталось: <code>{remaining_qty:.8f} ({remaining_pct:.1f}%)</code>"
     )
@@ -476,14 +477,14 @@ def format_trade_closed_message(
     emoji = "⚠️" if is_data_error else ("💚" if is_win else "💔")
     pnl_sign = "+" if pnl_pct is not None and pnl_pct > 0 else ""
     pnl_text = "DATA_ERROR" if is_data_error else f"{pnl_sign}{pnl_pct:.2f}%"
-    realized_rr_text = f"{realized_rr:.3f}" if realized_rr is not None else "—"
-    planned_rr_text = f"{planned_rr:.3f}" if planned_rr is not None else "—"
+    realized_rr_text = format_rr(realized_rr, decimals=2) if realized_rr is not None else "—"
+    planned_rr_text = format_rr(planned_rr, decimals=2) if planned_rr is not None else "—"
 
-    exit_text = f"{exit_price:.8g}" if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
+    exit_text = format_price(exit_price) if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
     lines = [
         f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
         "",
-        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
+        f"Вход <code>{format_price(entry_price)}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
@@ -1423,8 +1424,8 @@ def update_active_trades() -> None:
 
             close_emoji = "⚠️" if final_pnl is None else ("💚" if final_pnl >= 0.0 else "💔")
             pnl_text = "DATA_ERROR" if final_pnl is None else f"{final_pnl:+.2f}%"
-            exit_text = f"{exit_price:.8g}" if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
-            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %.2f | Exit: %s (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_text, exit_reason, duration_min)
+            exit_text = format_price(exit_price) if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
+            log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %s | Exit: %s (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, format_rr(realized_rr, decimals=2), format_rr(planned_rr, decimals=2), exit_text, exit_reason, duration_min)
 
             notification_persisted = True
             try:
