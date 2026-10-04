@@ -105,9 +105,22 @@ def test_kline_rate_limit_circuit_breaker_settings():
     assert 'BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC: "900"' in workflow
 
 
+def test_release_wires_trend_decision_to_closed_trigger_timestamp():
+    source = Path("run_once.py").read_text(encoding="utf-8")
+    assert 'decision_ts = int(_safe_float((trigger_diag or {}).get("trigger_bar_close_ts"), 0.0))' in source
+    assert 'decision_ts = int(trigger_observed_at_ts or time.time() * 1000)' not in source
+
+
 def test_release_uses_fixed_seven_percent_stop():
     workflow = _workflow()
     assert 'FIXED_STOP_LOSS_PCT: "7.00"' in workflow
+    assert 'TREND_FILTER_ENABLED: "true"' in workflow
+    assert 'TREND_FILTER_MODE: "shadow"' in workflow
+    assert 'TREND_FILTER_MIN_1H_BARS: "400"' in workflow
+    assert 'TREND_FILTER_MIN_4H_BARS: "400"' in workflow
+    assert 'TREND_FILTER_REQUIRE_PERSISTENCE: "false"' in workflow
+    assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
+    assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
     assert 'MAX_ENTRY_RISK_PCT: "7.00"' in workflow
     assert 'REJECT_ATR_RISK_CLIP: "false"' in workflow
 
@@ -118,10 +131,10 @@ def test_release_has_no_legacy_sr_tp3_cap_setting():
     assert "apply_sr_tp3_cap" not in workflow
 
 
-def test_release_enables_lazy_ajay_sr_room_using_spot():
+def test_release_temporarily_disables_ajay_sr_room():
     workflow = _workflow()
-    assert 'AJAY_SR_ROOM_ENABLED: "true"' in workflow
-    assert 'AJAY_SR_ROOM_MODE: "enforce"' in workflow
+    assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
+    assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
     assert 'AJAY_SR_REQUIRE_DATA: "false"' in workflow
     assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
     assert 'AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"' in workflow

@@ -222,9 +222,22 @@ def test_select_supported_tp_levels_adapts_to_position_size():
         {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
     ]
 
-    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2", "tp3"]
     assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 2.0, 0, 1.0)] == ["tp1", "tp2"]
     assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)] == ["tp3"]
+
+
+def test_select_supported_tp_levels_uses_allocator_feasibility():
+    from event_engine import bingx as bx
+
+    # Three legs are quantity-feasible even though the fractional split must be
+    # lifted to the exchange minimum; the selector must still retain all three.
+    levels = [
+        {"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 0.90},
+        {"leg": "tp2", "pnl_pct": 2.0, "close_fraction": 0.05},
+        {"leg": "tp3", "pnl_pct": 3.0, "close_fraction": 0.05},
+    ]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2", "tp3"]
 
 
 def test_allocate_tp_quantities_exact_sum():
@@ -1558,6 +1571,65 @@ def test_tp_leg_identity_works_without_client_order_id():
     order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.00", "origQty": "1"}
     assert bx._tp_leg_from_order(order, "tp1", 105.0, 2, None) is True
     assert bx._tp_leg_from_order(order, "tp1", 106.0, 2, None) is False
+
+
+def test_ensure_protection_uses_three_tp_legs_when_filled_qty_supports_them(monkeypatch):
+    from event_engine import bingx as bx
+
+    posted = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "ABC-USDT")
+    monkeypatch.setattr(
+        bx,
+        "get_contract",
+        lambda s: {"quantityPrecision": 0, "pricePrecision": 2, "tradeMinQuantity": 1.0},
+    )
+    live_orders = {"sl_orders": [], "tp_orders": []}
+
+    monkeypatch.setattr(
+        bx,
+        "get_open_protection_directional",
+        lambda *a, **k: {"status": "ok", **live_orders},
+    )
+    monkeypatch.setattr(bx, "_validate_sl_order_for_position", lambda *a, **k: True)
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+
+    def fake_post(symbol, direction, params, client_order_id, **kwargs):
+        order_id = f"O{len(posted) + 1}"
+        posted.append((params["type"], params.get("stopPrice"), params["quantity"]))
+        if params["type"] == "STOP_MARKET":
+            live_orders["sl_orders"] = [{
+                "orderId": order_id,
+                "type": "STOP_MARKET",
+                "stopPrice": params["stopPrice"],
+                "origQty": params["quantity"],
+            }]
+        else:
+            live_orders["tp_orders"].append({
+                "orderId": order_id,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": params["stopPrice"],
+                "origQty": params["quantity"],
+            })
+        return {"code": 0, "data": {"order": {"orderId": order_id}}}
+
+    monkeypatch.setattr(bx, "_post_protection_order_verified", fake_post)
+
+    levels = [
+        {"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 0.25},
+        {"leg": "tp2", "pnl_pct": 8.75, "close_fraction": 0.40},
+        {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
+    ]
+    out = bx.ensure_directional_protection(
+        "ABC", "LONG", 100.0, 100.0, 7.0, levels, trade_id="TR_TEST_3TP"
+    )
+
+    assert out["status"] == "PROTECTED"
+    assert out["tp_mode"] == "multi_tp"
+    assert [x["leg"] for x in out["effective_tp_levels"]] == ["tp1", "tp2", "tp3"]
+    assert [x["leg"] for x in out["tp_orders"]] == ["tp1", "tp2", "tp3"]
+    assert [x["qty"] for x in out["effective_tp_levels"]] == [25.0, 40.0, 35.0]
+    assert out["effective_weighted_rr"] == pytest.approx(1.3625)
+    assert len(posted) == 4  # one SL + three TP orders
 
 
 def test_ensure_protection_refuses_second_sl_and_cleans_stale(monkeypatch):

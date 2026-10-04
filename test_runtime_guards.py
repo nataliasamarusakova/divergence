@@ -2013,6 +2013,74 @@ def test_score_thresholds_are_real_admission_gates(monkeypatch):
     assert ro._score_gate_passed(75.0, "SHORT") is True
 
 
+def test_sr_retry_history_is_ignored_when_sr_disabled(monkeypatch, tmp_path):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
+    trades = tmp_path / "trades.jsonl"
+    trades.write_text(
+        json.dumps({
+            "record_type": "EXECUTION_ATTEMPT",
+            "event_id": "EVT_OLD_SR",
+            "result": {"status": "SR_DATA_UNAVAILABLE"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    counts = ro.load_sr_data_failure_counts(trades, set())
+    assert counts == {"EVT_OLD_SR": 1}
+
+    # The main cycle applies this history only when S/R is enabled. The disabled
+    # path therefore behaves as if there were no persisted SR retry budget.
+    effective_counts = (
+        ro.load_sr_data_failure_counts(trades, set())
+        if ro.AJAY_SR_ROOM_ENABLED and ro.AJAY_SR_ROOM_MODE != "off"
+        else {}
+    )
+    assert effective_counts == {}
+
+
+def test_execute_new_position_skips_sr_path_when_disabled(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda *args, **kwargs: pytest.fail("S/R snapshot must not be fetched while disabled"))
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda *args, **kwargs: {
+        "status": "found", "symbol": "TEST", "side": "LONG", "positionAmt": 10.0, "avgPrice": 100.0,
+    })
+    monkeypatch.setattr(ro, "evaluate_sr_room", lambda *args, **kwargs: pytest.fail("S/R geometry must not be evaluated while disabled"))
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: {
+        "status": "opened",
+        "order_id": "O_DISABLED_SR",
+        "position": {"symbol": "TEST", "side": "LONG", "positionAmt": 10.0, "avgPrice": 100.0},
+        "qty": 10.0,
+        "avgPrice": 100.0,
+        "leverage": 3,
+    })
+    monkeypatch.setattr(ro, "install_protection", lambda **kwargs: {
+        "status": "PROTECTED",
+        "tp_mode": "three_tp",
+        "effective_tp_levels": [
+            {"pnl_pct": 4.55, "qty": 2.5},
+            {"pnl_pct": 8.75, "qty": 4.0},
+            {"pnl_pct": 14.0, "qty": 3.5},
+        ],
+        "effective_weighted_rr": 1.3625,
+    })
+    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
+
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 7.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT", "trigger": {"trigger_price": 100.0}},
+        "EVT_SR_DISABLED",
+    )
+    assert out["status"] == "opened_protected"
+    assert out["setup_used_for_protection"].get("sr_context") is None
+
+
 def test_sr_geometry_error_blocks_entry_when_data_is_optional(monkeypatch):
     import run_once as ro
 

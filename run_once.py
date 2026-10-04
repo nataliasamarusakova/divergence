@@ -77,6 +77,7 @@ from event_engine.sr_context import (
 from event_engine.telegram import send as send_tg, format_signal
 from event_engine.formatting import format_number, format_price, format_rr, tp_price_from_pnl
 from event_engine.shadow import append_shadow_health, update_divergence_shadow_state, record_divergence_shadow_open
+from event_engine.trend_filter import evaluate_trend_filter
 from event_engine.tracker import (
     update_active_trades,
     register_active_trade,
@@ -205,6 +206,21 @@ MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
 MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "2.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
 MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "75"))
+
+# Trend Filter v1 is intentionally shadow-only in the current release. It is an
+# independent candidate-level diagnostic and never changes event detectors, zones,
+# trigger construction, execution, or accounting while mode=shadow.
+TREND_FILTER_ENABLED = os.environ.get("TREND_FILTER_ENABLED", "false").lower() == "true"
+TREND_FILTER_MODE = os.environ.get("TREND_FILTER_MODE", "off").strip().lower()
+if TREND_FILTER_MODE not in {"off", "shadow", "enforce"}:
+    TREND_FILTER_MODE = "off"
+TREND_FILTER_MIN_1H_BARS = max(200, int(os.environ.get("TREND_FILTER_MIN_1H_BARS", "400")))
+TREND_FILTER_MIN_4H_BARS = max(200, int(os.environ.get("TREND_FILTER_MIN_4H_BARS", "400")))
+TREND_FILTER_PERSISTENCE_LOOKBACK_1H = max(1, int(os.environ.get("TREND_FILTER_PERSISTENCE_LOOKBACK_1H", "6")))
+TREND_FILTER_PERSISTENCE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_PERSISTENCE_LOOKBACK_4H", "3")))
+TREND_FILTER_SLOPE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_SLOPE_LOOKBACK_4H", "6")))
+TREND_FILTER_HISTORY_BUFFER_BARS = max(1, int(os.environ.get("TREND_FILTER_HISTORY_BUFFER_BARS", "12")))
+TREND_FILTER_REQUIRE_PERSISTENCE = os.environ.get("TREND_FILTER_REQUIRE_PERSISTENCE", "false").lower() == "true"
 
 # Entry-quality policy is intentionally separate from the legacy diagnostic score.
 # It can be rolled back via environment variables without changing event detectors
@@ -1286,6 +1302,46 @@ def _frame_through_event_ts(df: pd.DataFrame | None, event_ts: int) -> pd.DataFr
     close_ts = pd.to_numeric(out["close_time"], errors="coerce")
     out = out.loc[close_ts <= int(event_ts)].copy()
     return out.sort_values("close_time").reset_index(drop=True)
+
+
+def _trend_history_causal_count(df: pd.DataFrame | None, decision_ts: int) -> int:
+    """Count usable bars that were closed by the exact trend decision timestamp."""
+    if not isinstance(df, pd.DataFrame) or df.empty or "close_time" not in df.columns:
+        return 0
+    close_ts = pd.to_numeric(df["close_time"], errors="coerce")
+    close = pd.to_numeric(df.get("close"), errors="coerce") if "close" in df.columns else None
+    mask = close_ts.notna() & (close_ts <= int(decision_ts))
+    if close is not None:
+        mask &= close.notna() & (close > 0)
+    return int(mask.sum())
+
+
+def _ensure_trend_history(
+    *,
+    symbol: str,
+    timeframe: str,
+    frame: pd.DataFrame,
+    decision_ts: int,
+    min_bars: int,
+) -> tuple[pd.DataFrame, bool]:
+    """Top up only the Trend Filter history when causal bars fall below its warmup.
+
+    The normal scanner keeps exactly the configured detector history. Trend Filter
+    needs a small causal margin because the latest 15M trigger can occur before the
+    latest closed 1H/4H candle. We therefore fetch an expanded frame only when the
+    already-cached scan frame cannot supply the required number of bars by the
+    trigger timestamp. Detector inputs and their fetch limits remain unchanged.
+    """
+    if _trend_history_causal_count(frame, decision_ts) >= int(min_bars):
+        return frame, False
+    base_limit = max(int(min_bars), int(os.environ.get(f"KLINE_LIMIT_{timeframe.upper()}", str(min_bars))))
+    expanded_limit = base_limit + TREND_FILTER_HISTORY_BUFFER_BARS
+    refreshed = _fetch_market_klines_scan(symbol, timeframe, expanded_limit)
+    if isinstance(refreshed, pd.DataFrame):
+        refreshed_df = refreshed.copy()
+    else:
+        refreshed_df = pd.DataFrame(refreshed if refreshed is not None else [])
+    return refreshed_df, True
 
 
 def _refresh_timeframe_events(
@@ -2992,13 +3048,6 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 if sr_result.get("supporting_zone_confirmation"):
                     log.info("[SR_ROOM] %s %s supportive directional-zone confirmation: %s", direction, symbol, sr_result.get("directional_zone_alignment"))
                 if sr_result.get("reject") and AJAY_SR_ROOM_MODE == "enforce":
-                    record_action({
-                        "event_id": event_id, "symbol": symbol, "direction": direction,
-                        "event_type": event_type_for_risk,
-                        "execution_status": "SR_ROOM_REJECTED",
-                        "sr_room": sr_result,
-                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-                    })
                     return {
                         "status": "SR_ROOM_REJECTED",
                         "mode": EXECUTION_MODE,
@@ -3297,7 +3346,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     else:
         final_status = "opened_protection_failed"
 
-    log.info("[EXECUTION] Protection installed for %s %s: Status=%s, SL=%.2f%%, TPs=%d legs", direction, symbol, final_status, sl_pct, len(tp_levels))
+    effective_tp_count = len(protection.get("effective_tp_levels", [])) if isinstance(protection, dict) else 0
+    log.info("[EXECUTION] Protection installed for %s %s: Status=%s, SL=%.2f%%, TPs=%d legs", direction, symbol, final_status, sl_pct, effective_tp_count)
 
     return {
         "status": final_status,
@@ -3332,6 +3382,11 @@ def _trigger_age_min(trigger_meta: dict[str, Any] | None, now_ms: int | None = N
         return None
     current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     return max(0.0, (current_ms - trigger_bar_ts) / 60_000.0)
+
+
+def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> bool:
+    """Return whether Trend Filter may block the current candidate evaluation."""
+    return str(mode or "off").lower() == "enforce" and (not isinstance(snapshot, dict) or snapshot.get("trend_decision") != "ALIGNED")
 
 
 def main() -> None:
@@ -3410,6 +3465,12 @@ def main() -> None:
         "telegram_pending_retries": 0,
         "telegram_pending_retry_success": 0,
         "by_timeframe": {},
+        "trend_shadow_candidates": 0,
+        "trend_shadow_aligned": 0,
+        "trend_shadow_rejected": 0,
+        "trend_shadow_unknown": 0,
+        "trend_shadow_persistent": 0,
+        "trend_shadow_by_event_type": {},
     }
 
     btc_regime_df = None
@@ -3593,7 +3654,13 @@ def main() -> None:
     terminal_event_ids = load_terminal_event_ids(TRADES)
     pre_order_drift_fail_counts = load_pre_order_drift_failure_counts(TRADES, terminal_event_ids)
     cross_exchange_drift_fail_counts = load_cross_exchange_drift_failure_counts(TRADES, terminal_event_ids)
-    sr_data_fail_counts = load_sr_data_failure_counts(TRADES, terminal_event_ids)
+    # Persisted S/R-data retry history must never influence candidate lifecycle
+    # while the S/R room gate is disabled for the current evaluation run.
+    sr_data_fail_counts = (
+        load_sr_data_failure_counts(TRADES, terminal_event_ids)
+        if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off"
+        else {}
+    )
     # Older state files may already contain an exhausted cross-exchange retry budget
     # without an EVENT_TERMINAL marker. Retire those events on restart so the next
     # scan cannot issue one more fresh MARKET-entry attempt for the same event.
@@ -3662,6 +3729,8 @@ def main() -> None:
     # Fresh 1H ATR is fetched only after an event passes the cheap 15M trigger + score gate.
     risk_1h_cache: dict[str, pd.DataFrame] = {}
     htf_context_cache: dict[str, dict[str, Any]] = {}
+    trend_1h_cache: dict[str, pd.DataFrame] = {}
+    trend_4h_cache: dict[str, pd.DataFrame] = {}
     for r in candidates:
         symbol = str(r.symbol)
         all_events = events_by_symbol.get(symbol, [])
@@ -3881,6 +3950,121 @@ def main() -> None:
                 stats["trigger_passed"] += 1
                 tf_stats["trigger_passed"] += 1
 
+            # Trend Filter v1 is evaluated only after a valid closed-15M trigger.
+            # The causal decision timestamp is the trigger candle close, not the later
+            # wall-clock observation time. The latter is retained separately for
+            # execution-age telemetry/staleness checks. Every HTF frame is clipped to
+            # bars with close_time <= this trigger timestamp, so later 1H/4H bars can
+            # never influence the shadow/enforce decision.
+            if TREND_FILTER_ENABLED and TREND_FILTER_MODE != "off":
+                decision_ts = int(_safe_float((trigger_diag or {}).get("trigger_bar_close_ts"), 0.0))
+                try:
+                    if symbol not in trend_1h_cache:
+                        k1_trend = scan_klines_cache.get((symbol, "1h"))
+                        if k1_trend is None:
+                            k1_trend = _fetch_market_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "400")))
+                        trend_1h_cache[symbol] = pd.DataFrame(k1_trend or [])
+                    if symbol not in trend_4h_cache:
+                        k4_trend = scan_klines_cache.get((symbol, "4h"))
+                        if k4_trend is None:
+                            k4_trend = _fetch_market_klines_scan(symbol, "4h", int(os.environ.get("KLINE_LIMIT_4H", "400")))
+                        trend_4h_cache[symbol] = pd.DataFrame(k4_trend or [])
+
+                    # The scanner intentionally keeps the detector history at 400 closed bars.
+                    # A 15M trigger may close before the latest 1H/4H bar, leaving only 399
+                    # causal bars. Top up Trend Filter history only in that edge case.
+                    trend_1h_cache[symbol], refetched_1h = _ensure_trend_history(
+                        symbol=symbol, timeframe="1h", frame=trend_1h_cache[symbol],
+                        decision_ts=decision_ts, min_bars=TREND_FILTER_MIN_1H_BARS,
+                    )
+                    trend_4h_cache[symbol], refetched_4h = _ensure_trend_history(
+                        symbol=symbol, timeframe="4h", frame=trend_4h_cache[symbol],
+                        decision_ts=decision_ts, min_bars=TREND_FILTER_MIN_4H_BARS,
+                    )
+                    if refetched_1h or refetched_4h:
+                        log.info(
+                            "[TREND_FILTER] topped-up causal history for %s | 1H=%s 4H=%s decision_ts=%s.",
+                            symbol, refetched_1h, refetched_4h, _format_execution_ts(decision_ts),
+                        )
+                    trend_snapshot = evaluate_trend_filter(
+                        symbol=symbol,
+                        direction=direction,
+                        event_type=event_type,
+                        df_1h=trend_1h_cache[symbol],
+                        df_4h=trend_4h_cache[symbol],
+                        btc_1h_df=btc_regime_df,
+                        decision_ts_ms=decision_ts,
+                        min_bars_1h=TREND_FILTER_MIN_1H_BARS,
+                        min_bars_4h=TREND_FILTER_MIN_4H_BARS,
+                        persistence_lookback_1h=TREND_FILTER_PERSISTENCE_LOOKBACK_1H,
+                        persistence_lookback_4h=TREND_FILTER_PERSISTENCE_LOOKBACK_4H,
+                        slope_lookback_4h=TREND_FILTER_SLOPE_LOOKBACK_4H,
+                        require_persistence=TREND_FILTER_REQUIRE_PERSISTENCE,
+                        mode=TREND_FILTER_MODE,
+                    )
+                except Exception as exc:
+                    trend_snapshot = {
+                        "version": "trend-v1-2026-10-04",
+                        "enabled": True,
+                        "mode": TREND_FILTER_MODE,
+                        "symbol": symbol,
+                        "event_direction": direction,
+                        "event_type": event_type,
+                        "decision_ts": decision_ts,
+                        "trend_decision": "REJECT",
+                        "trend_reject_reason": "TREND_DATA_ERROR",
+                        "trend_4h": "UNKNOWN",
+                        "trend_1h": "UNKNOWN",
+                        "trend_persistence": "UNKNOWN",
+                        "error": str(exc),
+                    }
+                    stats["trend_shadow_unknown"] += 1
+                    _record_scan_error(stats, "trend_filter")
+                    ev.setdefault("event_fact", {})["trend_filter"] = trend_snapshot
+                    log.warning("[TREND_SHADOW] %s %s (%s/%s) unavailable: %s", direction, symbol, tf, event_type, exc)
+                    if _trend_filter_enforce_reject(trend_snapshot, TREND_FILTER_MODE):
+                        log.info("[TREND_FILTER] %s %s rejected for current evaluation: TREND_DATA_ERROR", direction, symbol)
+                        continue
+                else:
+                    stats["trend_shadow_candidates"] += 1
+                    reason = trend_snapshot.get("trend_reject_reason")
+                    decision = str(trend_snapshot.get("trend_decision") or "REJECT")
+                    if decision == "ALIGNED":
+                        stats["trend_shadow_aligned"] += 1
+                    else:
+                        stats["trend_shadow_rejected"] += 1
+                        if str(reason or "").endswith("UNKNOWN") or str(reason or "") in {"TREND_DATA_ERROR", "TREND_DECISION_TS_INVALID"}:
+                            stats["trend_shadow_unknown"] += 1
+                    if trend_snapshot.get("trend_persistence") == "PERSISTENT":
+                        stats["trend_shadow_persistent"] += 1
+                    by_event = stats.setdefault("trend_shadow_by_event_type", {})
+                    bucket = by_event.setdefault(event_type, {"candidates": 0, "aligned": 0, "rejected": 0})
+                    bucket["candidates"] += 1
+                    bucket["aligned" if decision == "ALIGNED" else "rejected"] += 1
+                    ev.setdefault("event_fact", {})["trend_filter"] = trend_snapshot
+                    log.info(
+                        "[TREND_SHADOW] %s %s (%s/%s) decision=%s reason=%s 4H=%s 1H=%s persistence=%s BTC=%s decision_ts=%s 4H_bar=%s 1H_bar=%s.",
+                        direction, symbol, tf, event_type, decision, reason or "NONE",
+                        trend_snapshot.get("trend_4h"), trend_snapshot.get("trend_1h"),
+                        trend_snapshot.get("trend_persistence"), trend_snapshot.get("btc_regime"),
+                        _format_execution_ts(decision_ts),
+                        _format_execution_ts(trend_snapshot.get("trend_4h_bar_close_ts")),
+                        _format_execution_ts(trend_snapshot.get("trend_1h_bar_close_ts")),
+                    )
+                    record_action({
+                        "event_id": event_id, "symbol": symbol, "direction": direction,
+                        "event_type": event_type, "execution_status": "TREND_SHADOW_" + ("ALIGNED" if decision == "ALIGNED" else "REJECTED"),
+                        "trend_filter": trend_snapshot,
+                        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+                    })
+                    if _trend_filter_enforce_reject(trend_snapshot, TREND_FILTER_MODE):
+                        # Even in enforce mode this is a retryable current-evaluation veto;
+                        # do not terminalize the parent event because the trend can change.
+                        log.info("[TREND_FILTER] %s %s rejected for current evaluation: %s", direction, symbol, reason or "trend_not_aligned")
+                        continue
+            else:
+                trend_snapshot = None
+
             if REQUIRE_CVD:
                 try: cvd24_value = float(getattr(r, "cvd24", 0.0))
                 except (TypeError, ValueError): stats["rejected_cvd"] += 1; continue
@@ -4045,6 +4229,8 @@ def main() -> None:
             }
             setup["event_timeframe"] = tf
             setup["event_type"] = event_type
+            if isinstance(trend_snapshot, dict):
+                setup["trend_filter"] = trend_snapshot
             setup["entry_context"] = _entry_context(r, ev, btc_regime_snapshot)
             setup["trigger_ok"] = True
 
@@ -4421,12 +4607,18 @@ def main() -> None:
                         "event_type": ev.get("event_type"),
                         "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                         "result": execution_result,
-                        "setup": setup,
+                        # A confirmed TRADE_OPEN must preserve the exact setup
+                        # recalculated from the actual fill, including effective
+                        # TP mode/levels and any post-fill SR context. Rejected
+                        # execution attempts keep the pre-order setup because no
+                        # fill-derived setup exists.
+                        "setup": (execution_result.get("setup_used_for_protection") or setup) if confirmed_trade else setup,
                         "planned_metrics": {
                             "target_rr": (execution_result.get("setup_used_for_protection") or setup).get("target_rr"),
                             "planned_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("planned_weighted_rr"),
                             "effective_weighted_rr": (execution_result.get("setup_used_for_protection") or setup).get("effective_weighted_rr"),
                             "tp_mode": (execution_result.get("setup_used_for_protection") or setup).get("tp_mode"),
+                            "effective_tp_levels": (execution_result.get("setup_used_for_protection") or setup).get("effective_tp_levels", []),
                             "realized_rr": None,
                         },
                     }
@@ -4520,6 +4712,8 @@ def main() -> None:
                 "telegram_required": bool(is_real_execution),
                 "telegram_attempted": bool(is_real_execution and event_id not in telegram_attempted_this_cycle),
                 "execution_status": execution_result.get("status"),
+                "error": execution_result.get("error"),
+                "sr_room": execution_result.get("sr_room") if isinstance(execution_result.get("sr_room"), dict) else None,
                 "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
             }
         )
@@ -4533,6 +4727,14 @@ def main() -> None:
         log.info("[TF_STATS] %s %s", tf_name.upper(), " ".join(f"{k}={v}" for k, v in tf_rec.items()))
 
     log.info("[SUMMARY] [SCAN_ERRORS_BY_STAGE] %s", stats.get("scan_errors_by_stage", {}))
+    log.info(
+        "[TREND_SHADOW_SUMMARY] candidates=%d aligned=%d rejected=%d unknown=%d persistent=%d",
+        int(stats.get("trend_shadow_candidates", 0)),
+        int(stats.get("trend_shadow_aligned", 0)),
+        int(stats.get("trend_shadow_rejected", 0)),
+        int(stats.get("trend_shadow_unknown", 0)),
+        int(stats.get("trend_shadow_persistent", 0)),
+    )
 
     summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
     log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)

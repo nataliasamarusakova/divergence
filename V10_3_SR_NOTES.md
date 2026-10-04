@@ -4,6 +4,8 @@ Scheduler persistence restored to the v9 model: `recent_event_cache.json` and `t
 
 # v10.3.8 Audited: fixed 7% SL + Ajay R5.41 S/R room integration
 
+> **Current release status (2026-10-04): temporarily disabled in the VST workflow.** The S/R implementation remains intact for later re-enablement; it is not applied to entry admission or post-fill protection while `AJAY_SR_ROOM_ENABLED=false` / `AJAY_SR_ROOM_MODE=off`.
+
 ## Current behavior
 
 The SR layer is deliberately **lazy**: it is not calculated for the whole universe.
@@ -117,9 +119,12 @@ A BingX contract that disappears or becomes unavailable after the candidate pref
 
 ## v10.3.8 TP and Telegram policy
 
-New entries use the tighter TP ladder defined centrally in `run_once.py`: normal 0.75R/1.25R/2.00R
-and squeeze 1.00R/1.50R/2.00R, with existing partial-exit fractions preserved. Restart/reconciliation fallback
-uses the same current ladder only when no persisted TP profile exists; persisted historical TP profiles are preserved.
+New entries use the TP ladder defined centrally in `run_once.py`: normal 0.65R/1.25R/2.00R
+and squeeze 1.00R/1.50R/2.00R, with the configured partial-exit fractions preserved. Protection
+adapts after the confirmed fill: use 3 TP legs when the actual quantity is executable, otherwise
+fall back to TP1/TP2, and finally to a single terminal TP3 when only one leg is supported.
+Restart/reconciliation fallback uses the same current ladder only when no persisted TP profile exists;
+persisted historical TP profiles are preserved.
 BE remains an execution/risk-management mechanism, but the successful `BE_ACTIVATED` transition is no longer
 queued for Telegram. Local `[TRACKER_BE_ACTIVATED]` logging and `BE_FAILED` Telegram alerts remain intact.
 
