@@ -613,8 +613,9 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
 
     # TP count is selected after the confirmed fill from the actual position
     # quantity. Do not reject a valid market entry merely because the position
-    # cannot support the historical 3-leg TP ladder. The protection layer will
-    # safely choose 2 legs or 1 terminal TP3 leg according to exchange limits.
+    # cannot support the full TP ladder. The protection layer will choose the
+    # largest executable profile: 3 legs when possible, otherwise 2, otherwise
+    # one terminal TP3 leg.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -1178,43 +1179,60 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
 
 
 def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
-    """Select the largest safe TP profile supported by the filled position.
+    """Select the largest TP profile the confirmed filled position can execute.
 
-    The shipped ladder is still calculated as three milestones, but execution
-    uses at most two conditional TP orders as requested:
-      2 legs -> TP1/TP2
-      1 leg  -> TP3 (terminal target)
+    Selection is intentionally done after the market fill because the exchange
+    quantity/precision constraints apply to the actual filled quantity. The
+    candidate profiles are tried from largest to smallest:
+      3 legs -> TP1/TP2/TP3 when allocation is executable
+      2 legs -> TP1/TP2 when a 3-leg allocation is not executable
+      1 leg  -> terminal TP3 (or the last supplied level) as the final fallback
 
-    This keeps the normal first two milestones for a position that can support
-    two orders, while the existing single-TP micro-position policy preserves
-    the farthest TP3 target.
-
-    Capacity is based on the exchange minimum executable quantity after the
-    position has actually filled, including quantity precision.
+    Feasibility is tested with the same allocator used for the real TP orders,
+    rather than only comparing ``position_qty`` with ``min_qty * n``. This also
+    covers quantity precision and cases where the configured fractional split
+    itself cannot be represented safely across all legs.
     """
     if not tp_levels_norm or position_qty <= 0:
         return []
 
     try:
-        step = Decimal(1).scaleb(-int(precision)) if int(precision) >= 0 else Decimal("1")
-        min_leg = max(step, Decimal(str(max(float(min_qty or 0.0), 0.0))))
-        position = Decimal(str(position_qty))
+        precision_i = int(precision)
+        min_qty_f = max(float(min_qty or 0.0), 0.0)
+        position = float(position_qty)
+        if not math.isfinite(position) or position <= 0:
+            return []
+        if not math.isfinite(min_qty_f):
+            min_qty_f = 0.0
     except (TypeError, ValueError, ArithmeticError):
-        # Internal callers pass validated numeric values. If malformed data ever
-        # reaches this helper, keep the hard two-TP ceiling rather than restoring
-        # an unbounded TP profile.
-        return list(tp_levels_norm[:2])
+        return []
 
-    count = min(len(tp_levels_norm), 2)
-    supported = 1
-    for candidate_count in range(count, 0, -1):
-        if position >= min_leg * candidate_count:
-            supported = candidate_count
-            break
+    # The strategy defines at most three milestones. Keep that ceiling explicit
+    # even if an old/custom state contains additional TP-like entries.
+    available_levels = [dict(x) for x in tp_levels_norm[:3]]
+    if not available_levels:
+        return []
 
-    if supported >= 2:
-        return list(tp_levels_norm[:2])
-    return [dict(tp_levels_norm[-1])]
+    # Try the largest executable profile first. The allocator is the single
+    # source of truth for whether the selected fractions can be represented by
+    # the actual filled quantity, precision, and minimum executable quantity.
+    for candidate_count in range(len(available_levels), 0, -1):
+        if candidate_count == 1:
+            candidate = [dict(available_levels[-1])]
+        else:
+            candidate = [dict(x) for x in available_levels[:candidate_count]]
+        try:
+            _allocate_tp_quantities(
+                position_qty=position,
+                precision=precision_i,
+                min_qty=min_qty_f,
+                fractions=[x["close_fraction"] for x in candidate],
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            continue
+        return candidate
+
+    return []
 
 
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
@@ -1906,11 +1924,11 @@ def ensure_directional_protection(
             "emergency_close": rollback,
         }
 
-    # Adapt the TP profile to the confirmed exchange position size. A position
-    # that cannot support 3 independent legs still gets 2 legs when possible,
-    # or one terminal TP3 leg when necessary. This is intentionally independent
-    # of REQUIRE_MULTI_TP: a valid entry must not be discarded only because the
-    # account is too small for the historical 3-leg profile.
+    # Adapt the TP profile to the confirmed exchange position size. Use all 3
+    # independent legs when executable; otherwise fall back to TP1/TP2, and
+    # finally to one terminal TP3 leg. This is intentionally independent of
+    # REQUIRE_MULTI_TP: a valid entry must not be discarded merely because the
+    # account is too small for the full 3-leg profile.
     tp_levels_norm = _select_supported_tp_levels(
         tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
     )
