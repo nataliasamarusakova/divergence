@@ -46,12 +46,22 @@ jobs:
       ENTRY_QUALITY_MODE: "shadow"
       MIN_SETUP_SCORE: "60"
       MIN_SHORT_SETUP_SCORE: "75"
-      # Ajay R5.41 S/R room is checked only for final trade candidates, immediately
-      # before order placement. SPOT is kept for now; futures can be added later
-      # after feed-to-TradingView validation.
-      AJAY_SR_ROOM_ENABLED: "true"
-      AJAY_SR_ROOM_MODE: "enforce"
-      # Missing Binance Spot S/R source/data is diagnostic only; it must not veto an otherwise valid entry.
+      # Trend Filter v1 starts in shadow: it records causal 4H/1H/BTC state but does not block trades yet.
+      TREND_FILTER_ENABLED: "true"
+      TREND_FILTER_MODE: "shadow"
+      TREND_FILTER_MIN_1H_BARS: "400"
+      TREND_FILTER_MIN_4H_BARS: "400"
+      TREND_FILTER_PERSISTENCE_LOOKBACK_1H: "6"
+      TREND_FILTER_PERSISTENCE_LOOKBACK_4H: "3"
+      TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
+      TREND_FILTER_HISTORY_BUFFER_BARS: "12"
+      TREND_FILTER_REQUIRE_PERSISTENCE: "false"
+      # Demand/Supply (Ajay R5.41 S/R room) is temporarily disabled for the VST evaluation run.
+      # Keep the implementation and diagnostics intact so the gate can be re-enabled later
+      # without changing the event/entry strategy itself.
+      AJAY_SR_ROOM_ENABLED: "false"
+      AJAY_SR_ROOM_MODE: "off"
+      # If S/R is re-enabled later, missing Binance Spot S/R source/data remains diagnostic only.
       AJAY_SR_REQUIRE_DATA: "false"
       AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"
       AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"
@@ -78,7 +88,7 @@ jobs:
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
       SYMBOL_LOSS_COOLDOWN_MIN: "360"
-      # TP count adapts to the filled position size: 2 legs when supported, otherwise one terminal TP3.
+      # TP count adapts to the filled position size: 3 legs when supported, otherwise 2, otherwise one terminal TP3.
       REJECT_SINGLE_TP: "false"
       REQUIRE_MULTI_TP: "false"
       FIXED_STOP_LOSS_PCT: "7.00"
