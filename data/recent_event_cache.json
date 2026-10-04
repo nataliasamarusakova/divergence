@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791114122469,
+  "updated_ts": 1791114431202,
   "events": [
     {
       "event_id": "EVT_2E403242D376C2C2",
@@ -1579,6 +1579,29 @@
         "trigger_level": 0.4537,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_25B455F47AB9EB41",
+      "symbol": "IOTA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791104399999,
+        "pivot_2_ts": 1791111599999,
+        "detected_at_ts": 1791111599999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.06036,
+        "range_high": 0.06036,
+        "range_low": 0.05777,
+        "manipulation_depth_atr": 1.5103806589252358,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
