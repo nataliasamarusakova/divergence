@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791094016949,
+  "updated_ts": 1791094373833,
   "events": [
     {
       "event_id": "EVT_063C2A78CF1B6A0C",
@@ -1683,6 +1683,120 @@
         "requires_retest": true,
         "trigger_level": 0.4581,
         "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_3CF0BD9A082688BB",
+      "symbol": "SKY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKOUT_MOMENTUM",
+      "timestamps": {
+        "pivot_1_ts": 1791089999999,
+        "pivot_2_ts": 1791089999999,
+        "detected_at_ts": 1791089999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09349,
+        "donchian_high": 0.09311,
+        "donchian_low": 0.08719,
+        "breakout_atr": 0.27376923707644696,
+        "bb_width": 0.07600978915624092,
+        "bb_width_threshold": 0.07069172367559651,
+        "volume_ratio": 1.628352510607637,
+        "adx": 25.195254699143515,
+        "requires_retest": true,
+        "trigger_level": 0.09311,
+        "engine": "BREAKOUT_MOMENTUM",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_96E37F21AB714B48",
+      "symbol": "SKY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791089999999,
+        "pivot_2_ts": 1791089999999,
+        "detected_at_ts": 1791089999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09349,
+        "donchian_high": 0.09311,
+        "donchian_low": 0.08719,
+        "breakout_atr": 0.27376923707644696,
+        "volume_ratio": 1.628352510607637,
+        "adx": 25.195254699143515,
+        "ema200": 0.08226393967226113,
+        "compressed_recent": true,
+        "bb_width": 0.07600978915624092,
+        "trigger_level": 0.09311,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_009E7FF4211F5740",
+      "symbol": "SKY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKOUT_MOMENTUM",
+      "timestamps": {
+        "pivot_1_ts": 1791093599999,
+        "pivot_2_ts": 1791093599999,
+        "detected_at_ts": 1791093599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09735,
+        "donchian_high": 0.09438,
+        "donchian_low": 0.08719,
+        "breakout_atr": 1.8153721884105458,
+        "bb_width": 0.10505602501779286,
+        "bb_width_threshold": 0.07069172367559651,
+        "volume_ratio": 5.548949788822872,
+        "adx": 27.77074893379159,
+        "requires_retest": true,
+        "trigger_level": 0.09438,
+        "engine": "BREAKOUT_MOMENTUM",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_F85D7349C28326E9",
+      "symbol": "SKY",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791093599999,
+        "pivot_2_ts": 1791093599999,
+        "detected_at_ts": 1791093599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09735,
+        "donchian_high": 0.09438,
+        "donchian_low": 0.08719,
+        "breakout_atr": 1.8153721884105458,
+        "volume_ratio": 5.548949788822872,
+        "adx": 27.77074893379159,
+        "ema200": 0.08241404972527346,
+        "compressed_recent": true,
+        "bb_width": 0.10505602501779286,
+        "trigger_level": 0.09438,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
