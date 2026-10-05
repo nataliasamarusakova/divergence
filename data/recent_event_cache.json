@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791199724442,
+  "updated_ts": 1791200050812,
   "events": [
     {
       "event_id": "EVT_09A39EAE84341D68",
@@ -245,34 +245,6 @@
         "displacement_atr": 1.35073621077839,
         "volume_ratio": 1.4960770078852637,
         "body_fraction": 0.9229999999999975,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_E0190DAA60559197",
-      "symbol": "MOVR",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1791194399999,
-        "pivot_2_ts": 1791194399999,
-        "detected_at_ts": 1791194399999
-      },
-      "event_fact": {
-        "detection_close_price": 2.3123,
-        "donchian_high": 2.0956,
-        "donchian_low": 1.6524,
-        "breakout_atr": 2.1435398261086407,
-        "bb_width": 0.3304188973537757,
-        "bb_width_threshold": 0.1341681073999982,
-        "volume_ratio": 11.475428127253704,
-        "adx": 24.388894427202768,
-        "requires_retest": true,
-        "trigger_level": 2.0956,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
@@ -2261,6 +2233,29 @@
         "vwap": 0.11099703689878108,
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_725660B0F0B3D216",
+      "symbol": "PENDLE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1791190799999,
+        "pivot_2_ts": 1791197999999,
+        "detected_at_ts": 1791197999999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 2.4524,
+        "range_high": 2.5291,
+        "range_low": 2.4524,
+        "manipulation_depth_atr": 0.1002261351448421,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
