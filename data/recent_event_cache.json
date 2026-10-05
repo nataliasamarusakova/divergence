@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791212058048,
+  "updated_ts": 1791212344311,
   "events": [
     {
       "event_id": "EVT_9FA9AB288D7293FC",
@@ -3288,6 +3288,57 @@
         "range_high": 0.05912,
         "range_low": 0.05852,
         "manipulation_depth_atr": 0.16471756299902227,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_7EB7E11AE469FDA4",
+      "symbol": "2Z",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791205199999,
+        "pivot_2_ts": 1791205199999,
+        "detected_at_ts": 1791205199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04454,
+        "compression_ratio": 0.4156894812799282,
+        "ma_spread_atr": 0.48247635037384484,
+        "compression_threshold": 1.1606652852708146,
+        "breakout_atr": 0.8467751903987989,
+        "volume_ratio": 1.1170415491267431,
+        "requires_retest": true,
+        "trigger_level": 0.04467,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_99DDE901133EB782",
+      "symbol": "2Z",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1791205199999,
+        "pivot_2_ts": 1791205199999,
+        "detected_at_ts": 1791205199999
+      },
+      "event_fact": {
+        "ema_fast": 0.04490878663167655,
+        "ema_slow": 0.046225316927062304,
+        "ema200": 0.052820461806431074,
+        "body_atr": 0.8054690835500781,
+        "volume_ratio": 1.1170415491267431,
+        "trigger_level": 0.04490878663167655,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
