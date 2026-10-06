@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791250455450,
+  "updated_ts": 1791250756187,
   "events": [
     {
       "event_id": "EVT_E75EF8401EA48756",
@@ -2712,6 +2712,57 @@
         "mss_level": 1.539,
         "broken_ts": 1791187199999,
         "bos_ts": 1790967599999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_8D54A1947CBCBA11",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791244799999,
+        "pivot_2_ts": 1791244799999,
+        "detected_at_ts": 1791244799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.08581,
+        "compression_ratio": 0.03084909764802544,
+        "ma_spread_atr": 0.01906377768149169,
+        "compression_threshold": 0.6179687295557543,
+        "breakout_atr": 1.1712709887589323,
+        "volume_ratio": 1.1415781117680468,
+        "requires_retest": true,
+        "trigger_level": 0.08481,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E20975D54E6F5679",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1791244799999,
+        "pivot_2_ts": 1791244799999,
+        "detected_at_ts": 1791244799999
+      },
+      "event_fact": {
+        "ema_fast": 0.08413109648203362,
+        "ema_slow": 0.08396221969534824,
+        "ema200": 0.08265795902013785,
+        "body_atr": 1.1712709887589323,
+        "volume_ratio": 1.1415781117680468,
+        "trigger_level": 0.08413109648203362,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
