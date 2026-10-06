@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791307847296,
+  "updated_ts": 1791308141808,
   "events": [
     {
       "event_id": "EVT_D6B813FDC60AEAC1",
@@ -5340,6 +5340,149 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_620F2B795778725B",
+      "symbol": "GRIFFAIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_MACD",
+      "timestamps": {
+        "pivot_1_ts": 1791248399999,
+        "pivot_2_ts": 1791298799999,
+        "detected_at_ts": 1791305999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.023023,
+        "p1_price": 0.01991,
+        "p2_price": 0.024426,
+        "p1_indicator": 0.0005104373401279769,
+        "p2_indicator": 0.00047039269498050026,
+        "bars_between": 14,
+        "price_delta_atr": 5.904499782842826,
+        "price_delta_pct": 22.68206931190356,
+        "volume_ratio_20": 1.9125023213749204,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.01792693768486549,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E20877271C766BA5",
+      "symbol": "GRIFFAIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_STOCH",
+      "timestamps": {
+        "pivot_1_ts": 1791248399999,
+        "pivot_2_ts": 1791298799999,
+        "detected_at_ts": 1791305999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.023023,
+        "p1_price": 0.01991,
+        "p2_price": 0.024426,
+        "p1_indicator": 84.77435901444325,
+        "p2_indicator": 61.877448463799034,
+        "bars_between": 14,
+        "price_delta_atr": 5.904499782842826,
+        "price_delta_pct": 22.68206931190356,
+        "volume_ratio_20": 1.9125023213749204,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.01792693768486549,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_C3C968A4A09B12C5",
+      "symbol": "GRIFFAIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1791248399999,
+        "pivot_2_ts": 1791298799999,
+        "detected_at_ts": 1791305999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.023023,
+        "p1_price": 0.01991,
+        "p2_price": 0.024426,
+        "p1_indicator": 0.12963580272236666,
+        "p2_indicator": -0.05283538425631077,
+        "bars_between": 14,
+        "price_delta_atr": 5.904499782842826,
+        "price_delta_pct": 22.68206931190356,
+        "volume_ratio_20": 1.9125023213749204,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.01792693768486549,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_77E06E95E677F014",
+      "symbol": "GRIFFAIN",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791302399999,
+        "pivot_2_ts": 1791302399999,
+        "detected_at_ts": 1791302399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.022581,
+        "donchian_high": 0.020523,
+        "donchian_low": 0.016206,
+        "breakout_atr": 1.916920622810058,
+        "volume_ratio": 11.929567167212795,
+        "adx": 39.67010164391104,
+        "ema200": 0.015079443792334005,
+        "compressed_recent": true,
+        "bb_width": 0.3219597446709454,
+        "trigger_level": 0.020523,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_BF4E658DB17C8197",
+      "symbol": "GRIFFAIN",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1791230399999,
+        "pivot_2_ts": 1791302399999,
+        "detected_at_ts": 1791302399999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.019241,
+        "zone_high": 0.019241,
+        "zone_low": 0.018769,
+        "bos_level": 0.019932,
+        "ob_ts": 1791273599999,
+        "displacement_atr": 2.655559132959899,
+        "volume_ratio": 11.929567167212795,
+        "body_fraction": 0.6040254237288136,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
