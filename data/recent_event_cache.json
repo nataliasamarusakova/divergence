@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791293864865,
+  "updated_ts": 1791294161425,
   "events": [
     {
       "event_id": "EVT_A610B7750C6A562A",
@@ -4057,6 +4057,85 @@
         "mss_level": 20.172,
         "broken_ts": 1790726399999,
         "bos_ts": 1790179199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_AB2D9567E890DF5C",
+      "symbol": "GALA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791291599999,
+        "pivot_2_ts": 1791291599999,
+        "detected_at_ts": 1791291599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.002462,
+        "compression_ratio": 0.9919216082570306,
+        "ma_spread_atr": 0.3537416582212697,
+        "compression_threshold": 0.3566225952500944,
+        "breakout_atr": 0.4608832442748015,
+        "volume_ratio": 0.9573645181961137,
+        "requires_retest": true,
+        "trigger_level": 0.00247,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_6B9904D4104DA68B",
+      "symbol": "GALA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1790938799999,
+        "pivot_2_ts": 1791291599999,
+        "detected_at_ts": 1791291599999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.002465,
+        "zone_high": 0.002538,
+        "zone_low": 0.002465,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1791064799999,
+        "liquidity_sweep_level": 0.002551,
+        "mss_ts": 1791212399999,
+        "mss_pivot_ts": 1791050399999,
+        "mss_level": 0.002499,
+        "broken_ts": 1791212399999,
+        "bos_ts": 1790953199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_5FE9792DC931C709",
+      "symbol": "GALA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791284399999,
+        "pivot_2_ts": 1791291599999,
+        "detected_at_ts": 1791291599999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.002477,
+        "range_high": 0.002477,
+        "range_low": 0.002445,
+        "manipulation_depth_atr": 0.2962820856052326,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
