@@ -1,0 +1,2634 @@
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+def _wilder_smooth(values: pd.Series, n: int) -> pd.Series:
+    """Wilder/RMA smoothing with a classic SMA seed over the first n valid values.
+
+    This matches TradingView's RMA-style initialization while correctly handling
+    series whose first valid sample is not at index 0 (e.g. RSI deltas) and series
+    whose first sample is already valid (e.g. True Range for ATR).
+    """
+    out = pd.Series(np.nan, index=values.index, dtype=float)
+    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    if len(arr) == 0 or n <= 0:
+        return out
+
+    finite_positions = np.flatnonzero(np.isfinite(arr))
+    if len(finite_positions) < n:
+        return out
+
+    seed_positions = finite_positions[:n]
+    seed = float(np.mean(arr[seed_positions]))
+    seed_pos = int(seed_positions[-1])
+    result = np.full(len(arr), np.nan, dtype=float)
+    result[seed_pos] = seed
+    prev = seed
+
+    for i in range(seed_pos + 1, len(arr)):
+        x = arr[i]
+        if np.isfinite(x):
+            prev = (prev * (n - 1) + x) / n
+        result[i] = prev
+
+    out.iloc[:] = result
+    return out
+
+
+def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    # Wilder RSI (audit fix B1): SMA-seeded smoothing instead of a bare EMA so
+    # values match TradingView Pine ta.rsi within < 0.1 point.
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = _wilder_smooth(gain, n)
+    avg_loss = _wilder_smooth(loss, n)
+
+    zero_loss = (avg_loss == 0) & (avg_gain > 0)
+    zero_both = (avg_loss == 0) & (avg_gain == 0)
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    rsi = rsi.where(~zero_loss, 100.0)
+    rsi = rsi.where(~zero_both, 50.0)
+
+    valid_warmup = avg_gain.notna() & avg_loss.notna()
+    return rsi.where(valid_warmup, np.nan)
+
+
+def _bbands(
+    series: pd.Series,
+    n: int = 20,
+    std: float = 2.0,
+):
+    mid = series.rolling(n, min_periods=n).mean()
+    sd = series.rolling(n, min_periods=n).std(ddof=0)
+    upper = mid + std * sd
+    lower = mid - std * sd
+    return upper, mid, lower
+
+
+def _atr(
+    df: pd.DataFrame,
+    n: int = 14,
+) -> pd.Series:
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"] - df["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return _wilder_smooth(tr, n)
+
+
+def _pivots(
+    df: pd.DataFrame,
+    left: int = 3,
+    right: int = 2,
+):
+    lows: list[int] = []
+    highs: list[int] = []
+
+    for i in range(left, len(df) - right):
+        current_low = float(df["low"].iloc[i])
+        previous_lows = df["low"].iloc[i - left:i]
+        next_lows = df["low"].iloc[i + 1:i + right + 1]
+
+        current_high = float(df["high"].iloc[i])
+        previous_highs = df["high"].iloc[i - left:i]
+        next_highs = df["high"].iloc[i + 1:i + right + 1]
+
+        if current_low <= float(previous_lows.min()) and current_low < float(next_lows.min()):
+            lows.append(i)
+
+        if current_high >= float(previous_highs.max()) and current_high > float(next_highs.max()):
+            highs.append(i)
+
+    return lows, highs
+
+
+def _event_id(
+    symbol: str,
+    tf: str,
+    typ: str,
+    p1_ts: int,
+    p2_ts: int,
+) -> str:
+    fp = f"{symbol}:{tf}:{typ}:{int(p1_ts)}:{int(p2_ts)}"
+    return "EVT_" + hashlib.sha256(fp.encode()).hexdigest()[:16].upper()
+
+
+def add_cvd(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build a continuous CVD state without fabricating zero flow.
+
+    A missing/invalid taker-flow bar does not reset the cumulative CVD. The last
+    known CVD value is carried forward, while ``taker_flow_valid`` stays False so
+    callers can apply a coverage/validity policy. This preserves continuity
+    without asserting that missing flow was actually zero.
+    """
+    work = df.copy()
+
+    if "bar_delta_usdt" not in work.columns:
+        work["bingx_cvd"] = float("nan")
+        work["taker_flow_valid"] = False
+        work["cvd_segment_id"] = 0
+        work["cvd_valid_coverage"] = 0.0
+        return work
+
+    if "taker_flow_valid" not in work.columns:
+        work["taker_flow_valid"] = False
+
+    work["taker_flow_valid"] = work["taker_flow_valid"].fillna(False).astype(bool)
+    work["bar_delta_usdt"] = pd.to_numeric(work["bar_delta_usdt"], errors="coerce")
+
+    cvd = []
+    coverage = []
+    current = float("nan")
+    valid_count = 0
+    for i in work.index:
+        valid = bool(work.at[i, "taker_flow_valid"]) and pd.notna(work.at[i, "bar_delta_usdt"])
+        if valid:
+            delta = float(work.at[i, "bar_delta_usdt"])
+            current = delta if pd.isna(current) else current + delta
+            valid_count += 1
+        cvd.append(current)
+        coverage.append(valid_count / max(1, len(cvd)))
+
+    work["bingx_cvd"] = cvd
+    work["cvd_valid_coverage"] = coverage
+    # Kept as a stable column for existing event metadata/tests; there are no
+    # artificial segments anymore, so every row belongs to the same sequence.
+    work["cvd_segment_id"] = 0
+    return work
+
+
+def add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """Append MACD line, signal line and histogram with deterministic warmup.
+
+    The MACD line is ``EMA(fast) - EMA(slow)``. The signal is an EMA of the
+    MACD line and the histogram is ``macd - macd_signal``. ``min_periods`` on
+    the slow EMA and signal EMA prevents early partial values from becoming
+    divergence pivots.
+    """
+    work = df.copy()
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean() if close is not None else pd.Series(dtype=float)
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean() if close is not None else pd.Series(dtype=float)
+    work["macd"] = ema_fast - ema_slow
+    work["macd_signal"] = work["macd"].ewm(span=signal, adjust=False, min_periods=signal).mean()
+    work["macd_hist"] = work["macd"] - work["macd_signal"]
+    return work
+
+
+def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """Append cumulative VWAP using HLC3 and base volume."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["vwap"] = float("nan")
+        return work
+
+    typical_price = (high + low + close) / 3.0
+    volume_cum = volume.clip(lower=0).cumsum()
+    value_cum = (typical_price * volume.clip(lower=0)).cumsum()
+    work["vwap"] = value_cum / volume_cum.replace(0.0, np.nan)
+    return work
+
+
+def add_mfi(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    """Append Money Flow Index using HLC3 and signed rolling money flow."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["mfi"] = float("nan")
+        return work
+
+    typical_price = (high + low + close) / 3.0
+    raw_money_flow = typical_price * volume.clip(lower=0)
+    delta = typical_price.diff()
+    positive = raw_money_flow.where(delta > 0, 0.0)
+    negative = raw_money_flow.where(delta < 0, 0.0)
+    positive_sum = positive.rolling(length, min_periods=length).sum()
+    negative_sum = negative.rolling(length, min_periods=length).sum()
+    total = positive_sum + negative_sum
+    work["mfi"] = 100.0 * positive_sum / total.replace(0.0, np.nan)
+    work.loc[total == 0, "mfi"] = 50.0
+    work.loc[(negative_sum == 0) & (positive_sum > 0), "mfi"] = 100.0
+    return work
+
+
+def add_cmf(df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
+    """Append Chaikin Money Flow using rolling money-flow volume."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce")
+    if high is None or low is None or close is None or volume is None:
+        work["cmf"] = float("nan")
+        return work
+
+    hl_range = high - low
+    mfm = ((close - low) - (high - close)) / hl_range.replace(0.0, np.nan)
+    mfm = mfm.fillna(0.0)
+    mfv = mfm * volume.clip(lower=0)
+    mfv_sum = mfv.rolling(length, min_periods=length).sum()
+    volume_sum = volume.clip(lower=0).rolling(length, min_periods=length).sum()
+    work["cmf"] = mfv_sum / volume_sum.replace(0.0, np.nan)
+    return work
+
+
+def add_ema(df: pd.DataFrame, periods: tuple[int, ...] = (5, 10, 30, 50, 200)) -> pd.DataFrame:
+    work = df.copy()
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    if close is None:
+        return work
+    for n in periods:
+        work[f"ema{int(n)}"] = close.ewm(span=int(n), adjust=False, min_periods=int(n)).mean()
+    return work
+
+
+def add_adx(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    if high is None or low is None or close is None:
+        work["adx"] = float("nan")
+        return work
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = _wilder_smooth(tr, n)
+    plus = 100.0 * _wilder_smooth(plus_dm, n) / atr.replace(0, np.nan)
+    minus = 100.0 * _wilder_smooth(minus_dm, n) / atr.replace(0, np.nan)
+    dx = 100.0 * (plus - minus).abs() / (plus + minus).replace(0, np.nan)
+    work["adx"] = _wilder_smooth(dx, n)
+    work["plus_di"] = plus
+    work["minus_di"] = minus
+    return work
+
+
+def _trend_context(df: pd.DataFrame, direction: str) -> dict[str, Any]:
+    """Describe the prevailing local trend without looking into the future."""
+    if len(df) < 55:
+        return {"trend_ok": None, "trend": "UNKNOWN"}
+    d = str(direction).upper()
+    work = add_ema(df, (20, 50, 200))
+    close = float(pd.to_numeric(work["close"], errors="coerce").iloc[-1])
+    ema20 = float(work["ema20"].iloc[-1]) if pd.notna(work["ema20"].iloc[-1]) else close
+    ema50 = float(work["ema50"].iloc[-1]) if pd.notna(work["ema50"].iloc[-1]) else ema20
+    slope50 = float(work["ema50"].iloc[-1] - work["ema50"].iloc[-6]) if len(work) >= 56 and work["ema50"].iloc[-6:].notna().all() else 0.0
+    if d == "LONG":
+        ok = close > ema50 and slope50 >= 0
+        trend = "UP" if ok else "DOWN_OR_FLAT"
+    else:
+        ok = close < ema50 and slope50 <= 0
+        trend = "DOWN" if ok else "UP_OR_FLAT"
+    return {"trend_ok": bool(ok), "trend": trend, "ema20": ema20, "ema50": ema50, "slope50": slope50}
+
+
+def detect_macd_4h(df: pd.DataFrame, symbol: str, timeframe: str = "4h") -> list[dict[str, Any]]:
+    """Detect a confirmed 4H MACD regime transition as a standalone event."""
+    if len(df) < 220 or timeframe.lower() != "4h":
+        return []
+    d = df.copy()
+    for col in ("close", "high", "low", "close_time"):
+        if col not in d.columns:
+            return []
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["close", "high", "low", "close_time"]).reset_index(drop=True)
+    if len(d) < 80:
+        return []
+    d = add_macd(d)
+    d = add_ema(d, (200,))
+    macd = d["macd"]
+    signal = macd.ewm(span=9, adjust=False, min_periods=9).mean()
+    hist = macd - signal
+    i = len(d) - 1
+    if i < 2 or any(pd.isna(x) for x in (macd.iloc[i-1], signal.iloc[i-1], macd.iloc[i], signal.iloc[i], hist.iloc[i])):
+        return []
+    cross_up = macd.iloc[i-1] <= signal.iloc[i-1] and macd.iloc[i] > signal.iloc[i]
+    cross_down = macd.iloc[i-1] >= signal.iloc[i-1] and macd.iloc[i] < signal.iloc[i]
+    close = float(d["close"].iloc[i])
+    ema200 = float(d["ema200"].iloc[i]) if pd.notna(d["ema200"].iloc[i]) else close
+    if pd.isna(d["ema200"].iloc[i]):
+        return []
+    if cross_up and close > ema200:
+        direction, typ = "LONG", "MACD_4H_BULLISH_CROSS"
+    elif cross_down and close < ema200:
+        direction, typ = "SHORT", "MACD_4H_BEARISH_CROSS"
+    else:
+        return []
+    ts = int(d["close_time"].iloc[i])
+    return [{
+        "event_id": _event_id(symbol, timeframe, typ, ts, ts),
+        "symbol": symbol, "timeframe": timeframe, "direction": direction, "event_type": typ,
+        "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
+        "event_fact": {"detection_close_price": close, "macd": float(macd.iloc[i]), "macd_signal": float(signal.iloc[i]),
+                        "macd_hist": float(hist.iloc[i]), "ema200": ema200, "distance_ema200_atr": None,
+                        "engine": "MACD_4H"},
+    }]
+
+
+def detect_ma_compression_breakout(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
+                                   compression_lookback: int = 20, compression_quantile: float = 0.35) -> list[dict[str, Any]]:
+    """1H MA compression followed by a structural breakout. Entry later requires retest."""
+    if timeframe.lower() != "1h" or len(df) < 80:
+        return []
+    d = df.copy()
+    for col in ("close", "high", "low", "volume", "close_time"):
+        if col not in d.columns:
+            return []
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["close", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    d = add_ema(d, (5, 10, 30, 50))
+    d["atr"] = _atr(d, 14)
+    spread = (d["ema5"] - d["ema30"]).abs() / d["atr"].replace(0, np.nan)
+    hist = spread.iloc[:-1].dropna().tail(compression_lookback * 3)
+    if len(hist) < compression_lookback or pd.isna(spread.iloc[-2]) or pd.isna(spread.iloc[-1]):
+        return []
+    threshold = float(hist.quantile(compression_quantile))
+    was_compressed = float(spread.iloc[-2]) <= threshold
+    if not was_compressed:
+        return []
+    close = float(d["close"].iloc[-1])
+    prev = float(d["close"].iloc[-2])
+    atr = float(d["atr"].iloc[-1]) if pd.notna(d["atr"].iloc[-1]) else 0.0
+    if atr <= 0:
+        return []
+    prior_high = float(d["high"].iloc[-2])
+    prior_low = float(d["low"].iloc[-2])
+    vol_mean = d["volume"].iloc[-21:-1].mean() if len(d) >= 21 else np.nan
+    vol_ratio = float(d["volume"].iloc[-1] / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else 0.0
+    if close > prior_high and close > float(d["ema30"].iloc[-1]):
+        direction, breakout = "LONG", (close - prev) / atr
+    elif close < prior_low and close < float(d["ema30"].iloc[-1]):
+        direction, breakout = "SHORT", (prev - close) / atr
+    else:
+        return []
+    ts = int(d["close_time"].iloc[-1])
+    typ = "MA_COMPRESSION_BREAKOUT"
+    return [{
+        "event_id": _event_id(symbol, timeframe, typ, ts, ts), "symbol": symbol, "timeframe": timeframe,
+        "direction": direction, "event_type": typ, "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
+        "event_fact": {"detection_close_price": close, "compression_ratio": float(spread.iloc[-2] / max(threshold, 1e-9)),
+                        "ma_spread_atr": float(spread.iloc[-2]), "compression_threshold": threshold,
+                        "breakout_atr": float(breakout), "volume_ratio": vol_ratio, "requires_retest": True, "trigger_level": float(prior_high if direction == "LONG" else prior_low), "engine": "MA_COMPRESSION", "requires_htf_context": True},
+    }]
+
+
+def detect_breakout_momentum(df: pd.DataFrame, symbol: str, timeframe: str = "1h", donchian_n: int = 20) -> list[dict[str, Any]]:
+    """Breakout + compression + momentum + volume + ADX trend event."""
+    if timeframe.lower() not in {"1h", "4h"} or len(df) < max(80, donchian_n + 40):
+        return []
+    d = df.copy()
+    for col in ("close", "high", "low", "volume", "close_time"):
+        if col not in d.columns:
+            return []
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["close", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    d = add_ema(d, (50,))
+    d = add_adx(d, 14)
+    bb_u, mid, bb_l = _bbands(d["close"], 20, 2.0)
+    atr = _atr(d, 14)
+    bb_width = (bb_u - bb_l) / mid.replace(0, np.nan)
+    hist = bb_width.iloc[:-1].dropna().tail(100)
+    if len(hist) < 30 or pd.isna(atr.iloc[-1]) or pd.isna(d["adx"].iloc[-1]):
+        return []
+    width_threshold = float(hist.quantile(0.35))
+    compressed_recent = bool((bb_width.iloc[-11:-1] <= width_threshold).any())
+    close = float(d["close"].iloc[-1]); atr_v = float(atr.iloc[-1])
+    dc_high = float(d["high"].iloc[-donchian_n-1:-1].max())
+    dc_low = float(d["low"].iloc[-donchian_n-1:-1].min())
+    vol_mean = d["volume"].iloc[-21:-1].mean()
+    vol_ratio = float(d["volume"].iloc[-1] / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else 0.0
+    adx = float(d["adx"].iloc[-1])
+    if not compressed_recent or adx < 20 or vol_ratio < 1.5 or atr_v <= 0:
+        return []
+    if close > dc_high + 0.10 * atr_v and close > float(d["ema50"].iloc[-1]):
+        direction, breakout_atr = "LONG", (close - dc_high) / atr_v
+    elif close < dc_low - 0.10 * atr_v and close < float(d["ema50"].iloc[-1]):
+        direction, breakout_atr = "SHORT", (dc_low - close) / atr_v
+    else:
+        return []
+    ts = int(d["close_time"].iloc[-1])
+    typ = "BREAKOUT_MOMENTUM"
+    return [{
+        "event_id": _event_id(symbol, timeframe, typ, ts, ts), "symbol": symbol, "timeframe": timeframe,
+        "direction": direction, "event_type": typ, "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
+        "event_fact": {"detection_close_price": close, "donchian_high": dc_high, "donchian_low": dc_low,
+                        "breakout_atr": float(breakout_atr), "bb_width": float(bb_width.iloc[-1]),
+                        "bb_width_threshold": width_threshold, "volume_ratio": vol_ratio, "adx": adx,
+                        "requires_retest": True, "trigger_level": float(dc_high if direction == "LONG" else dc_low), "engine": "BREAKOUT_MOMENTUM", "requires_htf_context": True},
+    }]
+
+
+
+def detect_donchian_retest(df: pd.DataFrame, symbol: str, timeframe: str = "1h", donchian_n: int = 20,
+                           adx_min: float = 20.0, volume_min: float = 1.30, atr_buffer: float = 0.10,
+                           compression_quantile: float = 0.50) -> list[dict[str, Any]]:
+    """Detect a trend-aligned Donchian breakout as a setup; entry requires a later retest.
+
+    This is deliberately stricter than a naked channel break: the breakout must be
+    outside a prior Donchian extreme by an ATR buffer, have participation, and agree
+    with the 200 EMA regime. Compression is contextual rather than mandatory to avoid
+    overfitting a single volatility regime.
+    """
+    if timeframe.lower() not in {"1h", "4h"} or len(df) < max(220, donchian_n + 50):
+        return []
+    d = df.copy()
+    for c in ("close", "high", "low", "volume", "close_time"):
+        if c not in d.columns:
+            return []
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["close", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    d = add_ema(d, (200, 50))
+    d = add_adx(d, 14)
+    atr = _atr(d, 14)
+    if len(d) < max(220, donchian_n + 50) or pd.isna(atr.iloc[-1]) or pd.isna(d["ema200"].iloc[-1]) or pd.isna(d["adx"].iloc[-1]):
+        return []
+
+    close = float(d["close"].iloc[-1]); atr_v = float(atr.iloc[-1])
+    dc_high = float(d["high"].iloc[-donchian_n-1:-1].max())
+    dc_low = float(d["low"].iloc[-donchian_n-1:-1].min())
+    vol_mean = float(d["volume"].iloc[-21:-1].mean()) if pd.notna(d["volume"].iloc[-21:-1].mean()) else 0.0
+    vol_ratio = float(d["volume"].iloc[-1] / vol_mean) if vol_mean > 0 else 0.0
+    adx = float(d["adx"].iloc[-1])
+    if atr_v <= 0 or adx < adx_min or vol_ratio < volume_min:
+        return []
+
+    bb_u, mid, bb_l = _bbands(d["close"], 20, 2.0)
+    bb_width = (bb_u - bb_l) / mid.replace(0, np.nan)
+    hist = bb_width.iloc[:-1].dropna().tail(100)
+    compression_threshold = float(hist.quantile(compression_quantile)) if len(hist) >= 30 else None
+    compressed_recent = bool(bb_width.iloc[-11:-1].le(compression_threshold).any()) if compression_threshold is not None else False
+
+    if close > dc_high + atr_buffer * atr_v and close > float(d["ema200"].iloc[-1]):
+        direction = "LONG"
+        breakout_atr = (close - dc_high) / atr_v
+        level = dc_high
+    elif close < dc_low - atr_buffer * atr_v and close < float(d["ema200"].iloc[-1]):
+        direction = "SHORT"
+        breakout_atr = (dc_low - close) / atr_v
+        level = dc_low
+    else:
+        return []
+
+    ts = int(d["close_time"].iloc[-1])
+    typ = "DONCHIAN_RETEST_BREAKOUT"
+    return [{
+        "event_id": _event_id(symbol, timeframe, typ, ts, ts),
+        "symbol": symbol, "timeframe": timeframe, "direction": direction, "event_type": typ,
+        "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
+        "event_fact": {
+            "detection_close_price": close, "donchian_high": dc_high, "donchian_low": dc_low,
+            "breakout_atr": float(breakout_atr), "volume_ratio": vol_ratio, "adx": adx,
+            "ema200": float(d["ema200"].iloc[-1]), "compressed_recent": compressed_recent,
+            "bb_width": float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else None,
+            "trigger_level": level, "requires_retest": True, "engine": "DONCHIAN_RETEST", "requires_htf_context": True,
+        },
+    }]
+
+
+def detect_liquidity_sweep_reclaim(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
+                                   lookback: int = 20, min_displacement_atr: float = 0.10,
+                                   min_volume_ratio: float = 1.10,
+                                   min_rejection_wick_fraction: float = 0.35,
+                                   sweep_tolerance_pct: float = 0.0) -> list[dict[str, Any]]:
+    """Detect a prior-range liquidity sweep followed by a reclaim.
+
+    The reference geometry is intentionally explicit: use the extreme of the
+    previous ``lookback`` completed bars, exceed it by at least
+    ``min_displacement_atr`` measured against the *previous bar's* ATR, close
+    back inside the level, and devote at least ``min_rejection_wick_fraction``
+    of the current candle range to the rejection wick. Total-volume ratio is
+    retained only as an additional local strategy filter.
+    """
+    if timeframe.lower() not in {"1h", "4h"} or len(df) < max(80, lookback + 2):
+        return []
+    d = df.copy()
+    for c in ("close", "open", "high", "low", "volume", "close_time"):
+        if c not in d.columns:
+            return []
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["close", "open", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    if len(d) < max(80, lookback + 2):
+        return []
+    d["atr"] = _atr(d, 14)
+    prev_atr = d["atr"].iloc[-2]
+    if pd.isna(prev_atr) or float(prev_atr) <= 0:
+        return []
+    atr_v = float(prev_atr)
+
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    close = float(last["close"])
+    open_v = float(last["open"])
+    high = float(last["high"])
+    low = float(last["low"])
+    candle_range = high - low
+    if candle_range <= 0:
+        return []
+
+    vol_mean = float(d["volume"].iloc[-21:-1].mean()) if pd.notna(d["volume"].iloc[-21:-1].mean()) else 0.0
+    vol_ratio = float(last["volume"] / vol_mean) if vol_mean > 0 else 0.0
+    if vol_ratio < min_volume_ratio:
+        return []
+
+    history = d.iloc[-(lookback + 1):-1]
+    if len(history) < lookback:
+        return []
+    tol = max(0.0, sweep_tolerance_pct) / 100.0
+
+    low_pos = int(history["low"].idxmin())
+    high_pos = int(history["high"].idxmax())
+    low_level = float(d.loc[low_pos, "low"])
+    high_level = float(d.loc[high_pos, "high"])
+
+    events = []
+    lower_wick = max(0.0, min(open_v, close) - low)
+    upper_wick = max(0.0, high - max(open_v, close))
+    lower_wick_fraction = lower_wick / candle_range
+    upper_wick_fraction = upper_wick / candle_range
+
+    swept_low = low < low_level * (1.0 - tol)
+    reclaim_long = close > low_level
+    sweep_depth_long = (low_level - low) / atr_v
+    if (swept_low and reclaim_long and sweep_depth_long >= min_displacement_atr
+            and lower_wick_fraction >= min_rejection_wick_fraction):
+        ts = int(last["close_time"])
+        typ = "LIQUIDITY_SWEEP_RECLAIM"
+        events.append({
+            "event_id": _event_id(symbol, timeframe, typ + "_LONG", ts, int(d.loc[low_pos, "close_time"])),
+            "symbol": symbol, "timeframe": timeframe, "direction": "LONG", "event_type": typ,
+            "timestamps": {"pivot_1_ts": int(d.loc[low_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
+            "event_fact": {
+                "swept_level": low_level, "sweep_depth_atr": float(sweep_depth_long),
+                "reclaim_displacement_atr": float((close - low_level) / atr_v),
+                "rejection_wick_fraction": float(lower_wick_fraction),
+                "atr_reference": "previous_bar", "atr_reference_ts": int(prev["close_time"]),
+                "lookback_bars": int(lookback), "volume_ratio": vol_ratio,
+                "trigger_level": low_level, "requires_retest": True,
+                "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True,
+            },
+        })
+
+    swept_high = high > high_level * (1.0 + tol)
+    reclaim_short = close < high_level
+    sweep_depth_short = (high - high_level) / atr_v
+    if (swept_high and reclaim_short and sweep_depth_short >= min_displacement_atr
+            and upper_wick_fraction >= min_rejection_wick_fraction):
+        ts = int(last["close_time"])
+        typ = "LIQUIDITY_SWEEP_RECLAIM"
+        events.append({
+            "event_id": _event_id(symbol, timeframe, typ + "_SHORT", ts, int(d.loc[high_pos, "close_time"])),
+            "symbol": symbol, "timeframe": timeframe, "direction": "SHORT", "event_type": typ,
+            "timestamps": {"pivot_1_ts": int(d.loc[high_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
+            "event_fact": {
+                "swept_level": high_level, "sweep_depth_atr": float(sweep_depth_short),
+                "reclaim_displacement_atr": float((high_level - close) / atr_v),
+                "rejection_wick_fraction": float(upper_wick_fraction),
+                "atr_reference": "previous_bar", "atr_reference_ts": int(prev["close_time"]),
+                "lookback_bars": int(lookback), "volume_ratio": vol_ratio,
+                "trigger_level": high_level, "requires_retest": True,
+                "engine": "LIQUIDITY_SWEEP", "requires_htf_context": True,
+            },
+        })
+    return events
+
+
+def detect_ema_pullback_continuation(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
+                                     fast: int = 21, slow: int = 55, min_body_atr: float = 0.25,
+                                     min_volume_ratio: float = 1.00) -> list[dict[str, Any]]:
+    """Detect a trend pullback into EMA21/55 followed by a directional rejection bar."""
+    if timeframe.lower() not in {"1h", "4h"} or len(df) < 220:
+        return []
+    d = df.copy()
+    for c in ("close", "open", "high", "low", "volume", "close_time"):
+        if c not in d.columns:
+            return []
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["close", "open", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    d = add_ema(d, (fast, slow, 200))
+    d["atr"] = _atr(d, 14)
+    last = d.iloc[-1]
+    atr_v = float(last["atr"]) if pd.notna(last["atr"]) else 0.0
+    if atr_v <= 0 or pd.isna(last[f"ema{slow}"]) or pd.isna(last["ema200"]):
+        return []
+    vol_mean = float(d["volume"].iloc[-21:-1].mean()) if pd.notna(d["volume"].iloc[-21:-1].mean()) else 0.0
+    vol_ratio = float(last["volume"] / vol_mean) if vol_mean > 0 else 0.0
+    if vol_ratio < min_volume_ratio:
+        return []
+
+    ema_f = float(last[f"ema{fast}"]); ema_s = float(last[f"ema{slow}"]); ema200 = float(last["ema200"])
+    body_atr = abs(float(last["close"]) - float(last["open"])) / atr_v
+    if body_atr < min_body_atr:
+        return []
+
+    direction = None; level = None
+    if ema_f > ema_s and float(last["close"]) > ema200 and float(last["low"]) <= ema_f and float(last["close"]) > ema_f and float(last["close"]) > float(last["open"]):
+        direction, level = "LONG", ema_f
+    elif ema_f < ema_s and float(last["close"]) < ema200 and float(last["high"]) >= ema_f and float(last["close"]) < ema_f and float(last["close"]) < float(last["open"]):
+        direction, level = "SHORT", ema_f
+    if direction is None:
+        return []
+
+    ts = int(last["close_time"]); typ = "EMA_PULLBACK_CONTINUATION"
+    return [{
+        "event_id": _event_id(symbol, timeframe, typ, ts, ts), "symbol": symbol,
+        "timeframe": timeframe, "direction": direction, "event_type": typ,
+        "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
+        "event_fact": {"ema_fast": ema_f, "ema_slow": ema_s, "ema200": ema200, "body_atr": body_atr,
+                        "volume_ratio": vol_ratio, "trigger_level": level, "requires_retest": True, "engine": "EMA_PULLBACK", "requires_htf_context": True},
+    }]
+
+
+def validate_strategy_htf_context(ev: dict[str, Any], htf_df: pd.DataFrame | None, context_timeframe: str) -> tuple[bool, str, dict[str, Any]]:
+    """Validate standalone strategy events against a true higher-timeframe trend.
+
+    1H setups use 4H context; 4H setups use 1D context. The check is deliberately
+    fail-closed because these engines are trend/continuation oriented. Regular
+    divergence retains its separate reversal-context policy elsewhere.
+    """
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    if not fact.get("requires_htf_context"):
+        return True, "HTF_NOT_REQUIRED", {}
+    direction = str(ev.get("direction") or "LONG").upper()
+    if htf_df is None or not isinstance(htf_df, pd.DataFrame) or len(htf_df) < 60:
+        return False, "STRATEGY_HTF_CONTEXT_UNAVAILABLE", {}
+    meta = _trend_context(htf_df, direction)
+    if meta.get("trend_ok") is not True:
+        return False, "STRATEGY_HTF_TREND_MISMATCH", {"htf_trend": meta.get("trend"), "htf_ema50": meta.get("ema50"), "htf_slope50": meta.get("slope50"), "context_timeframe": context_timeframe}
+    return True, "STRATEGY_HTF_OK", {"htf_trend": meta.get("trend"), "htf_ema50": meta.get("ema50"), "htf_slope50": meta.get("slope50"), "context_timeframe": context_timeframe}
+
+
+def _prepare_pattern_frame(df: pd.DataFrame, required: set[str], min_len: int = 60) -> pd.DataFrame | None:
+    if not isinstance(df, pd.DataFrame) or len(df) < min_len or not required.issubset(df.columns):
+        return None
+    d = df.copy()
+    for col in required:
+        d[col] = pd.to_numeric(d[col], errors='coerce')
+    d = d.dropna(subset=list(required)).sort_values('close_time').reset_index(drop=True)
+    return d if len(d) >= min_len else None
+
+
+def _body_fraction(row: pd.Series) -> float:
+    rng = float(row['high']) - float(row['low'])
+    if rng <= 0:
+        return 0.0
+    return abs(float(row['close']) - float(row['open'])) / rng
+
+
+def _make_event(symbol: str, timeframe: str, typ: str, direction: str, ts: int, ref_ts: int,
+                fact: dict[str, Any], pivot_1_ts: int | None = None) -> dict[str, Any]:
+    return {
+        'event_id': _event_id(symbol, timeframe, typ, ref_ts, ts),
+        'symbol': symbol,
+        'timeframe': timeframe,
+        'direction': direction,
+        'event_type': typ,
+        'timestamps': {
+            'pivot_1_ts': int(pivot_1_ts or ref_ts),
+            'pivot_2_ts': int(ts),
+            'detected_at_ts': int(ts),
+        },
+        'event_fact': dict(fact),
+    }
+
+
+def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 80,
+                       min_displacement_atr: float = 0.80, min_volume_ratio: float = 1.20,
+                       min_body_fraction: float = 0.55) -> list[dict[str, Any]]:
+    """Detect the latest causal BOS-backed order block as an entry setup."""
+    if timeframe.lower() not in {'1h', '4h'}:
+        return []
+    d = _prepare_pattern_frame(df, {'open','high','low','close','volume','close_time'}, 100)
+    if d is None:
+        return []
+    d['atr'] = _atr(d, 14)
+    pivot_right = 2
+    lows, highs = _pivots(d, 3, pivot_right)
+    last = len(d) - 1
+    recent_start = max(0, last - int(lookback))
+    swing_highs = [i for i in highs if recent_start <= i < last - 1]
+    swing_lows = [i for i in lows if recent_start <= i < last - 1]
+    for bos_i in range(last, max(3, last - int(lookback)), -1):
+        atr = float(d['atr'].iloc[bos_i]) if pd.notna(d['atr'].iloc[bos_i]) else 0.0
+        if atr <= 0:
+            continue
+        body = abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i]))
+        body_frac = _body_fraction(d.iloc[bos_i])
+        local_vol_base = pd.to_numeric(d['volume'].iloc[max(0, bos_i-20):bos_i], errors='coerce').mean()
+        if not pd.notna(local_vol_base) or local_vol_base <= 0:
+            continue
+        vol_ratio = float(d['volume'].iloc[bos_i] / local_vol_base)
+        if body / atr < min_displacement_atr or body_frac < min_body_fraction or vol_ratio < min_volume_ratio:
+            continue
+
+        prior_highs = [i for i in swing_highs if i + pivot_right < bos_i]
+        if prior_highs:
+            sh = prior_highs[-1]
+            bos_level = float(d['high'].iloc[sh])
+            if float(d['close'].iloc[bos_i]) > bos_level + 0.05 * atr:
+                for ob_i in range(bos_i - 1, max(1, bos_i - 8), -1):
+                    if float(d['close'].iloc[ob_i]) < float(d['open'].iloc[ob_i]):
+                        zone_high = float(d['high'].iloc[ob_i]); zone_low = float(d['low'].iloc[ob_i])
+                        invalidated = False
+                        if bos_i + 1 <= last and float(d['low'].iloc[bos_i+1:last+1].min()) < zone_low:
+                            invalidated = True
+                        if invalidated:
+                            continue
+                        ts = int(d['close_time'].iloc[bos_i])
+                        return [_make_event(symbol, timeframe, 'ORDER_BLOCK_BULLISH', 'LONG', ts,
+                            int(d['close_time'].iloc[ob_i]), {
+                                'engine':'ORDER_BLOCK','requires_htf_context':True,'requires_retest':True,
+                                'trigger_level':zone_high,'zone_high':zone_high,'zone_low':zone_low,
+                                'bos_level':bos_level,'ob_ts':int(d['close_time'].iloc[ob_i]),
+                                'displacement_atr':body/atr,'volume_ratio':vol_ratio,'body_fraction':body_frac,
+                            }, pivot_1_ts=int(d['close_time'].iloc[sh]))]
+
+        prior_lows = [i for i in swing_lows if i + pivot_right < bos_i]
+        if prior_lows:
+            sl = prior_lows[-1]
+            bos_level = float(d['low'].iloc[sl])
+            if float(d['close'].iloc[bos_i]) < bos_level - 0.05 * atr:
+                for ob_i in range(bos_i - 1, max(1, bos_i - 8), -1):
+                    if float(d['close'].iloc[ob_i]) > float(d['open'].iloc[ob_i]):
+                        zone_high = float(d['high'].iloc[ob_i]); zone_low = float(d['low'].iloc[ob_i])
+                        invalidated = False
+                        if bos_i + 1 <= last and float(d['high'].iloc[bos_i+1:last+1].max()) > zone_high:
+                            invalidated = True
+                        if invalidated:
+                            continue
+                        ts = int(d['close_time'].iloc[bos_i])
+                        return [_make_event(symbol, timeframe, 'ORDER_BLOCK_BEARISH', 'SHORT', ts,
+                            int(d['close_time'].iloc[ob_i]), {
+                                'engine':'ORDER_BLOCK','requires_htf_context':True,'requires_retest':True,
+                                'trigger_level':zone_low,'zone_high':zone_high,'zone_low':zone_low,
+                                'bos_level':bos_level,'ob_ts':int(d['close_time'].iloc[ob_i]),
+                                'displacement_atr':body/atr,'volume_ratio':vol_ratio,'body_fraction':body_frac,
+                            }, pivot_1_ts=int(d['close_time'].iloc[sl]))]
+    return []
+
+def _level_was_consumed(
+    d: pd.DataFrame,
+    level: float,
+    start_i: int,
+    end_i: int,
+    side: str,
+) -> bool:
+    """Return True when a liquidity/structure level was already consumed.
+
+    A swing level cannot be reused after a prior close-through or prior wick
+    sweep/rejection. Keeping this state explicit prevents stale pivots from
+    generating a second synthetic sweep or MSS later in the same sequence.
+    """
+    if end_i <= start_i:
+        return False
+    for i in range(start_i, end_i):
+        high = float(d['high'].iloc[i])
+        low = float(d['low'].iloc[i])
+        close = float(d['close'].iloc[i])
+        if side == 'bearish':
+            if high > level or close >= level:
+                return True
+        else:
+            if low < level or close <= level:
+                return True
+    return False
+
+
+def _liquidity_sweep_before_break(
+    d: pd.DataFrame,
+    pivots: list[int],
+    bos_i: int,
+    break_i: int,
+    side: str,
+    pivot_right: int = 2,
+) -> tuple[int, float] | None:
+    """Return the first post-BOS swing sweep that occurs before MSS/OB break.
+
+    A bearish breaker requires buy-side liquidity to be swept (a later high
+    takes out a confirmed swing high) before the bearish market-structure
+    break. A bullish breaker is the mirrored sell-side sequence.
+    """
+    candidate_pivots = [i for i in pivots if bos_i < i < break_i]
+    if not candidate_pivots:
+        return None
+
+    for pivot_i in reversed(candidate_pivots):
+        level = float(d['high'].iloc[pivot_i] if side == 'bearish' else d['low'].iloc[pivot_i])
+        for sweep_i in range(pivot_i + 1, break_i):
+            # The swept level must already be known when the sweep occurs and
+            # must not have been consumed by an earlier bar.
+            if pivot_i + pivot_right >= sweep_i:
+                continue
+            if _level_was_consumed(d, level, pivot_i + pivot_right + 1, sweep_i, side):
+                continue
+            sweep_value = float(d['high'].iloc[sweep_i] if side == 'bearish' else d['low'].iloc[sweep_i])
+            close_value = float(d['close'].iloc[sweep_i])
+            if side == 'bearish':
+                # A genuine buy-side sweep must reject the level: wick through,
+                # then close back below the swept high. A mere breakout is not
+                # a liquidity sweep.
+                if sweep_value > level and close_value < level:
+                    return sweep_i, level
+            else:
+                # Mirror semantics for sell-side liquidity.
+                if sweep_value < level and close_value > level:
+                    return sweep_i, level
+    return None
+
+
+def _mss_level_before_sweep(
+    d: pd.DataFrame,
+    pivots: list[int],
+    bos_i: int,
+    sweep_i: int,
+    side: str,
+    pivot_right: int = 2,
+) -> tuple[int, float] | None:
+    """Return the confirmed structural level that price must break after the sweep.
+
+    Classic breaker sequencing uses an intervening swing structure: after a
+    sell-side/buy-side sweep, price must close through the opposite confirmed
+    swing before the failed order block is treated as a breaker.
+    """
+    candidates = [
+        i for i in pivots
+        if bos_i < i < sweep_i and i + pivot_right < sweep_i
+    ]
+    if not candidates:
+        return None
+    for pivot_i in reversed(candidates):
+        level = float(d['low'].iloc[pivot_i] if side == 'bearish' else d['high'].iloc[pivot_i])
+        # MSS must be a fresh post-sweep structural break. If the swing was
+        # already closed through before the sweep, it cannot serve as the MSS
+        # level for this breaker sequence. Wicks alone are not enough here; the
+        # structure is considered broken by a close.
+        if side == 'bearish':
+            already_broken = any(float(d['close'].iloc[i]) <= level for i in range(pivot_i + pivot_right + 1, sweep_i))
+        else:
+            already_broken = any(float(d['close'].iloc[i]) >= level for i in range(pivot_i + pivot_right + 1, sweep_i))
+        if already_broken:
+            continue
+        return pivot_i, level
+    return None
+
+
+def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 120,
+                         min_displacement_atr: float = 0.80) -> list[dict[str, Any]]:
+    """Detect a true breaker: liquidity sweep -> MSS/OB break -> flip-zone retest."""
+    if timeframe.lower() not in {'1h', '4h'}:
+        return []
+    d = _prepare_pattern_frame(df, {'open','high','low','close','volume','close_time'}, 120)
+    if d is None:
+        return []
+    d['atr'] = _atr(d, 14)
+    pivot_right = 2
+    lows, highs = _pivots(d, 3, pivot_right)
+    last = len(d) - 1
+    search_start = max(10, last - int(lookback))
+
+    # Find the latest valid original OB + BOS, then a later decisive break of that OB,
+    # and require the current bar to be the actual flip-zone retest.
+    for bos_i in range(last - 2, search_start, -1):
+        atr = float(d['atr'].iloc[bos_i]) if pd.notna(d['atr'].iloc[bos_i]) else 0.0
+        if atr <= 0:
+            continue
+        body = abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i]))
+        if body / atr < min_displacement_atr:
+            continue
+        prior_highs = [i for i in highs if search_start <= i + pivot_right < bos_i]
+        prior_lows = [i for i in lows if search_start <= i + pivot_right < bos_i]
+        # Bullish OB -> broken downward -> bearish breaker retest.
+        if prior_highs and float(d['close'].iloc[bos_i]) > float(d['high'].iloc[prior_highs[-1]]) + 0.05 * atr:
+            ob_i = next((k for k in range(bos_i-1, max(search_start, bos_i-8), -1)
+                         if float(d['close'].iloc[k]) < float(d['open'].iloc[k])), None)
+            if ob_i is not None:
+                zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
+                breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) < zlo]
+                for break_i in breaks:
+                    # ICT-style breaker sequencing: buy-side liquidity must be
+                    # swept first, then the later OB break is the MSS/flip event.
+                    sweep = _liquidity_sweep_before_break(d, highs, bos_i, break_i, 'bearish', pivot_right)
+                    if sweep is None:
+                        continue
+                    sweep_i, sweep_level = sweep
+                    mss = _mss_level_before_sweep(d, lows, bos_i, sweep_i, 'bearish', pivot_right)
+                    if mss is None or float(d['close'].iloc[break_i]) >= mss[1]:
+                        continue
+                    mss_pivot_i, mss_level = mss
+                    # The breaker must be retested AFTER the decisive break;
+                    # do not count the same candle as both break and retest.
+                    if break_i >= last:
+                        continue
+                    cur_high=float(d['high'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
+                    if cur_high >= zlo and cur_close < zlo:
+                        ts=int(d['close_time'].iloc[-1])
+                        return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BEARISH','SHORT',ts,int(d['close_time'].iloc[ob_i]),{
+                            'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
+                            'trigger_level':zlo,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BULLISH_OB',
+                            'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
+                            'liquidity_sweep_level':sweep_level,
+                            'mss_ts':int(d['close_time'].iloc[break_i]),
+                            'mss_pivot_ts':int(d['close_time'].iloc[mss_pivot_i]),
+                            'mss_level':mss_level,
+                            'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
+                        },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
+        # Bearish OB -> broken upward -> bullish breaker retest.
+        if prior_lows and float(d['close'].iloc[bos_i]) < float(d['low'].iloc[prior_lows[-1]]) - 0.05 * atr:
+            ob_i = next((k for k in range(bos_i-1, max(search_start, bos_i-8), -1)
+                         if float(d['close'].iloc[k]) > float(d['open'].iloc[k])), None)
+            if ob_i is not None:
+                zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
+                breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) > zhi]
+                for break_i in breaks:
+                    # ICT-style breaker sequencing: sell-side liquidity must be
+                    # swept first, then the later OB break is the MSS/flip event.
+                    sweep = _liquidity_sweep_before_break(d, lows, bos_i, break_i, 'bullish', pivot_right)
+                    if sweep is None:
+                        continue
+                    sweep_i, sweep_level = sweep
+                    mss = _mss_level_before_sweep(d, highs, bos_i, sweep_i, 'bullish', pivot_right)
+                    if mss is None or float(d['close'].iloc[break_i]) <= mss[1]:
+                        continue
+                    mss_pivot_i, mss_level = mss
+                    # The breaker must be retested AFTER the decisive break;
+                    # do not count the same candle as both break and retest.
+                    if break_i >= last:
+                        continue
+                    cur_low=float(d['low'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
+                    if cur_low <= zhi and cur_close > zhi:
+                        ts=int(d['close_time'].iloc[-1])
+                        return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BULLISH','LONG',ts,int(d['close_time'].iloc[ob_i]),{
+                            'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
+                            'trigger_level':zhi,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BEARISH_OB',
+                            'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
+                            'liquidity_sweep_level':sweep_level,
+                            'mss_ts':int(d['close_time'].iloc[break_i]),
+                            'mss_pivot_ts':int(d['close_time'].iloc[mss_pivot_i]),
+                            'mss_level':mss_level,
+                            'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
+                        },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
+    return []
+
+def detect_mitigation_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 80,
+                            min_displacement_atr: float = 1.20, return_tolerance_pct: float = 0.20) -> list[dict[str, Any]]:
+    """Detect a failure-swing mitigation block with a causal structure sequence.
+
+    Canonical sequence used here:
+      bullish: confirmed swing low -> confirmed intervening swing high -> higher low
+               -> candle-body close above the intervening swing high -> retest
+      bearish: confirmed swing high -> confirmed intervening swing low -> lower high
+               -> candle-body close below the intervening swing low -> retest
+
+    A prior external sweep invalidates the mitigation setup; such a sequence belongs
+    to the breaker family instead. The existing retest/tolerance contract is kept.
+    """
+    if timeframe.lower() not in {'1h', '4h'}:
+        return []
+    d = _prepare_pattern_frame(df, {'open', 'high', 'low', 'close', 'volume', 'close_time'}, 100)
+    if d is None:
+        return []
+    d['atr'] = _atr(d, 14)
+    lows, highs = _pivots(d, 3, 2)
+    last = len(d) - 1
+    search_start = max(20, last - int(lookback))
+
+    def _confirmed_before(pivot_i: int, event_i: int) -> bool:
+        return search_start <= pivot_i < event_i - 2
+
+    def _body_displacement_ok(i: int) -> tuple[bool, float]:
+        atr = float(d['atr'].iloc[i]) if pd.notna(d['atr'].iloc[i]) else 0.0
+        if atr <= 0:
+            return False, atr
+        body = abs(float(d['close'].iloc[i]) - float(d['open'].iloc[i]))
+        return body / atr >= min_displacement_atr, atr
+
+    def _origin_before(pivot_i: int, bullish: bool) -> int | None:
+        """Nearest same-direction origin candle at or immediately before the failure swing pivot."""
+        for k in range(pivot_i, max(search_start, pivot_i - 8) - 1, -1):
+            op = float(d['open'].iloc[k]); cl = float(d['close'].iloc[k])
+            if (cl > op) if bullish else (cl < op):
+                return k
+        return None
+
+    # Bullish mitigation: swing low -> swing high -> higher low -> break above swing high.
+    for low_i in reversed(lows):
+        if not _confirmed_before(low_i, low_i + 3):
+            continue
+        low_level = float(d['low'].iloc[low_i])
+        for high_i in highs:
+            if high_i <= low_i or not _confirmed_before(low_i, high_i) or not _confirmed_before(high_i, high_i + 3):
+                continue
+            high_level = float(d['high'].iloc[high_i])
+            higher_lows = [p for p in lows if high_i < p < last and p + 2 < last and float(d['low'].iloc[p]) > low_level]
+            for higher_low_i in higher_lows:
+                if high_i + 2 >= higher_low_i:
+                    continue
+                # No external sell-side sweep before the structural break.
+                if float(d['low'].iloc[low_i + 1:higher_low_i].min()) <= low_level:
+                    continue
+                breaks = [k for k in range(higher_low_i + 1, last) if float(d['close'].iloc[k]) > high_level]
+                if not breaks:
+                    continue
+                bos_i = next((k for k in breaks if _body_displacement_ok(k)[0]), None)
+                if bos_i is None or bos_i <= higher_low_i + 1:
+                    continue
+                post_lo = float(d['low'].iloc[higher_low_i + 1:bos_i].min()) if bos_i > higher_low_i + 1 else float('inf')
+                if post_lo <= low_level:
+                    continue
+                origin_i = _origin_before(high_i, bullish=True)
+                if origin_i is None:
+                    continue
+                zone_hi = float(d['high'].iloc[origin_i]); zone_lo = float(d['low'].iloc[origin_i])
+                level = float(d['open'].iloc[origin_i])
+                touched = float(d['low'].iloc[-1]) <= level * (1 + return_tolerance_pct / 100.0)
+                still_valid = float(d['close'].iloc[-1]) > zone_lo
+                if touched and still_valid:
+                    ok, atr = _body_displacement_ok(bos_i)
+                    ts = int(d['close_time'].iloc[-1])
+                    return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BULLISH', 'LONG', ts,
+                        int(d['close_time'].iloc[origin_i]), {
+                            'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
+                            'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
+                            'origin_ts': int(d['close_time'].iloc[origin_i]),
+                            'failure_swing_ts': int(d['close_time'].iloc[higher_low_i]),
+                            'failure_swing_level': float(d['low'].iloc[higher_low_i]),
+                            'impulse_ts': int(d['close_time'].iloc[bos_i]), 'bos_ts': int(d['close_time'].iloc[bos_i]),
+                            'structure_level': high_level, 'structure_pivot_ts': int(d['close_time'].iloc[high_i]),
+                            'displacement_atr': float(abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i])) / atr),
+                            'return_tolerance_pct': return_tolerance_pct,
+                            'failure_swing_no_sweep': True,
+                        }, pivot_1_ts=int(d['close_time'].iloc[high_i]))]
+
+    # Bearish mitigation: swing high -> swing low -> lower high -> break below swing low.
+    for high_i in reversed(highs):
+        if not _confirmed_before(high_i, high_i + 3):
+            continue
+        high_level = float(d['high'].iloc[high_i])
+        for low_i in lows:
+            if low_i <= high_i or not _confirmed_before(high_i, low_i) or not _confirmed_before(low_i, low_i + 3):
+                continue
+            low_level = float(d['low'].iloc[low_i])
+            lower_highs = [p for p in highs if low_i < p < last and p + 2 < last and float(d['high'].iloc[p]) < high_level]
+            for lower_high_i in lower_highs:
+                if low_i + 2 >= lower_high_i:
+                    continue
+                # No external buy-side sweep before the structural break.
+                if float(d['high'].iloc[high_i + 1:lower_high_i].max()) >= high_level:
+                    continue
+                breaks = [k for k in range(lower_high_i + 1, last) if float(d['close'].iloc[k]) < low_level]
+                if not breaks:
+                    continue
+                bos_i = next((k for k in breaks if _body_displacement_ok(k)[0]), None)
+                if bos_i is None or bos_i <= lower_high_i + 1:
+                    continue
+                post_hi = float(d['high'].iloc[lower_high_i + 1:bos_i].max()) if bos_i > lower_high_i + 1 else float('-inf')
+                if post_hi >= high_level:
+                    continue
+                origin_i = _origin_before(low_i, bullish=False)
+                if origin_i is None:
+                    continue
+                zone_hi = float(d['high'].iloc[origin_i]); zone_lo = float(d['low'].iloc[origin_i])
+                level = float(d['open'].iloc[origin_i])
+                touched = float(d['high'].iloc[-1]) >= level * (1 - return_tolerance_pct / 100.0)
+                still_valid = float(d['close'].iloc[-1]) < zone_hi
+                if touched and still_valid:
+                    ok, atr = _body_displacement_ok(bos_i)
+                    ts = int(d['close_time'].iloc[-1])
+                    return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BEARISH', 'SHORT', ts,
+                        int(d['close_time'].iloc[origin_i]), {
+                            'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
+                            'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
+                            'origin_ts': int(d['close_time'].iloc[origin_i]),
+                            'failure_swing_ts': int(d['close_time'].iloc[lower_high_i]),
+                            'failure_swing_level': float(d['high'].iloc[lower_high_i]),
+                            'impulse_ts': int(d['close_time'].iloc[bos_i]), 'bos_ts': int(d['close_time'].iloc[bos_i]),
+                            'structure_level': low_level, 'structure_pivot_ts': int(d['close_time'].iloc[low_i]),
+                            'displacement_atr': float(abs(float(d['close'].iloc[bos_i]) - float(d['open'].iloc[bos_i])) / atr),
+                            'return_tolerance_pct': return_tolerance_pct,
+                            'failure_swing_no_sweep': True,
+                        }, pivot_1_ts=int(d['close_time'].iloc[low_i]))]
+    return []
+
+
+def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 30,
+               min_sweep_atr: float = 0.10, min_volume_ratio: float = 1.20,
+               min_outside_volume_share: float = 0.20) -> list[dict[str, Any]]:
+    """Detect a confirmed SFP and require volume participation in the sweep wick.
+
+    BingX supplies aggregated candle volume but not lower-timeframe intrabar
+    volume in this detector. We therefore use a conservative candle-level
+    proxy: the share of total candle volume attributed to the price segment
+    outside the swept level, estimated from the outside-range fraction.
+    ``volume_ratio`` remains the historical total-volume guard; the new
+    ``outside_volume_share`` prevents a large total-volume candle whose sweep
+    wick is only a negligible fraction of the range from passing as an SFP.
+    """
+    if timeframe.lower() not in {'1h','4h'}: return []
+    d=_prepare_pattern_frame(df,{'open','high','low','close','volume','close_time'},80)
+    if d is None: return []
+    d['atr']=_atr(d,14)
+    lows,highs=_pivots(d,3,2)
+    last=len(d)-1
+    atr=float(d['atr'].iloc[-1]) if pd.notna(d['atr'].iloc[-1]) else 0.0
+    if atr<=0: return []
+    base=float(d['volume'].iloc[-21:-1].mean()) if len(d)>=22 else 0.0
+    vr=float(d['volume'].iloc[-1]/base) if base>0 else 0.0
+    if vr<min_volume_ratio: return []
+
+    last_row = d.iloc[-1]
+    candle_range = float(last_row['high']) - float(last_row['low'])
+    if candle_range <= 0:
+        return []
+
+    def outside_volume_share(level: float, direction: str) -> float:
+        if direction == 'LONG':
+            outside_range = max(0.0, level - float(last_row['low']))
+        else:
+            outside_range = max(0.0, float(last_row['high']) - level)
+        # With only OHLCV available, allocate candle volume proportionally to
+        # price-range segments. This is explicitly a proxy for LTF/wick-volume
+        # accounting, not a fabricated intrabar data series.
+        return max(0.0, min(1.0, outside_range / candle_range))
+
+    lookback_start = max(0, last - int(lookback))
+    if lows:
+        li=[i for i in lows if lookback_start <= i <= last-3]
+        for i in reversed(li):
+            level=float(d['low'].iloc[i])
+            if _level_was_consumed(d, level, i + 3, last, 'bullish'):
+                continue
+            sweep=(level-float(d['low'].iloc[-1]))/atr
+            outside_share = outside_volume_share(level, 'LONG')
+            if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
+                    and float(d['close'].iloc[-1])>level and float(d['close'].iloc[-1])>float(d['open'].iloc[-1])):
+                ts=int(d['close_time'].iloc[-1])
+                return [_make_event(symbol,timeframe,'SFP_BULLISH','LONG',ts,int(d['close_time'].iloc[i]),{
+                    'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
+                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
+                    'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
+                    'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
+    if highs:
+        hi=[i for i in highs if lookback_start <= i <= last-3]
+        for i in reversed(hi):
+            level=float(d['high'].iloc[i])
+            if _level_was_consumed(d, level, i + 3, last, 'bearish'):
+                continue
+            sweep=(float(d['high'].iloc[-1])-level)/atr
+            outside_share = outside_volume_share(level, 'SHORT')
+            if (sweep>=min_sweep_atr and outside_share>=min_outside_volume_share
+                    and float(d['close'].iloc[-1])<level and float(d['close'].iloc[-1])<float(d['open'].iloc[-1])):
+                ts=int(d['close_time'].iloc[-1])
+                return [_make_event(symbol,timeframe,'SFP_BEARISH','SHORT',ts,int(d['close_time'].iloc[i]),{
+                    'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
+                    'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
+                    'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
+                    'body_fraction':_body_fraction(d.iloc[-1])},pivot_1_ts=int(d['close_time'].iloc[i]))]
+    return []
+
+
+def _latest_fvg(d: pd.DataFrame, start: int, end: int) -> list[tuple[int, str, float, float]]:
+    out: list[tuple[int, str, float, float]] = []
+    for i in range(max(2, start), end + 1):
+        if float(d['low'].iloc[i]) > float(d['high'].iloc[i-2]):
+            out.append((i, 'BULLISH', float(d['high'].iloc[i-2]), float(d['low'].iloc[i])))
+        elif float(d['high'].iloc[i]) < float(d['low'].iloc[i-2]):
+            out.append((i, 'BEARISH', float(d['high'].iloc[i]), float(d['low'].iloc[i-2])))
+    return out
+
+
+def detect_liquidation_cascade_fvg(
+    row: Any,
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = '1h',
+    min_impulse_atr: float = 1.50,
+    min_volume_ratio: float = 3.0,
+    min_liq_oi_ratio: float = 0.005,
+    min_impulse_pct_4h: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Research-only cascade+FVG proxy; disabled by default until local liquidation series exist."""
+    if timeframe.lower() not in {'1h', '4h'} or row is None:
+        return []
+    d = _prepare_pattern_frame(df, {'open','high','low','close','volume','close_time'}, 80)
+    if d is None:
+        return []
+    d['atr'] = _atr(d, 14)
+    atr = float(d['atr'].iloc[-1]) if pd.notna(d['atr'].iloc[-1]) else 0.0
+    if atr <= 0:
+        return []
+    vol_base = pd.to_numeric(d['volume'].iloc[-21:-1], errors='coerce').mean()
+    if not pd.notna(vol_base) or vol_base <= 0:
+        return []
+    last_open = float(d['open'].iloc[-1]); last_close = float(d['close'].iloc[-1])
+    move = last_close - last_open
+    impulse_pct = abs(move) / last_open * 100.0 if last_open else 0.0
+    volume_ratio = float(d['volume'].iloc[-1] / vol_base)
+    if abs(move) / atr < min_impulse_atr or volume_ratio < min_volume_ratio:
+        return []
+    if timeframe.lower() == '4h' and impulse_pct < min_impulse_pct_4h:
+        return []
+    oi = float(getattr(row, 'oi', 0) or 0)
+    if oi <= 0:
+        return []
+    liq_short = float(getattr(row, 'liq_short24', 0) or 0)
+    liq_long = float(getattr(row, 'liq_long24', 0) or 0)
+    direction = 'LONG' if move > 0 else 'SHORT' if move < 0 else ''
+    if not direction:
+        return []
+    liq_ratio = (liq_short if direction == 'LONG' else liq_long) / oi
+    if liq_ratio < min_liq_oi_ratio:
+        return []
+    fvgs = _latest_fvg(d, max(2, len(d)-8), len(d)-1)
+    if not fvgs:
+        return []
+    idx, kind, bottom, top = fvgs[-1]
+    if (direction == 'LONG' and kind != 'BULLISH') or (direction == 'SHORT' and kind != 'BEARISH'):
+        return []
+    mid = (bottom + top) / 2.0
+    ts = int(d['close_time'].iloc[-1])
+    typ = 'LIQUIDATION_CASCADE_FVG_LONG' if direction == 'LONG' else 'LIQUIDATION_CASCADE_FVG_SHORT'
+    return [_make_event(symbol, timeframe, typ, direction, ts, int(d['close_time'].iloc[idx]), {
+        'engine':'LIQUIDATION_CASCADE_FVG','requires_htf_context':True,'requires_retest':True,
+        'trigger_level':mid,'fvg_top':top,'fvg_bottom':bottom,'fvg_mid':mid,'fvg_index':idx,
+        'impulse_atr':abs(move)/atr,'impulse_pct':impulse_pct,'volume_ratio':volume_ratio,
+        'liq_ratio_24h':liq_ratio,'research_only_24h_liquidation_context':True,
+    }, pivot_1_ts=int(d['close_time'].iloc[idx]))]
+
+
+def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
+               min_range_atr: float = 0.60, min_sweep_atr: float = 0.10) -> list[dict[str, Any]]:
+    """Detect three-candle Candle Range Theory: range → manipulation → reclaim."""
+    if timeframe.lower() not in {'15m','1h','4h'}: return []
+    d=_prepare_pattern_frame(df,{'open','high','low','close','close_time'},40)
+    if d is None: return []
+    d['atr']=_atr(d,14)
+    c1=d.iloc[-3]; c2=d.iloc[-2]; c3=d.iloc[-1]
+    atr=float(c3['atr']) if pd.notna(c3['atr']) else 0.0
+    if atr<=0: return []
+    c1_range=float(c1['high'])-float(c1['low'])
+    if c1_range/atr<min_range_atr: return []
+    # Bullish CRT: C2 sweeps below C1 low and C3 reclaims C1 low.
+    if (float(c2['low']) < float(c1['low']) - min_sweep_atr*atr
+            and float(c2['high']) <= float(c1['high'])
+            and float(c1['low']) < float(c3['close']) < float(c1['high'])
+            and float(c3['close']) > float(c3['open'])):
+        ts=int(c3['close_time'])
+        return [_make_event(symbol,timeframe,'CRT_BULLISH','LONG',ts,int(c1['close_time']),{
+            'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['low']),
+            'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c1['low'])-float(c2['low']))/atr,
+        },pivot_1_ts=int(c1['close_time']))]
+    if (float(c2['high']) > float(c1['high']) + min_sweep_atr*atr
+            and float(c2['low']) >= float(c1['low'])
+            and float(c1['low']) < float(c3['close']) < float(c1['high'])
+            and float(c3['close']) < float(c3['open'])):
+        ts=int(c3['close_time'])
+        return [_make_event(symbol,timeframe,'CRT_BEARISH','SHORT',ts,int(c1['close_time']),{
+            'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['high']),
+            'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c2['high'])-float(c1['high']))/atr,
+        },pivot_1_ts=int(c1['close_time']))]
+    return []
+
+def diagnose_15m_retest_trigger(df15: pd.DataFrame, direction: str, reference_level: float,
+                                event_detected_at_ts: int, max_delay_min: float = 30.0,
+                                volume_mult: float = 1.10, tolerance_pct: float = 0.25) -> dict[str, Any]:
+    """Require breakout acceptance through a retest instead of buying the first break."""
+    out = {"ok": False, "reason": "no_retest_window", "trigger_bar_close_ts": None, "trigger_price": None,
+           "trigger_delay_min": None, "volume_ratio": None, "retest_level": reference_level}
+    if not isinstance(df15, pd.DataFrame) or len(df15) < 22:
+        out["reason"] = "insufficient_data"; return out
+    d = df15.copy()
+    for c in ("close_time", "open", "high", "low", "close", "volume"):
+        if c not in d.columns:
+            out["reason"] = "invalid_data"; return out
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["close_time", "open", "high", "low", "close", "volume"]).sort_values("close_time").reset_index(drop=True)
+    ref = float(reference_level)
+    tol = abs(ref) * max(0.0, tolerance_pct) / 100.0
+    candidate_indices = []
+    event_ts = int(event_detected_at_ts)
+    for i in range(1, len(d)):
+        ts = int(d["close_time"].iloc[i])
+        delay = (ts - event_ts) / 60000.0
+        if 0 < delay <= max_delay_min:
+            candidate_indices.append(i)
+    out["bars_considered"] = len(candidate_indices)
+    for i in reversed(candidate_indices):
+        ts = int(d["close_time"].iloc[i])
+        delay = (ts - event_ts) / 60000.0
+        prev = d.iloc[i-1]; cur = d.iloc[i]
+        vol_mean = d["volume"].iloc[max(0, i-20):i].mean()
+        vol_ratio = float(cur["volume"] / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else 0.0
+        if direction.upper() == "LONG":
+            retest = float(cur["low"]) <= ref + tol and float(cur["close"]) > ref and float(cur["close"]) > float(cur["open"])
+        else:
+            retest = float(cur["high"]) >= ref - tol and float(cur["close"]) < ref and float(cur["close"]) < float(cur["open"])
+        if retest and vol_ratio >= volume_mult:
+            out.update({"ok": True, "reason": "retest_passed", "trigger_bar_close_ts": ts,
+                        "trigger_price": float(cur["close"]), "trigger_delay_min": round(delay, 3), "volume_ratio": round(vol_ratio, 6)})
+            return out
+    return out
+
+
+def add_stochastic(df: pd.DataFrame, n: int = 14, smooth: int = 3) -> pd.DataFrame:
+    """Append slow %K (raw %K smoothed by SMA(smooth))."""
+    work = df.copy()
+    high = pd.to_numeric(work.get("high"), errors="coerce")
+    low = pd.to_numeric(work.get("low"), errors="coerce")
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+
+    if high is None or low is None or close is None:
+        work["stoch"] = float("nan")
+        return work
+
+    hh = high.rolling(n, min_periods=n).max()
+    ll = low.rolling(n, min_periods=n).min()
+    raw_k = (close - ll) / (hh - ll).replace(0, np.nan) * 100.0
+    work["stoch"] = raw_k.rolling(smooth, min_periods=smooth).mean()
+    return work
+
+
+def add_obv(df: pd.DataFrame) -> pd.DataFrame:
+    """Append On-Balance Volume (standard implementation of volume divergence)."""
+    work = df.copy()
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    volume = pd.to_numeric(work.get("volume"), errors="coerce").fillna(0.0) if "volume" in work.columns else None
+
+    if close is None or volume is None:
+        work["obv"] = float("nan")
+        return work
+
+    direction = np.sign(close.diff()).fillna(0.0)
+    work["obv"] = (direction * volume).cumsum()
+    return work
+
+
+def attach_oi_series(df: pd.DataFrame, oi_history: dict[str, float] | None) -> pd.DataFrame:
+    """Map the accumulated OI snapshot history onto closed bars.
+
+    oi_history maps "1h bucket index" (close_time // 3_600_000) to the last
+    OI snapshot recorded inside that bucket. Snapshots are only written while
+    their bucket is active, so a stored value is always from before the bucket
+    closed. For 4h bars we take the last 1h bucket strictly before the bar
+    close (bucket index of (close_time - 1) // 3_600_000).
+    """
+    work = df.copy()
+    if not isinstance(oi_history, dict) or not oi_history:
+        work["oi"] = float("nan")
+        return work
+
+    close_time = pd.to_numeric(work.get("close_time"), errors="coerce")
+    buckets = (close_time - 1).floordiv(3_600_000)
+    work["oi"] = buckets.map(
+        lambda b: oi_history.get(str(int(b)), float("nan")) if pd.notna(b) else float("nan")
+    )
+    return work
+
+
+def attach_funding_series(df: pd.DataFrame, funding_history: dict[str, float] | None) -> pd.DataFrame:
+    """Map 1h funding-rate snapshots onto closed bars without look-ahead."""
+    work = df.copy()
+    if not isinstance(funding_history, dict) or not funding_history:
+        work["fr_oiw"] = float("nan")
+        return work
+
+    close_time = pd.to_numeric(work.get("close_time"), errors="coerce")
+    buckets = (close_time - 1).floordiv(3_600_000)
+    work["fr_oiw"] = buckets.map(
+        lambda b: funding_history.get(str(int(b)), float("nan")) if pd.notna(b) else float("nan")
+    )
+    return work
+
+
+def detect_divergences(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    left: int = 3,
+    right: int = 2,
+    min_bars: int = 5,
+    max_bars: int = 16,
+    min_delta_atr: float = 0.35,
+) -> list[dict[str, Any]]:
+
+    if len(df) < 60:
+        return []
+
+    required = {"close", "high", "low", "close_time"}
+    if not required.issubset(df.columns):
+        return []
+
+    work = df.copy()
+    for col in ("close", "high", "low", "close_time"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work = work.dropna(subset=["close", "high", "low", "close_time"]).reset_index(drop=True)
+    if len(work) < 60:
+        return []
+
+    work["rsi"] = _rsi(work["close"], 14)
+    work["atr"] = _atr(work, 14)
+    # Additional divergence sources (audit gaps B2 / missing features):
+    # MACD line + histogram, slow Stochastic %K, OBV (volume divergence) and,
+    # when the caller attached a historical OI series, Price-vs-OI divergence.
+    work = add_macd(work)
+    work = add_stochastic(work)
+    work = add_obv(work)
+    work = add_vwap(work)
+    work = add_mfi(work)
+    work = add_cmf(work)
+
+    indicators: list[str] = ["rsi", "bingx_cvd", "macd", "macd_hist", "stoch", "obv"]
+    if "oi" in work.columns:
+        indicators.append("oi")
+    if "fr_oiw" in work.columns:
+        # Funding can be negative and its raw magnitude is not comparable
+        # across regimes. Compare pivot z-scores instead of raw rates.
+        fr = pd.to_numeric(work["fr_oiw"], errors="coerce")
+        rolling_mean = fr.rolling(50, min_periods=20).mean()
+        rolling_std = fr.rolling(50, min_periods=20).std(ddof=0)
+        work["fr_oiw_z"] = (fr - rolling_mean) / rolling_std.replace(0.0, np.nan)
+        indicators.append("fr_oiw_z")
+    if "mfi" in work.columns:
+        indicators.append("mfi")
+    if "cmf" in work.columns:
+        indicators.append("cmf")
+
+    lows, highs = _pivots(work, left, right)
+    events: list[dict[str, Any]] = []
+
+    def emit_divergence(p1i: int, p2i: int, indicator: str, is_low: bool) -> None:
+        bars = p2i - p1i
+        if not (min_bars <= bars <= max_bars):
+            return
+
+        atr_value = work["atr"].iloc[p2i]
+        if pd.isna(atr_value):
+            return
+
+        atr = float(atr_value)
+        if not math.isfinite(atr) or atr <= 0:
+            return
+
+        if indicator not in work.columns:
+            return
+
+        p1v = work[indicator].iloc[p1i]
+        p2v = work[indicator].iloc[p2i]
+        if pd.isna(p1v) or pd.isna(p2v):
+            return
+
+        detected = p2i + right
+        if detected >= len(work):
+            return
+
+        if indicator == "bingx_cvd":
+            # CVD is continuous across missing bars, but a divergence must still
+            # have enough valid taker-flow observations to be trustworthy.
+            if "taker_flow_valid" not in work.columns:
+                return
+            span = work.iloc[p1i:detected + 1]
+            valid = span["taker_flow_valid"].astype(bool) & span["bar_delta_usdt"].notna()
+            if valid.mean() < 0.80:
+                return
+
+            vwap_value = work["vwap"].iloc[detected] if "vwap" in work.columns else float("nan")
+            detected_price = work["close"].iloc[detected]
+            if pd.isna(vwap_value) or float(vwap_value) <= 0 or pd.isna(detected_price):
+                return
+            vwap_distance_pct = abs(float(detected_price) - float(vwap_value)) / float(vwap_value) * 100.0
+            if not math.isfinite(vwap_distance_pct) or vwap_distance_pct > 1.50:
+                return
+        else:
+            vwap_distance_pct = None
+
+        price_column = "low" if is_low else "high"
+        p1_price = float(work[price_column].iloc[p1i])
+        p2_price = float(work[price_column].iloc[p2i])
+        price_delta_atr = abs(p2_price - p1_price) / atr
+
+        if not math.isfinite(price_delta_atr) or price_delta_atr < min_delta_atr:
+            return
+
+        price_delta_pct = abs(p2_price - p1_price) / max(abs(p1_price), 1e-12) * 100.0
+        volume_ratio_20 = None
+        volume_mean_20 = None
+        if "volume" in work.columns:
+            try:
+                volume_mean_20 = float(work["volume"].iloc[detected - 20:detected].mean()) if detected >= 20 else None
+                if volume_mean_20 and math.isfinite(volume_mean_20) and volume_mean_20 > 0:
+                    volume_ratio_20 = float(work["volume"].iloc[detected]) / volume_mean_20
+            except (TypeError, ValueError):
+                volume_ratio_20 = None
+
+        volume_confirmation_enabled = str(os.environ.get("DIVERGENCE_VOLUME_CONFIRMATION_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+        if volume_confirmation_enabled:
+            if volume_ratio_20 is None or not math.isfinite(volume_ratio_20) or volume_ratio_20 < 1.20:
+                return
+            if not math.isfinite(price_delta_pct) or price_delta_pct < 1.0:
+                return
+
+        typ = None
+        direction = None
+
+        if is_low:
+            if p2_price < p1_price and float(p2v) > float(p1v):
+                typ = "REGULAR_BULLISH_" + indicator.upper()
+                direction = "LONG"
+            elif p2_price > p1_price and float(p2v) < float(p1v):
+                typ = "HIDDEN_BULLISH_" + indicator.upper()
+                direction = "LONG"
+        else:
+            if p2_price > p1_price and float(p2v) < float(p1v):
+                typ = "REGULAR_BEARISH_" + indicator.upper()
+                direction = "SHORT"
+            elif p2_price < p1_price and float(p2v) > float(p1v):
+                typ = "HIDDEN_BEARISH_" + indicator.upper()
+                direction = "SHORT"
+
+        if not typ or not direction:
+            return
+
+        p1_ts = int(work["close_time"].iloc[p1i])
+        p2_ts = int(work["close_time"].iloc[p2i])
+        detected_ts = int(work["close_time"].iloc[detected])
+
+        events.append(
+            {
+                "event_id": _event_id(symbol, timeframe, typ, p1_ts, p2_ts),
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": typ,
+                "timestamps": {
+                    "pivot_1_ts": p1_ts,
+                    "pivot_2_ts": p2_ts,
+                    "detected_at_ts": detected_ts,
+                },
+                "event_fact": {
+                    "detection_close_price": float(work["close"].iloc[detected]),
+                    "p1_price": p1_price,
+                    "p2_price": p2_price,
+                    "p1_indicator": float(p1v),
+                    "p2_indicator": float(p2v),
+                    "bars_between": bars,
+                    "price_delta_atr": float(price_delta_atr),
+                    "price_delta_pct": float(price_delta_pct),
+                    "volume_ratio_20": float(volume_ratio_20) if volume_ratio_20 is not None else None,
+                    "volume_confirmation_enabled": volume_confirmation_enabled,
+                    "vwap": float(work["vwap"].iloc[detected]) if pd.notna(work["vwap"].iloc[detected]) else None,
+                    "vwap_distance_pct": float(vwap_distance_pct) if vwap_distance_pct is not None else None,
+                    "engine": "DIVERGENCE",
+                },
+            }
+        )
+
+    def scan_pivots(pivots: list[int], is_low: bool) -> None:
+        # Multi-pivot ledger: every earlier pivot is a candidate anchor for the
+        # current pivot, then emit_divergence applies the actual bar-distance
+        # window [min_bars, max_bars].  Do not restrict the scan to adjacent
+        # pivots: valid divergence can span the 3rd, 4th, ... prior pivot.
+        num_piv = len(pivots)
+        for i in range(num_piv):
+            p1 = pivots[i]
+            for j in range(i + 1, num_piv):
+                p2 = pivots[j]
+                bars = p2 - p1
+                if bars > max_bars:
+                    # pivots are chronological, so all later pairs are even
+                    # farther apart and cannot enter the allowed bar window.
+                    break
+                if bars < min_bars:
+                    continue
+                for indicator in indicators:
+                    emit_divergence(p1, p2, indicator, is_low)
+
+    if len(lows) >= 2:
+        scan_pivots(lows, is_low=True)
+
+    if len(highs) >= 2:
+        scan_pivots(highs, is_low=False)
+
+    return events
+
+
+def _harmonic_event_id(symbol: str, timeframe: str, pattern: str, d_ts: int) -> str:
+    fp = f"{symbol}:{timeframe}:{pattern}:{int(d_ts)}"
+    return "HAR_" + hashlib.sha256(fp.encode()).hexdigest()[:16].upper()
+
+
+def _ratio_in(value: float, lo: float, hi: float, tolerance: float) -> bool:
+    if not math.isfinite(value):
+        return False
+    pad_lo = lo * (1.0 - tolerance)
+    pad_hi = hi * (1.0 + tolerance)
+    return pad_lo <= value <= pad_hi
+
+
+def _ratio_near(value: float, target: float, tolerance: float) -> bool:
+    if not math.isfinite(value):
+        return False
+    return abs(value / target - 1.0) <= tolerance
+
+
+def detect_harmonic_patterns(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    left: int = 5,
+    right: int = 5,
+    max_pivots: int = 40,
+    tolerance: float | None = None,
+) -> list[dict[str, Any]]:
+    """Detect completed XABCD harmonic patterns from alternating confirmed pivots.
+
+    Gartley/Bat/Butterfly follow the requested ratios. Crab/Cypher/Shark use
+    published open implementation ranges where the user plan did not specify all
+    legs explicitly. D is already a confirmed pivot, so this detector never
+    forecasts an unconfirmed D point.
+    """
+    required = {"high", "low", "close", "close_time"}
+    if len(df) < 80 or not required.issubset(df.columns):
+        return []
+
+    w = df.copy().reset_index(drop=True)
+    for col in ("high", "low", "close", "close_time"):
+        w[col] = pd.to_numeric(w[col], errors="coerce")
+    w = w.dropna(subset=["high", "low", "close", "close_time"]).reset_index(drop=True)
+    if len(w) < 80:
+        return []
+
+    tol = 0.05 if tolerance is None else max(0.0, float(tolerance))
+    lows, highs = _pivots(w, left=left, right=right)
+    pivots = [(i, "low", float(w["low"].iloc[i])) for i in lows]
+    pivots += [(i, "high", float(w["high"].iloc[i])) for i in highs]
+    pivots.sort(key=lambda x: x[0])
+    if len(pivots) < 5:
+        return []
+    pivots = pivots[-max(5, int(max_pivots)):]
+
+    results: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
+    for start in range(0, len(pivots) - 4):
+        points = pivots[start:start + 5]
+        kinds = [p[1] for p in points]
+        if any(kinds[i] == kinds[i + 1] for i in range(4)):
+            continue
+
+        prices = [p[2] for p in points]
+        x, a, b, c, d = prices
+        xa = abs(a - x)
+        ab = abs(b - a)
+        bc = abs(c - b)
+        cd = abs(d - c)
+        ad = abs(d - a)
+        xc = abs(c - x)
+        if min(xa, ab, bc, cd, ad, xc) <= 0:
+            continue
+
+        ab_xa = ab / xa
+        bc_ab = bc / ab
+        bc_xa = bc / xa
+        xc_xa = xc / xa
+        cd_bc = cd / bc
+        cd_xc = cd / xc
+        ad_xa = ad / xa
+        xd_xa = abs(d - x) / xa
+        xd_xc = abs(d - x) / xc
+
+        candidates: list[str] = []
+        # Ratios follow the user-specified plan for Gartley/Bat/Butterfly.
+        if _ratio_near(ab_xa, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 1.272, 1.618, tol) and _ratio_near(ad_xa, 0.786, tol):
+            candidates.append("GARTLEY")
+        if (
+            _ratio_in(ab_xa, 0.382, 0.500, tol)
+            and _ratio_in(bc_ab, 0.382, 0.886, tol)
+            and _ratio_in(cd_bc, 1.618, 2.618, tol)
+            and _ratio_near(ad_xa, 0.886, tol)
+        ):
+            candidates.append("BAT")
+        if (
+            _ratio_near(ab_xa, 0.786, tol)
+            and _ratio_in(bc_ab, 0.382, 0.886, tol)
+            and (
+                _ratio_in(cd_bc, 1.618, 2.618, tol)
+                or _ratio_in(ad_xa, 1.272, 2.618, tol)
+            )
+        ):
+            candidates.append("BUTTERFLY")
+
+        # These three use the published public ratio families from the open
+        # HarmonicPatterns project / TradingView implementations.
+        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 2.618, 3.618, tol) and _ratio_near(xd_xa, 1.618, tol):
+            candidates.append("CRAB")
+        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(xc_xa, 1.272, 1.414, tol) and _ratio_near(cd_xc, 0.786, tol):
+            candidates.append("CYPHER")
+        if _ratio_in(bc_ab, 1.130, 1.618, tol) and _ratio_in(cd_bc, 1.618, 2.240, tol) and _ratio_in(ad_xa, 0.886, 1.130, tol):
+            candidates.append("SHARK")
+
+        if not candidates:
+            continue
+
+        direction = "LONG" if points[0][1] == "low" else "SHORT"
+        d_idx = points[4][0]
+        confirmation_idx = d_idx + right
+        if confirmation_idx >= len(w):
+            continue
+        d_ts = int(w["close_time"].iloc[d_idx])
+        detected_ts = int(w["close_time"].iloc[confirmation_idx])
+        d_price = float(d)
+        for pattern in candidates:
+            event_id = _harmonic_event_id(symbol, timeframe, pattern, d_ts)
+            if event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event_id)
+            results.append({
+                "event_id": event_id,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": f"HARMONIC_{pattern}_{direction}",
+                "timestamps": {
+                    "x_ts": int(w["close_time"].iloc[points[0][0]]),
+                    "a_ts": int(w["close_time"].iloc[points[1][0]]),
+                    "b_ts": int(w["close_time"].iloc[points[2][0]]),
+                    "c_ts": int(w["close_time"].iloc[points[3][0]]),
+                    "d_ts": d_ts,
+                    "detected_at_ts": detected_ts,
+                },
+                "event_fact": {
+                    "trigger_level": d_price,
+                    "detection_close_price": float(w["close"].iloc[confirmation_idx]),
+                    "pattern": pattern,
+                    "x_price": x,
+                    "a_price": a,
+                    "b_price": b,
+                    "c_price": c,
+                    "d_price": d_price,
+                    "ab_xa": ab_xa,
+                    "bc_ab": bc_ab,
+                    "bc_xa": bc_xa,
+                    "xc_xa": xc_xa,
+                    "cd_bc": cd_bc,
+                    "cd_xc": cd_xc,
+                    "ad_xa": ad_xa,
+                    "xd_xa": xd_xa,
+                    "xd_xc": xd_xc,
+                    "ratio_tolerance": tol,
+                    "engine": "HARMONIC_PATTERN",
+                },
+            })
+
+    return results
+
+
+def _profile_event_id(symbol: str, timeframe: str, event_type: str, detected_ts: int) -> str:
+    fp = f"{symbol}:{timeframe}:{event_type}:{int(detected_ts)}"
+    return "VP_" + hashlib.sha256(fp.encode()).hexdigest()[:16].upper()
+
+
+def detect_volume_profile_divergence(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    lookback: int = 100,
+    bins: int = 24,
+    recent_bars: int = 20,
+    growth_ratio: float = 1.10,
+    min_distance_bins: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Detect an OHLCV approximation of price-vs-HVN accumulation/distribution.
+
+    Exact exchange volume-profile reconstruction needs lower-timeframe/tick
+    allocation of volume across the candle's traded price range. This engine uses
+    the candle typical price (HLC3) as the deterministic proxy, then compares the
+    recent HVN-bin volume against the preceding baseline. It is intentionally a
+    separate research engine rather than silently redefining classic divergence.
+    """
+    required = {"high", "low", "close", "volume", "close_time"}
+    if len(df) < max(lookback, 60) or not required.issubset(df.columns):
+        return []
+
+    w = df.copy().tail(lookback).reset_index(drop=True)
+    for col in ("high", "low", "close", "volume", "close_time"):
+        w[col] = pd.to_numeric(w[col], errors="coerce")
+    w = w.dropna(subset=["high", "low", "close", "volume", "close_time"]).reset_index(drop=True)
+    if len(w) < max(lookback, 60) or len(w) <= recent_bars + 20:
+        return []
+
+    price_low = float(w["low"].min())
+    price_high = float(w["high"].max())
+    if not math.isfinite(price_low) or not math.isfinite(price_high) or price_high <= price_low:
+        return []
+
+    bin_count = max(8, min(int(bins), 100))
+    width = (price_high - price_low) / bin_count
+    if width <= 0:
+        return []
+
+    typical = (w["high"] + w["low"] + w["close"]) / 3.0
+    vol = w["volume"].clip(lower=0.0)
+    positions = np.floor((typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+
+    profile = np.zeros(bin_count, dtype=float)
+    for idx, volume in zip(positions.to_numpy(), vol.to_numpy(dtype=float)):
+        if math.isfinite(volume) and volume > 0:
+            profile[int(idx)] += volume
+
+    hvn_idx = int(np.argmax(profile))
+    hvn_volume = float(profile[hvn_idx])
+    if not math.isfinite(hvn_volume) or hvn_volume <= 0:
+        return []
+
+    baseline = w.iloc[:-recent_bars]
+    recent = w.iloc[-recent_bars:]
+    baseline_typical = (baseline["high"] + baseline["low"] + baseline["close"]) / 3.0
+    recent_typical = (recent["high"] + recent["low"] + recent["close"]) / 3.0
+
+    baseline_pos = np.floor((baseline_typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+    recent_pos = np.floor((recent_typical - price_low) / width).astype(int).clip(0, bin_count - 1)
+    baseline_hvn_volume = float(baseline["volume"].where(baseline_pos == hvn_idx, 0.0).sum())
+    recent_hvn_volume = float(recent["volume"].where(recent_pos == hvn_idx, 0.0).sum())
+    baseline_projected = baseline_hvn_volume / max(1, len(baseline)) * len(recent)
+    if baseline_projected <= 0 or recent_hvn_volume < baseline_projected * float(growth_ratio):
+        return []
+
+    current_price = float(w["close"].iloc[-1])
+    hvn_center = price_low + (hvn_idx + 0.5) * width
+    distance_bins = abs(current_price - hvn_center) / width
+    if not math.isfinite(distance_bins) or distance_bins < float(min_distance_bins):
+        return []
+    # Require an actual recent transition away from the HVN, not merely a
+    # current price that happens to sit far from it.
+    current_bin = int(np.floor((current_price - price_low) / width))
+    current_bin = min(bin_count - 1, max(0, current_bin))
+    recent_positions = recent_pos.to_numpy(dtype=int)
+    # Emit only on the first confirmed bar that leaves the HVN. Without an
+    # immediate transition guard, several subsequent candles could emit the
+    # same accumulation/distribution event while merely remaining away from
+    # the HVN.
+    if len(recent_positions) < 2 or recent_positions[-1] == hvn_idx or recent_positions[-2] != hvn_idx:
+        return []
+
+    atr_series = _atr(w, 14)
+    atr_value = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else float("nan")
+    side = "below" if current_price < hvn_center else "above"
+    if side == "below":
+        direction = "LONG"
+        event_type = "VOLUME_PROFILE_ACCUMULATION"
+    else:
+        direction = "SHORT"
+        event_type = "VOLUME_PROFILE_DISTRIBUTION"
+
+    detected_ts = int(w["close_time"].iloc[-1])
+    return [{
+        "event_id": _profile_event_id(symbol, timeframe, event_type, detected_ts),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "event_type": event_type,
+        "timestamps": {"detected_at_ts": detected_ts},
+        "event_fact": {
+            "detection_close_price": current_price,
+            "hvn_center": float(hvn_center),
+            "hvn_bin": int(hvn_idx),
+            "hvn_volume": hvn_volume,
+            "baseline_hvn_volume_projected": float(baseline_projected),
+            "recent_hvn_volume": recent_hvn_volume,
+            "hvn_growth_ratio": float(recent_hvn_volume / baseline_projected) if baseline_projected > 0 else None,
+            "distance_from_hvn_bins": float(distance_bins),
+            "price_left_hvn": True,
+            "atr": atr_value if math.isfinite(atr_value) else None,
+            "volume_profile_method": "ohlcv_typical_price_proxy",
+            "engine": "VOLUME_PROFILE_DIVERGENCE",
+        },
+    }]
+
+
+def detect_squeeze_release(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+    min_squeeze_bars: int = 3,
+    release_lookback_bars: int = 4,
+) -> list[dict[str, Any]]:
+    """Detect recent volatility-squeeze releases without changing release math.
+
+    The original detector evaluated only the final closed bar. That creates a
+    missed-event hole if a scheduled scan is delayed or a runner misses a
+    timeframe bucket. We preserve the exact BB/KC transition rule and simply
+    inspect a short recent tail. Freshness is enforced by the caller/event TTL.
+    """
+
+    if len(df) < 40:
+        return []
+
+    required = {"close", "high", "low", "close_time"}
+    if not required.issubset(df.columns):
+        return []
+
+    b = df.copy()
+    for col in ("close", "high", "low", "close_time"):
+        b[col] = pd.to_numeric(b[col], errors="coerce")
+
+    b = b.dropna(subset=["close", "high", "low", "close_time"]).reset_index(drop=True)
+    if len(b) < 40:
+        return []
+
+    bb_u, mid, bb_l = _bbands(b["close"], 20, 2.0)
+    atr = _atr(b, 20)
+    kc_u = mid + 1.5 * atr
+    kc_l = mid - 1.5 * atr
+
+    in_sq = (bb_u <= kc_u) & (bb_l >= kc_l)
+    if len(b) < (min_squeeze_bars + 2):
+        return []
+
+    lookback = max(1, int(release_lookback_bars))
+    first_release_idx = max(1, len(b) - lookback)
+    releases: list[dict[str, Any]] = []
+
+    for current_idx in range(first_release_idx, len(b)):
+        prev_idx = current_idx - 1
+        if pd.isna(bb_u.iloc[current_idx]) or pd.isna(kc_u.iloc[current_idx]):
+            continue
+        if bool(in_sq.iloc[current_idx]) or not bool(in_sq.iloc[prev_idx]):
+            continue
+
+        sq_duration = 0
+        idx = prev_idx
+        while idx >= 0 and bool(in_sq.iloc[idx]):
+            sq_duration += 1
+            idx -= 1
+        if sq_duration < min_squeeze_bars:
+            continue
+
+        close_val = float(b["close"].iloc[current_idx])
+        kc_u_val = float(kc_u.iloc[current_idx])
+        kc_l_val = float(kc_l.iloc[current_idx])
+        if close_val > kc_u_val:
+            direction = "LONG"
+        elif close_val < kc_l_val:
+            direction = "SHORT"
+        else:
+            continue
+
+        ts = int(b["close_time"].iloc[current_idx])
+        typ = "VOLATILITY_SQUEEZE_RELEASE"
+        bb_w = float(bb_u.iloc[current_idx] - bb_l.iloc[current_idx])
+        kc_w = float(kc_u.iloc[current_idx] - kc_l.iloc[current_idx])
+        compression_ratio = bb_w / kc_w if kc_w > 0 else 1.0
+        releases.append(
+            {
+                "event_id": _event_id(symbol, timeframe, typ, ts, ts),
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": typ,
+                "timestamps": {
+                    "pivot_1_ts": ts,
+                    "pivot_2_ts": ts,
+                    "detected_at_ts": ts,
+                },
+                "event_fact": {
+                    "detection_close_price": close_val,
+                    "bb_width": bb_w,
+                    "kc_width": kc_w,
+                    "squeeze_duration_bars": sq_duration,
+                    "compression_ratio": float(compression_ratio),
+                    "engine": "VOLATILITY_SQUEEZE",
+                    "requires_retest": True,
+                    "trigger_level": float(kc_u_val if direction == "LONG" else kc_l_val),
+                },
+            }
+        )
+
+    return releases
+
+
+def _liq_squeeze_thresholds() -> dict[str, float]:
+    """Environment-tunable thresholds for forced-liquidation squeeze detection.
+
+    Funding-rate units follow Coinalyze's displayed values (0.03 == 0.03%),
+    consistent with calculate_setup_score's existing funding handling.
+    """
+
+    def _num(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, ""))
+            return value if math.isfinite(value) else default
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "liq_oi_ratio": _num("LIQ_SQUEEZE_MIN_LIQ_OI_RATIO", 0.01),
+        "oi_chg4h_min": _num("LIQ_SQUEEZE_MIN_OI_CHG4H_PCT", 1.5),
+        "funding_extreme": _num("LIQ_SQUEEZE_FUNDING_EXTREME", 0.03),
+        "price_spike_atr": _num("LIQ_SQUEEZE_PRICE_SPIKE_ATR", 1.0),
+        "ls_short_max": _num("LIQ_SQUEEZE_LS_SHORT_MAX", 0.75),
+        "ls_long_min": _num("LIQ_SQUEEZE_LS_LONG_MIN", 2.5),
+    }
+
+
+def detect_liquidation_squeeze(
+    row: Any,
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str = "1h",
+) -> list[dict[str, Any]]:
+    """Detect forced-liquidation cascades (audit gap B3).
+
+    SHORT_SQUEEZE (trade direction LONG): sharp up-spike on the last closed bar
+    plus elevated short liquidations relative to open interest.
+    LONG_SQUEEZE (trade direction SHORT): the mirror image for long liquidations.
+
+    Hard factors (both required): price spike (close breaks the previous bar's
+    extreme by >= LIQ_SQUEEZE_PRICE_SPIKE_ATR * ATR14) and a liquidation ratio
+    liq24/oi >= LIQ_SQUEEZE_MIN_LIQ_OI_RATIO. Soft factors (at least one
+    required): 4h OI surge, extreme OI-weighted funding, crowded L/S accounts.
+    All factor values are stored in event_fact for later review. Returns []
+    whenever Coinalyze data is unavailable instead of guessing.
+    """
+    if row is None or df is None or not isinstance(df, pd.DataFrame) or len(df) < 30:
+        return []
+
+    required = {"close", "high", "low", "close_time"}
+    if not required.issubset(df.columns):
+        return []
+
+    liq_short = getattr(row, "liq_short24", None)
+    liq_long = getattr(row, "liq_long24", None)
+    oi = getattr(row, "oi", None)
+    if liq_short is None or liq_long is None or oi is None:
+        return []
+
+    try:
+        liq_short = float(liq_short)
+        liq_long = float(liq_long)
+        oi = float(oi)
+    except (TypeError, ValueError):
+        return []
+    if oi <= 0 or liq_short < 0 or liq_long < 0:
+        return []
+
+    th = _liq_squeeze_thresholds()
+
+    b = df.copy()
+    for col in ("close", "high", "low", "close_time"):
+        b[col] = pd.to_numeric(b[col], errors="coerce")
+    b = b.dropna(subset=["close", "high", "low", "close_time"]).reset_index(drop=True)
+    if len(b) < 30:
+        return []
+
+    atr_series = _atr(b, 14)
+    atr_value = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return []
+
+    last = b.iloc[-1]
+    prev = b.iloc[-2]
+    close_val = float(last["close"])
+    prev_close = float(prev["close"])
+    prev_high = float(prev["high"])
+    prev_low = float(prev["low"])
+    move = close_val - prev_close
+
+    detected_ts = int(last["close_time"])
+
+    def _soft_factors(direction: str) -> dict[str, Any]:
+        oi_chg4h = getattr(row, "oi_chg4h_pct", None)
+        fr = getattr(row, "fr_oiw", None)
+        ls = getattr(row, "ls_accounts", None)
+        try:
+            oi_chg4h = float(oi_chg4h) if oi_chg4h is not None else None
+        except (TypeError, ValueError):
+            oi_chg4h = None
+        try:
+            fr = float(fr) if fr is not None else None
+        except (TypeError, ValueError):
+            fr = None
+        try:
+            ls = float(ls) if ls is not None else None
+        except (TypeError, ValueError):
+            ls = None
+
+        oi_surge = oi_chg4h is not None and oi_chg4h >= th["oi_chg4h_min"]
+        if direction == "LONG":
+            # A long trade caused by short squeeze needs crowded/negative funding.
+            funding_extreme = fr is not None and fr <= -abs(th["funding_extreme"])
+            ls_crowded = ls is not None and ls <= th["ls_short_max"]
+        else:
+            # A short trade caused by long squeeze needs crowded/positive funding.
+            funding_extreme = fr is not None and fr >= abs(th["funding_extreme"])
+            ls_crowded = ls is not None and ls >= th["ls_long_min"]
+
+        return {
+            "oi_chg4h_pct": oi_chg4h,
+            "fr_oiw": fr,
+            "ls_accounts": ls,
+            "oi_surge": bool(oi_surge),
+            "funding_extreme": bool(funding_extreme),
+            "ls_crowded": bool(ls_crowded),
+        }
+
+    candidates: list[tuple[str, str, float, int]] = []
+
+    # A liquidation cascade can span several consecutive bars. Keep one stable
+    # episode/family identity across that run so the event is updated rather
+    # than emitted as a new opportunity on every bar.
+    def _family_start_index(last_idx: int, direction: str) -> int:
+        start = last_idx
+        for idx in range(last_idx, 0, -1):
+            cur = b.iloc[idx]
+            prv = b.iloc[idx - 1]
+            cur_close = float(cur["close"])
+            prv_close = float(prv["close"])
+            cur_move = cur_close - prv_close
+            cur_atr = float(atr_series.iloc[idx]) if pd.notna(atr_series.iloc[idx]) else 0.0
+            if not math.isfinite(cur_atr) or cur_atr <= 0:
+                break
+            if direction == "LONG":
+                qualifies = cur_move > 0 and cur_close > float(prv["high"]) and cur_move >= th["price_spike_atr"] * cur_atr
+            else:
+                qualifies = cur_move < 0 and cur_close < float(prv["low"]) and abs(cur_move) >= th["price_spike_atr"] * cur_atr
+            if not qualifies:
+                break
+            start = idx - 1
+        return start + 1 if start < last_idx else last_idx
+
+    if move > 0 and close_val > prev_high and move >= th["price_spike_atr"] * atr_value:
+        ratio = liq_short / oi
+        if ratio >= th["liq_oi_ratio"]:
+            family_start = _family_start_index(len(b) - 1, "LONG")
+            candidates.append(("SHORT_SQUEEZE", "LONG", ratio, family_start))
+
+    if move < 0 and close_val < prev_low and abs(move) >= th["price_spike_atr"] * atr_value:
+        ratio = liq_long / oi
+        if ratio >= th["liq_oi_ratio"]:
+            family_start = _family_start_index(len(b) - 1, "SHORT")
+            candidates.append(("LONG_SQUEEZE", "SHORT", ratio, family_start))
+
+    events: list[dict[str, Any]] = []
+    for typ, direction, liq_ratio, family_start_index in candidates:
+        family_start_ts = int(b["close_time"].iloc[family_start_index])
+        family_id = _event_id(symbol, timeframe, typ + "_FAMILY", family_start_ts, family_start_ts)
+        soft = _soft_factors(direction)
+        soft_hits = sum(1 for k in ("funding_extreme", "ls_crowded") if soft[k])
+        # OI growth alone is leverage buildup, not proof that a liquidation
+        # cascade is occurring. Require directional crowding evidence.
+        if soft_hits < 1:
+            continue
+
+        events.append(
+            {
+                "event_id": family_id,
+                "squeeze_family_id": family_id,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "direction": direction,
+                "event_type": typ,
+                "timestamps": {
+                    "pivot_1_ts": detected_ts,
+                    "pivot_2_ts": detected_ts,
+                    "detected_at_ts": detected_ts,
+                    "squeeze_family_start_ts": family_start_ts,
+                    "squeeze_family_end_ts": detected_ts,
+                },
+                "event_fact": {
+                    "detection_close_price": close_val,
+                    "spike_move": float(move),
+                    "spike_atr_mult": float(abs(move) / atr_value),
+                    "liq_ratio_24h": float(liq_ratio),
+                    "liq_short24": liq_short,
+                    "liq_long24": liq_long,
+                    "open_interest": oi,
+                    **soft,
+                },
+            }
+        )
+
+    return events
+
+
+def diagnose_15m_trigger(
+    df15: pd.DataFrame,
+    direction: str,
+    event_detected_at_ts: int | None = None,
+    max_trigger_delay_min: float = 30.0,
+    min_vol_mult: float = 1.05,
+    require_event_ts: bool = True,
+) -> dict[str, Any]:
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "reason": None,
+        "direction": str(direction).upper(),
+        "event_detected_at_ts": event_detected_at_ts,
+        "max_trigger_delay_min": float(max_trigger_delay_min),
+        # Audit fix B7: make the last-bar fallback explicit so backtests can
+        # detect (or forbid) look-ahead instead of silently reading a "future"
+        # bar. require_event_ts=True hard-fails the fallback path.
+        "event_ts_missing": event_detected_at_ts is None,
+        "bars_after_event": 0,
+        "bars_considered": 0,
+        "trigger_bar_close_ts": None,
+        "trigger_delay_min": None,
+        "previous_high": None,
+        "previous_low": None,
+        "current_close": None,
+        "current_volume": None,
+        "volume_sma20": None,
+        "volume_ratio": None,
+        "breakout_pass": False,
+        "volume_pass": True,
+        "data_pass": True,
+        "direction_pass": True,
+        "scanned_bar_details": [],
+    }
+
+    if require_event_ts and event_detected_at_ts is None:
+        result["reason"] = "event_ts_required"
+        result["data_pass"] = False
+        return result
+
+    if not isinstance(df15, pd.DataFrame):
+        result["reason"] = "invalid_15m_data"
+        result["data_pass"] = False
+        return result
+
+    if len(df15) < 2:
+        result["reason"] = "insufficient_data"
+        result["data_pass"] = False
+        return result
+
+    d = str(direction).upper()
+    if d not in {"LONG", "SHORT"}:
+        result["reason"] = "invalid_direction"
+        result["direction_pass"] = False
+        return result
+
+    required = {"close", "high", "low"}
+    if event_detected_at_ts is not None:
+        required.add("close_time")
+
+    missing = required - set(df15.columns)
+    if missing:
+        result["reason"] = "invalid_15m_data"
+        result["data_pass"] = False
+        return result
+
+    work = df15.copy()
+    for col in ("close", "high", "low"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    if "volume" in work.columns:
+        work["volume"] = pd.to_numeric(work["volume"], errors="coerce")
+
+    if "close_time" in work.columns:
+        work["close_time"] = pd.to_numeric(work["close_time"], errors="coerce")
+
+    work = work.dropna(subset=["close", "high", "low"]).reset_index(drop=True)
+    if len(work) < 2:
+        result["reason"] = "insufficient_data"
+        result["data_pass"] = False
+        return result
+
+    if event_detected_at_ts is None:
+        i = len(work) - 1
+        h = work.iloc[i]
+        p = work.iloc[i - 1]
+
+        try:
+            current_close = float(h["close"])
+            previous_high = float(p["high"])
+            previous_low = float(p["low"])
+        except (TypeError, ValueError):
+            result["reason"] = "invalid_15m_data"
+            result["data_pass"] = False
+            return result
+
+        current_volume = float(h["volume"]) if ("volume" in work.columns and pd.notna(h["volume"])) else None
+
+        if d == "LONG":
+            breakout_pass = current_close > previous_high
+        else:
+            breakout_pass = current_close < previous_low
+
+        volume_sma20 = None
+        volume_ratio = None
+        volume_pass = True
+
+        if "volume" in work.columns and len(work) >= 20 and min_vol_mult > 0:
+            volume_window = pd.to_numeric(work["volume"].iloc[-21:-1], errors="coerce")
+            if len(volume_window) == 20 and volume_window.notna().all():
+                volume_sma20 = float(volume_window.mean())
+                if volume_sma20 > 0 and current_volume is not None:
+                    volume_ratio = current_volume / volume_sma20
+                    volume_pass = current_volume >= (volume_sma20 * min_vol_mult)
+
+        result["bars_after_event"] = 1
+        result["bars_considered"] = 1
+        result["breakout_pass"] = bool(breakout_pass)
+        result["volume_pass"] = bool(volume_pass)
+        result["previous_high"] = previous_high
+        result["previous_low"] = previous_low
+        result["current_close"] = current_close
+        result["current_volume"] = current_volume
+        result["volume_sma20"] = volume_sma20
+        result["volume_ratio"] = volume_ratio
+
+        if not breakout_pass:
+            result["reason"] = "breakout_failed"
+            return result
+        if not volume_pass:
+            result["reason"] = "volume_failed"
+            return result
+
+        result["ok"] = True
+        result["reason"] = "passed"
+        return result
+
+    try:
+        event_ts = int(event_detected_at_ts)
+    except (TypeError, ValueError):
+        result["reason"] = "invalid_event_timestamp"
+        result["data_pass"] = False
+        return result
+
+    work = work.dropna(subset=["close_time"]).sort_values("close_time").reset_index(drop=True)
+    if len(work) < 2:
+        result["reason"] = "insufficient_data"
+        result["data_pass"] = False
+        return result
+
+    candidate_indices: list[int] = []
+    for i in range(1, len(work)):
+        close_ts = int(work["close_time"].iloc[i])
+        if close_ts <= event_ts:
+            continue
+        delay_min = (close_ts - event_ts) / 60000.0
+        if delay_min < 0 or delay_min > max_trigger_delay_min:
+            continue
+        candidate_indices.append(i)
+
+    result["bars_after_event"] = len(candidate_indices)
+    if not candidate_indices:
+        result["reason"] = "no_trigger_window"
+        return result
+
+    saw_breakout = False
+    saw_breakout_without_volume = False
+    last_diagnostic = None
+
+    for i in reversed(candidate_indices):
+        h = work.iloc[i]
+        p = work.iloc[i - 1]
+        try:
+            current_close = float(h["close"])
+            previous_high = float(p["high"])
+            previous_low = float(p["low"])
+            close_ts = int(h["close_time"])
+        except (TypeError, ValueError):
+            continue
+
+        current_volume = float(h["volume"]) if ("volume" in work.columns and pd.notna(h["volume"])) else None
+        delay_min = (close_ts - event_ts) / 60000.0
+
+        if d == "LONG":
+            breakout_pass = current_close > previous_high
+        else:
+            breakout_pass = current_close < previous_low
+
+        volume_sma20 = None
+        volume_ratio = None
+        volume_pass = True
+
+        if "volume" in work.columns and i >= 20 and min_vol_mult > 0:
+            volume_window = pd.to_numeric(work["volume"].iloc[i - 20:i], errors="coerce")
+            if len(volume_window) == 20 and volume_window.notna().all():
+                volume_sma20 = float(volume_window.mean())
+                if volume_sma20 > 0 and current_volume is not None:
+                    volume_ratio = current_volume / volume_sma20
+                    volume_pass = current_volume >= (volume_sma20 * min_vol_mult)
+
+        detail = {
+            "close_ts": close_ts,
+            "delay_min": round(delay_min, 3),
+            "previous_high": previous_high,
+            "previous_low": previous_low,
+            "current_close": current_close,
+            "current_volume": current_volume,
+            "volume_sma20": volume_sma20,
+            "volume_ratio": volume_ratio,
+            "breakout_pass": bool(breakout_pass),
+            "volume_pass": bool(volume_pass),
+        }
+        result["scanned_bar_details"].append(detail)
+        result["bars_considered"] += 1
+        last_diagnostic = detail
+
+        if not breakout_pass:
+            continue
+
+        saw_breakout = True
+        if not volume_pass:
+            saw_breakout_without_volume = True
+            continue
+
+        result.update(
+            {
+                "ok": True,
+                "reason": "passed",
+                "breakout_pass": True,
+                "volume_pass": True,
+                "trigger_bar_close_ts": close_ts,
+                "trigger_delay_min": round(delay_min, 3),
+                "previous_high": previous_high,
+                "previous_low": previous_low,
+                "current_close": current_close,
+                "current_volume": current_volume,
+                "volume_sma20": volume_sma20,
+                "volume_ratio": volume_ratio,
+            }
+        )
+        return result
+
+    if saw_breakout and saw_breakout_without_volume:
+        result["reason"] = "volume_failed"
+    else:
+        result["reason"] = "breakout_failed"
+
+    if last_diagnostic:
+        result.update(
+            {
+                "previous_high": last_diagnostic["previous_high"],
+                "previous_low": last_diagnostic["previous_low"],
+                "current_close": last_diagnostic["current_close"],
+                "current_volume": last_diagnostic["current_volume"],
+                "volume_sma20": last_diagnostic["volume_sma20"],
+                "volume_ratio": last_diagnostic["volume_ratio"],
+                "breakout_pass": bool(saw_breakout),
+                "volume_pass": not saw_breakout_without_volume,
+            }
+        )
+
+    return result
+
+
+def build_15m_trigger(
+    df15: pd.DataFrame,
+    direction: str,
+    min_vol_mult: float = 1.0,
+    event_detected_at_ts: int | None = None,
+    max_trigger_delay_min: float = 30.0,
+    require_event_ts: bool = False,
+) -> bool:
+    diagnostic = diagnose_15m_trigger(
+        df15=df15,
+        direction=direction,
+        event_detected_at_ts=event_detected_at_ts,
+        max_trigger_delay_min=max_trigger_delay_min,
+        min_vol_mult=min_vol_mult,
+        require_event_ts=require_event_ts,
+    )
+    return bool(diagnostic.get("ok", False))
+
+
+def check_btc_regime(
+    btc_1h_df: pd.DataFrame,
+    direction: str,
+) -> tuple[bool, str]:
+
+    if len(btc_1h_df) < 5 or "close" not in btc_1h_df.columns:
+        return True, "INSUFFICIENT_DATA"
+
+    close = pd.to_numeric(btc_1h_df["close"], errors="coerce")
+    if close.isna().any():
+        return True, "INSUFFICIENT_DATA"
+
+    last_close = float(close.iloc[-1])
+    prev_1h = float(close.iloc[-2])
+    prev_4h = float(close.iloc[-5])
+
+    if (
+        not all(math.isfinite(value) for value in (last_close, prev_1h, prev_4h))
+        or last_close <= 0
+        or prev_1h <= 0
+        or prev_4h <= 0
+    ):
+        return True, "INSUFFICIENT_DATA"
+
+    chg_1h_pct = ((last_close - prev_1h) / prev_1h) * 100.0
+    chg_4h_pct = ((last_close - prev_4h) / prev_4h) * 100.0
+
+    d = str(direction).upper()
+    if d == "LONG":
+        if chg_1h_pct < -1.2:
+            return False, f"BTC_DUMPING_1H ({chg_1h_pct:.2f}%)"
+        if chg_4h_pct < -2.5:
+            return False, f"BTC_DUMPING_4H ({chg_4h_pct:.2f}%)"
+    elif d == "SHORT":
+        if chg_1h_pct > 1.5:
+            return False, f"BTC_PUMPING_1H (+{chg_1h_pct:.2f}%)"
+        if chg_4h_pct > 3.0:
+            return False, f"BTC_PUMPING_4H (+{chg_4h_pct:.2f}%)"
+
+    return True, "OK"
+
+
+def validate_divergence_context(
+    ev: dict[str, Any],
+    df_htf: pd.DataFrame | None = None,
+    context_timeframe: str = "4h",
+) -> tuple[bool, str, dict[str, Any]]:
+    """Validate divergence semantics: hidden requires aligned trend; regular needs non-trending/exhaustion context.
+
+    The validator is intentionally conservative and causal. When higher-TF data is
+    supplied, it is preferred for regime confirmation. Otherwise the event is not
+    rejected solely for missing context; the caller can decide whether to require it.
+    """
+    event_type = str(ev.get("event_type", "")).upper()
+    direction = str(ev.get("direction", "")).upper()
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    meta: dict[str, Any] = {"context_validated": False, "context_source": None}
+    if "REGULAR_" not in event_type and "HIDDEN_" not in event_type:
+        return True, "NOT_DIVERGENCE", meta
+
+    if isinstance(df_htf, pd.DataFrame) and len(df_htf) >= 60:
+        ctx = _trend_context(df_htf, direction)
+        meta.update({"context_source": str(context_timeframe).lower(), "htf_trend": ctx.get("trend"), "htf_trend_ok": ctx.get("trend_ok")})
+        try:
+            htf_events = detect_divergences(df_htf, str(ev.get("symbol", "")), context_timeframe)
+            detected_ts = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+            htf_bar_minutes = 1_440 if str(context_timeframe).lower() == "1d" else 240
+            lookback_bars = max(1, int(os.environ.get("DIVERGENCE_MTF_LOOKBACK_BARS", "6")))
+            lookback_ms = lookback_bars * htf_bar_minutes * 60_000
+            matched = []
+            for candidate in htf_events:
+                if str(candidate.get("event_type", "")).upper() != event_type:
+                    continue
+                if str(candidate.get("direction", "")).upper() != direction:
+                    continue
+                candidate_ts = int(candidate.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+                if candidate_ts <= 0 or detected_ts <= 0:
+                    continue
+                if 0 <= detected_ts - candidate_ts <= lookback_ms:
+                    matched.append(candidate)
+            meta["mtf_confirmed"] = bool(matched)
+            meta["mtf_confirmation_event_id"] = matched[-1].get("event_id") if matched else None
+            meta["mtf_confirmation_timeframe"] = str(context_timeframe).lower()
+        except Exception:
+            # MTF confirmation is a metadata enhancement; it must never turn a
+            # valid divergence into a false rejection if the secondary scan fails.
+            meta["mtf_confirmed"] = False
+    else:
+        # Local event context fallback: do not fabricate a trend decision.
+        ctx = _trend_context(pd.DataFrame(), direction)
+
+    if "HIDDEN_" in event_type:
+        if ctx.get("trend_ok") is None:
+            return False, "HIDDEN_CONTEXT_UNAVAILABLE", meta
+        if not bool(ctx["trend_ok"]):
+            return False, "HIDDEN_TREND_MISMATCH", meta
+        meta["context_validated"] = True
+        return True, "HIDDEN_TREND_ALIGNED", meta
+
+    # Regular divergence is a reversal candidate. Avoid forcing a strong-trend veto,
+    # but require meaningful price displacement and a non-flat divergence geometry.
+    price_delta_atr = float(fact.get("price_delta_atr", 0.0) or 0.0)
+    if price_delta_atr < 0.35:
+        return False, "REGULAR_WEAK_PRICE_DISPLACEMENT", meta
+    meta["context_validated"] = True
+    meta["reversal_candidate"] = True
+    return True, "REGULAR_CONTEXT_OK", meta
