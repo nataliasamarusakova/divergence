@@ -1,29 +1,25 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""Exact-ish, standalone reproduction of the Ajay R5.41 S/R block supplied by the user.
 
-"""Standalone, exact-ish reproduction of the supplied Ajay R5.41 Pine S/R block.
-
-This module only computes the visible SR state from closed 1H OHLCV candles.
-It does not import or modify the trading engine.
-
-Parameters reproduced from the supplied block:
-- rb = 10 pivot confirmation bars
-- prd = 284 lookback bars
-- ChannelW = 10 percent of the lookback high-low range
+This module intentionally does not import or modify the zone-engine trading code.
+It reproduces only the Pine S/R calculations needed for the visible price values:
+- rb = 10 pivot confirmation
+- prd = 284 lookback
+- ChannelW = 10
 - strengthSR = 2
-- up to 20 stored SR levels
+- sr_levels array (up to 20 levels)
+- highestph / lowestpl
 
-Important Pine-state semantics reproduced from the supplied implementation:
-- pivot values are emitted on their confirmation bar, not on the pivot bar;
-- the current SR array is the last state created by a confirmed pivot event and
-  persists between later bars until another pivot event fires;
-- when both ph and pl are present on one confirmation bar, the candidate price
-  uses ph precedence while the two successive storage statements let pl overwrite
-  the same sr_levels slot, matching the supplied code.
-
-The returned ``cwidth`` is the Pine clustering width. It is NOT asserted here to
-be the exact visual thickness of a TradingView rectangle. The trading filter may
-use it as a conservative cluster band, controlled by a scale parameter.
+Important Pine semantics reproduced here:
+- ph/pl are emitted on the confirmation bar, not the pivot bar.
+- The current displayed SR arrays are the state from the most recent bar where
+  ph or pl fires; between pivot confirmations they persist.
+- When ph and pl somehow coexist on the same confirmation bar, SR candidate
+  selection uses ph precedence (matching "ph[x] ? ... : low[x+rb]") while
+  highestph/lowestpl consider both, and sr_levels storage follows Pine's two
+  successive if statements (pl overwrites ph at the same countpp).
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
@@ -59,9 +55,8 @@ def _is_pivot_low(candles: list[Candle], pivot_idx: int, rb: int) -> bool:
     return True
 
 
-def build_confirmed_pivots(
-    candles: list[Candle], rb: int = 10
-) -> tuple[list[float | None], list[float | None]]:
+def build_confirmed_pivots(candles: list[Candle], rb: int = 10) -> tuple[list[float | None], list[float | None]]:
+    """Return ph/pl series indexed by the Pine confirmation bar."""
     n = len(candles)
     ph: list[float | None] = [None] * n
     pl: list[float | None] = [None] * n
@@ -78,12 +73,12 @@ def build_confirmed_pivots(
 
 def _rolling_high(candles: list[Candle], end_idx: int, length: int) -> float:
     start = max(0, end_idx - length + 1)
-    return max(c.high for c in candles[start : end_idx + 1])
+    return max(c.high for c in candles[start:end_idx + 1])
 
 
 def _rolling_low(candles: list[Candle], end_idx: int, length: int) -> float:
     start = max(0, end_idx - length + 1)
-    return min(c.low for c in candles[start : end_idx + 1])
+    return min(c.low for c in candles[start:end_idx + 1])
 
 
 def _event_pivots(
@@ -93,6 +88,7 @@ def _event_pivots(
     event_idx: int,
     prd: int,
 ) -> list[tuple[int, float, str, float | None, float | None]]:
+    """Newest-to-oldest pivot events visible to Pine's x=0..prd loops."""
     out: list[tuple[int, float, str, float | None, float | None]] = []
     for x in range(prd + 1):
         idx = event_idx - x
@@ -100,6 +96,7 @@ def _event_pivots(
             break
         if ph[idx] is None and pl[idx] is None:
             continue
+        # Pine candidate price: ph ? high[x+rb] : low[x+rb].
         if ph[idx] is not None:
             candidate_price = float(ph[idx])
             candidate_kind = "H"
@@ -122,6 +119,7 @@ def calculate_event_sr(
     channel_w: float = 10.0,
     strength_sr: int = 2,
 ) -> dict[str, Any]:
+    """Recreate the Pine code's single `if ph or pl` calculation block."""
     window_high = _rolling_high(candles, event_idx, prd)
     window_low = _rolling_low(candles, event_idx, prd)
     cwidth = (window_high - window_low) * channel_w / 100.0
@@ -131,6 +129,7 @@ def calculate_event_sr(
 
     pivots = _event_pivots(candles, ph, pl, event_idx, prd)
 
+    # Pine's highestph/lowestpl pass uses both ph and pl when both exist.
     for _, _, _, phv, plv in pivots:
         if phv is not None:
             highestph = max(highestph, float(phv))
@@ -161,6 +160,7 @@ def calculate_event_sr(
             cnt += 1
             if cnt > 40:
                 break
+            # Pine: if array.get(aas, cnt)
             if not aas[cnt]:
                 continue
             if dnl <= price2 <= upl:
@@ -173,6 +173,8 @@ def calculate_event_sr(
                     aas[g] = False
 
             if countpp < 21:
+                # Pine has two independent if statements; a simultaneous pl
+                # overwrites the sr_levels[countpp] written by ph.
                 if phv is not None:
                     sr_levels[countpp] = float(phv)
                 if plv is not None:
@@ -200,29 +202,14 @@ def calculate_event_sr(
     }
 
 
-def compute_current_sr(
-    candles: list[Candle],
-    rb: int = 10,
-    prd: int = 284,
-    channel_w: float = 10.0,
-    strength_sr: int = 2,
-) -> dict[str, Any]:
+def compute_current_sr(candles: list[Candle], rb: int = 10, prd: int = 284, channel_w: float = 10.0, strength_sr: int = 2) -> dict[str, Any]:
     if len(candles) < prd + rb + 2:
         raise ValueError(f"Need at least {prd + rb + 2} candles, got {len(candles)}")
     ph, pl = build_confirmed_pivots(candles, rb=rb)
     current: dict[str, Any] | None = None
     for i in range(len(candles)):
         if ph[i] is not None or pl[i] is not None:
-            current = calculate_event_sr(
-                candles,
-                ph,
-                pl,
-                i,
-                rb=rb,
-                prd=prd,
-                channel_w=channel_w,
-                strength_sr=strength_sr,
-            )
+            current = calculate_event_sr(candles, ph, pl, i, rb=rb, prd=prd, channel_w=channel_w, strength_sr=strength_sr)
     if current is None:
         return {
             "levels": [],
@@ -233,8 +220,6 @@ def compute_current_sr(
             "event_idx": None,
             "event_timestamp": None,
             "accepted": [],
-            "latest_closed_timestamp": candles[-1].ts,
-            "latest_closed_close": candles[-1].close,
         }
     current = dict(current)
     current["latest_closed_timestamp"] = candles[-1].ts

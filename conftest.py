@@ -1,21 +1,32 @@
-"""Pytest isolation for production-only runtime gates.
-
-The GitHub Actions workflow sets production VST environment variables for the
-whole job. Unit tests must not inherit those execution gates implicitly: tests
-that are specifically about S/R explicitly enable the S/R gate themselves.
-"""
 from __future__ import annotations
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolate_production_entry_gates(monkeypatch):
-    import run_once as ro
+def isolate_repository_research_data(monkeypatch, tmp_path):
+    """Never allow pytest research tests to mutate the repository's production data/."""
+    from event_engine import research
 
-    # Keep ordinary unit/integration tests deterministic even when CI exports
-    # production VST settings such as AJAY_SR_ROOM_MODE=enforce.
-    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
-    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
-    monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", False)
-    yield
+    runtime_data = tmp_path / "research-data"
+    runtime_data.mkdir(parents=True, exist_ok=True)
+    (runtime_data / "active_trades.json").write_text("{}", encoding="utf-8")
+    # Do not create any other runtime data up-front: individual tests may intentionally
+    # construct their own tmp/data directory for retention-policy assertions.
+    research_paths = {
+        "DATA_DIR": runtime_data,
+        "ZONE_OBSERVATIONS_PATH": runtime_data / "zone_observations.jsonl",
+        "ENTRY_DECISIONS_PATH": runtime_data / "entry_decisions.jsonl",
+        "MARKET_BARS_1H_PATH": runtime_data / "market_bars_1h.jsonl",
+        "MARKET_BARS_5M_PATH": runtime_data / "market_bars_5m.jsonl",
+        "RESEARCH_BAR_CURSORS_PATH": runtime_data / "research_bar_cursors.json",
+        "RESEARCH_MANIFEST_PATH": runtime_data / "research_manifest.json",
+        "RESEARCH_ERRORS_PATH": runtime_data / "research_persistence_errors.jsonl",
+        "RESEARCH_OUTCOMES_PATH": runtime_data / "research_outcomes.jsonl",
+        "RESEARCH_OUTCOME_STATE_PATH": runtime_data / "research_outcome_state.json",
+        "COUNTERFACTUAL_EXPERIMENTS_PATH": runtime_data / "counterfactual_experiments.jsonl",
+        "MARKET_CONTEXT_PATH": runtime_data / "market_context.jsonl",
+        "ACCOUNT_CONTEXT_PATH": runtime_data / "account_context.jsonl",
+    }
+    for name, value in research_paths.items():
+        monkeypatch.setattr(research, name, value)
