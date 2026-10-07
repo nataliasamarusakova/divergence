@@ -1,7 +1,7 @@
 """Causal, deterministic trend/regime diagnostics for entry candidates.
 
 This module is intentionally isolated from the existing event detectors.  It does
-not generate signals, alter Demand/Supply construction, or change the 15M trigger.
+not generate signals, alter Demand/Supply construction, or change the existing closed 5M trigger.
 The first release is intended to run in shadow mode before becoming an enforce gate.
 """
 from __future__ import annotations
@@ -12,6 +12,38 @@ from typing import Any
 import pandas as pd
 
 
+def _parse_ts(value: Any) -> pd.Timestamp | None:
+    """Normalize ISO/epoch ns/us/ms/s timestamps to UTC."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, pd.Timestamp):
+            ts = value
+        elif isinstance(value, (int, float)):
+            x = float(value)
+            if not math.isfinite(x):
+                return None
+            m = abs(x)
+            unit = "ns" if m >= 1e17 else "us" if m >= 1e14 else "ms" if m >= 1e11 else "s" if m >= 1e8 else None
+            ts = pd.to_datetime(value, unit=unit, utc=True) if unit else pd.to_datetime(value, utc=True)
+        else:
+            text = str(value).strip()
+            numeric = pd.to_numeric(text, errors="coerce")
+            if pd.notna(numeric):
+                x = float(numeric); m = abs(x)
+                unit = "ns" if m >= 1e17 else "us" if m >= 1e14 else "ms" if m >= 1e11 else "s" if m >= 1e8 else None
+                ts = pd.to_datetime(numeric, unit=unit, utc=True) if unit else pd.to_datetime(text, utc=True)
+            else:
+                ts = pd.to_datetime(text, utc=True)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    except Exception:
+        return None
+
+
+def _timestamp_series_to_ms(series: pd.Series) -> pd.Series:
+    return series.map(lambda x: int(_parse_ts(x).timestamp() * 1000) if _parse_ts(x) is not None else None).astype("Float64")
+
+
 def _clean_closed_frame(df: pd.DataFrame | None, decision_ts_ms: int | float | None) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or "close" not in df.columns:
         return pd.DataFrame()
@@ -19,7 +51,7 @@ def _clean_closed_frame(df: pd.DataFrame | None, decision_ts_ms: int | float | N
     if "close_time" not in work.columns:
         return pd.DataFrame()
     work["close"] = pd.to_numeric(work["close"], errors="coerce")
-    work["close_time"] = pd.to_numeric(work["close_time"], errors="coerce")
+    work["close_time"] = _timestamp_series_to_ms(work["close_time"])
     work = work.dropna(subset=["close", "close_time"]).sort_values("close_time").drop_duplicates("close_time", keep="last")
     work = work[work["close"] > 0]
     if decision_ts_ms is not None:
@@ -71,6 +103,58 @@ def _snapshot_frame(df: pd.DataFrame, *, ema_periods: tuple[int, ...], slope_loo
     return out
 
 
+def _structure_snapshot(df: pd.DataFrame, *, pivot_span: int = 2) -> dict[str, Any]:
+    """Causal local structure snapshot using only confirmed pivots."""
+    out={"pivot_span":int(pivot_span),"last_swing_high":None,"last_swing_high_ts":None,"last_swing_high_confirmation_ts":None,"last_swing_low":None,"last_swing_low_ts":None,"last_swing_low_confirmation_ts":None,"break_above_last_swing_high":False,"break_below_last_swing_low":False,"sweep_below_last_swing_low_reclaim":False,"sweep_above_last_swing_high_reject":False,"structure_state":"UNKNOWN"}
+    if len(df) < 2*int(pivot_span)+3:
+        return out
+    work=df.reset_index(drop=True)
+    highs=pd.to_numeric(work["high"],errors="coerce") if "high" in work.columns else pd.Series(dtype=float)
+    lows=pd.to_numeric(work["low"],errors="coerce") if "low" in work.columns else pd.Series(dtype=float)
+    closes=pd.to_numeric(work["close"],errors="coerce")
+    eligible_last=len(work)-1-int(pivot_span); hi=None; lo=None
+    for i in range(int(pivot_span),eligible_last+1):
+        lh=highs.iloc[i-int(pivot_span):i];rh=highs.iloc[i+1:i+1+int(pivot_span)]
+        ll=lows.iloc[i-int(pivot_span):i];rl=lows.iloc[i+1:i+1+int(pivot_span)]
+        h=highs.iloc[i];l=lows.iloc[i]
+        def _close_ts_ms(row_idx: int) -> int | None:
+            try:
+                value = work.iloc[row_idx]["close_time"]
+                ts = _parse_ts(value)
+                return int(ts.timestamp() * 1000) if ts is not None else None
+            except Exception:
+                return None
+
+        if pd.notna(h) and len(lh)==pivot_span and len(rh)==pivot_span and h>=float(lh.max()) and h>=float(rh.max()):
+            pivot_ts = _close_ts_ms(i)
+            confirmation_ts = _close_ts_ms(i + pivot_span)
+            if pivot_ts is not None and confirmation_ts is not None:
+                hi=(float(h), pivot_ts, confirmation_ts)
+        if pd.notna(l) and len(ll)==pivot_span and len(rl)==pivot_span and l<=float(ll.min()) and l<=float(rl.min()):
+            pivot_ts = _close_ts_ms(i)
+            confirmation_ts = _close_ts_ms(i + pivot_span)
+            if pivot_ts is not None and confirmation_ts is not None:
+                lo=(float(l), pivot_ts, confirmation_ts)
+    if hi is not None:
+        out["last_swing_high"],out["last_swing_high_ts"],out["last_swing_high_confirmation_ts"]=hi
+    if lo is not None:
+        out["last_swing_low"],out["last_swing_low_ts"],out["last_swing_low_confirmation_ts"]=lo
+    lc=float(closes.iloc[-1]) if pd.notna(closes.iloc[-1]) else None
+    lh=float(highs.iloc[-1]) if pd.notna(highs.iloc[-1]) else None
+    ll=float(lows.iloc[-1]) if pd.notna(lows.iloc[-1]) else None
+    if lc is None:return out
+    if hi is not None:
+        out["break_above_last_swing_high"]=bool(lc>hi[0]);out["sweep_above_last_swing_high_reject"]=bool(lh is not None and lh>hi[0] and lc<=hi[0])
+    if lo is not None:
+        out["break_below_last_swing_low"]=bool(lc<lo[0]);out["sweep_below_last_swing_low_reclaim"]=bool(ll is not None and ll<lo[0] and lc>=lo[0])
+    if out["break_above_last_swing_high"] and not out["break_below_last_swing_low"]: out["structure_state"]="BULL_BREAK"
+    elif out["break_below_last_swing_low"] and not out["break_above_last_swing_high"]: out["structure_state"]="BEAR_BREAK"
+    elif out["sweep_below_last_swing_low_reclaim"]: out["structure_state"]="BULL_SWEEP_RECLAIM"
+    elif out["sweep_above_last_swing_high_reject"]: out["structure_state"]="BEAR_SWEEP_REJECT"
+    else: out["structure_state"]="RANGE_OR_UNBROKEN"
+    return out
+
+
 def _classify_btc(df: pd.DataFrame, decision_ts_ms: int | float | None) -> dict[str, Any]:
     work = _clean_closed_frame(df, decision_ts_ms)
     out: dict[str, Any] = {
@@ -118,7 +202,7 @@ def evaluate_trend_filter(
     require_persistence: bool = False,
     mode: str = "shadow",
 ) -> dict[str, Any]:
-    """Evaluate a candidate against causal 4H regime + 1H direction.
+    """Evaluate a candidate against causal 4H regime + 1H direction; the caller supplies the existing closed-5M trigger timestamp.
 
     All available diagnostics are computed before the single prioritized reject
     reason is selected. The returned ``decision`` is diagnostic unless the caller
@@ -135,7 +219,7 @@ def evaluate_trend_filter(
         mode_norm = "shadow"
 
     base: dict[str, Any] = {
-        "version": "trend-v1-2026-10-04",
+        "version": "trend-v1-2026-10-06",
         "enabled": True,
         "mode": mode_norm,
         "symbol": symbol_u,
@@ -164,6 +248,8 @@ def evaluate_trend_filter(
         "persistence_lookback_1h": int(persistence_lookback_1h),
         "persistence_lookback_4h": int(persistence_lookback_4h),
         "slope_lookback_4h": int(slope_lookback_4h),
+        "structure_1h": {},
+        "structure_4h": {},
     }
 
     btc = _classify_btc(btc_1h_df, decision_ts)
@@ -186,6 +272,8 @@ def evaluate_trend_filter(
     h4 = _clean_closed_frame(df_4h, decision_ts)
     base["trend_1h_bars"] = int(len(h1))
     base["trend_4h_bars"] = int(len(h4))
+    base["structure_1h"] = _structure_snapshot(h1) if not h1.empty else {}
+    base["structure_4h"] = _structure_snapshot(h4) if not h4.empty else {}
 
     s4: dict[str, Any] | None = None
     s1: dict[str, Any] | None = None

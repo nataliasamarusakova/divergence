@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import html
 import os
-from typing import Any, Optional
+from typing import Any
 
 import requests
-
-from .formatting import format_number, format_percent, format_price, format_rr, tp_price_from_pnl
 
 
 def _chat_ids() -> list[str]:
@@ -14,230 +12,121 @@ def _chat_ids() -> list[str]:
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
 
-def send_detailed(text: str, only_chat_ids: Optional[list[str]] = None) -> dict[str, dict[str, Any]]:
+def send(text: str) -> bool:
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    ids = only_chat_ids if only_chat_ids is not None else _chat_ids()
-    ids = [str(x).strip() for x in ids if str(x).strip()]
+    ids = _chat_ids()
     if not token or not ids:
         print("[TELEGRAM] missing TG_BOT_TOKEN or TG_CHAT_IDS")
-        return {str(chat_id): {"sent": False, "error": "missing TG_BOT_TOKEN or TG_CHAT_IDS"} for chat_id in ids}
+        return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    result: dict[str, dict[str, Any]] = {}
+    ok_all = True
     for chat_id in ids:
         try:
-            r = requests.post(
+            response = requests.post(
                 url,
-                data={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                },
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"},
                 timeout=15,
             )
-            r.raise_for_status()
-            try:
-                payload = r.json()
-            except ValueError:
-                payload = {"ok": False, "description": r.text[:500]}
-            if payload.get("ok"):
-                result[str(chat_id)] = {"sent": True, "message_id": ((payload.get("result") or {}).get("message_id"))}
-            else:
-                error = str(payload.get("description", "unknown Telegram API error"))
-                print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
-                result[str(chat_id)] = {"sent": False, "error": error}
-        except requests.RequestException as exc:
-            error = str(exc)
-            print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {error}")
-            result[str(chat_id)] = {"sent": False, "error": error}
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                ok_all = False
+                print(f"[TELEGRAM] rejected: {payload.get('description', 'unknown')}")
         except Exception as exc:
-            error = str(exc)
-            print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {error}")
-            result[str(chat_id)] = {"sent": False, "error": error}
-    return result
+            ok_all = False
+            print(f"[TELEGRAM] send failed chat_id={chat_id}: {exc}")
+    return ok_all
 
 
-def send(text: str) -> bool:
-    result = send_detailed(text)
-    return bool(result) and all(bool(item.get("sent")) for item in result.values())
+def _esc(value: Any) -> str:
+    return html.escape("—" if value is None or value == "" else str(value), quote=False)
 
 
-def format_signal(
-    event: dict[str, Any],
-    setup: Optional[dict[str, Any]] = None,
-    coinalyze_row: Any = None,
-    execution: Optional[dict[str, Any]] = None,
-    score: Optional[float] = None,
-) -> str:
-    direction = str(event.get("direction", "")).upper()
-    header_prefix = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+def _fmt_price(value: Any) -> str:
+    """Human-readable price with no binary-float tail or scientific notation."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _esc(value)
+    if not (number == number) or number in (float("inf"), float("-inf")):
+        return _esc(value)
+    text = format(number, ".6g")
+    if "e" in text.lower():
+        exponent = int(text.lower().split("e", 1)[1])
+        decimals = max(0, min(14, 5 - exponent))
+        text = f"{number:.{decimals}f}".rstrip("0").rstrip(".")
+    return _esc(text)
 
-    fact = event.get("event_fact", {})
-    ts = event.get("timestamps", {})
+
+def _fmt_num(value: Any, digits: int = 3) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _esc(value)
+    if not (number == number) or number in (float("inf"), float("-inf")):
+        return _esc(value)
+    return _esc(f"{number:.{digits}f}".rstrip("0").rstrip("."))
+
+
+def format_signal(event: dict[str, Any], setup: dict[str, Any] | None = None, execution: dict[str, Any] | None = None, score: float | None = None, **_: Any) -> str:
+    direction = str(event.get("type") or event.get("direction") or "").upper()
+    symbol = str(event.get("symbol", "")).replace("-", "").upper()
+    icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     setup = setup or {}
     execution = execution or {}
+    zone = event.get("zone", {}) if isinstance(event.get("zone"), dict) else {}
+    confirmation = event.get("confirmation", {}) if isinstance(event.get("confirmation"), dict) else {}
+    counts = event.get("zone_counts", {}) if isinstance(event.get("zone_counts"), dict) else {}
+    if not counts:
+        setup_counts = setup.get("zone_counts", {}) if isinstance(setup.get("zone_counts"), dict) else {}
+        counts = {
+            "demand": setup_counts.get("demand", setup.get("active_demand", 0)),
+            "supply": setup_counts.get("supply", setup.get("active_supply", 0)),
+        }
+    demand_count = counts.get("demand", 0)
+    supply_count = counts.get("supply", 0)
 
-    def esc(v: Any) -> str:
-        return html.escape("—" if v is None or v == "" else str(v), quote=False)
+    def _ratio(value: Any) -> str:
+        return _fmt_num(value, 2) if value not in (None, "") else "—"
 
-    name = getattr(coinalyze_row, "name", None) or event.get("symbol", "")
-    symbol = event.get("symbol", "")
-    event_type = event.get("event_type", "")
-    timeframe = event.get("timeframe", "1h")
-    price = fact.get("detection_close_price") or fact.get("close")
-    detected_ts = ts.get("detected_at_ts")
-
-    require_trig = os.environ.get("REQUIRE_15M_TRIGGER", "true").lower() == "true"
-    trigger_suffix = " + trigger 15m (Vol Confirmed)" if require_trig else ""
-    score_str = f"{score:.0f}/100" if score is not None else "—"
+    target = event.get("target", {}) if isinstance(event.get("target"), dict) else {}
+    tp1_pct_text = _fmt_num(target.get("tp1_pct"), 1) if target.get("tp1_pct") is not None else "—"
+    tp2_pct_text = _fmt_num(target.get("tp2_pct"), 1) if target.get("tp2_pct") is not None else "—"
 
     lines = [
-        f"<b>{header_prefix} - {esc(name)} ({esc(symbol)})</b>",
+        f"<b>{icon} · {_esc(symbol)}</b>",
         "",
-        f"Score: <b>{score_str}</b>",
-        f"Event: <code>{esc(event_type)}</code>",
-        f"TF: <b>{esc(timeframe)}</b>{trigger_suffix}",
+        f"Score: <b>{_esc(f'{score:.0f}/100' if score is not None else event.get('score'))}</b>",
+        f"Zone: <b>{_esc(zone.get('kind'))}</b>",
+        "Signal: <code>Demand/Supply Zone First · zone touch</code>",
+        f"Entry reference: <code>{_fmt_price(event.get('entry'))}</code>",
+        f"SL: <code>{_fmt_price(event.get('sl'))}</code>",
+        f"TP1: <code>{_fmt_price(event.get('tp1'))}</code> ({tp1_pct_text}% / {_ratio(event.get('tp1_rr'))}R / 50%)",
+        f"TP2: <code>{_fmt_price(event.get('tp2'))}</code> ({tp2_pct_text}% / {_ratio(event.get('tp2_rr'))}R / 50%)",
+        f"Risk: <code>{_fmt_num(event.get('risk_pct'), 1)}%</code>",
+        "",
+        "<b>ZONE</b>",
+        f"Demand zones: <code>{_esc(demand_count)}</code>",
+        f"Supply zones: <code>{_esc(supply_count)}</code>",
+        f"Bottom: <code>{_fmt_price(zone.get('btm'))}</code>",
+        f"Top: <code>{_fmt_price(zone.get('top'))}</code>",
+        f"POI: <code>{_fmt_price(zone.get('poi'))}</code>",
+        f"Age: <code>{_esc(zone.get('age_bars'))}</code> bars",
+        f"Impulse: <code>{_fmt_num(zone.get('impulse_atr'), 3) if zone.get('impulse_atr') not in (None, '') else '—'}</code> ATR",
+        "",
+        "<b>CONFIRMATION</b>",
+        f"Volume / SMA20: <code>{_fmt_num(confirmation.get('volume_ratio'), 3) if confirmation.get('volume_ratio') not in (None, '') else '—'}</code>",
+        f"Candle body / ATR: <code>{_fmt_num(confirmation.get('candle_body_atr'), 3) if confirmation.get('candle_body_atr') not in (None, '') else '—'}</code>",
+        f"Range / ATR: <code>{_fmt_num(confirmation.get('range_atr'), 3) if confirmation.get('range_atr') not in (None, '') else '—'}</code>",
     ]
-
-    confluence_events = setup.get("confluence_events", []) if isinstance(setup, dict) else []
-    if isinstance(confluence_events, list) and confluence_events:
-        labels = []
-        for item in confluence_events:
-            if not isinstance(item, dict):
-                continue
-            label = f"{str(item.get('timeframe', '1h')).lower()} {str(item.get('event_type', 'EVENT'))}"
-            labels.append(f"<code>{esc(label)}</code>")
-        if labels:
-            lines.append(f"🔗 <b>CONFLUENCE:</b> {' + '.join(labels)}")
-
-    conflict_events = setup.get("conflict_events", []) if isinstance(setup, dict) else []
-    if isinstance(conflict_events, list) and conflict_events:
-        labels = []
-        for item in conflict_events:
-            if not isinstance(item, dict):
-                continue
-            label = f"{str(item.get('timeframe', '1h')).lower()} {str(item.get('direction', ''))}"
-            labels.append(f"<code>{esc(label)}</code>")
-        if labels:
-            lines.append(f"⚠️ <b>CONFLICT:</b> {' + '.join(labels)}")
-
-    lines.extend([
-        f"Price: <code>{esc(format_price(price))}</code>",
-        f"Detected: <code>{esc(detected_ts)}</code>",
-    ])
-
-    if "p1_price" in fact:
-        lines.extend([
-            "",
-            "<b>Divergence</b>",
-            f"P1: <code>{esc(format_price(fact.get('p1_price')))}</code>",
-            f"P2: <code>{esc(format_price(fact.get('p2_price')))}</code>",
-            f"Price Δ / ATR: <code>{esc(round(float(fact.get('price_delta_atr', 0)), 3))}</code>",
-        ])
-    elif "squeeze_duration_bars" in fact:
-        lines.extend([
-            "",
-            "<b>Volatility Squeeze</b>",
-            f"Duration: <code>{esc(fact.get('squeeze_duration_bars'))} bars</code>",
-            f"BB / KC Width: <code>{esc(round(float(fact.get('compression_ratio', 0)), 3))}</code>",
-        ])
-    elif "liq_ratio_24h" in fact:
-        # Audit B3: forced-liquidation squeeze event card.
-        ratio_pct = None
-        try:
-            ratio_pct = float(fact.get("liq_ratio_24h", 0)) * 100.0
-        except (TypeError, ValueError):
-            ratio_pct = None
-        lines.extend([
-            "",
-            "<b>Liquidation Squeeze</b>",
-            f"Liq/OI 24h: <code>{esc(round(ratio_pct, 3) if ratio_pct is not None else None)}%</code>",
-            f"Spike (ATR mult): <code>{esc(round(float(fact.get('spike_atr_mult', 0) or 0), 2))}</code>",
-            f"OI chg 4h: <code>{esc(fact.get('oi_chg4h_pct'))}%</code>",
-            f"Funding OI-w: <code>{esc(fact.get('fr_oiw'))}</code>",
-            f"L/S accounts: <code>{esc(fact.get('ls_accounts'))}</code>",
-        ])
-
-    if setup:
-        trigger = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
-        entry_reference = setup.get("entry_reference")
-        invalidation_price = setup.get("invalidation_price")
-        risk_pct = setup.get("risk_pct")
-
-        tp_levels = setup.get("effective_tp_levels")
-        if not isinstance(tp_levels, list) or not tp_levels:
-            tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else []
-
-        lines.extend([
-            "",
-            "<b>SETUP</b>",
-            f"Entry: <code>{esc(format_price(entry_reference))}</code>",
-            f"SL: <code>{esc(format_price(invalidation_price))}</code> <code>({esc(format_percent(-abs(float(risk_pct)), decimals=2, signed=True)) if risk_pct is not None else '—'})</code>",
-        ])
-
-        for index, level in enumerate(tp_levels[:3], start=1):
-            if not isinstance(level, dict):
-                continue
-            pnl_pct = level.get("pnl_pct")
-            tp_price = tp_price_from_pnl(entry_reference, direction, pnl_pct)
-            fraction = level.get("close_fraction")
-            fraction_text = ""
-            try:
-                fraction_text = f" · {float(fraction) * 100:.0f}%" if fraction is not None else ""
-            except (TypeError, ValueError):
-                fraction_text = ""
-            rr_text = ""
-            try:
-                if risk_pct is not None and float(risk_pct) > 0 and pnl_pct is not None:
-                    rr_text = f" · {esc(format_rr(float(pnl_pct) / float(risk_pct))) }"
-            except (TypeError, ValueError):
-                rr_text = ""
-            lines.append(
-                f"TP{index}: <code>{esc(format_price(tp_price))}</code> <code>({esc(format_percent(pnl_pct, decimals=2, signed=True))}{rr_text}{fraction_text})</code>"
-            )
-
-        if not tp_levels:
-            target_price = setup.get("target_price")
-            lines.append(f"TP3: <code>{esc(format_price(target_price))}</code>")
-
-        rr_value = setup.get("effective_weighted_rr")
-        if rr_value is None:
-            rr_value = setup.get("planned_weighted_rr")
-        if rr_value is None:
-            rr_value = setup.get("realized_rr")
-        tp_mode = setup.get("tp_mode") or "multi_tp"
-        lines.extend([
-            f"R:R: <code>{esc(str(rr_value))}</code>",
-            f"TP Mode: <code>{esc(tp_mode)}</code>",
-        ])
-
-        sr_context = setup.get("sr_context") if isinstance(setup.get("sr_context"), dict) else {}
-        alignment = str(sr_context.get("directional_zone_alignment") or "").upper()
-        if alignment == "LONG_IN_DEMAND":
-            confirmation = f"🟢 <b>2/2</b> — {direction} {event_type} + <b>DEMAND</b>"
-        elif alignment == "SHORT_IN_SUPPLY":
-            confirmation = f"🔴 <b>2/2</b> — {direction} {event_type} + <b>SUPPLY</b>"
-        elif str(sr_context.get("supporting_zone_context") or "").upper().startswith("SUPPORTIVE_"):
-            zone_kind = "DEMAND" if direction == "LONG" else "SUPPLY"
-            confirmation = f"🟡 <b>1/2</b> — {direction} {event_type} + {zone_kind} nearby"
-        else:
-            confirmation = f"⚪ <b>1/2</b> — {direction} {event_type} only"
-
-        lines.extend([
-            f"<b>CONFIRMATION:</b> {confirmation}",
-            f"Trigger Price: <code>{esc(format_price(trigger.get('trigger_price')))}</code>",
-            f"Trigger Delay: <code>{esc(format_number(trigger.get('trigger_delay_min'), decimals=2))} min</code>",
-        ])
-
     if execution:
-        order_id = execution.get("order_id")
-        lines.extend([
+        lines += [
             "",
             "<b>EXECUTION</b>",
-            f"Mode: <code>{esc(execution.get('mode', 'vst'))}</code>",
-            f"Status: <code>{esc(execution.get('status'))}</code>",
-            f"Order: <code>{esc(order_id)}</code>",
-        ])
-
+            f"Status: <code>{_esc(execution.get('status'))}</code>",
+            f"Order: <code>{_esc((execution.get('order') or {}).get('order_id') or (execution.get('order') or {}).get('client_order_id'))}</code>",
+            f"Protection: <code>{_esc((execution.get('protection') or {}).get('status'))}</code>",
+            f"Error: <code>{_esc(execution.get('error') or (execution.get('order') or {}).get('error'))}</code>",
+        ]
     return "\n".join(lines)

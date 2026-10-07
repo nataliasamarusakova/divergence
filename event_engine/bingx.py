@@ -8,8 +8,12 @@ import json
 import logging
 import math
 import os
+import re
 import time
+import threading
+import uuid
 from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from decimal import (
     Decimal,
     ROUND_CEILING,
@@ -17,34 +21,21 @@ from decimal import (
     ROUND_FLOOR,
 )
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from event_engine import telemetry
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
 
-
-class BingXRateLimitError(RuntimeError):
-    """A BingX rate-limit response that must not be blind-retried.
-
-    ``retry_after_ms`` is the server-provided absolute retry timestamp when
-    BingX includes one in the error message.
-    """
-
-    def __init__(self, message: str, *, code: int | str | None = None, retry_after_ms: int | None = None):
-        super().__init__(message)
-        self.code = code
-        self.retry_after_ms = retry_after_ms
-
-API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
 BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
-REQUIRE_MULTI_TP = os.environ.get("REQUIRE_MULTI_TP", os.environ.get("REJECT_SINGLE_TP", "false")).strip().lower() == "true"
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
 MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "10"))
+MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 
 SYMBOL_MAP = {}
 try:
@@ -54,11 +45,23 @@ except Exception:
 
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
-LIVE_PRICE_PATH = "/openApi/swap/v1/ticker/price"
 ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
+POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+BOOK_TICKER_PATH = "/openApi/swap/v2/quote/bookTicker"
+TICKER_PATH = "/openApi/swap/v2/quote/ticker"
+DEPTH_PATH = "/openApi/swap/v2/quote/depth"
+TRADES_PATH = "/openApi/swap/v2/quote/trades"
+PREMIUM_INDEX_PATH = "/openApi/swap/v2/quote/premiumIndex"
+OPEN_INTEREST_PATH = "/openApi/swap/v2/quote/openInterest"
+FUNDING_RATE_PATH = "/openApi/swap/v2/quote/fundingRate"
+BALANCE_PATH = "/openApi/swap/v3/user/balance"
+COMMISSION_RATE_PATH = "/openApi/swap/v2/user/commissionRate"
+INCOME_PATH = "/openApi/swap/v2/user/income"
+FORCE_ORDERS_PATH = "/openApi/swap/v2/trade/forceOrders"
+ALL_FILL_ORDERS_PATH = "/openApi/swap/v2/trade/allFillOrders"
 
 CACHE = {
     "ts": 0.0,
@@ -67,25 +70,22 @@ CACHE = {
 }
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
+_POSITION_MODE_CACHE: dict[str, Any] = {"ts": 0.0, "dual": None}
+_BOOK_TICKER_LOCK = threading.Lock()
+_LAST_BOOK_TICKER_TS = 0.0
+_RESEARCH_RATE_LOCK_GUARD = threading.Lock()
+_RESEARCH_RATE_LOCKS: dict[str, threading.Lock] = {}
+_RESEARCH_RATE_LAST_TS: dict[str, float] = {}
 
-# Live-price requests are used by the tracker and by execution sizing. A bad
-# symbol must never be allowed to fan out into repeated invalid requests that
-# trigger BingX's 109429 temporary restriction. Keep this protection local to
-# the current process; a fresh engine cycle re-validates the live endpoint.
-LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC", "900")))
-LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC = max(30.0, float(os.environ.get("BINGX_LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC", "900")))
-_LIVE_PRICE_INVALID_UNTIL: dict[str, float] = {}
-_LIVE_PRICE_COOLDOWN_UNTIL = 0.0
-
+# Requests Session is not used concurrently across scan worker threads.
+# Public scan requests get one Session per worker thread, each with a small bounded
+# connection pool. This avoids urllib3 "Connection pool is full" churn while still
+# keeping the public scan concurrent. Private/retryable requests use a dedicated
+# process-wide Session because those calls are serialized by the orchestration layer.
 SESSION = requests.Session()
-# Fast-fail session used by reconciliation/health-sensitive GETs. It deliberately
-# has no urllib3 retry adapter so a single stalled request cannot consume several
-# consecutive 10-second retry windows before the reconciliation loop can continue.
-FAST_SESSION = requests.Session()
-
-_adapter = HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20,
+_SESSION_ADAPTER = HTTPAdapter(
+    pool_connections=8,
+    pool_maxsize=8,
     max_retries=Retry(
         total=3,
         connect=3,
@@ -98,35 +98,105 @@ _adapter = HTTPAdapter(
         raise_on_status=False,
     ),
 )
-SESSION.mount("https://", _adapter)
-SESSION.mount("http://", _adapter)
+SESSION.mount("https://", _SESSION_ADAPTER)
+SESSION.mount("http://", _SESSION_ADAPTER)
+
+_FAST_LOCAL = threading.local()
+
+def _get_fast_session() -> requests.Session:
+    session = getattr(_FAST_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _FAST_LOCAL.session = session
+    return session
+
+
+def get_credentials() -> tuple[str, str]:
+    """Read private BingX credentials at call time, not only at module import."""
+    return os.environ.get("BINGX_API_KEY", "").strip(), os.environ.get("BINGX_SECRET_KEY", "").strip()
+
+
+def credentials_available() -> bool:
+    key, secret = get_credentials()
+    return bool(key and secret)
+
+def _canonical_params(params: dict[str, Any]) -> str:
+    """BingX canonical signing string: ASCII-sort keys; values are not URL encoded."""
+    return "&".join(f"{key}={params[key]}" for key in sorted(params))
+
+
+def _validate_signed_values(params: dict[str, Any]) -> None:
+    """Reject query-string metacharacters that could alter signed semantics."""
+    forbidden = re.compile(r"[&=?#\r\n]")
+    for key, value in params.items():
+        text = str(value)
+        if forbidden.search(text):
+            raise ValueError(f"parameter {key!r} contains forbidden query character")
+
+
+def _signed_query(params: dict[str, Any]) -> str:
+    """Build BingX's actual query string from the unencoded canonical params."""
+    canonical = _canonical_params(params)
+    needs_encoding = "[" in canonical or "{" in canonical
+    parts = []
+    for key in sorted(params):
+        value = str(params[key])
+        if needs_encoding:
+            value = quote(value, safe="-_.~")
+        parts.append(f"{key}={value}")
+    return "&".join(parts)
 
 
 def _sign(params: dict[str, Any]) -> str:
-    qs = urlencode(params)
-    return hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    _, secret_key = get_credentials()
+    canonical = _canonical_params(params)
+    return hmac.new(secret_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _apply_request_timestamp(params: dict[str, Any]) -> None:
+def _apply_request_timestamp(params: dict[str, Any]) -> str:
     params.pop("signature", None)
-    params["timestamp"] = str(int(time.time() * 1000) + SERVER_TIME_OFFSET_MS)
-    params["signature"] = _sign(params)
+    params["timestamp"] = int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
+    signature = _sign(params)
+    params["signature"] = signature
+    return signature
 
 
-def _update_server_time_offset(response: requests.Response) -> bool:
+def _update_server_time_offset(response: Any) -> bool:
+    """Synchronize the signing timestamp from the HTTP Date header.
+
+    BingX can reject signed requests when local clock drift exceeds the allowed
+    window. The request wrapper retries once after refreshing this offset.
+    """
     global SERVER_TIME_OFFSET_MS
-    date_header = response.headers.get("Date")
-    if not date_header:
-        return False
     try:
-        server_ms = int(parsedate_to_datetime(date_header).timestamp() * 1000)
-    except (TypeError, ValueError, OverflowError):
+        date_header = response.headers.get("Date") if response is not None else None
+        if not date_header:
+            return False
+        dt = parsedate_to_datetime(date_header)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        server_ms = int(dt.timestamp() * 1000)
+        local_ms = int(time.time() * 1000)
+        SERVER_TIME_OFFSET_MS = server_ms - local_ms
+        log.warning("[BINGX] Server time offset synchronized: %d ms", SERVER_TIME_OFFSET_MS)
+        return True
+    except Exception as exc:
+        log.warning("[BINGX] Failed to synchronize server time: %s", exc)
         return False
 
-    local_ms = int(time.time() * 1000)
-    SERVER_TIME_OFFSET_MS = server_ms - local_ms
-    log.warning("[BINGX] Time sync offset_ms=%d", SERVER_TIME_OFFSET_MS)
-    return True
+def _base_urls() -> list[str]:
+    primary = BASE_URL
+    if primary.endswith(".com"):
+        fallback = primary[:-4] + ".pro"
+        return [primary, fallback] if fallback != primary else [primary]
+    return [primary]
+
+
+def _is_network_error(exc: Exception) -> bool:
+    return isinstance(exc, (requests.Timeout, requests.ConnectionError))
 
 
 def _request(
@@ -144,48 +214,91 @@ def _request(
     except (TypeError, ValueError):
         request_timeout = 10.0
     request_timeout = max(1.0, min(request_timeout, 60.0))
-    session = SESSION if retryable else FAST_SESSION
-    headers = {}
-    max_timestamp_retries = 1 if signed else 0
+    session = SESSION if retryable else _get_fast_session()
 
-    if signed:
-        if not API_KEY or not SECRET_KEY:
+    try:
+        source_key_required = True
+        api_key, secret_key = get_credentials()
+        if signed and (not api_key or not secret_key):
             return {"code": -1, "msg": "missing BingX credentials"}
-        headers["X-BX-APIKEY"] = API_KEY
 
-    for attempt in range(max_timestamp_retries + 1):
-        request_params = dict(base_params)
-        if signed:
-            _apply_request_timestamp(request_params)
+        last_error: Exception | None = None
+        for base_url in _base_urls():
+            for attempt in range(2 if signed else 1):
+                request_params = dict(base_params)
+                headers = {"X-SOURCE-KEY": "BX-AI-SKILL"} if source_key_required else {}
+                if signed:
+                    _apply_request_timestamp(request_params)
+                    headers["X-BX-APIKEY"] = api_key
 
-        try:
-            response = session.request(
-                method=method,
-                url=BASE_URL + path,
-                params=request_params,
-                headers=headers,
-                timeout=request_timeout,
-            )
-            payload = response.json()
-        except Exception as exc:
-            return {"code": -1, "msg": str(exc)}
+                signature = str(request_params.get("signature", "")) if signed else ""
+                wire_params = dict(request_params)
 
-        try:
-            code = int(payload.get("code"))
-        except (TypeError, ValueError, AttributeError):
-            code = None
+                try:
+                    if method.upper() == "POST":
+                        # BingX expects the exact canonical parameter string in the
+                        # application/x-www-form-urlencoded POST body. Sending a dict
+                        # lets requests rebuild/encode the body independently, which
+                        # can produce a different byte representation from the string
+                        # that was signed. Send the signed canonical string verbatim.
+                        if signed:
+                            canonical = _canonical_params({k: v for k, v in request_params.items() if k != "signature"})
+                            body = f"{canonical}&signature={signature}"
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
+                        else:
+                            body = urlencode(wire_params, doseq=False)
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
+                        response = session.request(
+                            method=method,
+                            url=base_url + path,
+                            data=body,
+                            headers=headers,
+                            timeout=request_timeout,
+                        )
+                    else:
+                        if signed:
+                            _validate_signed_values({k: v for k, v in request_params.items() if k != "signature"})
+                            query = _signed_query({k: v for k, v in request_params.items() if k != "signature"})
+                            query = f"{query}&signature={signature}"
+                            url = f"{base_url + path}?{query}"
+                            request_kwargs = {"method": method, "url": url, "headers": headers, "timeout": request_timeout}
+                        else:
+                            request_kwargs = {"method": method, "url": base_url + path, "params": wire_params, "headers": headers, "timeout": request_timeout}
+                        response = session.request(**request_kwargs)
+                    payload = response.json()
+                except Exception as exc:
+                    last_error = exc
+                    # NEVER resend a non-idempotent POST after a transport error.
+                    # The exchange may have accepted the order while the response
+                    # was lost; sending the same MARKET/STOP/TP POST to another
+                    # endpoint can create a duplicate order. GET/DELETE remain
+                    # eligible for the endpoint fallback.
+                    if retryable and _is_network_error(exc) and method.upper() != "POST" and base_url != _base_urls()[-1]:
+                        log.warning("[BINGX] Network failure on %s; trying fallback domain: %s", base_url, _safe_exception_message(exc))
+                        break
+                    return {"code": -1, "msg": _safe_exception_message(exc)}
 
-        if signed and code == 109400 and attempt < max_timestamp_retries and _update_server_time_offset(response):
-            continue
+                try:
+                    code = int(payload.get("code"))
+                except (TypeError, ValueError, AttributeError):
+                    code = None
 
-        return payload
+                # Keep one timestamp retry for signed requests after syncing from
+                # the server's Date header.
+                if signed and code == 109400 and attempt == 0:
+                    if _update_server_time_offset(response):
+                        continue
 
-    return {"code": -1, "msg": "request retry exhausted"}
+                return payload
 
+        return {"code": -1, "msg": str(last_error) if last_error else "request failed"}
+    except Exception as exc:
+        log.exception("[BINGX] Request wrapper failure: %s %s", method, path)
+        return {"code": -1, "msg": _safe_exception_message(exc)}
 
 def refresh_contracts() -> dict[str, Any]:
     resp = _request("GET", CONTRACTS_PATH, signed=False)
-    if resp.get("code") not in (0, "0"):
+    if resp.get("code") != 0:
         raise RuntimeError(f"[BINGX] Contracts error: {resp.get('msg')}")
 
     data = {}
@@ -200,51 +313,49 @@ def refresh_contracts() -> dict[str, Any]:
             by_name[name] = c
 
     CACHE.update(ts=time.time(), data=data, by_display_name=by_name)
-    log.info("[BINGX] Active contracts=%d", len(data))
+    log.debug("[BINGX] Active contracts=%d", len(data))
     return data
 
 
-def contracts(*, require_fresh: bool = False) -> dict[str, dict]:
-    cache_fresh = bool(CACHE["data"]) and time.time() - CACHE["ts"] < TTL
-    if cache_fresh and not require_fresh:
+def contracts() -> dict[str, dict]:
+    if CACHE["data"] and time.time() - CACHE["ts"] < TTL:
         return CACHE["data"]
     try:
         return refresh_contracts()
-    except Exception:
-        return {} if require_fresh else CACHE["data"]
+    except Exception as exc:
+        log.error("[BINGX] contracts fetch failed: %s", exc)
+        return CACHE["data"]
 
 
-def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
+def get_contract(symbol: str) -> dict | None:
     s = (symbol or "").strip().upper()
     if not s:
         return None
 
-    catalog = contracts(require_fresh=require_fresh)
     mapped = SYMBOL_MAP.get(s)
     if mapped:
-        c = catalog.get(str(mapped).strip().upper())
+        c = contracts().get(str(mapped).strip().upper())
         if c:
             return c
 
     direct = s if s.endswith("-USDT") else f"{s.replace('-', '')}-USDT"
-    c = catalog.get(direct)
+    c = contracts().get(direct)
     if c:
         return c
 
     base = s.replace("-USDT", "").replace("-", "")
-    for c in catalog.values():
+    for c in CACHE["data"].values():
         cs = str(c.get("symbol", "")).upper()
         if cs == f"{base}-USDT" or cs == base:
             return c
 
     norm_base = base.replace("-", "").replace("/", "").replace(" ", "")
-    for c in catalog.values():
+    for c in CACHE["data"].values():
         name = str(c.get("displayName", "")).upper().replace("-", "").replace("/", "").replace(" ", "")
         if name == f"{norm_base}USDT" or name == norm_base:
             return c
 
-    return {str(c.get("displayName", "")).strip().upper(): c for c in catalog.values() if c.get("displayName")}.get(f"{base}-USDT")
-
+    return CACHE["by_display_name"].get(f"{base}-USDT")
 
 
 def to_bx_symbol(symbol: str) -> str | None:
@@ -256,11 +367,7 @@ def to_bx_symbol(symbol: str) -> str | None:
 
 def contract_exists(symbol: str) -> bool:
     c = get_contract(symbol)
-    if not isinstance(c, dict):
-        return False
-    status_ok = str(c.get("status", "")).strip() in {"1", "1.0"}
-    api_open = str(c.get("apiStateOpen", "")).strip().lower() == "true"
-    return bool(status_ok and api_open)
+    return bool(c and c.get("status") == 1 and str(c.get("apiStateOpen", "")).lower() == "true")
 
 
 def fetch_klines(
@@ -285,36 +392,7 @@ def fetch_klines(
     )
     code = resp.get("code")
     if code not in (0, "0"):
-        msg = str(resp.get("msg") or "")
-        try:
-            code_int = int(code)
-        except (TypeError, ValueError):
-            code_int = None
-
-        # BingX Kline limits can surface as a 109429 wrapper whose message
-        # contains the backend 109415 counter (for example, ">5 ... requests
-        # within 900000 ms"). Treat both forms as a hard cooldown condition.
-        rate_limited = (
-            code_int == 109429
-            or ("109415" in msg and "requests within" in msg.lower())
-        )
-        if rate_limited:
-            import re
-
-            retry_after_ms = None
-            match = re.search(r"retry\s+after\s+time\s*:\s*(\d{13})", msg, flags=re.IGNORECASE)
-            if match:
-                try:
-                    retry_after_ms = int(match.group(1))
-                except (TypeError, ValueError):
-                    retry_after_ms = None
-            raise BingXRateLimitError(
-                f"[BINGX] Klines rate limited {bx}/{interval}: code={code} msg={msg}",
-                code=code_int if code_int is not None else code,
-                retry_after_ms=retry_after_ms,
-            )
-
-        raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={msg}")
+        raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={resp.get('msg')}")
 
     rows = resp.get("data") or []
     out: list[dict] = []
@@ -386,6 +464,7 @@ def fetch_klines(
 
         out.append(
             {
+                "timestamp": open_time,
                 "open_time": open_time,
                 "close_time": close_time,
                 "open": open_price,
@@ -415,14 +494,49 @@ def fetch_klines(
     return deduped
 
 
-def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> bool:
-    d = direction.upper() if direction else "LONG"
-    sides = (d, "BOTH") if d in {"LONG", "SHORT"} else ("BOTH",)
+def get_position_mode(*, force_refresh: bool = False, timeout_sec: float | None = None) -> str:
+    """Return BingX position mode: HEDGE or ONE_WAY. Never guess on API failure."""
+    override = os.environ.get("BINGX_POSITION_MODE", "").strip().upper()
+    if override in {"HEDGE", "ONE_WAY"} and os.environ.get("BINGX_POSITION_MODE_OVERRIDE", "false").strip().lower() == "true":
+        return override
 
-    for side in sides:
-        resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
-        if resp.get("code") in (0, "0"):
-            return True
+    now = time.time()
+    cached = _POSITION_MODE_CACHE.get("dual")
+    if not force_refresh and cached in (True, False) and now - float(_POSITION_MODE_CACHE.get("ts", 0.0)) < 300:
+        return "HEDGE" if cached else "ONE_WAY"
+
+    resp = _request("GET", POSITION_MODE_PATH, {}, signed=True, timeout_sec=timeout_sec, retryable=False)
+    if resp.get("code") != 0:
+        raise RuntimeError(f"position mode query failed: code={resp.get('code')} msg={resp.get('msg')}")
+    data = resp.get("data") or {}
+    dual = data.get("dualSidePosition")
+    if isinstance(dual, str):
+        dual = dual.strip().lower() == "true"
+    if not isinstance(dual, bool):
+        raise RuntimeError(f"position mode response missing dualSidePosition: {data}")
+    _POSITION_MODE_CACHE.update({"ts": now, "dual": dual})
+    mode = "HEDGE" if dual else "ONE_WAY"
+    log.debug("[BINGX] Position mode=%s", mode)
+    return mode
+
+
+def position_side_param(direction: str, *, force_refresh: bool = False) -> str:
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(f"invalid direction={direction}")
+    return direction if get_position_mode(force_refresh=force_refresh) == "HEDGE" else "BOTH"
+
+
+def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> bool:
+    try:
+        side = position_side_param(direction)
+    except Exception as exc:
+        log.error("[BINGX] Cannot determine position mode before leverage: %s", exc)
+        return False
+    resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
+    if resp.get("code") == 0:
+        return True
+    log.error("[BINGX] Leverage failed: side=%s code=%s msg=%s", side, resp.get("code"), resp.get("msg"))
     return False
 
 
@@ -449,83 +563,157 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") not in (0, "0"):
+    if resp.get("code") != 0:
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
     return _normalize_orders_list(resp)
 
 
-def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
+def get_order(
+    symbol: str,
+    order_id: str | int | None = None,
+    *,
+    client_order_id: str | None = None,
+) -> dict:
+    """Query an order by system orderId or exchange-supported clientOrderId."""
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
-    if order_id is None and not client_order_id:
-        return {"status": "error", "error": "order identifier required"}
+    if order_id in (None, "") and client_order_id in (None, ""):
+        return {"status": "error", "error": "order_id_or_client_order_id_required"}
 
-    params = {"symbol": bx}
-    if order_id is not None:
-        params["orderId"] = str(order_id)
-    else:
+    params: dict[str, Any] = {"symbol": bx}
+    if client_order_id not in (None, ""):
         params["clientOrderId"] = str(client_order_id)
+    else:
+        params["orderId"] = str(order_id)
 
-    resp = _request("GET", ORDER_PATH, params, signed=True, retryable=False)
-    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": resp.get("msg") if isinstance(resp, dict) else str(resp), "code": resp.get("code") if isinstance(resp, dict) else None}
+    resp = _request("GET", ORDER_PATH, params, signed=True)
+    if resp.get("code") != 0:
+        return {"status": "error", "error": resp.get("msg"), "code": resp.get("code")}
 
     data = resp.get("data") or {}
     order = data.get("order") or data
     if not isinstance(order, dict):
-        return {"status": "error", "error": "order response missing order object", "code": resp.get("code")}
+        return {"status": "error", "error": "order_payload_missing"}
 
-    def _first_float(*keys: str) -> float:
-        for key in keys:
-            raw = order.get(key)
-            if raw in (None, ""):
-                continue
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value):
-                return value
-        return 0.0
-
-    def _first_positive_float(*keys: str) -> float:
-        for key in keys:
-            raw = order.get(key)
-            if raw in (None, ""):
-                continue
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value) and value > 0:
-                return value
-        return 0.0
-
-    executed_qty = _first_positive_float("executedQty", "cumQty", "stopExecutedQty", "executedQuantity", "cumulatedQuantity")
-    avg_price = _first_positive_float("avgPrice", "avgFillPrice", "fillAvgPrice", "averagePrice", "executedAvgPrice")
-    trigger_price = _first_float("stopPrice", "triggerPrice", "activationPrice")
-    orig_qty = _first_positive_float("origQty", "quantity", "qty")
+    def _num(key: str, fallback: str | None = None) -> float:
+        raw = order.get(key)
+        if raw in (None, "") and fallback:
+            raw = order.get(fallback)
+        try:
+            value = float(raw) if raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
 
     return {
         "status": "ok",
-        "order_id": str(order.get("orderId") or order.get("orderID") or order_id or ""),
+        "order_id": str(order.get("orderID") or order.get("orderId") or order_id or ""),
         "order_status": str(order.get("status", "")).upper(),
-        "avg_price": avg_price,
-        "trigger_price": trigger_price,
-        "executed_qty": executed_qty,
-        "orig_qty": orig_qty,
-        "client_order_id": str(order.get("clientOrderId", "")),
-        "raw_order": order,
+        "symbol": str(order.get("symbol", bx)).upper(),
+        "side": str(order.get("side", "")).upper(),
+        "position_side": str(order.get("positionSide", "")).upper(),
+        "order_type": str(order.get("type", "")).upper(),
+        "avg_price": _num("avgPrice"),
+        "trigger_price": _num("stopPrice"),
+        "executed_qty": _num("executedQty", "cumQty"),
+        "orig_qty": _num("origQty", "quantity"),
+        "client_order_id": str(order.get("clientOrderId", client_order_id or "")),
+        "time_ms": int(_num("time")) if _num("time") > 0 else None,
+        "update_time_ms": int(_num("updateTime")) if _num("updateTime") > 0 else None,
     }
 
 
-def get_order(symbol: str, order_id: str | int) -> dict:
-    return _query_order(symbol, order_id=order_id)
+def get_fill_orders(
+    symbol: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    *,
+    order_id: str | int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Return exchange-confirmed perpetual-swap fills in a time window.
 
+    Unlike an order-status response, fill history is actual execution evidence and
+    contains per-fill quantity/price/realized-PnL/fee fields.  The tracker uses this
+    endpoint only as a reconciliation path, never as an entry gate.
+    """
+    # Unit tests and offline tooling must not accidentally perform private I/O.
+    # Check credentials before contract resolution because to_bx_symbol() may itself
+    # refresh the contracts cache over the network.
+    if not credentials_available():
+        return []
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return []
+    start_ms = max(0, int(start_time_ms))
+    end_ms = max(start_ms, int(end_time_ms))
+    params: dict[str, Any] = {
+        "tradingUnit": "CONT",
+        "startTs": start_ms,
+        "endTs": end_ms,
+        "currency": "USDT",
+    }
+    if order_id not in (None, ""):
+        params["orderId"] = str(order_id)
+    resp = _request(
+        "GET",
+        ALL_FILL_ORDERS_PATH,
+        params,
+        signed=True,
+        timeout_sec=min(5.0, float(os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5"))),
+        retryable=False,
+    )
+    if not isinstance(resp, dict):
+        raise RuntimeError("allFillOrders returned invalid response")
+    try:
+        response_code = int(resp.get("code", -1))
+    except (TypeError, ValueError):
+        response_code = -1
+    if response_code != 0:
+        raise RuntimeError(f"allFillOrders failed: code={response_code} msg={resp.get('msg')}")
+    raw = resp.get("data")
+    if isinstance(raw, dict):
+        for key in ("rows", "list", "items", "data"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        return []
 
-def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
-    return _query_order(symbol, client_order_id=client_order_id)
+    out: list[dict] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        item: dict[str, Any] = {}
+        for src, dst in (
+            ("tradeId", "trade_id"),
+            ("orderId", "order_id"),
+            ("orderID", "order_id"),
+            ("symbol", "symbol"),
+            ("side", "side"),
+            ("positionSide", "position_side"),
+        ):
+            if row.get(src) not in (None, "") and dst not in item:
+                item[dst] = str(row.get(src))
+        for src, dst in (
+            ("price", "price"),
+            ("qty", "qty"),
+            ("realizedPnl", "realized_pnl"),
+            ("fee", "fee"),
+            ("time", "time_ms"),
+        ):
+            if row.get(src) in (None, ""):
+                continue
+            try:
+                val = float(row.get(src))
+                if dst == "time_ms":
+                    val = int(val)
+                item[dst] = val if math.isfinite(float(val)) else None
+            except (TypeError, ValueError):
+                item[dst] = None
+        out.append(item)
+    return out
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
@@ -535,6 +723,66 @@ def cancel_order(symbol: str, order_id: str | int) -> dict:
 
     return _request("DELETE", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
 
+
+
+def get_all_orders(
+    symbol: str,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Fetch recent historical orders used for deterministic exit reconciliation."""
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return []
+    params: dict[str, Any] = {"symbol": bx, "limit": min(max(int(limit), 1), 100)}
+    if start_time_ms is not None:
+        params["startTime"] = int(start_time_ms)
+    if end_time_ms is not None:
+        params["endTime"] = int(end_time_ms)
+    resp = _request("GET", "/openApi/swap/v2/trade/allOrders", params, signed=True)
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return []
+    return _normalize_orders_list(resp)
+
+
+def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None, attempt_id: str | None = None) -> dict:
+    """Close an existing directional position with a MARKET order. Used only as
+    a safety rollback when mandatory protection cannot be established."""
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction}"}
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found"}
+    contract = get_contract(symbol) or {}
+    try:
+        prec = int(contract.get("quantityPrecision") or 0)
+    except (TypeError, ValueError):
+        prec = 0
+    close_qty = _round_qty(abs(float(qty)), prec)
+    if close_qty <= 0:
+        return {"status": "error", "error": "invalid close quantity", "qty": close_qty}
+
+    position_side = position_side_param(direction)
+    params = {
+        "symbol": bx,
+        "side": "SELL" if direction == "LONG" else "BUY",
+        "positionSide": position_side,
+        "type": "MARKET",
+        "quantity": _format_qty(close_qty, prec),
+    }
+    # BingX hedge mode rejects reduceOnly. It is only valid/needed in ONE-WAY
+    # (positionSide=BOTH).
+    if position_side == "BOTH" and reduce_only:
+        params["reduceOnly"] = "true"
+    if trade_id:
+        nonce = str(attempt_id or uuid.uuid4().hex).upper()[:12]
+        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_RB_{nonce}"[:40]
+    resp = _request("POST", ORDER_PATH, params)
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return {"status": "error", "error": f"close failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}", "response": resp}
+    return {"status": "closed", "symbol": bx, "direction": direction, "qty": close_qty, "response": resp}
 
 def has_open_position(symbol: str, direction: str) -> bool:
     bx = to_bx_symbol(symbol)
@@ -562,17 +810,47 @@ def _trade_digest(trade_id: str) -> str:
     return hashlib.sha256(str(trade_id).upper().encode()).hexdigest().upper()[:16]
 
 
-def _new_open_client_order_id(bx_symbol: str, trade_id: str, retry_index: int = 0) -> str:
-    # BingX clientOrderId is constrained to alphanumeric identifiers.
-    # The first attempt keeps the historical deterministic ID; a retry is a
-    # distinct deterministic ID so a confirmed CANCELED/EXPIRED order is never
-    # reused as a new order.
-    suffix = "" if retry_index <= 0 else f":RETRY:{int(retry_index)}"
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}{suffix}".encode()).hexdigest().upper()[:24]
-    return f"EVTOPEN{digest}"
+def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
+    """Return one deterministic clientOrderId for one logical entry event.
+
+    BingX requires clientOrderId to be unique per order and supports querying an
+    order by this ID. A deterministic ID lets a retry/concurrent worker refer to
+    the same logical order instead of manufacturing a second identity.
+    """
+    raw = f"{bx_symbol.upper()}:{trade_id}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
+    return f"EVT_OPEN_{digest}"[:40]
 
 
-def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
+def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
+    """Resolve an ambiguous order POST without issuing a duplicate order."""
+    try:
+        orders = get_all_orders(
+            symbol,
+            start_time_ms=max(0, int(time.time() * 1000) - int(lookback_ms)),
+            end_time_ms=int(time.time() * 1000) + 5_000,
+            limit=100,
+        )
+    except Exception:
+        return None
+    target = str(client_order_id).upper()
+    for order in orders:
+        if str(order.get("clientOrderId", "")).upper() == target:
+            return order
+    return None
+
+
+def _signal_price_displacement_pct(signal_price: float, executable_price: float) -> tuple[float, str]:
+    """Absolute signal-to-executable movement, independent of direction."""
+    if signal_price <= 0 or executable_price <= 0:
+        return float("inf"), "UNKNOWN"
+    delta_pct = (executable_price - signal_price) / signal_price * 100.0
+    if abs(delta_pct) <= 1e-12:
+        return 0.0, "UNCHANGED"
+    return abs(delta_pct), "UP" if delta_pct > 0 else "DOWN"
+
+
+def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None, attempt_id: str | None = None) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -594,94 +872,215 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     try:
         prec = int(c.get("quantityPrecision") or 0)
         min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
-        min_usdt = float(c.get("tradeMinUSDT") or c.get("minNotional") or c.get("minSizeUsd") or 0)
+        mult = float(c.get("multiplier") or 1)
         max_lev = int(c.get("maxShortLeverage" if direction == "SHORT" else "maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
-    sizing_price = _current_close_price(symbol)
-    if sizing_price is None or sizing_price <= 0:
-        return {"status": "error", "error": "live sizing price unavailable", "symbol": bx}
-
+    # Do not use an early quote for sizing or admission. The only quote that can
+    # authorize the MARKET order is the final venue quote captured immediately
+    # before the final drift/freshness checks below. This avoids stale preflight
+    # quotes becoming an accidental execution reference.
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
-    # Swap order quantity is expressed in the base coin. Contract ``size`` is
-    # informational here; do not multiply quantity by undocumented legacy fields.
-    target_notional_usdt = MARGIN_USDT * leverage
-    qty = target_notional_usdt / max(sizing_price, 1e-12)
-    q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-    qty = float(q)
-
-    # TP count is selected after the confirmed fill from the actual position
-    # quantity. Do not reject a valid market entry merely because the position
-    # cannot support the full TP ladder. The protection layer will choose the
-    # largest executable profile: 3 legs when possible, otherwise 2, otherwise
-    # one terminal TP3 leg.
-
-    if qty <= 0 or qty < min_qty:
-        return {
-            "status": "error",
-            "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "leverage": leverage, "sizing_price": sizing_price,
-        }
-
-    notional_usdt = qty * sizing_price
-    if min_usdt > 0 and notional_usdt + 1e-12 < min_usdt:
-        return {
-            "status": "error",
-            "error": f"notional={notional_usdt:.8g} < min_notional={min_usdt:.8g} at configured leverage={leverage}",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "min_notional": min_usdt, "notional_usdt": notional_usdt,
-            "leverage": leverage, "sizing_price": sizing_price,
-        }
-
-    if not _set_leverage(bx, leverage, direction):
-        return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
 
     side = "BUY" if direction == "LONG" else "SELL"
+    try:
+        position_side = position_side_param(direction)
+    except Exception as exc:
+        return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
+
+    # Exchange-side idempotency guard: if another worker already submitted this
+    # logical event, resolve its existing order instead of placing a second one.
+    try:
+        existing_order = get_order(symbol, client_order_id=client_order_id)
+    except Exception:
+        existing_order = {"status": "error"}
+    if existing_order.get("status") == "ok":
+        same_order = (
+            existing_order.get("symbol", bx) == bx
+            and existing_order.get("side", "") == side
+            and existing_order.get("order_type", "") == "MARKET"
+            and existing_order.get("position_side", position_side) == position_side
+        )
+        if same_order:
+            order_status = str(existing_order.get("order_status", "")).upper()
+            if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                return {
+                    "status": "opened",
+                    "symbol": bx,
+                    "qty": None,
+                    "leverage": leverage,
+                    "sizing_price": None,
+                    "signal_price": float(price),
+                    "order_reference_price": None,
+                    "order_id": existing_order.get("order_id"),
+                    "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "idempotency": "existing_client_order_resolved_before_post",
+                    "response": {"code": 0, "data": existing_order},
+                    "execution_quote": execution_quote,
+                }
+            if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                return {
+                    "status": "error",
+                    "symbol": bx,
+                    "error": f"clientOrderId already used by terminal exchange order status={order_status}; refusing reuse",
+                    "order_id": existing_order.get("order_id"),
+                    "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "idempotency": "terminal_client_order_prevents_reuse",
+                    "response": {"code": 0, "data": existing_order},
+                    "execution_quote": execution_quote,
+                }
+
+
+    # Final venue quote is deliberately obtained after position-mode/idempotency
+    # REST calls and before the leverage mutation. This is the quote used for final
+    # sizing and signal-drift validation.
+    final_quote = get_execution_quote(symbol, reference_price=price)
+    if final_quote.get("status") != "ok":
+        return {"status": "error", "error": final_quote.get("error", "final execution quote unavailable"), "symbol": bx}
+    try:
+        max_quote_age = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
+    except (TypeError, ValueError):
+        max_quote_age = 2.0
+    fresh, local_age, exchange_age, freshness_source = _quote_freshness(final_quote, max_quote_age)
+    if exchange_age is None and (_require_exchange_quote_timestamp() or _unknown_exchange_quote_age_policy() == "block"):
+        return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp", "symbol": bx, "execution_quote": final_quote}
+    final_quote["quote_local_age_sec"] = local_age
+    final_quote["quote_exchange_age_sec"] = exchange_age
+    final_quote["quote_freshness_source"] = freshness_source
+    if not fresh:
+        return {"status": "skipped_stale_signal", "error": f"execution_quote_stale local_age={local_age} exchange_age={exchange_age} limit={max_quote_age}", "symbol": bx, "execution_quote": final_quote}
+    bid = float(final_quote["bid"])
+    ask = float(final_quote["ask"])
+    sizing_price = ask if direction == "LONG" else bid
+    if sizing_price <= 0 or float(price) <= 0:
+        return {"status": "error", "error": "invalid final execution price", "symbol": bx, "execution_quote": final_quote}
+    try:
+        max_entry_slippage_pct = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
+    except (TypeError, ValueError):
+        max_entry_slippage_pct = 1.0
+    signal_drift_pct = (
+        max(0.0, (sizing_price - float(price)) / float(price) * 100.0)
+        if direction == "LONG"
+        else max(0.0, (float(price) - sizing_price) / float(price) * 100.0)
+        if direction == "SHORT"
+        else float("inf")
+    )
+    signal_price_displacement_pct, signal_price_displacement_direction = _signal_price_displacement_pct(float(price), sizing_price)
+    if signal_price_displacement_pct > MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:
+        return {
+            "status": "skipped_stale_signal",
+            "error": (
+                f"signal_price_displacement_pct={signal_price_displacement_pct:.4f}% "
+                f"> {MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:.4f}% direction={signal_price_displacement_direction}; "
+                f"signal_drift_pct={signal_drift_pct:.4f}%"
+            ),
+            "symbol": bx,
+            "execution_quote": final_quote,
+            "signal_drift_pct": signal_drift_pct,
+            "signal_price_displacement_pct": signal_price_displacement_pct,
+            "signal_price_displacement_direction": signal_price_displacement_direction,
+            "signal_price_displacement_limit_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
+            "signal_price": float(price),
+            "execution_reference_price": sizing_price,
+        }
+    if signal_drift_pct > max_entry_slippage_pct:
+        return {"status": "skipped_stale_signal", "error": f"signal_drift_pct={signal_drift_pct:.4f}% > {max_entry_slippage_pct:.4f}% at final order gate", "symbol": bx, "execution_quote": final_quote, "signal_drift_pct": signal_drift_pct, "signal_price": float(price), "execution_reference_price": sizing_price}
+
+    # Recompute quantity from the final quote, not from a quote captured before leverage/idempotency calls.
+    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
+    q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+    qty = float(q)
+    if qty <= 0:
+        return {"status": "error", "error": "calculated quantity is <= 0", "symbol": bx, "qty": qty, "min_qty": min_qty, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+    if min_qty > 0 and qty < min_qty:
+        required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
+        return {"status": "skipped_min_qty", "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}", "reason": "exchange_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+    if min_qty > 0 and qty < (2.0 * min_qty):
+        required_margin = (2.0 * min_qty * sizing_price * mult) / max(leverage, 1)
+        return {"status": "skipped_tp_min_qty", "error": f"qty={qty} cannot support 2 TP legs with min_qty={min_qty}", "reason": "tp_two_leg_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+
+    # Only change leverage after the final executable quote has passed all admission
+    # checks. The final micro-freshness check below covers the small REST delay from
+    # this call to the MARKET POST.
+    if not _set_leverage(bx, leverage, direction):
+        return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage, "execution_quote": final_quote}
+
+    execution_quote = final_quote
+
 
     params = {
         "symbol": bx,
         "side": side,
-        "positionSide": direction,
+        "positionSide": position_side,
         "type": "MARKET",
         "quantity": f"{qty:.{prec}f}",
         "clientOrderId": client_order_id,
     }
 
-    # A confirmed CANCELED/EXPIRED order is no longer active and BingX forbids
-    # reusing its clientOrderId. One deterministic fresh-ID retry is safe.
-    # NEW/unknown or failed lookup states remain UNKNOWN and are never blindly
-    # retried from inside this call.
-    for open_attempt in range(2):
-        response = _request("POST", ORDER_PATH, params)
+    # Last micro-check immediately before the network POST. This prevents a slow Python/network
+    # path from turning a freshly-read quote into a stale order reference.
+    fresh_now, local_age_now, exchange_age_now, freshness_source_now = _quote_freshness(execution_quote, max_quote_age)
+    if exchange_age_now is None and (_require_exchange_quote_timestamp() or _unknown_exchange_quote_age_policy() == "block"):
+        return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp_at_post", "symbol": bx, "execution_quote": execution_quote}
+    execution_quote["quote_local_age_sec_at_post"] = local_age_now
+    execution_quote["quote_exchange_age_sec_at_post"] = exchange_age_now
+    execution_quote["quote_freshness_source_at_post"] = freshness_source_now
+    if not fresh_now:
+        return {"status": "skipped_stale_signal", "error": f"execution_quote_stale_at_post local_age={local_age_now} exchange_age={exchange_age_now} limit={max_quote_age}", "symbol": bx, "execution_quote": execution_quote}
 
-        if isinstance(response, dict) and response.get("code") not in (0, "0"):
-            # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
-            # the outcome unknown -- the order may have been created even though we
-            # did not receive an ack. Never blindly retry a POST; verify the result
-            # via the position instead. The pre-flight has_open_position check above
-            # guarantees any position present now was opened by THIS order.
-            transport_error = (
-                response.get("code") == -1
-                and "missing bingx credentials" not in str(response.get("msg", "")).lower()
-            )
-            if transport_error:
-                log.warning("[BINGX] Order POST transport error for %s (%s); querying clientOrderId before retry/reconciliation...", bx, response.get("msg"))
-                try:
-                    queried = get_order_by_client_order_id(symbol, client_order_id)
-                except Exception as exc:
-                    queried = {"status": "error", "error": str(exc)}
+    # Preserve the exact venue quote that passed the final pre-POST freshness/drift
+    # gate. Do not write telemetry here: filesystem I/O between the final gate and
+    # MARKET POST would itself add avoidable execution latency.
+    execution_quote["execution_reference_price"] = sizing_price
+    execution_quote["signal_drift_pct"] = signal_drift_pct
 
-                if queried.get("status") == "ok":
-                    order_status = str(queried.get("order_status", "")).upper()
-                    executed_qty = float(queried.get("executed_qty", 0) or 0)
-                    if executed_qty > 0 or order_status in {"FILLED", "PARTIALLY_FILLED"}:
-                        log.warning(
-                            "[BINGX] Order %s found after transport error with status=%s executed_qty=%s; treating entry as accepted.",
-                            client_order_id, order_status, executed_qty,
-                        )
+    order_submit_at_ms = int(time.time() * 1000)
+    execution_quote["order_submit_at_ms"] = order_submit_at_ms
+    response = _request("POST", ORDER_PATH, params)
+
+    # Persist the authoritative pre-POST quote immediately after the POST attempt,
+    # with the actual submit timestamp. Telemetry remains best-effort and cannot
+    # influence order admission, submission, or reconciliation.
+    try:
+        telemetry.record_quote_snapshot(
+            event_id=trade_id,
+            attempt_id=attempt_id,
+            symbol=symbol,
+            direction=direction,
+            quote=execution_quote,
+            signal_price=float(price),
+            stage="FINAL_PRE_POST",
+        )
+    except Exception:
+        pass
+    log.info("[BINGX] OPEN order response: symbol=%s direction=%s positionSide=%s code=%s msg=%s", bx, direction, position_side, response.get("code") if isinstance(response, dict) else None, response.get("msg") if isinstance(response, dict) else None)
+
+    if isinstance(response, dict) and response.get("code") != 0:
+        # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
+        # the outcome unknown -- the order may have been created even though we
+        # did not receive an ack. Never blindly retry a POST; verify the result
+        # via the position instead. The pre-flight has_open_position check above
+        # guarantees any position present now was opened by THIS order.
+        transport_error = (
+            response.get("code") == -1
+            and "missing bingx credentials" not in str(response.get("msg", "")).lower()
+        )
+        if transport_error:
+            log.warning("[BINGX] Order POST transport error for %s (%s); reconciling clientOrderId before using position state...", bx, response.get("msg"))
+            resolved_order = get_order(symbol, client_order_id=client_order_id)
+            if resolved_order.get("status") == "ok":
+                same_order = (
+                    resolved_order.get("symbol", bx) == bx
+                    and resolved_order.get("side", "") == side
+                    and resolved_order.get("order_type", "") == "MARKET"
+                    and resolved_order.get("position_side", position_side) == position_side
+                )
+                if same_order:
+                    order_status = str(resolved_order.get("order_status", "")).upper()
+                    if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                        log.warning("[BINGX] Matching active/filled clientOrderId found after transport error; treating MARKET order as resolved.")
                         return {
                             "status": "opened",
                             "symbol": bx,
@@ -690,366 +1089,85 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                             "sizing_price": sizing_price,
                             "signal_price": float(price),
                             "order_reference_price": sizing_price,
-                            "order_id": queried.get("order_id"),
-                            "client_order_id": client_order_id,
-                            "idempotency": "order_queried_after_transport_error",
-                            "order_status": order_status,
-                            "executed_qty": executed_qty,
+                            "order_id": resolved_order.get("order_id"),
+                            "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                            "idempotency": "client_order_id_verified_after_transport_error",
                             "response": response,
+                            "execution_quote": execution_quote,
+                            "order_submit_at_ms": order_submit_at_ms,
+                            "historical_order": resolved_order,
                         }
-                    if order_status in {"CANCELED", "EXPIRED"}:
-                        if open_attempt == 0:
-                            retry_client_order_id = _new_open_client_order_id(bx, trade_id, retry_index=1)
-                            log.warning(
-                                "[BINGX] Entry order %s is %s after transport error; retrying once with fresh clientOrderId=%s.",
-                                client_order_id, order_status, retry_client_order_id,
-                            )
-                            client_order_id = retry_client_order_id
-                            params["clientOrderId"] = client_order_id
-                            continue
+                    if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
                         return {
                             "status": "error",
-                            "error": f"market entry retry order {client_order_id} is {order_status} after transport error",
-                            "symbol": bx, "clientOrderId": client_order_id,
-                            "order_id": queried.get("order_id"),
-                            "order_status": order_status,
-                            "retry_exhausted": True,
-                            "response": response,
-                        }
-                    # NEW/unknown exchange states are not safe to retry inside this call.
-                    return {
-                        "status": "unknown",
-                        "error": f"market order outcome remains pending after transport error: status={order_status or 'unknown'}",
-                        "symbol": bx, "clientOrderId": client_order_id,
-                        "order_id": queried.get("order_id"),
-                        "order_status": order_status,
-                        "response": response,
-                    }
-
-                try:
-                    if has_open_position(symbol, direction):
-                        log.warning("[BINGX] Position found after transport error; treating deterministic clientOrderId entry as accepted.")
-                        return {
-                            "status": "opened",
                             "symbol": bx,
-                            "qty": qty,
-                            "leverage": leverage,
-                            "sizing_price": sizing_price,
-                            "signal_price": float(price),
-                            "order_reference_price": sizing_price,
-                            "order_id": None,
-                            "client_order_id": client_order_id,
-                            "idempotency": "position_verified_after_transport_error",
+                            "error": f"clientOrderId already used by terminal exchange order status={order_status}; refusing reuse",
+                            "order_id": resolved_order.get("order_id"),
+                            "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                            "idempotency": "terminal_client_order_prevents_reuse",
                             "response": response,
+                            "execution_quote": execution_quote,
+                            "historical_order": resolved_order,
                         }
-                except Exception as exc:
-                    log.error("[BINGX] Post-error position verification failed: %s", exc)
-
+            historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
+            if historical_order is not None:
+                log.warning("[BINGX] Matching historical clientOrderId found after transport error; treating MARKET order as resolved.")
                 return {
-                    "status": "unknown",
-                    "error": f"market order outcome unknown after transport error: {response.get('msg', '')}",
-                    "symbol": bx, "clientOrderId": client_order_id,
+                    "status": "opened",
+                    "symbol": bx,
+                    "qty": qty,
+                    "leverage": leverage,
+                    "sizing_price": sizing_price,
+                    "signal_price": float(price),
+                    "order_reference_price": sizing_price,
+                    "order_id": historical_order.get("orderId"),
+                    "client_order_id": historical_order.get("clientOrderId") or client_order_id,
+                    "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
+                    "execution_quote": execution_quote,
+                    "order_submit_at_ms": order_submit_at_ms,
+                    "historical_order": historical_order,
                 }
-
-            return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
-
-        data = response.get("data") or {}
-        order = data.get("order") or {}
-        order_id = order.get("orderId") or data.get("orderId")
-
-        return {
-            "status": "opened",
-            "symbol": bx,
-            "qty": qty,
-            "leverage": leverage,
-            "sizing_price": sizing_price,
-            "signal_price": float(price),
-            "order_reference_price": sizing_price,
-            "order_id": order_id,
-            "client_order_id": order.get("clientOrderId") or client_order_id,
-            "response": response,
-            "open_attempt": open_attempt + 1,
-        }
-
-    return {
-        "status": "error",
-        "error": "market entry retry exhausted",
-        "symbol": bx,
-        "clientOrderId": client_order_id,
-        "retry_exhausted": True,
-    }
-
-
-def emergency_close_position(symbol: str, direction: str, qty: float | None = None, reason_token: str | None = None) -> dict:
-    """Fail-safe close used when a freshly opened position cannot be protected.
-
-    It never blindly retries the same MARKET request. After each POST we query
-    the live directional position and, when necessary, close only the remaining
-    quantity with a fresh clientOrderId. This keeps the emergency path idempotent
-    even when the exchange acknowledgement is lost.
-    """
-    direction = str(direction).upper()
-    if direction not in {"LONG", "SHORT"}:
-        return {"status": "error", "error": f"invalid direction={direction}"}
-    bx_symbol = to_bx_symbol(symbol)
-    contract = get_contract(symbol)
-    if not bx_symbol or not contract:
-        return {"status": "error", "error": "contract_not_found"}
-    try:
-        precision = int(contract.get("quantityPrecision") or 0)
-        requested_qty = abs(float(qty)) if qty is not None else 0.0
-    except (TypeError, ValueError) as exc:
-        return {"status": "error", "error": f"invalid close parameters: {exc}"}
-
-    client_order_id = "EVTCLOSE" + hashlib.sha256(
-        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}".upper().encode()
-    ).hexdigest().upper()[:24]
-
-    for attempt in range(2):
-        try:
-            live = get_position_directional(symbol, direction)
-        except Exception as exc:
-            return {"status": "error", "error": f"position verification failed before emergency close: {exc}"}
-        if str(live.get("status", "")).lower() != "found":
-            return {"status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": attempt}
-
-        live_qty = abs(float(live.get("positionAmt", 0) or 0))
-        close_qty = live_qty if live_qty > 0 else requested_qty
-        close_qty = _round_qty(close_qty, precision)
-        if close_qty <= 0:
-            return {"status": "error", "error": "emergency close quantity is zero", "symbol": bx_symbol}
-
-        side = "SELL" if direction == "LONG" else "BUY"
-        params = {
-            "symbol": bx_symbol,
-            "side": side,
-            "positionSide": direction,
-            "type": "MARKET",
-            "quantity": _format_qty(close_qty, precision),
-            "clientOrderId": client_order_id,
-        }
-        response = _request("POST", ORDER_PATH, params)
-        code = response.get("code") if isinstance(response, dict) else None
-        if code not in (0, "0", -1, "-1"):
-            last_error = str(response.get("msg", "emergency close failed")) if isinstance(response, dict) else str(response)
-            if attempt == 1:
-                return {"status": "error", "error": last_error, "symbol": bx_symbol, "client_order_id": client_order_id}
-            continue
-
-        if code in (-1, "-1"):
             try:
-                queried = get_order_by_client_order_id(symbol, client_order_id)
+                if has_open_position(symbol, direction):
+                    log.warning("[BINGX] Position found after transport error with no matching historical order; treating as unresolved-but-opened without re-POST.")
+                    return {
+                        "status": "opened",
+                        "symbol": bx,
+                        "qty": qty,
+                        "leverage": leverage,
+                        "sizing_price": sizing_price,
+                        "signal_price": float(price),
+                        "order_reference_price": sizing_price,
+                        "order_id": None,
+                        "client_order_id": client_order_id,
+                        "idempotency": "position_verified_after_transport_error_no_order_match",
+                        "response": response,
+                        "execution_quote": execution_quote,
+                        "order_submit_at_ms": order_submit_at_ms,
+                    }
             except Exception as exc:
-                queried = {"status": "error", "error": str(exc)}
+                log.error("[BINGX] Post-error position verification failed: %s", exc)
 
-            if queried.get("status") == "ok":
-                order_status = str(queried.get("order_status", "")).upper()
-                executed_qty = float(queried.get("executed_qty", 0) or 0)
-                if order_status in {"FILLED", "PARTIALLY_FILLED"} or executed_qty > 0:
-                    log.warning(
-                        "[EMERGENCY_CLOSE] %s found after transport error with status=%s executed_qty=%s; verifying residual before any new POST.",
-                        client_order_id, order_status, executed_qty,
-                    )
-                    time.sleep(0.25)
-                    try:
-                        after_recovery = get_position_directional(symbol, direction)
-                    except Exception as exc:
-                        return {
-                            "status": "unknown",
-                            "error": f"emergency close order outcome found but residual verification failed: {exc}",
-                            "symbol": bx_symbol, "direction": direction,
-                            "client_order_id": client_order_id, "escalation_required": True,
-                        }
-                    residual_qty = abs(float(after_recovery.get("positionAmt", 0) or 0)) if str(after_recovery.get("status", "")).lower() == "found" else 0.0
-                    if residual_qty <= 0:
-                        return {
-                            "status": "closed",
-                            "symbol": bx_symbol,
-                            "direction": direction,
-                            "client_order_id": client_order_id,
-                            "execution_price": queried.get("avg_price") or None,
-                            "idempotency": "order_queried_after_transport_error",
-                        }
-                    if order_status == "FILLED":
-                        return {
-                            "status": "unknown",
-                            "error": "MARKET close order is FILLED but position remains; refusing blind duplicate",
-                            "symbol": bx_symbol, "direction": direction,
-                            "client_order_id": client_order_id,
-                            "remaining_qty": residual_qty, "escalation_required": True,
-                        }
-                    # A verified partial fill justifies one fresh order for the
-                    # exact residual quantity. Never reuse the filled order id.
-                    digest = hashlib.sha256(
-                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RESIDUAL:{attempt}".upper().encode()
-                    ).hexdigest().upper()[:24]
-                    client_order_id = f"EVTCLOSE{digest}"
-                    requested_qty = residual_qty
-                    continue
+        return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
 
-                if order_status in {"CANCELED", "EXPIRED"}:
-                    digest = hashlib.sha256(
-                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RETRY:{attempt}".upper().encode()
-                    ).hexdigest().upper()[:24]
-                    client_order_id = f"EVTCLOSE{digest}"
-                    continue
-
-                return {
-                    "status": "unknown",
-                    "error": f"MARKET close order pending after transport error: status={order_status or 'unknown'}; refusing blind duplicate",
-                    "symbol": bx_symbol, "direction": direction,
-                    "client_order_id": client_order_id,
-                    "escalation_required": True,
-                }
-
-            if queried.get("status") == "absent":
-                # A proven-absent order may be safely retried with the SAME
-                # clientOrderId. If the first POST was actually accepted but
-                # the query is only lagging, BingX's unique clientOrderId
-                # prevents creation of a second order.
-                if attempt + 1 < 2:
-                    time.sleep(0.25)
-                    continue
-                continue
-
-            # If the order lookup itself is unavailable, do not manufacture a
-            # new MARKET order. The original clientOrderId remains the canonical
-            # recovery key for the next reconciliation cycle.
-            return {
-                "status": "unknown",
-                "error": f"MARKET close transport outcome unknown; order lookup failed: {queried.get('error', 'unknown')}",
-                "symbol": bx_symbol, "direction": direction,
-                "client_order_id": client_order_id,
-                "escalation_required": True,
-            }
-
-        time.sleep(0.25)
-        execution_price = None
-        if isinstance(response, dict):
-            data = response.get("data") or {}
-            order = data.get("order") if isinstance(data, dict) else {}
-            if isinstance(order, dict):
-                for key in ("avgPrice", "avg_price", "executedAvgPrice"):
-                    try:
-                        candidate = float(order.get(key))
-                    except (TypeError, ValueError):
-                        continue
-                    if candidate > 0:
-                        execution_price = candidate
-                        break
-        try:
-            after = get_position_directional(symbol, direction)
-        except Exception as exc:
-            return {"status": "unknown", "error": f"emergency close submitted but verification failed: {exc}", "symbol": bx_symbol, "client_order_id": client_order_id}
-        if str(after.get("status", "")).lower() != "found" or abs(float(after.get("positionAmt", 0) or 0)) <= 0:
-            return {
-                "status": "closed",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "execution_price": execution_price,
-            }
-
-        # An HTTP-successful MARKET close can still race the position endpoint: the
-        # order may already be FILLED while the live position view has not caught up.
-        # Never infer "partial" solely from a stale position snapshot. Verify the
-        # acknowledged order by its clientOrderId before issuing any second MARKET.
-        try:
-            verified_order = get_order_by_client_order_id(symbol, client_order_id)
-        except Exception as exc:
-            verified_order = {"status": "error", "error": str(exc)}
-
-        if verified_order.get("status") != "ok":
-            # The original POST was acknowledged, but the order lookup endpoint
-            # is unavailable. A single bounded retry with the SAME clientOrderId
-            # is safe: it cannot create a second independent order identity.
-            # Never mint a fresh ID while the original outcome is unverified.
-            if attempt + 1 < 2:
-                time.sleep(0.25)
-                continue
-            continue
-
-        verified_status = str(verified_order.get("order_status", "")).upper()
-        verified_executed_qty = float(verified_order.get("executed_qty", 0) or 0)
-        residual_qty = abs(float(after.get("positionAmt", 0) or 0))
-
-        if verified_status == "FILLED" and residual_qty > 0:
-            return {
-                "status": "unknown",
-                "error": "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "remaining_qty": residual_qty,
-                "executed_qty": verified_executed_qty,
-                "escalation_required": True,
-            }
-
-        if verified_status in {"CANCELED", "EXPIRED"}:
-            digest = hashlib.sha256(
-                f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:ACK_CANCEL_RETRY:{attempt}".upper().encode()
-            ).hexdigest().upper()[:24]
-            client_order_id = f"EVTCLOSE{digest}"
-            continue
-
-        if verified_status not in {"PARTIALLY_FILLED", "FILLED"} or verified_executed_qty <= 0:
-            return {
-                "status": "unknown",
-                "error": f"MARKET close acknowledged but order status={verified_status or 'unknown'} with residual position; refusing blind duplicate",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "remaining_qty": residual_qty,
-                "escalation_required": True,
-            }
-
-        # Verified partial fill: a second close is justified for the exact live
-        # residual, but it must use a fresh clientOrderId because the first ID
-        # already belongs to the exchange order.
-        digest = hashlib.sha256(
-            f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:SUCCESS_RESIDUAL:{attempt}".upper().encode()
-        ).hexdigest().upper()[:24]
-        client_order_id = f"EVTCLOSE{digest}"
-
-    # Two verified close attempts are the automatic safety limit. Do one final
-    # read-only position check and surface an explicit unresolved state rather
-    # than silently collapsing it into a generic error. The caller can then
-    # trigger its existing rollback/alert path without a blind third POST.
-    try:
-        final_state = get_position_directional(symbol, direction)
-    except Exception as exc:
-        log.critical(
-            "[EMERGENCY_CLOSE] position state unknown after two attempts: %s %s: %s",
-            bx_symbol, direction, exc,
-        )
-        return {
-            "status": "unknown",
-            "error": "emergency close final verification failed after two attempts",
-            "symbol": bx_symbol, "direction": direction, "attempts": 2,
-            "escalation_required": True,
-        }
-
-    if str(final_state.get("status", "")).lower() == "found":
-        try:
-            remaining_qty = abs(float(final_state.get("positionAmt", 0) or 0))
-        except (TypeError, ValueError):
-            remaining_qty = None
-        log.critical(
-            "[EMERGENCY_CLOSE] UNFLATTENED after two attempts: %s %s remaining_qty=%s",
-            bx_symbol, direction, remaining_qty,
-        )
-        return {
-            "status": "UNFLATTENED",
-            "error": "emergency close did not flatten position after two attempts",
-            "symbol": bx_symbol, "direction": direction, "attempts": 2,
-            "remaining_qty": remaining_qty, "escalation_required": True,
-        }
+    data = response.get("data") or {}
+    order = data.get("order") or {}
+    order_id = order.get("orderId") or data.get("orderId")
 
     return {
-        "status": "closed",
-        "symbol": bx_symbol, "direction": direction, "attempts": 2,
-        "verification": "final_readback",
+        "status": "opened",
+        "symbol": bx,
+        "qty": qty,
+        "leverage": leverage,
+        "sizing_price": sizing_price,
+        "signal_price": float(price),
+        "order_reference_price": sizing_price,
+        "order_id": order_id,
+        "client_order_id": order.get("clientOrderId") or client_order_id,
+        "response": response,
+        "execution_quote": execution_quote,
+        "order_submit_at_ms": order_submit_at_ms,
     }
 
 
@@ -1060,7 +1178,7 @@ def get_position_directional(symbol: str, direction: str) -> dict:
         return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
 
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if resp.get("code") not in (0, "0"):
+    if resp.get("code") != 0:
         return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
 
     for p in _normalize_orders_list(resp):
@@ -1101,13 +1219,23 @@ def get_position_directional(symbol: str, direction: str) -> dict:
 
 def wait_for_position_fill_directional(symbol: str, direction: str, timeout_sec: int = 30, poll_interval: float = 0.5) -> dict:
     started = time.time()
+    last_error: dict | None = None
     while time.time() - started < timeout_sec:
         pos = get_position_directional(symbol, direction)
-        if pos.get("status") in {"found", "error"}:
+        if pos.get("status") == "found":
             return pos
+        if pos.get("status") == "error":
+            last_error = pos
         time.sleep(poll_interval)
 
-    return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper()}
+    # One final authoritative read. A transient API error during the normal poll
+    # interval must not be mistaken for a definitive non-fill.
+    final = get_position_directional(symbol, direction)
+    if final.get("status") == "found":
+        return final
+    if final.get("status") == "error":
+        return {**final, "last_poll_error": last_error}
+    return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper(), "last_poll_error": last_error}
 
 
 def get_open_protection_directional(
@@ -1129,7 +1257,7 @@ def get_open_protection_directional(
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") not in (0, "0"):
+    if resp.get("code") != 0:
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
 
     tp_orders = []
@@ -1149,6 +1277,124 @@ def get_open_protection_directional(
     return {"status": "ok", "symbol": bx_symbol, "positionSide": direction, "tp_orders": tp_orders, "sl_orders": sl_orders}
 
 
+def prepare_protection_capacity(symbol: str, direction: str) -> dict:
+    """Ensure a flat symbol is not carrying stale engine protection.
+
+    A new trade needs one SL plus two TP legs. Opening the market position first
+    and only then discovering stale TP/SL orders can trigger the exchange order
+    limit and force an emergency exit. When no position exists, engine-owned
+    protective orders are stale by definition and can be safely cancelled.
+
+    Manual/non-engine protection is never cancelled. Its presence blocks a new
+    engine entry for this symbol/direction because the exchange-side protection
+    capacity cannot be proven safely.
+    """
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction}"}
+
+    position = get_position_directional(symbol, direction)
+    if position.get("status") == "found":
+        return {
+            "status": "blocked_existing_position",
+            "symbol": symbol,
+            "direction": direction,
+            "position": position,
+        }
+    if position.get("status") not in {"not_found", "found"}:
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "direction": direction,
+            "error": position.get("error", "position state unavailable"),
+        }
+
+    existing = get_open_protection_directional(symbol, direction)
+    if existing.get("status") != "ok":
+        return {"status": "error", "symbol": symbol, "direction": direction, "error": existing.get("error", "openOrders unavailable")}
+
+    orders = list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", []))
+    stale_engine_ids = []
+    external_ids = []
+    for order in orders:
+        oid = str(order.get("orderId", ""))
+        cid = str(order.get("clientOrderId", "")).upper()
+        if not oid:
+            continue
+        if cid.startswith("EVT_"):
+            stale_engine_ids.append(oid)
+        else:
+            external_ids.append(oid)
+
+    if external_ids:
+        return {
+            "status": "blocked_external_protection",
+            "symbol": symbol,
+            "direction": direction,
+            "external_order_ids": external_ids,
+            "existing_engine_order_ids": stale_engine_ids,
+            "existing_sl_count": len(existing.get("sl_orders", [])),
+            "existing_tp_count": len(existing.get("tp_orders", [])),
+            "error": "non-engine protection orders are present; exchange protection capacity cannot be proven safely",
+        }
+
+    cancelled = []
+    for order_id in stale_engine_ids:
+        try:
+            resp = cancel_order(symbol, order_id)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection cleanup failed for {order_id}: {exc}",
+                "cancelled_order_ids": cancelled,
+            }
+        if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection cleanup failed for {order_id}: {resp}",
+                "cancelled_order_ids": cancelled,
+            }
+        cancelled.append(order_id)
+
+    if stale_engine_ids:
+        verified = get_open_protection_directional(symbol, direction)
+        if verified.get("status") != "ok":
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": "stale engine protection cleanup verification failed",
+                "cancelled_order_ids": cancelled,
+            }
+        remaining = [
+            str(o.get("orderId", ""))
+            for o in list(verified.get("sl_orders", [])) + list(verified.get("tp_orders", []))
+            if str(o.get("orderId", "")) in set(stale_engine_ids)
+        ]
+        if remaining:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection still visible after cleanup: {remaining}",
+                "cancelled_order_ids": cancelled,
+            }
+
+    return {
+        "status": "ready",
+        "symbol": symbol,
+        "direction": direction,
+        "cancelled_order_ids": cancelled,
+        "existing_sl_count": 0,
+        "existing_tp_count": 0,
+        "required_new_protection_orders": 3,
+    }
+
+
 def _round_qty(qty: float, precision: int) -> float:
     if precision < 0:
         return float(qty)
@@ -1164,75 +1410,16 @@ def _format_price(price: float, precision: int) -> str:
 
 
 def build_tp_client_order_id(leg: str, trade_id: str | None = None) -> str:
-    leg_u = str(leg).upper().replace("_", "")
-    if leg_u not in {"TP1", "TP2", "TP3"}:
-        leg_u = "TP" + "".join(ch for ch in leg_u if ch.isdigit())[:1] or "1"
+    leg_u = str(leg).upper()
     if trade_id:
-        return f"EVTTP{leg_u[-1]}{_trade_digest(trade_id)}"
-    return f"EVT{leg_u}"
+        return f"EVT_{_trade_digest(trade_id)}_{leg_u}"
+    return f"EVT_{leg_u}"
 
 
 def build_sl_client_order_id(trade_id: str | None = None) -> str:
     if trade_id:
-        return f"EVTSL{_trade_digest(trade_id)}"
-    return "EVTSL"
-
-
-def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
-    """Select the largest TP profile the confirmed filled position can execute.
-
-    Selection is intentionally done after the market fill because the exchange
-    quantity/precision constraints apply to the actual filled quantity. The
-    candidate profiles are tried from largest to smallest:
-      3 legs -> TP1/TP2/TP3 when allocation is executable
-      2 legs -> TP1/TP2 when a 3-leg allocation is not executable
-      1 leg  -> terminal TP3 (or the last supplied level) as the final fallback
-
-    Feasibility is tested with the same allocator used for the real TP orders,
-    rather than only comparing ``position_qty`` with ``min_qty * n``. This also
-    covers quantity precision and cases where the configured fractional split
-    itself cannot be represented safely across all legs.
-    """
-    if not tp_levels_norm or position_qty <= 0:
-        return []
-
-    try:
-        precision_i = int(precision)
-        min_qty_f = max(float(min_qty or 0.0), 0.0)
-        position = float(position_qty)
-        if not math.isfinite(position) or position <= 0:
-            return []
-        if not math.isfinite(min_qty_f):
-            min_qty_f = 0.0
-    except (TypeError, ValueError, ArithmeticError):
-        return []
-
-    # The strategy defines at most three milestones. Keep that ceiling explicit
-    # even if an old/custom state contains additional TP-like entries.
-    available_levels = [dict(x) for x in tp_levels_norm[:3]]
-    if not available_levels:
-        return []
-
-    # Try the largest executable profile first. The allocator is the single
-    # source of truth for whether the selected fractions can be represented by
-    # the actual filled quantity, precision, and minimum executable quantity.
-    for candidate_count in range(len(available_levels), 0, -1):
-        if candidate_count == 1:
-            candidate = [dict(available_levels[-1])]
-        else:
-            candidate = [dict(x) for x in available_levels[:candidate_count]]
-        try:
-            _allocate_tp_quantities(
-                position_qty=position,
-                precision=precision_i,
-                min_qty=min_qty_f,
-                fractions=[x["close_fraction"] for x in candidate],
-            )
-        except (TypeError, ValueError, ArithmeticError):
-            continue
-        return candidate
-
-    return []
+        return f"EVT_{_trade_digest(trade_id)}_SL"
+    return "EVT_SL"
 
 
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
@@ -1278,6 +1465,8 @@ def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float,
 
 
 def _normalize_tp_levels(tp_levels: list) -> list[dict]:
+    if isinstance(tp_levels, list) and len(tp_levels) == 0:
+        return []
     normalized = []
     for tp in (tp_levels or []):
         leg = str(tp.get("leg", f"tp{len(normalized) + 1}"))
@@ -1292,9 +1481,11 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
         normalized.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
     if not normalized:
-        normalized = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
+        return []
 
     total = sum(x["close_fraction"] for x in normalized)
+    if not math.isfinite(total) or total <= 0:
+        return []
     for x in normalized:
         x["close_fraction"] /= total
     return normalized
@@ -1316,172 +1507,922 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     expected_leg = str(expected_leg).upper()
     client_id = str(order.get("clientOrderId", "")).upper()
 
-    unit = 10 ** (-max(0, int(price_precision)))
-    price_tolerance = max(unit * 0.51, 1e-12)
-    def _price_matches() -> bool:
-        return abs(actual_price - expected_price) <= price_tolerance
-
     expected_formatted = _format_price(expected_price, price_precision)
     actual_formatted = _format_price(actual_price, price_precision)
 
-    # When a client id explicitly identifies a TP leg, that identity is
-    # authoritative. Do not fall back to trigger-price matching for a different
-    # leg, otherwise one order can be assigned to multiple TP legs when prices
-    # happen to coincide. Current conditional BingX orders may have no
-    # clientOrderId at all, so price matching remains the fallback for that case.
-    declared_leg_num = None
-    if client_id.startswith("EVTTP") and len(client_id) > len("EVTTP") and client_id[len("EVTTP")].isdigit():
-        declared_leg_num = client_id[len("EVTTP")]
-    else:
-        marker = "_TP"
-        marker_pos = client_id.rfind(marker)
-        if marker_pos >= 0 and marker_pos + len(marker) < len(client_id) and client_id[marker_pos + len(marker)].isdigit():
-            declared_leg_num = client_id[marker_pos + len(marker)]
+    if trade_id:
+        if client_id == f"EVT_{_trade_digest(trade_id)}_{expected_leg}":
+            return actual_formatted == expected_formatted
 
-    expected_leg_num = "".join(ch for ch in expected_leg if ch.isdigit())[:1]
-    if declared_leg_num is not None:
-        if declared_leg_num != expected_leg_num:
-            return False
-
-    # Prefer the legacy/deterministic client id when it is present. New
-    # conditional BingX protection orders do not support clientOrderId, so for
-    # those orders the trigger price becomes the stable leg identity.
-    if trade_id and client_id:
-        digest = _trade_digest(trade_id)
-        if client_id == f"EVTTP{expected_leg_num}{digest}":
-            return _price_matches()
-        # Backward compatibility for protection orders created before the
-        # alphanumeric clientOrderId hardening.
-        if client_id == f"EVT_{digest}_{expected_leg}":
-            return _price_matches()
-
-    if client_id:
-        if f"_{expected_leg}_" in f"_{client_id}_":
-            return _price_matches()
-        if client_id.startswith(f"EVTTP{expected_leg_num}"):
-            return _price_matches()
-
-    # Current BingX conditional protection orders: identify the leg by the
-    # expected trigger price when no clientOrderId is available.
-    return _price_matches()
-
-
-def _parse_retry_after_ms(message: object) -> int | None:
-    import re
-
-    text = str(message or "")
-    match = re.search(r"retry\s+after\s+time\s*:\s*(\d{13})", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-
-
-def _live_price_in_cooldown(bx_symbol: str, now: float) -> bool:
-    global _LIVE_PRICE_INVALID_UNTIL, _LIVE_PRICE_COOLDOWN_UNTIL
-
-    if _LIVE_PRICE_COOLDOWN_UNTIL > now:
-        return True
-    until = float(_LIVE_PRICE_INVALID_UNTIL.get(bx_symbol, 0.0))
-    if until > now:
-        return True
-    if until:
-        _LIVE_PRICE_INVALID_UNTIL.pop(bx_symbol, None)
+    if f"_{expected_leg}_" in f"_{client_id}_":
+        return actual_formatted == expected_formatted
     return False
 
 
-def get_live_price(symbol: str) -> float | None:
-    """Return the current BingX live ticker price, failing closed on errors.
+def _valid_quote(bid: float, ask: float) -> bool:
+    return (
+        math.isfinite(bid)
+        and math.isfinite(ask)
+        and bid > 0
+        and ask > 0
+        and ask >= bid
+    )
 
-    A 109425 response triggers one fresh contract-catalog lookup and one ticker
-    retry when BingX still exposes a valid contract. Confirmed-invalid symbols are
-    quarantined locally. There is no global invalid-symbol breaker, so an
-    unrelated bad contract cannot disable all valid live-price requests.
-    """
-    bx_symbol = to_bx_symbol(symbol)
-    if not bx_symbol:
-        log.warning("[BINGX] Live price unavailable: unknown symbol=%s", symbol)
+
+def _normalize_market_timestamp_ms(value: Any) -> int | None:
+    """Normalize a BingX market timestamp to epoch milliseconds."""
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
         return None
-
-    now = time.time()
-    if _live_price_in_cooldown(bx_symbol, now):
+    if not math.isfinite(raw) or raw <= 0:
         return None
-
-    global _LIVE_PRICE_COOLDOWN_UNTIL
-    for attempt in range(2):
-        try:
-            resp = _request("GET", LIVE_PRICE_PATH, {"symbol": bx_symbol}, signed=False, retryable=False)
-        except Exception as exc:
-            log.warning("[BINGX] Failed to read live price for %s: %s", bx_symbol, exc)
-            return None
-
-        try:
-            code = int(resp.get("code"))
-        except (TypeError, ValueError, AttributeError):
-            log.warning("[BINGX] Malformed live-price response for %s: %r", bx_symbol, resp)
-            return None
-
-        if code == 109425:
-            # A contract can disappear between the cycle-level catalog refresh and
-            # this ticker request. Re-resolve once from a fresh catalog; if BingX
-            # maps the logical symbol to a different active contract, retry it once.
-            if attempt == 0:
-                try:
-                    fresh_contract = get_contract(symbol, require_fresh=True)
-                except Exception:
-                    fresh_contract = None
-                fresh_symbol = str((fresh_contract or {}).get("symbol", "")).strip().upper()
-                if fresh_symbol and fresh_symbol != bx_symbol:
-                    bx_symbol = fresh_symbol
-                elif fresh_symbol == bx_symbol:
-                    pass
-                else:
-                    _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
-                    log.warning("[BINGX] Live-price symbol unsupported after fresh catalog check: %s (109425); symbol quarantined %.0fs", bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC)
-                    return None
-                continue
-            _LIVE_PRICE_INVALID_UNTIL[bx_symbol] = now + LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC
-            log.warning("[BINGX] Live-price symbol unsupported: %s (109425); symbol quarantined %.0fs", bx_symbol, LIVE_PRICE_INVALID_SYMBOL_COOLDOWN_SEC)
-            return None
-
-        if code == 109429:
-            retry_after_ms = _parse_retry_after_ms(resp.get("msg"))
-            retry_until = (retry_after_ms / 1000.0) if retry_after_ms else (now + LIVE_PRICE_RATE_LIMIT_FALLBACK_SEC)
-            _LIVE_PRICE_COOLDOWN_UNTIL = max(_LIVE_PRICE_COOLDOWN_UNTIL, retry_until)
-            log.error("[BINGX] Live-price API temporarily restricted (109429) for %s; live-price HTTP requests paused until %.0f.", bx_symbol, _LIVE_PRICE_COOLDOWN_UNTIL)
-            return None
-
-        if code != 0:
-            log.warning("[BINGX] Live-price API error for %s: code=%s msg=%s", bx_symbol, code, resp.get("msg"))
-            return None
-
-        data = resp.get("data")
-        if isinstance(data, list):
-            row = next((item for item in data if isinstance(item, dict) and str(item.get("symbol", "")).upper() == bx_symbol), None)
-            row = row or (data[0] if data and isinstance(data[0], dict) else None)
-        elif isinstance(data, dict):
-            row = data
-        else:
-            row = None
-        if not isinstance(row, dict):
-            log.warning("[BINGX] Live-price response has no data row for %s", bx_symbol)
-            return None
-        try:
-            price = float(row.get("price"))
-        except (TypeError, ValueError):
-            log.warning("[BINGX] Invalid live price for %s: %r", bx_symbol, row.get("price"))
-            return None
-        if not math.isfinite(price) or price <= 0:
-            log.warning("[BINGX] Non-positive live price for %s: %r", bx_symbol, row.get("price"))
-            return None
-        return price
+    if raw >= 1e11:
+        return int(raw)
+    if raw >= 1e8:
+        return int(raw * 1000.0)
     return None
 
+
+def _require_exchange_quote_timestamp() -> bool:
+    raw = str(os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "true")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _unknown_exchange_quote_age_policy() -> str:
+    """Explicit policy when the venue response has no usable exchange timestamp."""
+    raw = str(os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "block")).strip().lower()
+    aliases = {
+        "allow": "allow_with_local_age",
+        "allow_with_local": "allow_with_local_age",
+        "allow_with_local_age": "allow_with_local_age",
+        "block": "block",
+        "reject": "block",
+    }
+    return aliases.get(raw, "block")
+
+
+def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, float | None, float | None, str]:
+    limit = max(0.0, float(max_age_sec))
+    observed_ms = _normalize_market_timestamp_ms(quote.get("quote_observed_at_ms"))
+    exchange_ms = _normalize_market_timestamp_ms(quote.get("quote_exchange_time_ms"))
+    local_now_ms = int(time.time() * 1000)
+    exchange_now_ms = local_now_ms + int(SERVER_TIME_OFFSET_MS)
+    local_age = max(0.0, (local_now_ms - observed_ms) / 1000.0) if observed_ms is not None else None
+    exchange_age = None
+    if exchange_ms is not None:
+        raw_age = (exchange_now_ms - exchange_ms) / 1000.0
+        if raw_age >= 0:
+            exchange_age = raw_age
+    if limit > 0 and exchange_age is not None and exchange_age > limit:
+        return False, local_age, exchange_age, "exchange_timestamp"
+    if limit > 0 and local_age is not None and local_age > limit:
+        return False, local_age, exchange_age, "local_observed_elapsed"
+    return True, local_age, exchange_age, "exchange_timestamp" if exchange_age is not None else "local_observed_elapsed"
+
+
+def _parse_top_of_book_payload(resp: Any, symbol: str, source: str) -> tuple[float, float, Any] | None:
+    """Parse BingX futures book/ticker payloads across current and legacy envelopes.
+
+    Current futures Book Ticker responses may nest the row under
+    ``data.book_ticker``; older/alternate responses may expose ``data`` directly
+    or as a one-element/list payload. Keep all accepted forms here so execution
+    quote fallback is driven by actual schema incompatibility, not by a parser gap.
+    """
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return None
+    data = resp.get("data")
+    row: dict[str, Any] | None = None
+
+    def _select_row(payload: Any) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            nested = payload.get("book_ticker") or payload.get("bookTicker")
+            if isinstance(nested, (dict, list)):
+                selected = _select_row(nested)
+                if selected is not None:
+                    return selected
+            return payload
+        if isinstance(payload, list):
+            match = next((x for x in payload if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol), None)
+            if match is not None:
+                return match
+            if len(payload) == 1 and isinstance(payload[0], dict):
+                return payload[0]
+        return None
+
+    row = _select_row(data)
+    if not isinstance(row, dict):
+        return None
+    try:
+        bid = float(row.get("bidPrice", 0) or 0)
+        ask = float(row.get("askPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not _valid_quote(bid, ask):
+        return None
+    return bid, ask, row.get("time")
+
+
+def _parse_depth_top(resp: Any) -> tuple[float, float, Any] | None:
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return None
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return None
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+
+    def _price(level: Any) -> float | None:
+        try:
+            if isinstance(level, (list, tuple)) and level:
+                return float(level[0])
+            if isinstance(level, dict):
+                return float(level.get("price") or level.get("p") or 0)
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    bid = next((p for p in (_price(x) for x in bids) if p and math.isfinite(p) and p > 0), None)
+    ask = next((p for p in (_price(x) for x in asks) if p and math.isfinite(p) and p > 0), None)
+    if bid is None or ask is None or not _valid_quote(bid, ask):
+        return None
+    return bid, ask, data.get("T") or data.get("timestamp") or data.get("time")
+
+
+def _safe_exception_message(exc: Exception) -> str:
+    """Redact query strings/signatures from network exception text before telemetry."""
+    text = str(exc)
+    if "?" in text:
+        text = text.split("?", 1)[0] + "?[REDACTED]"
+    return text
+
+
+def _quote_error(source: str, resp: Any, symbol: str) -> str:
+    code = resp.get("code") if isinstance(resp, dict) else None
+    msg = resp.get("msg") if isinstance(resp, dict) else None
+    return f"{source} unavailable: code={code} msg={msg or 'invalid response'}"
+
+
+def _quote_provenance_fields(quote_time: Any) -> dict[str, Any]:
+    exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+    observed_ms = int(time.time() * 1000)
+    _ok, local_age, exchange_age, source = _quote_freshness(
+        {"quote_observed_at_ms": observed_ms, "quote_exchange_time_ms": exchange_time_ms},
+        max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0"))),
+    )
+    return {
+        "quote_exchange_time_ms": exchange_time_ms,
+        "quote_observed_at_ms": observed_ms,
+        "quote_local_age_sec": local_age,
+        "quote_exchange_age_sec": exchange_age,
+        "quote_freshness_source": source,
+        "execution_reference_quality": (
+            "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "LOCAL_OBSERVED_ONLY"
+        ),
+    }
+
+
+def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
+    """Return a valid BingX executable top-of-book quote immediately before entry.
+
+    Fallback order is BingX-only: bookTicker -> ticker -> depth. No Binance or
+    candle-close fallback is allowed because entry safety must be based on the
+    execution venue's live market.
+    """
+    global _LAST_BOOK_TICKER_TS
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found", "symbol": symbol}
+    try:
+        interval = float(
+            os.environ.get("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "1.05")
+            if min_interval_sec is None else min_interval_sec
+        )
+    except (TypeError, ValueError):
+        interval = 1.05
+    interval = max(0.0, interval)
+
+    def _call(path: str) -> Any:
+        return _request(
+            "GET", path, {"symbol": bx}, signed=True,
+            timeout_sec=float(os.environ.get("BINGX_BOOK_TICKER_TIMEOUT_SEC", "3")),
+            retryable=False,
+        )
+
+    with _BOOK_TICKER_LOCK:
+        wait = interval - (time.monotonic() - _LAST_BOOK_TICKER_TS)
+        if wait > 0:
+            time.sleep(wait)
+        attempts: list[tuple[str, Any]] = []
+        resp = _call(BOOK_TICKER_PATH)
+        _LAST_BOOK_TICKER_TS = time.monotonic()
+        attempts.append(("bookTicker", resp))
+
+        parsed = _parse_top_of_book_payload(resp, bx, "bookTicker")
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | bookTicker returned no usable exchange timestamp", bx)
+            else:
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_sources_attempted": ["bookTicker"],
+                    "quote_fallback_reason": None,
+                    **provenance,
+                }
+
+        ticker_resp = _call(TICKER_PATH)
+        attempts.append(("ticker", ticker_resp))
+        parsed = _parse_top_of_book_payload(ticker_resp, bx, "ticker")
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | ticker returned no usable exchange timestamp", bx)
+            else:
+                log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker invalid/unavailable -> ticker", bx)
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "ticker",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_sources_attempted": [source for source, _ in attempts],
+                    "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
+                    **provenance,
+                }
+
+        depth_resp = _call(DEPTH_PATH)
+        attempts.append(("depth", depth_resp))
+        parsed = _parse_depth_top(depth_resp)
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | depth returned no usable exchange timestamp", bx)
+            else:
+                log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker/ticker invalid -> depth", bx)
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "depth",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_sources_attempted": [source for source, _ in attempts],
+                    "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
+                    **provenance,
+                }
+
+    details = "; ".join(_quote_error(source, response, bx) for source, response in attempts)
+    return {
+        "status": "error",
+        "error": f"BingX executable quote unavailable after bookTicker->ticker->depth | {details}",
+        "symbol": bx,
+        "quote_sources_attempted": [source for source, _ in attempts],
+    }
+
+
+
+def _research_endpoint_lock(endpoint_key: str) -> threading.Lock:
+    with _RESEARCH_RATE_LOCK_GUARD:
+        lock = _RESEARCH_RATE_LOCKS.get(endpoint_key)
+        if lock is None:
+            lock = threading.Lock()
+            _RESEARCH_RATE_LOCKS[endpoint_key] = lock
+        return lock
+
+
+def _research_public_get(endpoint_key: str, path: str, params: dict[str, Any], *, timeout_sec: float = 3.0) -> dict[str, Any]:
+    """Rate-limit each public research endpoint independently to the documented BingX rate."""
+    try:
+        interval = max(1.01, float(os.environ.get("RESEARCH_BINGX_ENDPOINT_INTERVAL_SEC", "1.05")))
+    except (TypeError, ValueError):
+        interval = 1.05
+    lock = _research_endpoint_lock(endpoint_key)
+    with lock:
+        wait = interval - (time.monotonic() - _RESEARCH_RATE_LAST_TS.get(endpoint_key, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = _request("GET", path, params, signed=False, timeout_sec=timeout_sec, retryable=False)
+        finally:
+            _RESEARCH_RATE_LAST_TS[endpoint_key] = time.monotonic()
+    return resp if isinstance(resp, dict) else {"code": -1, "msg": "invalid response type"}
+
+
+def _research_symbol_row(data: Any, symbol: str) -> dict[str, Any] | None:
+    bx = str(symbol).upper()
+    if isinstance(data, dict):
+        if str(data.get("symbol", "")).upper() in {"", bx}:
+            return data
+        return None
+    if isinstance(data, list):
+        for row in data:
+            if isinstance(row, dict) and str(row.get("symbol", "")).upper() == bx:
+                return row
+        if len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+    return None
+
+
+def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"status": "error", "error": "depth_data_invalid"}
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+
+    def parse_level(level: Any) -> tuple[float, float] | None:
+        try:
+            if isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, qty = float(level[0]), float(level[1])
+            elif isinstance(level, dict):
+                price = float(level.get("price") or level.get("p"))
+                qty = float(level.get("quantity") or level.get("qty") or level.get("q"))
+            else:
+                return None
+            if not (math.isfinite(price) and math.isfinite(qty)) or price <= 0 or qty < 0:
+                return None
+            return price, qty
+        except (TypeError, ValueError):
+            return None
+
+    # Normalize provider payload order before selecting top-N.
+    bp = sorted((x for x in (parse_level(v) for v in bids) if x), key=lambda x: x[0], reverse=True)
+    ap = sorted((x for x in (parse_level(v) for v in asks) if x), key=lambda x: x[0])
+    best_bid = bp[0][0] if bp else None
+    best_ask = ap[0][0] if ap else None
+    book_mid = ((best_bid + best_ask) / 2.0) if best_bid and best_ask else None
+    depth_reference_type = "MARK_PRICE" if mid_price is not None and float(mid_price) > 0 else "BOOK_MID"
+    mid = float(mid_price) if mid_price is not None and float(mid_price) > 0 else book_mid
+
+    def depth_quote(levels: list[tuple[float, float]], pct: float) -> float:
+        if mid is None or mid <= 0:
+            return 0.0
+        lo = mid * (1.0 - pct / 100.0)
+        hi = mid * (1.0 + pct / 100.0)
+        return sum(price * qty for price, qty in levels if lo <= price <= hi)
+
+    bid_qty_5 = sum(q for _, q in bp[:5])
+    ask_qty_5 = sum(q for _, q in ap[:5])
+    bid_qty_10 = sum(q for _, q in bp[:10])
+    ask_qty_10 = sum(q for _, q in ap[:10])
+    total5 = bid_qty_5 + ask_qty_5
+    total10 = bid_qty_10 + ask_qty_10
+    bid_quote_5 = sum(price * qty for price, qty in bp[:5])
+    ask_quote_5 = sum(price * qty for price, qty in ap[:5])
+    bid_quote_10 = sum(price * qty for price, qty in bp[:10])
+    ask_quote_10 = sum(price * qty for price, qty in ap[:10])
+    quote_total5 = bid_quote_5 + ask_quote_5
+    quote_total10 = bid_quote_10 + ask_quote_10
+    microprice = None
+    if best_bid is not None and best_ask is not None and bp and ap:
+        if (bp[0][1] + ap[0][1]) > 0:
+            microprice = ((best_ask * bp[0][1]) + (best_bid * ap[0][1])) / (bp[0][1] + ap[0][1])
+    spread_pct = ((best_ask - best_bid) / ((best_ask + best_bid) / 2.0) * 100.0) if best_bid and best_ask and best_bid > 0 else None
+    microprice_distance_pct = (microprice / book_mid - 1.0) * 100.0 if microprice is not None and book_mid and book_mid > 0 else None
+    raw_ts = data.get("T") or data.get("timestamp") or data.get("time")
+    try:
+        book_timestamp_ms = int(float(raw_ts)) if raw_ts is not None else None
+    except (TypeError, ValueError):
+        book_timestamp_ms = None
+    return {
+        "status": "ok",
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_pct": spread_pct,
+        "mid_price": mid,
+        "book_mid_price": book_mid,
+        "depth_reference_price": mid,
+        "depth_reference_type": depth_reference_type,
+        "bid_qty_5": bid_qty_5,
+        "ask_qty_5": ask_qty_5,
+        "bid_qty_10": bid_qty_10,
+        "ask_qty_10": ask_qty_10,
+        "book_imbalance_5": ((bid_qty_5 - ask_qty_5) / total5) if total5 > 0 else None,
+        "book_imbalance_10": ((bid_qty_10 - ask_qty_10) / total10) if total10 > 0 else None,
+        "bid_quote_5": bid_quote_5,
+        "ask_quote_5": ask_quote_5,
+        "bid_quote_10": bid_quote_10,
+        "ask_quote_10": ask_quote_10,
+        "book_quote_imbalance_5": ((bid_quote_5 - ask_quote_5) / quote_total5) if quote_total5 > 0 else None,
+        "book_quote_imbalance_10": ((bid_quote_10 - ask_quote_10) / quote_total10) if quote_total10 > 0 else None,
+        "microprice": microprice,
+        "microprice_distance_pct": microprice_distance_pct,
+        "bid_depth_quote_0_1pct": depth_quote(bp, 0.1),
+        "ask_depth_quote_0_1pct": depth_quote(ap, 0.1),
+        "bid_depth_quote_0_5pct": depth_quote(bp, 0.5),
+        "ask_depth_quote_0_5pct": depth_quote(ap, 0.5),
+        "bid_depth_quote_1pct": depth_quote(bp, 1.0),
+        "ask_depth_quote_1pct": depth_quote(ap, 1.0),
+        "bids_top10": [[p, q] for p, q in bp[:10]],
+        "asks_top10": [[p, q] for p, q in ap[:10]],
+        "timestamp": raw_ts,
+        "timestamp_ms": book_timestamp_ms,
+    }
+
+
+def _research_sanitize(value: Any) -> Any:
+    """Convert optional research payload values to strict JSON-safe Python types."""
+    if isinstance(value, dict):
+        return {str(k): _research_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_research_sanitize(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if hasattr(value, "item"):
+        try:
+            return _research_sanitize(value.item())
+        except Exception:
+            pass
+    return value
+
+
+def _research_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _research_trade_metrics(data: Any) -> dict[str, Any]:
+    if not isinstance(data, list):
+        return {"status": "error", "error": "trades_data_invalid"}
+    buy_quote = sell_quote = 0.0
+    buy_count = sell_count = 0
+    buyer_maker_present_count = buyer_maker_missing_count = 0
+    prices: list[float] = []
+    latest_ts = None
+    earliest_ts = None
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            price = float(row.get("price"))
+            raw_quote = row.get("quoteQty") or row.get("quote_qty")
+            quote_qty = float(raw_quote) if raw_quote is not None else (price * float(row.get("qty")))
+            ts = int(row.get("time")) if row.get("time") is not None else None
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(price) and price > 0 and math.isfinite(quote_qty) and quote_qty >= 0):
+            continue
+        prices.append(price)
+        buyer_maker_raw = row.get("buyerMaker") if "buyerMaker" in row else None
+        if buyer_maker_raw is None:
+            buyer_maker_missing_count += 1
+            # Missing maker/taker direction is unknown. Never classify it as BUY.
+            continue
+        buyer_maker_present_count += 1
+        maker_buyer = _research_bool(buyer_maker_raw)
+        # buyerMaker=true means the buyer was the maker; the aggressor was the seller.
+        if maker_buyer:
+            sell_quote += quote_qty
+            sell_count += 1
+        else:
+            buy_quote += quote_qty
+            buy_count += 1
+        if ts is not None:
+            latest_ts = max(latest_ts or ts, ts)
+            earliest_ts = min(earliest_ts or ts, ts)
+    total = buy_quote + sell_quote
+    return {
+        "status": "ok",
+        "sample_count": len(data),
+        "valid_trade_count": len(prices),
+        "buy_aggressor_quote": buy_quote,
+        "sell_aggressor_quote": sell_quote,
+        "buy_aggressor_count": buy_count,
+        "sell_aggressor_count": sell_count,
+        "buyer_maker_field_present_count": buyer_maker_present_count,
+        "buyer_maker_field_missing_count": buyer_maker_missing_count,
+        "buyer_maker_field_coverage": (buyer_maker_present_count / len(prices)) if prices else None,
+        "aggressor_validity": "valid" if buyer_maker_present_count > 0 and buyer_maker_missing_count == 0 else ("partial" if buyer_maker_present_count > 0 else "unknown"),
+        "aggressor_delta_quote": (buy_quote - sell_quote) if buyer_maker_present_count > 0 else None,
+        "buy_aggressor_ratio": (buy_quote / total) if total > 0 and buyer_maker_present_count > 0 else None,
+        "trade_min_price": min(prices) if prices else None,
+        "trade_max_price": max(prices) if prices else None,
+        "last_trade_ts": latest_ts,
+        "first_trade_ts": earliest_ts,
+        "sample_span_seconds": ((latest_ts - earliest_ts) / 1000.0) if latest_ts is not None and earliest_ts is not None and latest_ts >= earliest_ts else None,
+        "avg_trade_quote": (total / len(prices)) if prices else None,
+    }
+
+
+def fetch_research_market_context(
+    symbol: str,
+    *,
+    depth_limit: int = 20,
+    trades_limit: int = 100,
+    timeout_sec: float = 3.0,
+) -> dict[str, Any]:
+    """Collect a decision-time BingX market snapshot for research only.
+
+    This is deliberately best-effort: failure of one optional public context endpoint
+    must never block the production signal/execution path. The returned record contains
+    enough metadata to distinguish missing context from a real zero measurement.
+    """
+    bx = to_bx_symbol(symbol)
+    captured_ms = int(time.time() * 1000)
+    collection_started = time.monotonic()
+    result: dict[str, Any] = {
+        "schema": "bingx_research_market_context_v2",
+        "context_schema_version": 2,
+        "symbol": str(symbol).upper(),
+        "bingx_symbol": bx,
+        "provider": "bingx",
+        "context_provider": "bingx",
+        "context_source": "bingx_swap_public",
+        "captured_at_ms": captured_ms,
+        "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
+        "capture_started_at_ms": captured_ms,
+        "capture_phase": "PRE_EXECUTION",
+        "feature_time_semantics": "PRE_EXECUTION_CONTEXT_NOT_TRIGGER_BOUNDARY",
+        "status": "ok",
+        "errors": [],
+        "endpoint_status": {},
+        "endpoint_latency_ms": {},
+    }
+    if not bx:
+        result["status"] = "error"
+        result["errors"].append("contract_not_found")
+        return result
+
+    def call(key: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            resp = _research_public_get(key, path, params, timeout_sec=max(0.5, float(timeout_sec)))
+            result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
+            if int(resp.get("code")) != 0:
+                result["endpoint_status"][key] = "error"
+                result["errors"].append(f"{key}:code={resp.get('code')}:msg={resp.get('msg')}")
+            else:
+                result["endpoint_status"][key] = "ok"
+            return resp
+        except Exception as exc:
+            result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
+            result["endpoint_status"][key] = "error"
+            result["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+            return {"code": -1, "msg": _safe_exception_message(exc)}
+
+    premium = call("premiumIndex", PREMIUM_INDEX_PATH, {"symbol": bx})
+    prow = _research_symbol_row(premium.get("data"), bx) if isinstance(premium, dict) else None
+    if prow:
+        for source_key, out_key in (("markPrice", "mark_price"), ("indexPrice", "index_price"), ("lastFundingRate", "funding_rate"), ("nextFundingTime", "next_funding_time_ms"), ("time", "premium_index_ts")):
+            if prow.get(source_key) is not None:
+                try:
+                    result[out_key] = float(prow[source_key]) if source_key not in {"nextFundingTime", "time"} else int(prow[source_key])
+                except (TypeError, ValueError):
+                    result[out_key] = None
+        result["funding_rate_unit"] = "DECIMAL_RATE"
+        result["funding_rate_pct"] = (float(result["funding_rate"]) * 100.0) if result.get("funding_rate") is not None else None
+
+    if result.get("mark_price") and result.get("index_price"):
+        idx = float(result["index_price"])
+        if idx > 0:
+            result["mark_index_basis_pct"] = (float(result["mark_price"]) / idx - 1.0) * 100.0
+
+    oi = call("openInterest", OPEN_INTEREST_PATH, {"symbol": bx})
+    orow = _research_symbol_row(oi.get("data"), bx) if isinstance(oi, dict) else None
+    if orow:
+        raw_oi = orow.get("openInterest")
+        try:
+            result["open_interest"] = float(raw_oi)
+        except (TypeError, ValueError):
+            result["open_interest"] = None
+        result["open_interest_raw"] = raw_oi
+        result["open_interest_unit"] = str(orow.get("unit") or "PROVIDER_NATIVE_UNSPECIFIED")
+        result["open_interest_ts"] = orow.get("time")
+
+    book = call("depth", DEPTH_PATH, {"symbol": bx, "limit": int(depth_limit)})
+    if isinstance(book, dict) and isinstance(book.get("data"), dict):
+        result["order_book"] = _research_depth_metrics(book["data"], mid_price=result.get("mark_price"))
+        result["order_book_timestamp"] = result["order_book"].get("timestamp")
+
+    trades = call("trades", TRADES_PATH, {"symbol": bx, "limit": int(trades_limit)})
+    result["recent_trades"] = _research_trade_metrics(trades.get("data")) if isinstance(trades, dict) else {"status": "error", "error": "trades_response_invalid"}
+
+    if result["errors"]:
+        result["status"] = "partial" if len(result["errors"]) < 4 else "error"
+    completed_ms = int(time.time() * 1000)
+    result["capture_completed_at_ms"] = completed_ms
+    result["capture_completed_at"] = datetime.fromtimestamp(completed_ms / 1000.0, tz=timezone.utc).isoformat()
+    result["context_capture_span_ms"] = max(0, completed_ms - captured_ms)
+    result["collection_latency_ms"] = round((time.monotonic() - collection_started) * 1000.0, 3)
+    return _research_sanitize(result)
+
+
+def fetch_research_account_snapshot() -> dict[str, Any]:
+    """Collect a read-only BingX futures account snapshot for research/risk attribution.
+
+    This is called at most once per scan, never from the per-symbol worker pool.
+    No order execution depends on this snapshot.
+    """
+    captured_ms = int(time.time() * 1000)
+    result: dict[str, Any] = {
+        "schema": "bingx_research_account_context_v1",
+        "captured_at_ms": captured_ms,
+        "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
+        "status": "ok",
+        "errors": [],
+        "account_realized_profit_source": "BALANCE_TOTAL",
+        "recent_realized_pnl_total": None,
+        "recent_realized_pnl_source": "UNAVAILABLE",
+        "recent_fill_source": "UNAVAILABLE",
+    }
+    api_key, secret_key = get_credentials()
+    if not api_key or not secret_key:
+        result["status"] = "unavailable"
+        result["errors"].append("missing_credentials")
+        return result
+    try:
+        balance = _request("GET", BALANCE_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if not isinstance(balance, dict) or int(balance.get("code", -1)) != 0:
+            result["status"] = "partial"
+            result["errors"].append(f"balance:code={balance.get('code') if isinstance(balance, dict) else 'invalid'}:msg={balance.get('msg') if isinstance(balance, dict) else 'invalid_response'}")
+        else:
+            rows = balance.get("data")
+            row = rows[0] if isinstance(rows, list) and rows else rows if isinstance(rows, dict) else None
+            if isinstance(row, dict):
+                for src, dst in (("asset", "asset"), ("balance", "balance"), ("equity", "equity"), ("unrealizedProfit", "unrealized_profit"), ("realisedProfit", "realized_profit"), ("realizedProfit", "realized_profit"), ("availableMargin", "available_margin"), ("usedMargin", "used_margin"), ("freezedMargin", "freezed_margin")):
+                    value = row.get(src)
+                    if value is None:
+                        continue
+                    if dst == "asset":
+                        result[dst] = str(value)
+                    else:
+                        try:
+                            num = float(value)
+                            result[dst] = num if math.isfinite(num) else None
+                        except (TypeError, ValueError):
+                            result[dst] = None
+            else:
+                result["status"] = "partial"
+                result["errors"].append("balance:payload_missing")
+    except Exception as exc:
+        result["status"] = "partial"
+        result["errors"].append(f"balance:{type(exc).__name__}:{exc}")
+
+    activity_lookback_min = max(5, min(60, int(os.environ.get("RESEARCH_ACCOUNT_ACTIVITY_LOOKBACK_MINUTES", "15"))))
+    activity_start_ms = max(0, captured_ms - activity_lookback_min * 60 * 1000)
+    activity_end_ms = captured_ms
+    try:
+        fills = _request(
+            "GET", ALL_FILL_ORDERS_PATH,
+            {"tradingUnit": "CONT", "startTs": activity_start_ms, "endTs": activity_end_ms, "currency": "USDT"},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
+            raw_rows = fills.get("data") if isinstance(fills.get("data"), list) else []
+            activity_rows = []
+            fee_values: list[float] = []
+            realized_values: list[float] = []
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("tradeId", "trade_id"), ("orderId", "order_id"), ("symbol", "symbol"), ("side", "side"), ("positionSide", "position_side")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("price", "price"), ("qty", "qty"), ("realizedPnl", "realized_pnl"), ("fee", "fee"), ("time", "time_ms")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        if dst == "time_ms":
+                            val = int(val)
+                        item[dst] = val if math.isfinite(float(val)) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                if item.get("fee") is not None:
+                    fee_values.append(float(item["fee"]))
+                if item.get("realized_pnl") is not None:
+                    realized_values.append(float(item["realized_pnl"]))
+                activity_rows.append(item)
+            fill_count = len(activity_rows)
+            fees_complete = len(fee_values) == fill_count
+            realized_complete = len(realized_values) == fill_count
+            result["recent_fill_window_start_ms"] = activity_start_ms
+            result["recent_fill_window_end_ms"] = activity_end_ms
+            result["recent_fills"] = activity_rows
+            result["recent_fill_count"] = fill_count
+            result["recent_fill_status"] = "EMPTY" if fill_count == 0 else "OK"
+            if fill_count == 0:
+                result["recent_fill_financial_status"] = "NO_FILLS"
+                result["recent_fill_fee_status"] = "NO_FILLS"
+                result["recent_fill_realized_pnl_status"] = "NO_FILLS"
+                result["recent_fill_fee_total"] = 0.0
+                result["recent_fill_realized_pnl_total"] = 0.0
+                result["recent_realized_pnl_total"] = 0.0
+                result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS_EMPTY"
+                result["recent_fill_source"] = "ALL_FILL_ORDERS_EMPTY"
+            else:
+                result["recent_fill_fee_status"] = "CONFIRMED" if fees_complete else "PARTIAL_MISSING_FIELD"
+                result["recent_fill_realized_pnl_status"] = "CONFIRMED" if realized_complete else "PARTIAL_MISSING_FIELD"
+                result["recent_fill_fee_total"] = sum(fee_values) if fees_complete else None
+                result["recent_fill_realized_pnl_total"] = sum(realized_values) if realized_complete else None
+                if fees_complete and realized_complete:
+                    result["recent_fill_financial_status"] = "CONFIRMED"
+                    result["recent_realized_pnl_total"] = sum(realized_values)
+                    result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS"
+                else:
+                    result["recent_fill_financial_status"] = "PARTIAL_MISSING_FIELDS"
+                    # A complete realized-PnL field remains authoritative even when
+                    # fee fields are incomplete. Do not replace it with a different
+                    # source merely because the combined financial row is partial.
+                    result["recent_realized_pnl_total"] = sum(realized_values) if realized_complete else None
+                    result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS_PARTIAL_MISSING"
+                result["recent_fill_source"] = "ALL_FILL_ORDERS"
+        else:
+            result["recent_fill_status"] = "error"
+            result["recent_fill_error"] = f"code={fills.get('code') if isinstance(fills, dict) else 'invalid'}"
+            result.setdefault("errors", []).append(f"fills:code={fills.get('code') if isinstance(fills, dict) else 'invalid'}")
+    except Exception as exc:
+        result["recent_fill_status"] = "error"
+        result["recent_fill_error"] = f"{type(exc).__name__}:{exc}"
+        result.setdefault("errors", []).append(f"fills:{type(exc).__name__}:{exc}")
+
+    try:
+        income = _request(
+            "GET", INCOME_PATH,
+            {"startTime": activity_start_ms, "endTime": activity_end_ms, "limit": 1000},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(income, dict) and int(income.get("code", -1)) == 0:
+            raw_rows = income.get("data") if isinstance(income.get("data"), list) else []
+            income_rows = []
+            totals: dict[str, float] = {}
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("incomeType", "income_type"), ("asset", "asset"), ("info", "info"), ("tranId", "tran_id"), ("tradeId", "trade_id")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("income", "income"), ("time", "time_ms")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        if dst == "time_ms":
+                            val = int(val)
+                        item[dst] = val if math.isfinite(float(val)) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                income_type = str(item.get("income_type") or "UNKNOWN")
+                value = item.get("income")
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    totals[income_type] = totals.get(income_type, 0.0) + float(value)
+                income_rows.append(item)
+            result["recent_income"] = income_rows
+            result["recent_income_count"] = len(income_rows)
+            result["recent_income_totals"] = totals
+            if result.get("recent_realized_pnl_total") is None and result.get("recent_realized_pnl_source") in {"UNAVAILABLE", "ALL_FILL_ORDERS_EMPTY", "ALL_FILL_ORDERS_PARTIAL_MISSING"}:
+                realized_from_income = totals.get("REALIZED_PNL")
+                if isinstance(realized_from_income, (int, float)) and math.isfinite(float(realized_from_income)):
+                    result["recent_realized_pnl_total"] = float(realized_from_income)
+                    result["recent_realized_pnl_source"] = "INCOME_REALIZED_PNL_FALLBACK"
+            if result.get("recent_realized_pnl_source") == "ALL_FILL_ORDERS":
+                result["recent_fill_source"] = "ALL_FILL_ORDERS"
+            elif result.get("recent_realized_pnl_source") == "INCOME_REALIZED_PNL_FALLBACK":
+                result["recent_fill_source"] = "INCOME_FALLBACK"
+        else:
+            result.setdefault("errors", []).append(f"income:code={income.get('code') if isinstance(income, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"income:{type(exc).__name__}:{exc}")
+
+    try:
+        forced = _request(
+            "GET", FORCE_ORDERS_PATH,
+            {"currency": "USDT", "startTime": activity_start_ms, "endTime": activity_end_ms, "limit": 100},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(forced, dict) and int(forced.get("code", -1)) == 0:
+            raw_rows = forced.get("data") if isinstance(forced.get("data"), list) else []
+            force_rows = []
+            liq_n = adl_n = 0
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("side", "side"), ("positionSide", "position_side"), ("autoCloseType", "auto_close_type"), ("orderId", "order_id"), ("time", "time_ms")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src)) if dst != "time_ms" else int(float(row.get(src)))
+                for src, dst in (("price", "price"), ("origQty", "qty"), ("avgPrice", "avg_price")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        item[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                kind = str(item.get("auto_close_type") or "").upper()
+                liq_n += kind == "LIQUIDATION"
+                adl_n += kind == "ADL"
+                force_rows.append(item)
+            result["recent_force_orders"] = force_rows
+            result["recent_force_order_count"] = len(force_rows)
+            result["recent_liquidation_count"] = liq_n
+            result["recent_adl_count"] = adl_n
+        else:
+            result.setdefault("errors", []).append(f"force_orders:code={forced.get('code') if isinstance(forced, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"force_orders:{type(exc).__name__}:{exc}")
+
+    try:
+        positions = _request("GET", POSITION_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if isinstance(positions, dict) and int(positions.get("code", -1)) == 0:
+            rows = _normalize_orders_list(positions)
+            position_rows = []
+            total_notional = 0.0
+            total_unrealized = 0.0
+            long_n = short_n = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("positionSide", "position_side"), ("side", "side")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("positionAmt", "position_amt"), ("positionAmtAbs", "position_amt_abs"), ("avgPrice", "entry_price"), ("entryPrice", "entry_price"), ("markPrice", "mark_price"), ("liquidationPrice", "liquidation_price"), ("leverage", "leverage"), ("unrealizedProfit", "unrealized_profit"), ("initialMargin", "initial_margin")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        item[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                if item.get("position_amt") is not None and item.get("mark_price") is not None:
+                    item["notional_usdt"] = abs(float(item["position_amt"]) * float(item["mark_price"]))
+                else:
+                    item["notional_usdt"] = None
+                if item.get("position_amt") is not None and abs(float(item["position_amt"])) <= 0:
+                    continue
+                if item.get("notional_usdt") is not None:
+                    total_notional += float(item["notional_usdt"])
+                if item.get("unrealized_profit") is not None:
+                    total_unrealized += float(item["unrealized_profit"])
+                direction = str(item.get("side") or item.get("position_side") or "").upper()
+                if direction in {"LONG", "BUY"}:
+                    long_n += 1
+                elif direction in {"SHORT", "SELL"}:
+                    short_n += 1
+                position_rows.append(item)
+            result["positions"] = position_rows
+            result["open_positions_count"] = len(position_rows)
+            result["long_positions_count"] = long_n
+            result["short_positions_count"] = short_n
+            result["open_positions_notional_usdt"] = total_notional
+            result["open_positions_unrealized_profit"] = total_unrealized
+        else:
+            result.setdefault("errors", []).append(f"positions:code={positions.get('code') if isinstance(positions, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"positions:{type(exc).__name__}:{exc}")
+
+    try:
+        commission = _request("GET", COMMISSION_RATE_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if isinstance(commission, dict) and int(commission.get("code", -1)) == 0:
+            row = commission.get("data") if isinstance(commission.get("data"), dict) else commission.get("data", {})
+            if isinstance(row, dict):
+                payload = row.get("commission") if isinstance(row.get("commission"), dict) else row
+                for src, dst in (("takerCommissionRate", "taker_commission_rate"), ("makerCommissionRate", "maker_commission_rate")):
+                    try:
+                        val = float(payload.get(src))
+                        result[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        result[dst] = None
+        else:
+            result.setdefault("errors", []).append(f"commission:code={commission.get('code') if isinstance(commission, dict) else 'invalid'}")
+    except Exception as exc:
+        result["errors"].append(f"commission:{type(exc).__name__}:{exc}")
+
+    if result["errors"] and result["status"] == "ok":
+        result["status"] = "partial"
+    return _research_sanitize(result)
+
+
 def _current_close_price(symbol: str) -> float | None:
-    """Backward-compatible name for the live execution/reference price."""
-    return get_live_price(symbol)
+    try:
+        rows = fetch_klines(symbol, "1m", limit=2)
+    except Exception as exc:
+        log.warning("[BINGX] Failed to read current 1m price for %s: %s", symbol, exc)
+        return None
+
+    if not rows:
+        return None
+    try:
+        price = float(rows[-1].get("close", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    return price if (math.isfinite(price) and price > 0) else None
 
 
 
@@ -1508,270 +2449,140 @@ def _effective_weighted_rr(levels: list[dict], stop_loss_pct: float) -> float | 
     return weighted / total if total > 0 else None
 
 
-def _protection_order_matches_params(order: dict, params: dict) -> bool:
-    """Match an uncertain conditional-order POST against an open order by shape.
 
-    Conditional BingX orders do not support clientOrderId according to the current
-    swap-trade API contract, so transport recovery must rely on immutable order
-    attributes instead of a client id.
-    """
-    if not isinstance(order, dict) or not isinstance(params, dict):
-        return False
-    if str(order.get("type", "")).upper() != str(params.get("type", "")).upper():
-        return False
-    if str(order.get("positionSide", "")).upper() != str(params.get("positionSide", "")).upper():
-        return False
-    if str(order.get("side", "")).upper() != str(params.get("side", "")).upper():
-        return False
-
-    def _num(value):
-        try:
-            x = float(value)
-            return x if math.isfinite(x) else None
-        except (TypeError, ValueError):
-            return None
-
-    expected_qty = _num(params.get("quantity"))
-    actual_qty = _num(order.get("origQty", order.get("quantity")))
-    if expected_qty is not None and actual_qty is not None:
-        if not _qty_matches_position(actual_qty, expected_qty):
-            return False
-    elif expected_qty is not None:
-        return False
-
-    order_type = str(params.get("type", "")).upper()
-    if order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
-        expected_stop = _num(params.get("stopPrice"))
-        actual_stop = _num(order.get("stopPrice", order.get("price")))
-        if expected_stop is None or actual_stop is None:
-            return False
-        if order_type in {"STOP", "STOP_MARKET"}:
-            price_matches = _sl_price_matches(actual_stop, expected_stop)
-        else:
-            price_matches = abs(actual_stop - expected_stop) / max(expected_stop, 1e-12) <= 0.002
-        if not price_matches:
-            return False
-    return True
-
-
-def _find_open_order_by_client_id(symbol: str, direction: str, client_order_id: str) -> tuple[str, dict | None]:
-    """Legacy-compatible client-id lookup; MARKET/LIMIT orders may use this."""
-    if not client_order_id:
-        return "absent", None
+def _order_qty(order: dict) -> float:
     try:
-        prot = get_open_protection_directional(symbol, direction, retryable=False)
-    except Exception as exc:
-        log.warning("[BINGX] Protection verification failed for %s %s: %s", symbol, direction, exc)
-        return "unknown", None
-    if prot.get("status") != "ok":
-        return "unknown", None
-    wanted = str(client_order_id).upper()
-    for order in list(prot.get("sl_orders", [])) + list(prot.get("tp_orders", [])):
-        if str(order.get("clientOrderId", "")).upper() == wanted:
-            return "found", order
-    return "absent", None
+        return abs(float(order.get("origQty", 0) or order.get("quantity", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _find_open_order_for_post(symbol: str, direction: str, params: dict, client_order_id: str | None = None) -> tuple[str, dict | None]:
-    """Return (found/absent/unknown, order) for an uncertain POST outcome."""
-    try:
-        prot = get_open_protection_directional(symbol, direction, retryable=False)
-    except Exception as exc:
-        log.warning("[BINGX] Protection verification failed for %s %s: %s", symbol, direction, exc)
-        return "unknown", None
-    if prot.get("status") != "ok":
-        return "unknown", None
-
-    orders = list(prot.get("sl_orders", [])) + list(prot.get("tp_orders", []))
-    if client_order_id:
-        wanted = str(client_order_id).upper()
-        for order in orders:
-            if str(order.get("clientOrderId", "")).upper() == wanted:
-                return "found", order
-
+def _find_open_order_by_client_id(orders: list[dict], client_order_id: str) -> dict | None:
+    target = str(client_order_id or "").upper()
+    if not target:
+        return None
     for order in orders:
-        if _protection_order_matches_params(order, params):
-            return "found", order
-    return "absent", None
+        if str(order.get("clientOrderId", "")).upper() == target:
+            return order
+    return None
 
 
-def _post_protection_order_verified(
-    symbol: str, direction: str, params: dict, client_order_id: str | None = None,
-    *, max_attempts: int = 2, retry_delay: float = 0.25,
+def _verify_open_order(
+    symbol: str,
+    direction: str,
+    *,
+    client_order_id: str,
+    order_kind: str,
+    expected_price: float,
+    expected_qty: float,
+    price_precision: int,
+    max_attempts: int = 3,
 ) -> dict:
-    """POST protection order with safe recovery when the POST outcome is unknown.
+    """Reconcile an order after POST, including ambiguous network failures.
 
-    For conditional protection orders, current BingX docs do not support
-    clientOrderId, so recovery matches the open order by order shape. When state
-    cannot be proven, never issue a blind duplicate; reconciliation repairs it later.
+    We never retransmit the POST. Instead we poll openOrders and accept the
+    already-created exchange order when its clientOrderId/side/price/qty match.
     """
-    last_resp: dict = {"code": -1, "msg": "protection request not attempted"}
-    order_type = str(params.get("type", "")).upper()
-    conditional = order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
-
-    request_params = dict(params)
-    if not conditional and client_order_id and not request_params.get("clientOrderId"):
-        request_params["clientOrderId"] = str(client_order_id)
-
-    for attempt in range(max_attempts):
+    expected_kind = str(order_kind).upper()
+    for attempt in range(max(1, max_attempts)):
         try:
-            resp = _request("POST", ORDER_PATH, request_params)
+            book = get_open_protection_directional(symbol, direction, retryable=False)
         except Exception as exc:
-            resp = {"code": -1, "msg": str(exc)}
-        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-            data = resp.get("data") or {}
-            order = data.get("order") if isinstance(data, dict) else None
-            if not isinstance(order, dict):
-                order = data if isinstance(data, dict) else {}
-            order_id = str(order.get("orderId", "") or "").strip()
-            if not order_id:
-                return {
-                    "code": -1,
-                    "msg": "successful protection response is missing orderId",
-                    "protection_state_unknown": True,
-                    "malformed_success_response": True,
-                }
-            return resp
-
-        last_resp = resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
-        is_transport = last_resp.get("code") == -1 and "missing bingx credentials" not in str(last_resp.get("msg", "")).lower()
-        if not is_transport:
-            return last_resp
-
-        state, found = _find_open_order_for_post(symbol, direction, params, client_order_id)
-        if state == "found" and found is not None:
-            return {
-                "code": 0,
-                "data": {"order": found},
-                "recovered": True,
-                "recovery": "open_order_verified_after_transport_error",
-            }
-        if state != "absent":
-            return {
-                "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; protection state unknown after POST",
-                "protection_state_unknown": True,
-            }
-
-        # For a conditional order we cannot prove that the POST was lost if the
-        # order is not open anymore: it may have immediately triggered/filled.
-        # Never send a duplicate in that state; the next reconciliation cycle
-        # will inspect the live position and repair what is actually missing.
-        if conditional:
-            # Distinguish a genuinely disappeared position from a still-open
-            # position, but never infer that the conditional POST was lost. It
-            # may already have triggered/filled between the POST and verification.
-            try:
-                live_pos = get_position_directional(symbol, direction)
-                live_status = str(live_pos.get("status", "")).lower()
-                live_qty = abs(float(live_pos.get("positionAmt", 0) or 0)) if live_status == "found" else 0.0
-            except Exception as exc:
-                return {
-                    "code": -1,
-                    "msg": f"{last_resp.get('msg', 'transport error')}; conditional protection verification failed: {exc}",
-                    "protection_state_unknown": True,
-                }
-            if live_status != "found" or live_qty <= 0:
-                return {
-                    "code": -1,
-                    "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after conditional-order timeout",
-                    "protection_state_unknown": True,
-                    "position_gone": True,
-                }
-            return {
-                "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; conditional protection outcome unknown; no blind retry",
-                "protection_state_unknown": True,
-            }
-
-        try:
-            live_pos = get_position_directional(symbol, direction)
-            live_status = str(live_pos.get("status", "")).lower()
-            live_qty = abs(float(live_pos.get("positionAmt", 0) or 0)) if live_status == "found" else 0.0
-        except Exception as exc:
-            return {
-                "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; live position verification failed: {exc}",
-                "protection_state_unknown": True,
-            }
-        if live_status != "found" or live_qty <= 0:
-            return {
-                "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after timeout",
-                "protection_state_unknown": True,
-                "position_gone": True,
-            }
-
-        # MARKET TP/close can fill between POST and verification. Never recreate.
-        if order_type == "MARKET":
-            return {
-                "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; MARKET outcome unknown after timeout; no blind retry",
-                "protection_state_unknown": True,
-            }
-
-        # Kept for any future non-conditional, non-MARKET order type.
-        params = dict(params)
-        try:
-            precision = int((get_contract(symbol) or {}).get("quantityPrecision") or 0)
-            params["quantity"] = _format_qty(_round_qty(live_qty, precision), precision)
-        except Exception:
-            pass
-
-        if attempt + 1 < max_attempts:
-            time.sleep(retry_delay)
-            continue
-        return last_resp
-
-    return last_resp
-
-def _sl_price_matches(actual_price: float, expected_price: float, tolerance: float = 0.002) -> bool:
-    return actual_price > 0 and expected_price > 0 and abs(actual_price - expected_price) / max(expected_price, 1e-12) <= tolerance
-
-
-
-
-def _cancel_protection_order_verified(symbol: str, direction: str, order: dict, *, max_attempts: int = 3) -> tuple[bool, str]:
-    order_id = str(order.get("orderId", ""))
-    if not order_id:
-        return False, "missing orderId"
-    last = ""
-    for attempt in range(max_attempts):
-        try:
-            resp = cancel_order(symbol, order_id)
-        except Exception as exc:
-            resp = {"code": -1, "msg": str(exc)}
-        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-            try:
-                latest = get_open_protection_directional(symbol, direction)
-                if latest.get("status") == "ok":
-                    open_ids = {str(o.get("orderId", "")) for o in (latest.get("sl_orders", []) + latest.get("tp_orders", []))}
-                    if order_id not in open_ids:
-                        return True, "cancelled_and_verified"
-                    last = "cancel acknowledged but order is still visible"
-                else:
-                    last = "cancel acknowledged but openOrders verification failed"
-            except Exception as exc:
-                last = f"cancel acknowledged but verification failed: {exc}"
-        else:
-            last = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
-        try:
-            latest = get_open_protection_directional(symbol, direction)
-            if latest.get("status") == "ok":
-                open_ids = {str(o.get("orderId", "")) for o in (latest.get("sl_orders", []) + latest.get("tp_orders", []))}
-                if order_id not in open_ids:
-                    return True, "already_gone"
-        except Exception:
-            pass
-        if attempt + 1 < max_attempts:
+            book = {"status": "error", "error": str(exc)}
+        if book.get("status") == "ok":
+            orders = list(book.get("sl_orders", [])) + list(book.get("tp_orders", []))
+            for order in orders:
+                if str(order.get("clientOrderId", "")).upper() != str(client_order_id).upper():
+                    continue
+                qty = _order_qty(order)
+                actual_price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
+                type_ok = str(order.get("type", "")).upper() == expected_kind
+                price_ok = _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
+                qty_ok = _qty_matches_position(qty, expected_qty)
+                if type_ok and price_ok and qty_ok:
+                    return {"status": "verified", "order": order, "attempt": attempt + 1}
+        if attempt + 1 < max(1, max_attempts):
             time.sleep(0.25 * (attempt + 1))
-    return False, last or "cancel failed"
+    return {"status": "not_found", "client_order_id": client_order_id}
+
+
+def _verify_market_reduce_order(
+    symbol: str,
+    direction: str,
+    order_id: str | None,
+    expected_qty: float,
+    pre_qty: float,
+    attempts: int = 5,
+) -> dict:
+    """Verify a crossed-TP MARKET reduction from exchange state.
+
+    A successful POST acknowledgement is not sufficient: the market order must
+    show execution and/or the live position must decrease. This helper never
+    retries the MARKET POST itself.
+    """
+    direction = str(direction).upper()
+    expected_qty = max(0.0, float(expected_qty))
+    pre_qty = max(0.0, float(pre_qty))
+    last = {"status": "unverified", "executed_qty": 0.0, "remaining_qty": pre_qty}
+    for attempt in range(max(1, attempts)):
+        executed_qty = 0.0
+        order_info = None
+        if order_id:
+            try:
+                order_info = get_order(symbol, order_id)
+            except Exception:
+                order_info = None
+            if isinstance(order_info, dict) and order_info.get("status") == "ok":
+                try:
+                    executed_qty = max(0.0, float(order_info.get("executed_qty", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    executed_qty = 0.0
+
+        try:
+            pos = get_position_directional(symbol, direction)
+        except Exception as exc:
+            pos = {"status": "error", "error": str(exc)}
+
+        if pos.get("status") == "found":
+            try:
+                remaining_qty = max(0.0, float(pos.get("positionAmt", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                remaining_qty = pre_qty
+        elif pos.get("status") == "not_found":
+            remaining_qty = 0.0
+        else:
+            remaining_qty = pre_qty
+
+        reduced_qty = max(0.0, pre_qty - remaining_qty)
+        last = {
+            "status": "unverified",
+            "executed_qty": executed_qty,
+            "remaining_qty": remaining_qty,
+            "reduced_qty": reduced_qty,
+            "order": order_info,
+        }
+
+        # Require real evidence of execution. Either the order reports fills,
+        # or the exchange position demonstrably shrank. For a position that
+        # disappeared entirely, the residual check itself is authoritative.
+        if executed_qty > 0 and (reduced_qty > 0 or remaining_qty <= 1e-12):
+            last["status"] = "verified"
+            return last
+        if reduced_qty > 0 and (executed_qty > 0 or order_info is None):
+            last["status"] = "verified"
+            return last
+
+        if attempt + 1 < max(1, attempts):
+            time.sleep(0.2 * (attempt + 1))
+
+    if expected_qty <= 0 and last.get("remaining_qty", pre_qty) <= 1e-12:
+        last["status"] = "verified"
+    return last
 
 
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
-    stop_loss_price: float | None = None,
 ) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1810,22 +2621,20 @@ def ensure_directional_protection(
     existing_tp = list(existing.get("tp_orders", []))
     existing_sl = list(existing.get("sl_orders", []))
     tp_levels_norm = _normalize_tp_levels(tp_levels)
+    if tp_levels and not tp_levels_norm:
+        return {
+            "status": "PROTECTION_FAILED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "error": "invalid_nonempty_tp_configuration",
+            "failure_class": "INVALID_TP_CONFIGURATION",
+        }
 
-    if stop_loss_price is not None:
-        try:
-            explicit_sl_price = float(stop_loss_price)
-        except (TypeError, ValueError):
-            return {"status": "error", "error": "invalid explicit stop_loss_price"}
-        if not math.isfinite(explicit_sl_price) or explicit_sl_price <= 0:
-            return {"status": "error", "error": "invalid explicit stop_loss_price"}
-        if direction == "LONG" and explicit_sl_price > avg_price:
-            return {"status": "error", "error": "LONG stop_loss_price is above avg_price"}
-        if direction == "SHORT" and explicit_sl_price < avg_price:
-            return {"status": "error", "error": "SHORT stop_loss_price is below avg_price"}
-        desired_sl_price = explicit_sl_price
-    else:
-        desired_sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
     valid_existing_sl = None
+    engine_owned_invalid_sl_ids: list[str] = []
     for sl in existing_sl:
         order_type = str(sl.get("type", "")).upper()
         if order_type not in {"STOP", "STOP_MARKET"}:
@@ -1839,21 +2648,38 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
-        is_break_even = _sl_price_matches(desired_sl_price, avg_price) and _sl_price_matches(sl_price, avg_price)
-        protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
-        if is_break_even:
-            protective_side = True
-        if protective_side and _sl_price_matches(sl_price, desired_sl_price) and _qty_matches_position(sl_qty, position_qty):
+        protective_side = (sl_price <= avg_price) if direction == "LONG" else (sl_price >= avg_price)
+        qty_matches = _qty_matches_position(sl_qty, position_qty)
+        if protective_side and qty_matches and valid_existing_sl is None:
             valid_existing_sl = sl
-            break
+            continue
+
+        # A stale/wrong-side/order-size-mismatched SL created by this engine
+        # must never remain alongside a newly-created protective SL. Manual
+        # orders are intentionally left untouched; the engine only cleans its
+        # own EVT_* protection orders.
+        client_id = str(sl.get("clientOrderId", ""))
+        order_id = str(sl.get("orderId", ""))
+        if order_id and client_id.upper().startswith("EVT_"):
+            engine_owned_invalid_sl_ids.append(order_id)
+
+    if engine_owned_invalid_sl_ids:
+        for old_id in engine_owned_invalid_sl_ids:
+            try:
+                cancel_resp = cancel_order(symbol, old_id)
+            except Exception as exc:
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {exc}"}
+            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
+
+        post_cleanup = get_open_protection_directional(symbol, direction)
+        if post_cleanup.get("status") != "ok":
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup could not be verified"}
+        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
+        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup not visible on exchange"}
 
     if valid_existing_sl is not None:
-        # Keep exactly one current SL; remove duplicate/stale SL orders first.
-        stale_sls = [o for o in existing_sl if str(o.get("orderId", "")) != str(valid_existing_sl.get("orderId", ""))]
-        for stale in stale_sls:
-            ok, note = _cancel_protection_order_verified(symbol, direction, stale)
-            if not ok:
-                return {"status": "PROTECTION_FAILED", "error": f"stale SL cancel failed: {note}"}
         sl = valid_existing_sl
         sl_result = {
             "status": "already_exists",
@@ -1861,55 +2687,76 @@ def ensure_directional_protection(
             "client_order_id": str(sl.get("clientOrderId", "")),
             "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
+            "protection_order_verified": True,
+            "execution_verified": None,
         }
     else:
-        # Never create a new SL while an old/wrong SL is still live.
-        for stale in existing_sl:
-            ok, note = _cancel_protection_order_verified(symbol, direction, stale)
-            if not ok:
-                return {"status": "PROTECTION_FAILED", "error": f"old SL cancel failed: {note}; refusing to create a second SL"}
-        sl_price = desired_sl_price
+        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
         client_order_id = build_sl_client_order_id(trade_id)
+        current_price = _current_close_price(symbol)
+        if current_price is not None:
+            sl_side_valid = (sl_price < current_price) if direction == "LONG" else (sl_price > current_price)
+            if not sl_side_valid:
+                return {
+                    "status": "PROTECTION_FAILED",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "avg_price": avg_price,
+                    "qty": position_qty,
+                    "error": f"stop_price_crossed_before_post: sl={sl_price} current={current_price}",
+                    "current_price": current_price,
+                }
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": direction,
+            "positionSide": position_side_param(direction),
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
+            "clientOrderId": client_order_id,
         }
 
-        resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
-        if resp.get("code") not in (0, "0"):
-            log.error("[BINGX] SL failed: code=%s msg=%s", resp.get("code"), resp.get("msg"))
-            rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLFAIL:{trade_id or bx_symbol}")
-            return {
-                "status": "PROTECTION_FAILED",
-                "error": f"SL failed: {resp.get('msg')}; emergency_close={rollback.get('status')}",
-                "sl_result": {"status": "error", "error": resp.get("msg")},
-                "tp_orders": [],
-                "rolled_back": rollback.get("status") == "closed",
-                "emergency_close": rollback,
-            }
-
+        resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-        sl_result = {
-            "status": "created",
-            "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or None,
-            "stop_price": sl_price,
-            "qty": position_qty,
-        }
+        if resp.get("code") != 0:
+            verify = _verify_open_order(
+                symbol, direction, client_order_id=client_order_id, order_kind="STOP_MARKET",
+                expected_price=sl_price, expected_qty=position_qty, price_precision=price_precision,
+            )
+            if verify.get("status") != "verified":
+                log.error("[BINGX] SL failed/unverified: code=%s msg=%s", resp.get("code"), resp.get("msg"))
+                return {
+                    "status": "PROTECTION_FAILED",
+                    "error": f"SL failed: {resp.get('msg')}",
+                    "sl_result": {"status": "error", "error": resp.get("msg")},
+                    "tp_orders": [],
+                }
+            order = verify["order"]
+            sl_result = {
+                "status": "reconciled_after_post_error",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "stop_price": float(order.get("stopPrice", 0) or order.get("price", 0) or sl_price),
+                "qty": _order_qty(order),
+                "protection_order_verified": True,
+                "execution_verified": None,
+            }
+        else:
+            sl_result = {
+                "status": "created",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "stop_price": sl_price,
+                "qty": position_qty,
+                "protection_order_verified": True,
+                "execution_verified": None,
+            }
 
     verified = get_open_protection_directional(symbol, direction)
     verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
-    verified_sl_valid = any(
-        _validate_sl_order_for_position(o, direction, avg_price, expected_price=desired_sl_price, expected_qty=position_qty)
-        for o in verified_sl
-    )
+    verified_sl_valid = any(_validate_sl_order_for_position(o, direction, avg_price, position_qty) for o in verified_sl)
 
     if not verified_sl_valid:
-        rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLVERIFY:{trade_id or bx_symbol}")
         return {
             "status": "SL_UNVERIFIED",
             "symbol": symbol,
@@ -1920,19 +2767,25 @@ def ensure_directional_protection(
             "sl_result": sl_result,
             "tp_orders": [],
             "error": "SL created but not visible on exchange",
-            "rolled_back": rollback.get("status") == "closed",
-            "emergency_close": rollback,
         }
 
-    # Adapt the TP profile to the confirmed exchange position size. Use all 3
-    # independent legs when executable; otherwise fall back to TP1/TP2, and
-    # finally to one terminal TP3 leg. This is intentionally independent of
-    # REQUIRE_MULTI_TP: a valid entry must not be discarded merely because the
-    # account is too small for the full 3-leg profile.
-    tp_levels_norm = _select_supported_tp_levels(
-        tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
-    )
     if not tp_levels_norm:
+        return {
+            "status": "PROTECTED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "sl_result": sl_result,
+            "tp_orders": [],
+            "tp_mode": "none",
+            "effective_tp_levels": [],
+            "effective_weighted_rr": 0.0,
+        }
+
+    tp_mode = "multi_tp"
+    if min_qty > 0 and position_qty < min_qty * len(tp_levels_norm):
         return {
             "status": "PROTECTION_FAILED",
             "symbol": symbol,
@@ -1942,15 +2795,8 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
-            "error": "no TP profile can be supported by the filled position quantity",
-            "rolled_back": False,
+            "error": f"position_qty={position_qty} cannot support required {len(tp_levels_norm)} TP legs with minQty={min_qty}",
         }
-    tp_mode = "single_tp" if len(tp_levels_norm) == 1 else ("two_tp" if len(tp_levels_norm) == 2 else "multi_tp")
-    log.info(
-        "[BINGX] %s %s TP profile selected: mode=%s legs=%s qty=%s min_qty=%s",
-        symbol, direction, tp_mode, ",".join(str(x.get("leg", "")).upper() for x in tp_levels_norm),
-        _format_qty(position_qty, precision), _format_qty(min_qty, precision) if min_qty > 0 else "0",
-    )
 
     try:
         desired_qtys = _allocate_tp_quantities(
@@ -1973,8 +2819,6 @@ def ensure_directional_protection(
         }
 
     tp_results = []
-    stale_tp_cancellations = []
-    handled_existing_tp_ids: set[str] = set()
     current_price = None
     current_price_checked = False
 
@@ -1985,17 +2829,11 @@ def ensure_directional_protection(
 
         existing_leg = None
         for order in existing_tp:
-            existing_order_id = str(order.get("orderId", ""))
-            if existing_order_id and existing_order_id in handled_existing_tp_ids:
-                continue
             if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id):
                 existing_leg = order
                 break
 
         if existing_leg:
-            existing_order_id = str(existing_leg.get("orderId", ""))
-            if existing_order_id:
-                handled_existing_tp_ids.add(existing_order_id)
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
             # An existing TP is reusable only when both price and quantity match
             # the current desired leg. Reusing a smaller/older order can leave
@@ -2011,18 +2849,21 @@ def ensure_directional_protection(
                         "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
                         "qty": existing_qty,
                         "pnl_pct": pnl_pct,
+                        "expected_tp_price": tp_price,
+                        "protection_order_verified": True,
+                        "execution_verified": None,
                     }
                 )
                 continue
 
             old_order_id = str(existing_leg.get("orderId", ""))
             if old_order_id:
-                cancel_ok, cancel_note = _cancel_protection_order_verified(symbol, direction, existing_leg)
-                if not cancel_ok:
+                cancel_resp = cancel_order(symbol, old_order_id)
+                if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
                     tp_results.append({
                         "leg": leg,
                         "status": "error",
-                        "error": f"stale TP cancel failed: {cancel_note}",
+                        "error": f"stale TP cancel failed: code={cancel_resp.get('code') if isinstance(cancel_resp, dict) else None} msg={cancel_resp.get('msg') if isinstance(cancel_resp, dict) else cancel_resp}",
                         "qty": tp_qty,
                         "pnl_pct": pnl_pct,
                     })
@@ -2039,85 +2880,137 @@ def ensure_directional_protection(
         trigger_invalid = (direction == "LONG" and tp_price <= current_price) or (direction == "SHORT" and tp_price >= current_price)
 
         if trigger_invalid:
-            log.warning("[BINGX] TP market execution for %s %s: price=%s current=%s (trigger crossed)", symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision))
-            client_order_id = build_tp_client_order_id(leg, trade_id)
-            market_params = {
-                "symbol": bx_symbol,
-                "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": direction,
-                "type": "MARKET",
-                "quantity": _format_qty(tp_qty, precision),
+            # Initial protection is established before local ownership is committed.
+            # Never reduce the just-opened position with a market TP in this window;
+            # return a protection failure so the caller uses its verified rollback path.
+            log.critical(
+                "[BINGX] TP target already crossed during initial protection for %s %s: price=%s current=%s",
+                symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision),
+            )
+            return {
+                "status": "PROTECTION_FAILED",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "direction": direction,
+                "avg_price": avg_price,
+                "qty": position_qty,
+                "sl_result": sl_result,
+                "tp_orders": tp_results,
+                "error": f"tp_target_crossed_before_initial_protection: leg={leg} tp={tp_price} current={current_price}",
+                "failed_leg": leg,
+                "failure_class": "TP_TARGET_CROSSED_BEFORE_PROTECTION",
             }
-
-            resp = _post_protection_order_verified(symbol, direction, market_params, client_order_id, max_attempts=2, retry_delay=0.25)
-            if resp.get("code") not in (0, "0"):
-                log.error("[BINGX] TP market close failed: %s msg=%s", leg, resp.get("msg"))
-                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
-            else:
-                order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-                tp_results.append({
-                    "leg": leg,
-                    "status": "created",
-                    "order_id": str(order.get("orderId", "")),
-                    "client_order_id": order.get("clientOrderId") or None,
-                    "price": current_price,
-                    "qty": tp_qty,
-                    "pnl_pct": pnl_pct,
-                })
-            continue
 
         client_order_id = build_tp_client_order_id(leg, trade_id)
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": direction,
+            "positionSide": position_side_param(direction),
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
+            "clientOrderId": client_order_id,
         }
 
-        resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
-        if resp.get("code") not in (0, "0"):
-            log.error("[BINGX] TP order failed: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
-            tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+        resp = _request("POST", ORDER_PATH, params)
+        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+        if resp.get("code") != 0:
+            verify = _verify_open_order(
+                symbol, direction, client_order_id=client_order_id, order_kind="TAKE_PROFIT_MARKET",
+                expected_price=tp_price, expected_qty=tp_qty, price_precision=price_precision,
+            )
+            if verify.get("status") != "verified":
+                log.error("[BINGX] TP order failed/unverified: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
+                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+                continue
+            order = verify["order"]
+            tp_results.append({
+                "leg": leg, "status": "reconciled_after_post_error",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
+                "qty": _order_qty(order), "pnl_pct": pnl_pct,
+                "protection_order_verified": True,
+                "execution_verified": None,
+            })
             continue
 
-        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+        # A code=0 acknowledgement is not enough for protection. Re-read the
+        # exchange open-order book and verify exact client ID, type, price and qty.
+        verify = _verify_open_order(
+            symbol, direction, client_order_id=client_order_id, order_kind="TAKE_PROFIT_MARKET",
+            expected_price=tp_price, expected_qty=tp_qty, price_precision=price_precision,
+        )
+        if verify.get("status") != "verified":
+            tp_results.append({"leg": leg, "status": "error", "error": "TP acknowledged but not verifiable on exchange", "qty": tp_qty, "pnl_pct": pnl_pct})
+            continue
+        order = verify["order"]
         tp_results.append({
-            "leg": leg,
-            "status": "created",
+            "leg": leg, "status": "created",
             "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or None,
-            "price": tp_price,
-            "qty": tp_qty,
-            "pnl_pct": pnl_pct,
+            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
+            "qty": _order_qty(order), "pnl_pct": pnl_pct,
+            "expected_tp_price": tp_price, "protection_order_verified": True, "execution_verified": None,
         })
 
-    # Reconcile the complete desired TP set, not only its members. When a
-    # position changes profile (e.g. 3 TPs -> single TP), any live conditional
-    # order that was not consumed by the current desired set is stale and must
-    # be cancelled and verified. This deliberately runs after desired orders
-    # are healthy so there is no intentional protection gap.
-    stale_tps = [
-        order for order in existing_tp
-        if str(order.get("orderId", "")) and str(order.get("orderId", "")) not in handled_existing_tp_ids
-    ]
-    stale_tp_cleanup_failed = False
-    for stale in stale_tps:
-        order_id = str(stale.get("orderId", ""))
-        ok, note = _cancel_protection_order_verified(symbol, direction, stale)
-        stale_tp_cancellations.append({
-            "order_id": order_id,
-            "status": "cancelled" if ok else "error",
-            "error": None if ok else note,
-        })
-        if not ok:
-            stale_tp_cleanup_failed = True
+    successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
+    tp_geometry_valid = True
+    tp_qty_valid = True
+    tp_identity_valid = True
+    seen_tp_order_ids: set[str] = set()
+    for level, expected_qty in zip(tp_levels_norm, desired_qtys):
+        leg = str(level["leg"])
+        pnl_pct = float(level["pnl_pct"])
+        expected_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
+        matches = [t for t in successful_tps if str(t.get("leg", "")) == leg]
+        if len(matches) != 1:
+            tp_identity_valid = False
+            continue
+        item = matches[0]
+        oid = str(item.get("order_id") or "")
+        if not oid or oid in seen_tp_order_ids:
+            tp_identity_valid = False
+        seen_tp_order_ids.add(oid)
+        actual_price = float(item.get("price") or 0.0)
+        actual_qty = float(item.get("qty") or 0.0)
+        expected_price_norm = float(_format_price(expected_price, price_precision))
+        actual_price_norm = float(_format_price(actual_price, price_precision))
+        # Exchange pricePrecision is authoritative: 103.12669 submitted to a
+        # 4-decimal market is 103.1267. Compare the normalized exchange price,
+        # not the unrounded mathematical target, otherwise valid protection is
+        # falsely downgraded to SL_ONLY and can trigger an emergency close.
+        qty_tol = max(1e-12, abs(expected_qty) * 1e-8)
+        if actual_price <= 0 or actual_price_norm != expected_price_norm:
+            tp_geometry_valid = False
+        if actual_qty <= 0 or abs(actual_qty - float(expected_qty)) > qty_tol:
+            tp_qty_valid = False
+        if item.get("protection_order_verified") is not True or item.get("execution_verified") is True:
+            tp_identity_valid = False
 
-    successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists"}]
-    if not verified_sl_valid or stale_tp_cleanup_failed:
+    tp_qty_sum = sum(float(t.get("qty") or 0.0) for t in successful_tps)
+    tp_qty_valid = tp_qty_valid and abs(tp_qty_sum - float(position_qty)) <= max(1e-12, abs(float(position_qty)) * 1e-8)
+
+    # Validate the actual rounded exchange trigger ladder. Rounding must not make
+    # TP1/TP2 collapse onto each other or cross the entry, otherwise the protection
+    # is economically invalid even when each individual order matches its target.
+    rounded_tp_prices = []
+    for level in tp_levels_norm:
+        pnl_pct = float(level["pnl_pct"])
+        expected = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
+        rounded_tp_prices.append(float(_format_price(expected, price_precision)))
+    if any(p <= 0 for p in rounded_tp_prices):
+        tp_geometry_valid = False
+    elif direction == "LONG":
+        if any(p <= avg_price for p in rounded_tp_prices) or any(b <= a for a, b in zip(rounded_tp_prices, rounded_tp_prices[1:])):
+            tp_geometry_valid = False
+    elif direction == "SHORT":
+        if any(p >= avg_price for p in rounded_tp_prices) or any(b >= a for a, b in zip(rounded_tp_prices, rounded_tp_prices[1:])):
+            tp_geometry_valid = False
+
+    if not verified_sl_valid:
         final_status = "PROTECTION_FAILED"
-    elif len(successful_tps) == len(tp_levels_norm):
+    elif len(successful_tps) == len(tp_levels_norm) and tp_geometry_valid and tp_qty_valid and tp_identity_valid:
         final_status = "PROTECTED"
     else:
         final_status = "SL_ONLY"
@@ -2143,16 +3036,20 @@ def ensure_directional_protection(
         "tp_mode": tp_mode,
         "effective_tp_levels": effective_levels,
         "effective_weighted_rr": effective_weighted_rr,
+        "protection_validation": {
+            "sl_verified": bool(verified_sl_valid),
+            "tp_geometry_valid": bool(tp_geometry_valid),
+            "tp_qty_valid": bool(tp_qty_valid),
+            "tp_identity_valid": bool(tp_identity_valid),
+            "tp_qty_sum": float(tp_qty_sum),
+            "position_qty": float(position_qty),
+        },
         "tp_orders": tp_results,
-        "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
     }
 
 
-def _validate_sl_order_for_position(
-    order: dict, direction: str, avg_price: float,
-    *, expected_price: float | None = None, expected_qty: float | None = None,
-) -> bool:
+def _validate_sl_order_for_position(order: dict, direction: str, avg_price: float, position_qty: float | None = None) -> bool:
     order_type = str(order.get("type", "")).upper()
     if order_type not in {"STOP", "STOP_MARKET"}:
         return False
@@ -2167,23 +3064,12 @@ def _validate_sl_order_for_position(
         return False
 
     direction = str(direction).upper()
+    if position_qty is not None and not _qty_matches_position(qty, float(position_qty)):
+        return False
+
     if direction == "LONG":
-        protective = sl_price < avg_price
-    elif direction == "SHORT":
-        protective = sl_price > avg_price
-    else:
-        return False
+        return sl_price <= avg_price
+    if direction == "SHORT":
+        return sl_price >= avg_price
 
-    # A break-even stop at the exact entry price is a valid protection state,
-    # but only when the caller explicitly expects that entry price. Do not
-    # globally relax the directional check for arbitrary equal-price stops.
-    if not protective and expected_price is not None:
-        protective = _sl_price_matches(float(expected_price), avg_price) and _sl_price_matches(sl_price, avg_price)
-
-    if not protective:
-        return False
-    if expected_price is not None and not _sl_price_matches(sl_price, float(expected_price)):
-        return False
-    if expected_qty is not None and not _qty_matches_position(qty, float(expected_qty)):
-        return False
-    return True
+    return False
