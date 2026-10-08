@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791454682981,
+  "updated_ts": 1791454923500,
   "events": [
     {
       "event_id": "EVT_93FA25EC1EC19D3C",
@@ -2490,6 +2490,91 @@
         "atr": 4.021806861492453e-05,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_C1A0AED3470AC241",
+      "symbol": "币安人生",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKOUT_MOMENTUM",
+      "timestamps": {
+        "pivot_1_ts": 1791449999999,
+        "pivot_2_ts": 1791449999999,
+        "detected_at_ts": 1791449999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.5666,
+        "donchian_high": 0.5639,
+        "donchian_low": 0.4704,
+        "breakout_atr": 0.22693185993636458,
+        "bb_width": 0.20967552808099305,
+        "bb_width_threshold": 0.02009392332218911,
+        "volume_ratio": 9.642677565336864,
+        "adx": 46.73960144592269,
+        "requires_retest": true,
+        "trigger_level": 0.5639,
+        "engine": "BREAKOUT_MOMENTUM",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_FCE3C0B3524B1EB4",
+      "symbol": "币安人生",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791449999999,
+        "pivot_2_ts": 1791449999999,
+        "detected_at_ts": 1791449999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.5666,
+        "donchian_high": 0.5639,
+        "donchian_low": 0.4704,
+        "breakout_atr": 0.22693185993636458,
+        "volume_ratio": 9.642677565336864,
+        "adx": 46.73960144592269,
+        "ema200": 0.49765048475019674,
+        "compressed_recent": true,
+        "bb_width": 0.20967552808099305,
+        "trigger_level": 0.5639,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_2B2EE5D748DB1FA6",
+      "symbol": "币安人生",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1791449999999,
+        "pivot_2_ts": 1791453599999,
+        "detected_at_ts": 1791453599999
+      },
+      "event_fact": {
+        "swept_level": 0.5757,
+        "sweep_depth_atr": 0.6639858124063929,
+        "reclaim_displacement_atr": 0.7900590679265892,
+        "rejection_wick_fraction": 0.5805369127516763,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1791449999999,
+        "lookback_bars": 20,
+        "volume_ratio": 6.0749804899272135,
+        "trigger_level": 0.5757,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
