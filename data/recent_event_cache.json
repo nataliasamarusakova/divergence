@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791535088249,
+  "updated_ts": 1791535374274,
   "events": [
     {
       "event_id": "EVT_7C27EDDFE84FF17A",
@@ -3405,6 +3405,62 @@
         "range_high": 0.3318,
         "range_low": 0.3205,
         "manipulation_depth_atr": 0.23003287607706843,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_AF9135CB0C858BA2",
+      "symbol": "KAIA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791172799999,
+        "pivot_2_ts": 1791529199999,
+        "detected_at_ts": 1791529199999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.03757,
+        "zone_high": 0.03788,
+        "zone_low": 0.03757,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1791421199999,
+        "liquidity_sweep_level": 0.03845,
+        "mss_ts": 1791439199999,
+        "mss_pivot_ts": 1791403199999,
+        "mss_level": 0.03779,
+        "broken_ts": 1791439199999,
+        "bos_ts": 1791176399999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_B6F53FBAE59DC3CC",
+      "symbol": "KAIA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791532799999,
+        "pivot_2_ts": 1791532799999,
+        "detected_at_ts": 1791532799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.03785,
+        "compression_ratio": 0.6542364689770962,
+        "ma_spread_atr": 0.3584164178380539,
+        "compression_threshold": 0.5478392520649923,
+        "breakout_atr": 0.49601794055804466,
+        "volume_ratio": 0.6845639834719931,
+        "requires_retest": true,
+        "trigger_level": 0.03767,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
