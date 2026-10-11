@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791703670881,
+  "updated_ts": 1791703941582,
   "events": [
     {
       "event_id": "EVT_AAEFB25588138F3A",
@@ -1391,6 +1391,34 @@
         "displacement_atr": 1.5248109093231927,
         "volume_ratio": 1.5064560944351055,
         "body_fraction": 0.833333333333341,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4C94D4F8ABBB0968",
+      "symbol": "ERA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1791629999999,
+        "pivot_2_ts": 1791701999999,
+        "detected_at_ts": 1791701999999
+      },
+      "event_fact": {
+        "swept_level": 0.08699,
+        "sweep_depth_atr": 0.6680422232374351,
+        "reclaim_displacement_atr": 0.7372418160827462,
+        "rejection_wick_fraction": 0.6360708534621577,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1791698399999,
+        "lookback_bars": 20,
+        "volume_ratio": 2.1995406060638825,
+        "trigger_level": 0.08699,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
