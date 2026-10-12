@@ -297,6 +297,39 @@ def test_trigger_age_returns_none_without_closed_bar_timestamp():
     assert run_once._trigger_age_min({"trigger_observed_at_ts": 1_000_000}, 2_000_000) is None
 
 
+def test_trigger_freshness_rejects_stale_closed_bar_before_order_queuing():
+    import run_once
+    status, age = run_once._trigger_freshness_status(
+        {"trigger_bar_close_ts": 1_000_000},
+        now_ms=1_600_000,
+        max_delay_min=8.0,
+        required=True,
+    )
+    assert status == "TRIGGER_STALE"
+    assert age == 10.0
+
+
+def test_trigger_freshness_fails_closed_when_required_timestamp_is_missing():
+    import run_once
+    status, age = run_once._trigger_freshness_status(
+        {"trigger_observed_at_ts": 1_000_000},
+        now_ms=2_000_000,
+        max_delay_min=8.0,
+        required=True,
+    )
+    assert status == "TRIGGER_TIMESTAMP_UNKNOWN"
+    assert age is None
+
+
+def test_trigger_freshness_can_be_disabled_only_when_trigger_is_not_required():
+    import run_once
+    status, age = run_once._trigger_freshness_status(
+        {}, now_ms=2_000_000, max_delay_min=8.0, required=False
+    )
+    assert status is None
+    assert age is None
+
+
 def test_same_direction_candidate_prefers_newer_event_even_with_lower_score():
     import run_once
     older = {"event": {"timestamps": {"detected_at_ts": 1_000}}, "score": 95.0}

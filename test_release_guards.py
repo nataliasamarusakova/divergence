@@ -294,3 +294,23 @@ def test_release_never_deletes_persistent_data_between_engine_runs():
     assert 'Clean test-generated runtime state (preserve persisted data)' not in workflow
     assert 'Run tests' not in workflow
     assert workflow.index('Checkout') < workflow.index('Run engine') < workflow.index('Commit state')
+
+
+def test_release_rejects_stale_trigger_before_scoring_and_opportunity_queue():
+    source = Path("run_once.py").read_text(encoding="utf-8")
+    trigger_success = source.index('if not trigger_diag.get("ok"):')
+    freshness_check = source.index('_trigger_freshness_status(', trigger_success)
+    score_calculation = source.index('score = calculate_setup_score', freshness_check)
+    setup_pass = source.index('stage="STRATEGY_FILTERS", decision="PASSED"', score_calculation)
+    assert trigger_success < freshness_check < score_calculation < setup_pass
+    assert 'reason = "TRIGGER_STALE_AT_CANDIDATE_EVALUATION"' in source
+    assert 'TRIGGER_TIMESTAMP_UNAVAILABLE' in source[freshness_check:score_calculation]
+
+
+def test_candidate_decision_journal_uses_actual_stage_timestamp():
+    source = Path("run_once.py").read_text(encoding="utf-8")
+    candidate_loop = source.index('stage="SIGNAL_DISCOVERED", decision="SEEN"')
+    assert 'evaluation_ts=int(time.time() * 1000)' in source[candidate_loop:candidate_loop + 300]
+    reject_helper = source.index('def reject_candidate(stage: str, reason: str, **details: Any) -> None:')
+    reject_end = source.index('if not event_id:', reject_helper)
+    assert 'evaluation_ts=int(time.time() * 1000)' in source[reject_helper:reject_end]

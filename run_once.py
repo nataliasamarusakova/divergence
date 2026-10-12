@@ -3797,6 +3797,24 @@ def _trigger_age_min(trigger_meta: dict[str, Any] | None, now_ms: int | None = N
     return max(0.0, (current_ms - trigger_bar_ts) / 60_000.0)
 
 
+def _trigger_freshness_status(
+    trigger_meta: dict[str, Any] | None,
+    now_ms: int | None = None,
+    max_delay_min: float | None = None,
+    required: bool = True,
+) -> tuple[str | None, float | None]:
+    """Fail closed when a required trigger has no verifiable close time or is stale."""
+    if not required:
+        return None, None
+    age = _trigger_age_min(trigger_meta, now_ms)
+    if age is None:
+        return "TRIGGER_TIMESTAMP_UNKNOWN", None
+    limit = MAX_TRIGGER_TO_ORDER_DELAY_MIN if max_delay_min is None else float(max_delay_min)
+    if age > max(0.0, limit):
+        return "TRIGGER_STALE", age
+    return None, age
+
+
 def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> bool:
     """Return whether Trend Filter may block the current candidate evaluation."""
     return str(mode or "off").lower() == "enforce" and (not isinstance(snapshot, dict) or snapshot.get("trend_decision") != "ALIGNED")
@@ -4221,7 +4239,7 @@ def main() -> None:
             _record_candidate_decision(
                 candidate_id=candidate_id, event_id=event_id, symbol=symbol,
                 direction=direction, event_type=event_type_name, timeframe=tf,
-                stage="SIGNAL_DISCOVERED", decision="SEEN", evaluation_ts=now_ms,
+                stage="SIGNAL_DISCOVERED", decision="SEEN", evaluation_ts=int(time.time() * 1000),
                 detected_at_ts=int(detected_candidate_ts) if detected_candidate_ts > 0 else None,
                 raw_event=_journal_safe(ev), raw_market_features=candidate_market_features,
                 features=candidate_features,
@@ -4232,7 +4250,7 @@ def main() -> None:
                     candidate_id=candidate_id, event_id=event_id, symbol=symbol,
                     direction=direction, event_type=event_type_name, timeframe=tf,
                     stage=stage, decision="REJECTED", reason=reason,
-                    evaluation_ts=now_ms, features=candidate_features, **details,
+                    evaluation_ts=int(time.time() * 1000), features=candidate_features, **details,
                 )
 
             if not event_id:
@@ -4275,7 +4293,7 @@ def main() -> None:
                     "reason": reason,
                     "policy": "DISABLED_EVENT_TYPES",
                     "candidate_id": candidate_id,
-                    "ts": int(now_ms),
+                    "ts": int(time.time() * 1000),
                 })
                 continue
 
@@ -4473,6 +4491,47 @@ def main() -> None:
                     log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
                     reject_candidate("15M_TRIGGER", str(reason), trigger_diagnostics=_journal_safe(trigger_diag))
                     continue
+
+                # A trigger may satisfy the event-to-trigger window yet already be
+                # too old to trade by the time a sequential universe scan reaches it.
+                # Reject it here before scoring/shadow telemetry/opportunity queuing;
+                # the independent pre-order check below still protects against queue delay.
+                trigger_observed_at_ts = int(time.time() * 1000)
+                trigger_freshness_status, trigger_age_at_observation = _trigger_freshness_status(
+                    trigger_diag,
+                    now_ms=trigger_observed_at_ts,
+                    max_delay_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+                    required=REQUIRE_TRIGGER,
+                )
+                if trigger_freshness_status:
+                    if trigger_freshness_status == "TRIGGER_STALE":
+                        stats["rejected_trigger_stale"] = int(stats.get("rejected_trigger_stale", 0) or 0) + 1
+                        tf_stats["rejected_trigger_stale"] = int(tf_stats.get("rejected_trigger_stale", 0) or 0) + 1
+                        reason = "TRIGGER_STALE_AT_CANDIDATE_EVALUATION"
+                        log.info(
+                            "[SIGNALS] %s %s (%s/%s) rejected: trigger age %.2fm > %.2fm freshness limit",
+                            direction, symbol, tf, event_type,
+                            float(trigger_age_at_observation), MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+                        )
+                        reject_candidate(
+                            "15M_TRIGGER", reason,
+                            trigger_age_min=trigger_age_at_observation,
+                            trigger_freshness_limit_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+                            trigger_bar_close_ts=trigger_diag.get("trigger_bar_close_ts"),
+                            trigger_bar_close_utc=_format_execution_ts(_safe_float(trigger_diag.get("trigger_bar_close_ts"), 0.0)),
+                            trigger_observed_at_ts=trigger_observed_at_ts,
+                            trigger_diagnostics=_journal_safe(trigger_diag),
+                        )
+                    else:
+                        stats["trigger_data_failed"] = int(stats.get("trigger_data_failed", 0) or 0) + 1
+                        tf_stats["trigger_data_failed"] = int(tf_stats.get("trigger_data_failed", 0) or 0) + 1
+                        reject_candidate(
+                            "15M_TRIGGER", "TRIGGER_TIMESTAMP_UNAVAILABLE",
+                            trigger_observed_at_ts=trigger_observed_at_ts,
+                            trigger_diagnostics=_journal_safe(trigger_diag),
+                        )
+                    continue
+
                 trigger_price = _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0)
                 if trigger_price <= 0:
                     stats["trigger_data_failed"] += 1
@@ -4493,10 +4552,8 @@ def main() -> None:
                     reject_candidate("ENTRY_DRIFT", "SIGNAL_TO_TRIGGER_DRIFT_EXCEEDED", drift_pct=drift_pct, drift_limit_pct=drift_limit, signal_price=signal_price, trigger_price=trigger_price, trigger_diagnostics=_journal_safe(trigger_diag))
                     continue
                 trigger_diag["signal_to_trigger_drift_pct"] = round(drift_pct, 6)
-                # Capture the trigger observation time at the moment the trigger
-                # actually passes validation. Do not reuse the cycle-start now_ms:
-                # the opportunity list may spend seconds/minutes before execution.
-                trigger_observed_at_ts = int(time.time() * 1000)
+                # trigger_observed_at_ts was captured immediately after the closed
+                # trigger passed its predicate and freshness checks above.
                 stats["trigger_passed"] += 1
                 tf_stats["trigger_passed"] += 1
             else:
@@ -4831,7 +4888,7 @@ def main() -> None:
             _record_candidate_decision(
                 candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
                 event_type=event_type, timeframe=tf, stage="STRATEGY_FILTERS", decision="PASSED",
-                evaluation_ts=now_ms, score=score, signal_price=signal_price,
+                evaluation_ts=int(time.time() * 1000), score=score, signal_price=signal_price,
                 trigger_diagnostics=_journal_safe(trigger_diag),
                 trend_filter=_journal_safe(trend_snapshot),
                 entry_quality_reasons=list(entry_quality_reasons),
@@ -4965,7 +5022,12 @@ def main() -> None:
         # list may contain many signals, and earlier trades can consume enough time
         # for a previously-valid trigger to become stale before this order is sent.
         execution_now_ms = int(time.time() * 1000)
-        trigger_age_min = _trigger_age_min(trigger_meta, execution_now_ms)
+        trigger_freshness_status, trigger_age_min = _trigger_freshness_status(
+            trigger_meta,
+            now_ms=execution_now_ms,
+            max_delay_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+            required=REQUIRE_TRIGGER,
+        )
         if EXECUTION_ENABLED and _is_divergence_event(ev) and DIVERGENCE_SHADOW_ONLY:
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
             trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)
@@ -5016,15 +5078,26 @@ def main() -> None:
                     "error": str(exc),
                 }
                 log.exception("[SHADOW] Failed to record divergence paper trade for %s %s (%s)", direction, symbol, event_id)
-        elif EXECUTION_ENABLED and trigger_age_min is not None and trigger_age_min > MAX_TRIGGER_TO_ORDER_DELAY_MIN:
-            stats["rejected_trigger_stale"] += 1
-            execution_result = {"status": "TRIGGER_STALE", "mode": EXECUTION_MODE, "order_id": None,
-                                "error": f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"}
-            # A stale trigger is a cycle-local skip, not a terminal event. The parent
-            # setup may still be valid for a subsequent freshly-detected trigger.
+        elif EXECUTION_ENABLED and trigger_freshness_status:
+            if trigger_freshness_status == "TRIGGER_STALE":
+                stats["rejected_trigger_stale"] = int(stats.get("rejected_trigger_stale", 0) or 0) + 1
+                tf_stats = _tf_stats(stats, str(ev.get("timeframe", "1h")))
+                tf_stats["rejected_trigger_stale"] = int(tf_stats.get("rejected_trigger_stale", 0) or 0) + 1
+                freshness_error = f"trigger_age={trigger_age_min:.3f}m > limit={MAX_TRIGGER_TO_ORDER_DELAY_MIN:.3f}m"
+            else:
+                # When trigger-required mode is enabled, an absent close timestamp
+                # must never degrade to an unchecked/eligible market order.
+                stats["trigger_data_failed"] = int(stats.get("trigger_data_failed", 0) or 0) + 1
+                tf_stats = _tf_stats(stats, str(ev.get("timeframe", "1h")))
+                tf_stats["trigger_data_failed"] = int(tf_stats.get("trigger_data_failed", 0) or 0) + 1
+                freshness_error = "required trigger close timestamp unavailable; order blocked"
+            execution_result = {"status": trigger_freshness_status, "mode": EXECUTION_MODE, "order_id": None,
+                                "error": freshness_error}
+            # A stale/unverifiable trigger is a cycle-local skip, not a terminal event.
+            # The parent setup may be retried only with a freshly validated trigger.
             record_action({"event_id": event_id, "symbol": symbol, "direction": direction,
                            "score": score, "event_type": ev.get("event_type"),
-                           "execution_status": "TRIGGER_STALE",
+                           "execution_status": trigger_freshness_status,
                            "trigger_age_min": trigger_age_min,
                            "trigger_bar_close_ts": trigger_bar_ts,
                            "trigger_bar_close_utc": _format_execution_ts(trigger_bar_ts),
