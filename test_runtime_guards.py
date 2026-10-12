@@ -3,6 +3,12 @@ import json
 import pandas as pd
 from pathlib import Path
 
+@pytest.fixture(autouse=True)
+def _disable_account_order_guard_for_unit_tests(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", False)
+
+
 
 def test_binance_transport_uses_only_explicit_proxy_when_vpn_enabled(monkeypatch):
     import event_engine.binance as binance
@@ -1970,6 +1976,7 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
     assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 8.75, 14.0])
+    assert [x["leg"] for x in levels] == ["tp1", "tp2", "tp3"]
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -2174,3 +2181,17 @@ def test_execution_skip_log_reports_non_stale_reason(caplog):
     assert "[EXECUTION] LONG ATH skipped: SR_SYMBOL_UNAVAILABLE" in caplog.text
     assert "No active Binance Spot USDT source" in caplog.text
     assert "EVT_TEST_SR" in caplog.text
+
+
+def test_btc_regime_is_diagnostic_only_in_candidate_admission():
+    import inspect
+    import run_once as ro
+
+    source = inspect.getsource(ro.main)
+    start = source.index('if btc_regime_df is not None and not _is_btc_symbol(symbol):')
+    end = source.index('funding_ok, funding_reason = check_funding_filter(', start)
+    btc_branch = source[start:end]
+    assert 'check_btc_regime' in btc_branch
+    assert 'BTC_CONTEXT_FLAGGED' in btc_branch
+    assert 'continue' not in btc_branch
+    assert 'diagnostic only' in btc_branch

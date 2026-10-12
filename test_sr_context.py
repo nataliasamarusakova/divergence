@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _disable_account_order_guard_for_unit_tests(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", False)
+
+
 
 
 def _snapshot(*zones):
@@ -618,3 +624,29 @@ def test_quantity_prefixed_spot_price_scale_matches_futures_unit():
     futures_price = 0.00589
     ratio = futures_price / spot_price
     assert ratio == pytest.approx(1000.0, rel=1e-6)
+
+
+def test_sr_room_rejects_non_finite_rr_targets():
+    import event_engine.sr_context as sr
+    with pytest.raises(ValueError, match="finite positive RR targets"):
+        sr.evaluate_sr_room(
+            _snapshot((104.5, "H")),
+            entry_price=100.0,
+            direction="LONG",
+            risk_pct=2.0,
+            target_rrs=(0.65, float("nan"), 2.0),
+        )
+
+
+def test_sr_room_supports_two_target_profile_without_inventing_tp3():
+    import event_engine.sr_context as sr
+    out = sr.evaluate_sr_room(
+        _snapshot((104.5, "H")),
+        entry_price=100.0,
+        direction="LONG",
+        risk_pct=2.0,
+        target_rrs=(0.65, 1.60),
+    )
+    assert out["reject"] is False
+    assert out["effective_tp3_price"] is None
+    assert "room_margin_to_tp3_r" not in out

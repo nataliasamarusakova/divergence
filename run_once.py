@@ -33,6 +33,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
     get_positions,
+    get_open_orders_account_wide,
     get_open_protection_directional,
     ensure_directional_protection,
     has_open_position,
@@ -255,14 +256,17 @@ HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
-# Current TP ladder: closer milestones while preserving staged partial exits.
-# These RR values are used consistently for new entries and restart fallback.
+# Keep the configured 3 -> 2 -> 1 TP ladder for new entries.
+# The order-capacity guard reserves room for SL + up to three TP orders.
+# Existing positions retain the TP levels stored in active_trades.json.
 NORMAL_TP_RR = (0.65, 1.25, 2.00)
 NORMAL_TP_FRACTIONS = (0.25, 0.40, 0.35)
 NORMAL_PLANNED_WEIGHTED_RR = 1.3625
 SQUEEZE_TP_RR = (1.00, 1.50, 2.00)
 SQUEEZE_TP_FRACTIONS = (0.30, 0.35, 0.35)
 SQUEEZE_PLANNED_WEIGHTED_RR = 1.525
+LEGACY_NORMAL_FINAL_TP_RR = 2.00
+LEGACY_SQUEEZE_FINAL_TP_RR = 2.00
 
 # Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
 # Current source is Binance SPOT 1H. Futures can be added later without changing
@@ -337,6 +341,10 @@ ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED",
 MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
 MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
 MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
+BINGX_ORDER_CAPACITY_GUARD_ENABLED = os.environ.get("BINGX_ORDER_CAPACITY_GUARD_ENABLED", "true").lower() == "true"
+BINGX_MAX_OPEN_ORDERS = max(1, int(os.environ.get("BINGX_MAX_OPEN_ORDERS", "200")))
+BINGX_OPEN_ORDER_RESERVE = max(0, int(os.environ.get("BINGX_OPEN_ORDER_RESERVE", "20")))
+BINGX_EXPECTED_NEW_PROTECTION_ORDERS = max(1, int(os.environ.get("BINGX_EXPECTED_NEW_PROTECTION_ORDERS", "4")))
 EXECUTION_MODE = _EXECUTION_MODE_HINT
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
@@ -1199,7 +1207,8 @@ def _tf_stats(stats: dict, timeframe: str) -> dict:
         "trigger_volume_failed": 0,
         "trigger_data_failed": 0,
         "trigger_direction_failed": 0,
-        "rejected_btc": 0,
+        "rejected_btc": 0,  # legacy counter; BTC is contextual, never an entry veto in V1
+        "btc_context_flagged": 0,
         "rejected_funding": 0,
         "rejected_cvd": 0,
         "rejected_score": 0,
@@ -2283,7 +2292,7 @@ def build_event_setup(ev: dict, df_1h: pd.DataFrame, entry_price: float) -> dict
     target_rr = SQUEEZE_TP_RR[-1] if is_squeeze else NORMAL_TP_RR[-1]
     planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR if is_squeeze else NORMAL_PLANNED_WEIGHTED_RR
 
-    # TP3 (финальная цель) ставится на target_rr
+    # Final TP leg is the last configured level (TP3 for the standard profile).
     if direction == "LONG":
         invalidation = entry_price * (1.0 - risk_pct / 100.0)
         target = entry_price * (1.0 + target_rr * risk_pct / 100.0)
@@ -2702,10 +2711,10 @@ def reconcile_all_open_positions() -> None:
                                 "close_fraction": _safe_float(tp.get("qty"), 0.0) / max(qty, 1e-12),
                             })
                         if not inferred_levels:
-                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * LEGACY_NORMAL_FINAL_TP_RR, "close_fraction": 1.0}]
                         total_fraction = sum(max(_safe_float(x.get("close_fraction"), 0.0), 0.0) for x in inferred_levels)
                         if total_fraction <= 0:
-                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
+                            inferred_levels = [{"leg": "tp3", "pnl_pct": inferred_risk * LEGACY_NORMAL_FINAL_TP_RR, "close_fraction": 1.0}]
                         else:
                             for level in inferred_levels:
                                 level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
@@ -2751,9 +2760,39 @@ def reconcile_all_open_positions() -> None:
                         log.error("[RECONCILIATION] Failed to register protected orphan %s (%s): %s", bx_symbol, direction, exc)
             continue
 
+        if not sl_valid:
+            sl_qty_values = []
+            sl_price_values = []
+            for sl_order in sl_orders:
+                sl_qty_values.append(_safe_float(sl_order.get("origQty", 0) or sl_order.get("quantity", 0), 0.0))
+                sl_price_values.append(_safe_float(sl_order.get("stopPrice", 0) or sl_order.get("price", 0), 0.0))
+            mismatch_reason = (
+                "SL_MISSING" if not sl_orders else
+                ("SL_MULTIPLE_ORDERS" if len(sl_orders) != 1 else
+                 ("SL_QTY_MISMATCH" if not sl_qty_values or abs(sl_qty_values[0] - qty) > max(qty * 1e-6, 1e-12) else "SL_PRICE_OR_STATUS_INVALID"))
+            )
+            log.critical(
+                "[PROTECTION_AUDIT] %s %s reason=%s position_qty=%.12g sl_qty=%s sl_price=%s; attempting reconciliation repair",
+                bx_symbol, direction, mismatch_reason, qty, sl_qty_values, sl_price_values,
+            )
+            record_action({
+                "record_type": "PROTECTION_RECONCILIATION_MISMATCH",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "reason": mismatch_reason,
+                "position_qty": qty,
+                "sl_order_ids": [str(x.get("orderId", "")) for x in sl_orders],
+                "sl_order_qty": sl_qty_values,
+                "sl_order_prices": sl_price_values,
+                "tp_order_count": len(tp_orders),
+                "expected_tp_legs": sorted(remaining_expected_legs),
+                "observed_tp_legs": sorted(known_tp_legs),
+                "ts": int(time.time() * 1000),
+            })
+
         log.warning(
             "[RECONCILIATION] %s (%s) Incomplete: SL=%s, TPs=%d/%d (hit: %s). Repairing missing...",
-            bx_symbol, direction, "OK" if sl_valid else "MISSING", len(known_tp_legs), len(remaining_expected_legs), list(hit_legs)
+            bx_symbol, direction, "OK" if sl_valid else "INVALID_OR_MISSING", len(known_tp_legs), len(remaining_expected_legs), list(hit_legs)
         )
 
         # Audit P1-3 (check/repair skew mitigation): re-inspect protection
@@ -2834,7 +2873,7 @@ def reconcile_all_open_positions() -> None:
             tp_levels.extend([x for x in default_levels if x["leg"] not in hit_legs])
 
         if not tp_levels:
-            final_rr = SQUEEZE_TP_RR[-1] if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else NORMAL_TP_RR[-1]
+            final_rr = LEGACY_SQUEEZE_FINAL_TP_RR if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else LEGACY_NORMAL_FINAL_TP_RR
             tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * final_rr, 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
@@ -3035,14 +3074,14 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct_preview), 1e-12)
                     for level in preview_tp_levels
                 )
-                if len(tp_rrs) != 3 or any(rr <= 0 for rr in tp_rrs):
+                if len(tp_rrs) not in {2, 3} or any(rr <= 0 for rr in tp_rrs):
                     raise ValueError("invalid TP ladder for SR room")
                 sr_result = evaluate_sr_room(
                     sr_snapshot,
                     entry_price=float(live_reference),
                     direction=direction,
                     risk_pct=risk_pct_for_sr,
-                    target_rrs=(float(tp_rrs[0]), float(tp_rrs[1]), float(tp_rrs[2])),
+                    target_rrs=tuple(float(rr) for rr in tp_rrs),
                 )
                 setup["sr_context"] = sr_result
                 if sr_result.get("supporting_zone_confirmation"):
@@ -3085,6 +3124,68 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     "position": {},
                     "error": str(exc),
                 }
+
+    if BINGX_ORDER_CAPACITY_GUARD_ENABLED:
+        try:
+            open_order_snapshot = get_open_orders_account_wide(timeout_sec=5.0, retryable=False)
+        except Exception as exc:
+            open_order_snapshot = {"status": "error", "error": str(exc), "orders": []}
+        if not isinstance(open_order_snapshot, dict) or str(open_order_snapshot.get("status", "")).lower() != "ok":
+            error = (
+                str(open_order_snapshot.get("error") or "account-wide open order count unavailable")
+                if isinstance(open_order_snapshot, dict)
+                else f"account-wide open order helper returned non-object payload: {type(open_order_snapshot).__name__}"
+            )
+            record_action({
+                "record_type": "ORDER_CAPACITY_CHECK",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "execution_status": "ORDER_CAPACITY_UNKNOWN",
+                "error": error,
+                "max_open_orders": BINGX_MAX_OPEN_ORDERS,
+                "reserve_orders": BINGX_OPEN_ORDER_RESERVE,
+                "ts": int(time.time() * 1000),
+            })
+            return {"status": "ORDER_CAPACITY_UNKNOWN", "mode": EXECUTION_MODE, "order_id": None, "error": error}
+        orders = open_order_snapshot.get("orders")
+        reported_count = open_order_snapshot.get("count")
+        if (
+            not isinstance(orders, list)
+            or any(not isinstance(order, dict) for order in orders)
+            or not isinstance(reported_count, int)
+            or isinstance(reported_count, bool)
+            or reported_count != len(orders)
+        ):
+            error = "account-wide open order snapshot has an invalid orders/count payload"
+            record_action({
+                "record_type": "ORDER_CAPACITY_CHECK",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "execution_status": "ORDER_CAPACITY_UNKNOWN",
+                "error": error,
+                "max_open_orders": BINGX_MAX_OPEN_ORDERS,
+                "reserve_orders": BINGX_OPEN_ORDER_RESERVE,
+                "ts": int(time.time() * 1000),
+            })
+            return {"status": "ORDER_CAPACITY_UNKNOWN", "mode": EXECUTION_MODE, "order_id": None, "error": error}
+        current_order_count = reported_count
+        allowed_order_count = max(0, BINGX_MAX_OPEN_ORDERS - BINGX_OPEN_ORDER_RESERVE)
+        required_order_count = BINGX_EXPECTED_NEW_PROTECTION_ORDERS
+        capacity_ok = current_order_count + required_order_count <= allowed_order_count
+        record_action({
+            "record_type": "ORDER_CAPACITY_CHECK",
+            "event_id": event_id, "symbol": symbol, "direction": direction,
+            "execution_status": "ORDER_CAPACITY_OK" if capacity_ok else "ORDER_CAPACITY_REACHED",
+            "current_open_orders": current_order_count,
+            "required_protection_orders": required_order_count,
+            "max_open_orders": BINGX_MAX_OPEN_ORDERS,
+            "reserve_orders": BINGX_OPEN_ORDER_RESERVE,
+            "allowed_order_count": allowed_order_count,
+            "ts": int(time.time() * 1000),
+        })
+        if not capacity_ok:
+            return {
+                "status": "ORDER_CAPACITY_REACHED", "mode": EXECUTION_MODE, "order_id": None,
+                "error": f"open_orders={current_order_count} + required_protection={required_order_count} > allowed={allowed_order_count} (limit={BINGX_MAX_OPEN_ORDERS}, reserve={BINGX_OPEN_ORDER_RESERVE})",
+            }
 
     log.info("[EXECUTION] Opening market position after all pre-order gates: %s %s at ref price %.8g...", direction, symbol, live_reference)
     try:
@@ -3262,7 +3363,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 float(level.get("pnl_pct", 0) or 0) / max(float(sl_pct), 1e-12)
                 for level in tp_levels
             )
-            if len(actual_tp_rrs) != 3 or any(rr <= 0 for rr in actual_tp_rrs):
+            if len(actual_tp_rrs) not in {2, 3} or any(rr <= 0 for rr in actual_tp_rrs):
                 raise ValueError("invalid actual-fill TP ladder for SR recheck")
             post_fill_sr = evaluate_sr_room(
                 sr_snapshot,
@@ -3426,7 +3527,8 @@ def main() -> None:
         "fresh_divergence": 0,
         "fresh_squeeze": 0,
         "rejected_age": 0,
-        "rejected_btc": 0,
+        "rejected_btc": 0,  # legacy counter; BTC is contextual, never an entry veto in V1
+        "btc_context_flagged": 0,
         "rejected_funding": 0,
         "rejected_trigger": 0,
         "rejected_cvd": 0,
@@ -3789,6 +3891,30 @@ def main() -> None:
             stats["fresh_long"] += int(direction == "LONG")
             stats["fresh_short"] += int(direction == "SHORT")
             event_type = str(ev.get("event_type", "")).upper()
+            # Research ledger: snapshot fresh candidates after the earlier de-duplication,
+            # direction, freshness and lifecycle checks, but before downstream strategy
+            # gates. This is NOT a universe-wide snapshot of every detector output and
+            # must not be treated as an unbiased sample of all rejected signals.
+            try:
+                candidate_row = r
+                record_action({
+                    "record_type": "CANDIDATE_SNAPSHOT",
+                    "snapshot_stage": "POST_PREFILTER_PRE_STRATEGY_GATES",
+                    "event_id": event_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "event_type": event_type,
+                    "timeframe": tf,
+                    "score": (_safe_float(ev.get("score"), 0.0) if ev.get("score") is not None else (_safe_float((ev.get("event_fact") or {}).get("score"), 0.0) if (ev.get("event_fact") or {}).get("score") is not None else None)),
+                    "signal_price": _safe_float(ev.get("signal_price") or ev.get("price") or (ev.get("event_fact") or {}).get("price") or (ev.get("event_fact") or {}).get("signal_price"), 0.0) or None,
+                    "detected_at_ts": detected_at,
+                    "evaluation_ts": int(time.time() * 1000),
+                    "age_min": round(age, 4),
+                    "event_fact": ev.get("event_fact", {}),
+                    "features": _entry_context(candidate_row, ev, btc_regime_snapshot),
+                })
+            except Exception as exc:
+                log.warning("[CANDIDATE_SNAPSHOT] failed for %s: %s", event_id, exc)
             is_squeeze = _is_squeeze_event(event_type)
             stats["fresh_squeeze"] += int(is_squeeze)
             is_divergence = _is_divergence_event(ev)
@@ -3800,9 +3926,22 @@ def main() -> None:
             if btc_regime_df is not None and not _is_btc_symbol(symbol):
                 btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
                 if not btc_ok:
-                    stats["rejected_btc"] += 1
-                    tf_stats["rejected_btc"] += 1
-                    continue
+                    # BTC is context-only in this research build. Preserve the
+                    # diagnostic without vetoing otherwise-valid candidates.
+                    stats["btc_context_flagged"] = stats.get("btc_context_flagged", 0) + 1
+                    tf_stats["btc_context_flagged"] = tf_stats.get("btc_context_flagged", 0) + 1
+                    record_action({
+                        "record_type": "BTC_CONTEXT_FLAGGED",
+                        "event_id": event_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "event_type": event_type,
+                        "timeframe": tf,
+                        "context_source": "CYCLE_OBSERVATION_NOT_ENTRY_GATE",
+                        "reason": btc_reason,
+                        "observed_ts": int(time.time() * 1000),
+                    })
+                    log.info("[BTC_CONTEXT] %s %s (%s/%s) flag=%s; diagnostic only, entry remains eligible", direction, symbol, tf, event_type, btc_reason)
 
             funding_ok, funding_reason = check_funding_filter(
                 r, direction, event_type=event_type
@@ -4011,7 +4150,7 @@ def main() -> None:
                         "event_direction": direction,
                         "event_type": event_type,
                         "decision_ts": decision_ts,
-                        "trend_decision": "REJECT",
+                        "trend_decision": "UNKNOWN",
                         "trend_reject_reason": "TREND_DATA_ERROR",
                         "trend_4h": "UNKNOWN",
                         "trend_1h": "UNKNOWN",
@@ -4028,19 +4167,22 @@ def main() -> None:
                 else:
                     stats["trend_shadow_candidates"] += 1
                     reason = trend_snapshot.get("trend_reject_reason")
-                    decision = str(trend_snapshot.get("trend_decision") or "REJECT")
+                    decision = str(trend_snapshot.get("trend_decision") or "UNKNOWN").upper()
                     if decision == "ALIGNED":
                         stats["trend_shadow_aligned"] += 1
+                    elif decision == "UNKNOWN":
+                        stats["trend_shadow_unknown"] += 1
                     else:
                         stats["trend_shadow_rejected"] += 1
-                        if str(reason or "").endswith("UNKNOWN") or str(reason or "") in {"TREND_DATA_ERROR", "TREND_DECISION_TS_INVALID"}:
-                            stats["trend_shadow_unknown"] += 1
                     if trend_snapshot.get("trend_persistence") == "PERSISTENT":
                         stats["trend_shadow_persistent"] += 1
                     by_event = stats.setdefault("trend_shadow_by_event_type", {})
-                    bucket = by_event.setdefault(event_type, {"candidates": 0, "aligned": 0, "rejected": 0})
+                    bucket = by_event.setdefault(event_type, {"candidates": 0, "aligned": 0, "rejected": 0, "unknown": 0})
+                    # Upgrade old persisted cycle stats gracefully if this process
+                    # is running with a bucket created by older code.
+                    bucket.setdefault("unknown", 0)
                     bucket["candidates"] += 1
-                    bucket["aligned" if decision == "ALIGNED" else "rejected"] += 1
+                    bucket[{"ALIGNED": "aligned", "UNKNOWN": "unknown"}.get(decision, "rejected")] += 1
                     ev.setdefault("event_fact", {})["trend_filter"] = trend_snapshot
                     log.info(
                         "[TREND_SHADOW] %s %s (%s/%s) decision=%s reason=%s 4H=%s 1H=%s persistence=%s BTC=%s decision_ts=%s 4H_bar=%s 1H_bar=%s.",
@@ -4053,7 +4195,11 @@ def main() -> None:
                     )
                     record_action({
                         "event_id": event_id, "symbol": symbol, "direction": direction,
-                        "event_type": event_type, "execution_status": "TREND_SHADOW_" + ("ALIGNED" if decision == "ALIGNED" else "REJECTED"),
+                        "event_type": event_type,
+                        "execution_status": "TREND_SHADOW_" + {
+                            "ALIGNED": "ALIGNED", "UNKNOWN": "UNKNOWN", "REJECT": "REJECTED",
+                        }.get(decision, "UNKNOWN"),
+                        "trend_filter_mode": TREND_FILTER_MODE,
                         "trend_filter": trend_snapshot,
                         "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                     })
@@ -4268,7 +4414,7 @@ def main() -> None:
                 tp_log_parts.append(
                     f"{str(level.get('leg', 'TP')).upper()}={format_price(tp_price)} ({tp_pct_text} {rr_text})"
                 )
-            tp_log_text = " | ".join(tp_log_parts) if tp_log_parts else f"TP3={format_price(setup.get('target_price'))}"
+            tp_log_text = " | ".join(tp_log_parts) if tp_log_parts else f"TP_FINAL={format_price(setup.get('target_price'))}"
             log.info(
                 "[SIGNALS] Signal valid: %s %s | Score: %.0f/100 | TF: %s | Event: %s | Price: %s | SL: %s (-%s) | %s",
                 direction, symbol, score, tf, event_type, format_price(signal_price),
@@ -4531,9 +4677,9 @@ def main() -> None:
                     terminal_reason = "SYMBOL_SUSPENDED"
                     log.warning("[EXECUTION] %s (%s) pair suspended on exchange; terminalizing event %s.", symbol, direction, event_id)
                 elif "multi_tp_not_supported" in err_str:
-                    terminal_reason = "MULTI_TP_NOT_REACHABLE"
+                    terminal_reason = "TP_PROFILE_NOT_REACHABLE"
                     stats["rejected_single_tp"] += 1
-                    log.warning("[EXECUTION] %s (%s) cannot support three TP legs at configured leverage; terminalizing event %s.", symbol, direction, event_id)
+                    log.warning("[EXECUTION] %s (%s) cannot support the configured TP profile at this filled quantity; terminalizing event %s.", symbol, direction, event_id)
                 elif "min_qty" in err_str:
                     terminal_reason = "MIN_QTY_NOT_REACHABLE"
                     log.warning("[EXECUTION] %s (%s) min_qty not met at configured leverage; terminalizing event %s to prevent slot burn.", symbol, direction, event_id)
@@ -4648,6 +4794,7 @@ def main() -> None:
                             setup=execution_result.get("setup_used_for_protection", setup),
                             requested_entry_price=_safe_float((execution_result.get("open_result") or {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
                             entry_ts_ms=execution_result.get("fill_ts_ms"),
+                            entry_order_id=execution_result.get("order_id"),
                         )
                     except Exception as exc:
                         log.error("[TRACKER] Registration error for %s: %s", symbol, exc)
