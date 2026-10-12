@@ -44,6 +44,7 @@ jobs:
       REQUIRE_CVD_CONFIRMATION: "false"
       ENTRY_QUALITY_GATE_ENABLED: "true"
       ENTRY_QUALITY_MODE: "shadow"
+      DISABLED_EVENT_TYPES: "CRT_BEARISH"
       MIN_SETUP_SCORE: "60"
       MIN_SHORT_SETUP_SCORE: "75"
       # Trend Filter v1 starts in shadow: it records causal 4H/1H/BTC state but does not block trades yet.
@@ -88,7 +89,7 @@ jobs:
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
       SYMBOL_LOSS_COOLDOWN_MIN: "360"
-      # TP count adapts to the filled position size: 3 legs when supported, otherwise 2, otherwise one terminal TP3.
+      # New positions use TP1 + terminal TP2; if the filled size cannot support both, use one terminal TP2.
       REJECT_SINGLE_TP: "false"
       REQUIRE_MULTI_TP: "false"
       FIXED_STOP_LOSS_PCT: "7.00"
