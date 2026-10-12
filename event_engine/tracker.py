@@ -13,6 +13,7 @@ from typing import Any
 from event_engine.bingx import (
     get_position_directional,
     get_order,
+    get_fill_history,
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
@@ -286,6 +287,322 @@ def _append_trade_record(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _normalized_order_id(value: Any) -> str:
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _trade_fill_history_rows(record: dict, opened_record: dict | None, now_ms: int) -> tuple[list[dict], str | None]:
+    """Read all pages of fill history for the time span of one closed trade."""
+    symbol = str(record.get("symbol") or (opened_record or {}).get("symbol") or "").strip()
+    if not symbol:
+        return [], "missing_symbol"
+    close_ts = int(_safe_float(record.get("closed_ts") or record.get("ts"), 0.0))
+    opened = opened_record if isinstance(opened_record, dict) else {}
+    execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
+    result = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    entry_ts = int(_safe_float(
+        opened.get("entry_ts") or result.get("fill_ts_ms") or opened.get("ts")
+        or record.get("entry_ts") or record.get("opened_ts"), 0.0
+    ))
+    # If no entry timestamp exists, bound the recovery to the most recent seven
+    # days rather than requesting an unbounded history and risking unrelated fills.
+    if close_ts <= 0:
+        close_ts = int(now_ms)
+    if entry_ts <= 0:
+        entry_ts = max(1, close_ts - 7 * 24 * 60 * 60 * 1000)
+    start_ts = max(1, entry_ts - 60_000)
+    end_ts = max(start_ts + 1, close_ts + 120_000)
+    # Avoid an unbounded response. The V2 historical fill endpoint is paginated;
+    # split long-lived trades into one-day windows so request windows stay modest.
+    chunk_ms = 24 * 60 * 60 * 1000
+    fills: list[dict] = []
+    seen_fill_keys: set[str] = set()
+    cursor = start_ts
+    while cursor < end_ts:
+        chunk_end = min(end_ts, cursor + chunk_ms - 1)
+        page_index = 1
+        while page_index <= 10:
+            try:
+                response = get_fill_history(
+                    symbol, cursor, chunk_end, page_index=page_index,
+                    page_size=1000, timeout_sec=5.0,
+                )
+            except Exception as exc:
+                return [], f"fill_history_exception:{exc}"
+            if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+                return [], str((response or {}).get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
+            page_rows = response.get("fills")
+            if not isinstance(page_rows, list) or not all(isinstance(item, dict) for item in page_rows):
+                return [], "fill_history_invalid_fills_payload"
+            for row in page_rows:
+                # Some exchange pagination/time-boundary responses may repeat a fill.
+                # Deduplicate before summing quantities or PnL.
+                key = _normalized_order_id(row.get("trade_id"))
+                if not key:
+                    key = "|".join(str(row.get(k) or "") for k in ("order_id", "symbol", "side", "time", "price", "qty"))
+                if key in seen_fill_keys:
+                    continue
+                seen_fill_keys.add(key)
+                fills.append(row)
+            if len(page_rows) < 1000:
+                break
+            page_index += 1
+        if page_index > 10:
+            return [], "fill_history_page_limit_exceeded"
+        cursor = chunk_end + 1
+    return fills, None
+
+
+def _reconstruct_closed_trade_from_fills(record: dict, opened_record: dict | None, fills: list[dict]) -> tuple[dict | None, str | None]:
+    """Reconstruct a DATA_ERROR close only when exchange fills cover the full size."""
+    symbol = str(record.get("symbol") or (opened_record or {}).get("symbol") or "").upper().replace("-USDT", "")
+    direction = str(record.get("direction") or (opened_record or {}).get("direction") or "").upper()
+    entry_price = _safe_float(record.get("entry_price"), 0.0)
+    opened = opened_record if isinstance(opened_record, dict) else {}
+    execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
+    if entry_price <= 0:
+        entry_price = _safe_float(execution.get("actual_entry_price"), 0.0)
+    target_qty = abs(_safe_float(record.get("total_closed_qty") or record.get("initial_qty"), 0.0))
+    if target_qty <= 0:
+        target_qty = abs(_safe_float(execution.get("actual_qty"), 0.0))
+    if not symbol or direction not in {"LONG", "SHORT"} or entry_price <= 0 or target_qty <= 0:
+        return None, "missing_trade_identity_or_size"
+
+    entry_order_id = _normalized_order_id(record.get("entry_order_id") or execution.get("order_id"))
+    sl_ids = set()
+    if record.get("sl_order_id"):
+        sl_ids.add(_normalized_order_id(record.get("sl_order_id")))
+    for item in record.get("sl_order_history", []) if isinstance(record.get("sl_order_history"), list) else []:
+        if isinstance(item, dict) and item.get("order_id"):
+            sl_ids.add(_normalized_order_id(item.get("order_id")))
+    sl_ids.discard("")
+    tp_ids = {
+        _normalized_order_id(item) for item in (record.get("tp_order_ids") or [])
+        if _normalized_order_id(item)
+    }
+    if not tp_ids:
+        protection = opened.get("protection") if isinstance(opened.get("protection"), dict) else {}
+        tp_orders = protection.get("tp_orders", []) if isinstance(protection.get("tp_orders"), list) else []
+        tp_ids = {_normalized_order_id(x.get("order_id") or x.get("orderId")) for x in tp_orders if isinstance(x, dict)}
+        tp_ids.discard("")
+
+    close_side = "SELL" if direction == "LONG" else "BUY"
+    close_fills = []
+    entry_fills = []
+    known_close_ids = sl_ids | tp_ids
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        fill_symbol = str(fill.get("symbol") or "").upper().replace("-USDT", "")
+        if fill_symbol and fill_symbol != symbol:
+            continue
+        ts = int(_safe_float(fill.get("time"), 0.0))
+        close_ts = int(_safe_float(record.get("closed_ts"), 0.0))
+        opened_ts = int(_safe_float((opened.get("result") or {}).get("fill_ts_ms") if isinstance(opened.get("result"), dict) else opened.get("ts"), 0.0))
+        if ts > 0 and close_ts > 0 and ts > close_ts + 120_000:
+            continue
+        if ts > 0 and opened_ts > 0 and ts < opened_ts - 60_000:
+            continue
+        pos_side = str(fill.get("position_side") or "").upper()
+        if pos_side and pos_side not in {direction, "BOTH"}:
+            continue
+        order_id = _normalized_order_id(fill.get("order_id"))
+        side = str(fill.get("side") or "").upper()
+        price = _safe_float(fill.get("price"), 0.0)
+        qty = abs(_safe_float(fill.get("qty"), 0.0))
+        if price <= 0 or qty <= 0 or side not in {"BUY", "SELL"}:
+            continue
+        if entry_order_id and order_id == entry_order_id:
+            entry_fills.append(fill)
+            continue
+        if side == close_side:
+            close_fills.append(fill)
+
+    # If we have known protective order identities and at least one of them is
+    # represented in the exchange history, restrict reconstruction to those order
+    # ids. Otherwise manual/emergency close fills remain eligible but still must
+    # match the complete position quantity exactly within exchange precision.
+    if known_close_ids and any(_normalized_order_id(x.get("order_id")) in known_close_ids for x in close_fills):
+        close_fills = [x for x in close_fills if _normalized_order_id(x.get("order_id")) in known_close_ids]
+
+    if not close_fills:
+        return None, "no_close_side_fills_found"
+    filled_qty = sum(abs(_safe_float(x.get("qty"), 0.0)) for x in close_fills)
+    tolerance = max(target_qty * 0.002, 1e-10)
+    if filled_qty < target_qty - tolerance:
+        return None, f"incomplete_close_fills:{filled_qty:.12g}/{target_qty:.12g}"
+    if filled_qty > target_qty + tolerance:
+        return None, f"ambiguous_close_fills_exceed_position:{filled_qty:.12g}/{target_qty:.12g}"
+
+    weighted_exit = sum(abs(_safe_float(x.get("qty"), 0.0)) * _safe_float(x.get("price"), 0.0) for x in close_fills) / filled_qty
+    weighted_pnl_sum = 0.0
+    for fill in close_fills:
+        price = _safe_float(fill.get("price"), 0.0)
+        qty = abs(_safe_float(fill.get("qty"), 0.0))
+        pnl_pct = ((price - entry_price) / entry_price * 100.0) if direction == "LONG" else ((entry_price - price) / entry_price * 100.0)
+        weighted_pnl_sum += qty * pnl_pct
+    realized_pnl_pct = weighted_pnl_sum / target_qty
+
+    used_order_ids = sorted({_normalized_order_id(x.get("order_id")) for x in close_fills if _normalized_order_id(x.get("order_id"))})
+    used_trade_ids = sorted({_normalized_order_id(x.get("trade_id")) for x in close_fills if _normalized_order_id(x.get("trade_id"))})
+    used_order_id_set = set(used_order_ids)
+    if used_order_id_set & sl_ids:
+        exit_reason = "BREAK_EVEN" if bool(record.get("be_activated")) else "STOP_LOSS"
+    elif used_order_id_set and used_order_id_set.issubset(tp_ids):
+        exit_reason = "TAKE_PROFIT_FULL"
+    else:
+        exit_reason = "POSITION_CLOSED_BY_FILL_HISTORY"
+
+    # Exchange-reported realised PnL and fees are preserved only when every
+    # selected fill contains the corresponding field. Unknown costs stay unknown.
+    pnl_values = [x.get("realized_pnl") for x in close_fills]
+    fees_values = [x.get("fee") for x in (entry_fills + close_fills)]
+    exchange_realized_pnl = sum(float(x) for x in pnl_values) if all(x is not None for x in pnl_values) else None
+    fees_usdt = sum(float(x) for x in fees_values) if fees_values and all(x is not None for x in fees_values) and entry_fills else None
+    qty_known_entry = sum(abs(_safe_float(x.get("qty"), 0.0)) for x in entry_fills)
+    if entry_fills and abs(qty_known_entry - target_qty) > tolerance:
+        fees_usdt = None
+
+    return {
+        "entry_price": entry_price,
+        "exit_price": weighted_exit,
+        "exit_execution_qty": filled_qty,
+        "realized_pnl_pct": realized_pnl_pct,
+        "realized_pnl_usdt": exchange_realized_pnl,
+        "fees_usdt": fees_usdt,
+        "exit_order_ids": used_order_ids,
+        "exit_trade_ids": used_trade_ids,
+        "exit_reason": exit_reason,
+        "fill_count": len(close_fills),
+        "entry_fill_count": len(entry_fills),
+        "confirmed_qty": target_qty,
+    }, None
+
+
+def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: int = 3) -> int:
+    """Repair durable DATA_ERROR close records from verified exchange fills.
+
+    History is retried with backoff, capped per cycle. An incomplete or ambiguous
+    fill set is left as DATA_ERROR; no mark price or trigger price is substituted.
+    """
+    if not TRADES_PATH.exists():
+        return 0
+    now_ms = int(now_ms or time.time() * 1000)
+    try:
+        raw_lines = TRADES_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as exc:
+        log.warning("[TRACKER_RECOVERY] Trade journal read failed: %s", exc)
+        return 0
+    records: list[dict | None] = []
+    changed = False
+    open_by_event: dict[str, dict] = {}
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            # Keep malformed forensic rows untouched if another row is repaired.
+            records.append(None)
+            continue
+        records.append(obj if isinstance(obj, dict) else None)
+        if isinstance(obj, dict) and obj.get("record_type") == "TRADE_OPEN" and obj.get("event_id"):
+            open_by_event[str(obj["event_id"])] = obj
+
+    attempts_this_cycle = 0
+    recovered = 0
+    for idx, record in enumerate(records):
+        if attempts_this_cycle >= max(0, int(max_records)):
+            break
+        if not isinstance(record, dict) or record.get("record_type") != "TRADE_CLOSE":
+            continue
+        if str(record.get("exit_reason", "")).upper() != "DATA_ERROR" and record.get("realized_pnl_pct") is not None and _safe_float(record.get("exit_price"), 0.0) > 0:
+            continue
+        recovery_state = record.get("fill_history_recovery") if isinstance(record.get("fill_history_recovery"), dict) else {}
+        if recovery_state.get("status") == "RECOVERED":
+            continue
+        next_retry = int(_safe_float(recovery_state.get("next_retry_ts"), 0.0))
+        if next_retry > now_ms:
+            continue
+
+        attempts_this_cycle += 1
+        event_id = str(record.get("event_id") or "")
+        opened = open_by_event.get(event_id)
+        fills, fill_error = _trade_fill_history_rows(record, opened, now_ms)
+        result, reconcile_error = (None, fill_error) if fill_error else _reconstruct_closed_trade_from_fills(record, opened, fills)
+        attempt = int(_safe_float(recovery_state.get("attempts"), 0.0)) + 1
+        if result:
+            old_error = record.get("data_error") or record.get("exit_reason")
+            record.update({
+                "entry_price": result["entry_price"],
+                "exit_price": result["exit_price"],
+                "exit_price_source": "BINGX_FILL_HISTORY_WEIGHTED_AVERAGE",
+                "exit_execution_qty": result["exit_execution_qty"],
+                "exit_order_ids_recovered": result["exit_order_ids"],
+                "exit_trade_ids_recovered": result["exit_trade_ids"],
+                "realized_pnl_pct": result["realized_pnl_pct"],
+                "exit_reason": result["exit_reason"],
+                "exit_reason_confidence": "confirmed",
+                "exit_reason_source": "BINGX_FILL_HISTORY",
+                "data_error_previous": old_error,
+                "data_error": None,
+                "fill_history_recovery": {
+                    "status": "RECOVERED", "attempts": attempt,
+                    "recovered_ts": now_ms, "fills": result["fill_count"],
+                    "entry_fills": result["entry_fill_count"],
+                    "qty_confirmed": result["confirmed_qty"],
+                    "order_ids": result["exit_order_ids"],
+                    "trade_ids": result["exit_trade_ids"],
+                },
+                "known_realized_pnl_status": "GROSS_ESTABLISHED_FROM_BINGX_FILL_HISTORY_COSTS_UNRECONCILED",
+            })
+            record["realized_pnl_usdt"] = result["realized_pnl_usdt"]
+            record["fees_usdt"] = result["fees_usdt"]
+            # Funding is deliberately not assumed to be zero, so net PnL stays
+            # unresolved even when fill-level fees are reconstructed.
+            record["net_pnl_usdt"] = None
+            record["pnl_costs_status"] = (
+                "FEES_RECONCILED_FUNDING_UNKNOWN" if result["fees_usdt"] is not None
+                else "FEES_OR_ENTRY_FILLS_UNKNOWN_FUNDING_UNKNOWN"
+            )
+            risk_pct = _safe_float(record.get("planned_risk_pct"), 0.0)
+            record["realized_rr"] = result["realized_pnl_pct"] / risk_pct if risk_pct > 0 else None
+            changed = True
+            recovered += 1
+            log.warning("[TRACKER_RECOVERY] Recovered DATA_ERROR close %s from %d BingX fills (qty=%.12g, exit=%.12g).", event_id, result["fill_count"], result["exit_execution_qty"], result["exit_price"])
+        else:
+            delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempt - 1, 4)))
+            record["fill_history_recovery"] = {
+                "status": "PENDING", "attempts": attempt,
+                "last_attempt_ts": now_ms,
+                "next_retry_ts": now_ms + delay_ms,
+                "last_error": str(reconcile_error or "insufficient_or_ambiguous_fills"),
+            }
+            changed = True
+            log.info("[TRACKER_RECOVERY] DATA_ERROR close %s remains unresolved: %s", event_id, reconcile_error)
+
+    if changed:
+        tmp_path = TRADES_PATH.with_name(TRADES_PATH.name + ".recovery.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as stream:
+                for raw_line, record in zip(raw_lines, records):
+                    if isinstance(record, dict):
+                        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    else:
+                        # Preserve unknown/non-object/malformed rows verbatim; the
+                        # recovery job must never silently delete journal evidence.
+                        stream.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, TRADES_PATH)
+        except OSError as exc:
+            log.error("[TRACKER_RECOVERY] Atomic trade journal update failed: %s", exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+    return recovered
+
+
 def _normalize_direction(direction: str) -> str:
     d = str(direction or "").upper()
     if d not in {"LONG", "SHORT"}:
@@ -377,6 +694,7 @@ def register_active_trade(
     setup: dict | None = None,
     requested_entry_price: float | None = None,
     entry_ts_ms: int | None = None,
+    entry_order_id: str | int | None = None,
 ) -> None:
     direction = _normalize_direction(direction)
     trades = _load_active_trades()
@@ -392,14 +710,21 @@ def register_active_trade(
     setup_metrics = _extract_setup_metrics(setup)
     research: dict[str, Any] = {}
 
+    research_attrs = (
+        "fr_oiw", "pfr_oiw", "liq_short24", "liq_long24",
+        "ls_accounts", "oi", "oi_chg24_pct", "oi_chg4h_pct",
+        "oi_vol_ratio", "oi_mktcap_ratio", "volume24",
+        "btc_corr7d", "cvd24", "lls24",
+    )
     if coinalyze_row is not None:
-        for attr in (
-            "fr_oiw", "pfr_oiw", "liq_short24", "liq_long24",
-            "ls_accounts", "oi", "oi_chg24_pct", "oi_chg4h_pct",
-            "oi_vol_ratio", "oi_mktcap_ratio", "volume24",
-            "btc_corr7d", "cvd24", "lls24",
-        ):
+        for attr in research_attrs:
             research[attr] = getattr(coinalyze_row, attr, None)
+    elif isinstance(setup, dict) and isinstance(setup.get("entry_context"), dict):
+        # Recovery after restart: use the context persisted with the original
+        # trade instead of silently losing research features when live row data
+        # is no longer available.
+        context = setup["entry_context"]
+        research = {attr: context.get(attr) for attr in research_attrs if attr in context}
 
     requested_price = _safe_float(requested_entry_price, 0.0) if requested_entry_price is not None else setup_metrics["entry_reference"]
     signal_reference_price = _safe_float((setup or {}).get("signal_price"), 0.0) if isinstance(setup, dict) else 0.0
@@ -434,6 +759,7 @@ def register_active_trade(
         "initial_notional_usdt": actual_entry_price * actual_qty,
         "remaining_qty": actual_qty,
         "entry_ts": actual_entry_ts,
+        "entry_order_id": str(entry_order_id) if entry_order_id is not None and str(entry_order_id).strip() else None,
         "tp_orders": tp_orders if isinstance(tp_orders, list) else [],
         "sl_order": sl_result if isinstance(sl_result, dict) else {},
         "hit_legs": [],
@@ -479,6 +805,152 @@ def register_active_trade(
     }
 
     _save_active_trades(trades)
+
+
+def restore_reconciled_trade_identity(
+    reconciled_event_id: str,
+    source_record: dict,
+    current_position_qty: float | None,
+    *,
+    allow_absent_position: bool = False,
+) -> str | None:
+    """Restore an adopted position's original trade identity from its journal row.
+
+    This is a local bookkeeping migration only: live protection orders and runtime
+    execution counters are preserved. It is allowed only when the original full
+    entry quantity still matches the tracked initial and remaining quantities.
+    Partial positions can be migrated only when the tracked initial quantity still
+    matches the original fill and the locally tracked remaining quantity matches
+    the current exchange quantity. If a successful positions query confirms that
+    the position is already absent, an identity-only migration is also allowed
+    when the original full entry quantity and entry identity match exactly; all
+    current fill counters and remaining quantity are preserved for the tracker to
+    reconcile the close under the original event id. An orphan first adopted after
+    a partial close will not pass this check because its initial quantity is only
+    the remainder.
+    """
+    trades = _load_active_trades()
+    current = trades.get(str(reconciled_event_id))
+    if not isinstance(current, dict) or current.get("closed", False):
+        return None
+    if str(current.get("event_type", "")).upper() != "RECONCILED_POSITION":
+        return None
+    if not isinstance(source_record, dict) or bool(source_record.get("reconciliation")):
+        return None
+
+    source_event_id = str(source_record.get("event_id") or "").strip()
+    if not source_event_id or source_event_id == str(reconciled_event_id):
+        return None
+    existing_original = trades.get(source_event_id)
+    if isinstance(existing_original, dict):
+        # Never overwrite any pre-existing original identity, including a closed
+        # local record. A closed record without a matching journal close indicates
+        # state/journal disagreement and requires explicit audit rather than an
+        # implicit reopen or duplicate economic close.
+        return None
+
+    signal = source_record.get("signal") if isinstance(source_record.get("signal"), dict) else {}
+    execution = source_record.get("execution") if isinstance(source_record.get("execution"), dict) else {}
+    result = source_record.get("result") if isinstance(source_record.get("result"), dict) else {}
+    position = result.get("position") if isinstance(result.get("position"), dict) else {}
+    open_result = result.get("open_result") if isinstance(result.get("open_result"), dict) else {}
+    protection = result.get("protection") if isinstance(result.get("protection"), dict) else {}
+    setup = source_record.get("setup") if isinstance(source_record.get("setup"), dict) else {}
+    # Restore the exchange's canonical instrument name when it was captured in
+    # the original fill record; a detector alias (e.g. MON) may differ from the
+    # traded contract (MONAD-USDT). This is identity metadata only.
+    symbol = _normalized_symbol(
+        position.get("symbol") or open_result.get("symbol") or protection.get("bx_symbol")
+        or execution.get("symbol") or source_record.get("symbol") or ""
+    )
+    current_symbol = _normalized_symbol(current.get("symbol") or "")
+    direction = str(source_record.get("direction") or "").upper()
+    current_direction = str(current.get("direction") or "").upper()
+    if not symbol or symbol != current_symbol or direction not in {"LONG", "SHORT"} or direction != current_direction:
+        return None
+
+    source_price = _safe_float(execution.get("actual_entry_price"), 0.0)
+    source_qty = abs(_safe_float(execution.get("actual_qty"), 0.0))
+    live_qty = abs(_safe_float(current_position_qty, 0.0))
+    tracked_initial_qty = abs(_safe_float(current.get("initial_qty"), 0.0))
+    tracked_remaining_qty = abs(_safe_float(current.get("remaining_qty"), 0.0))
+    tolerance = max(live_qty * 1e-6, tracked_initial_qty * 1e-6, source_qty * 1e-6, 1e-12)
+    if source_price <= 0 or source_qty <= 0:
+        return None
+    if abs(source_price - _safe_float(current.get("actual_entry_price"), 0.0)) > max(source_price * 0.0025, 1e-12):
+        return None
+    if abs(tracked_initial_qty - source_qty) > tolerance:
+        return None
+    if live_qty > 0:
+        if abs(tracked_remaining_qty - live_qty) > tolerance or live_qty > source_qty + tolerance:
+            return None
+    else:
+        # No live quantity is accepted only when the caller successfully queried
+        # the account and established that this position no longer exists. This
+        # changes identity metadata only; the tracker remains responsible for
+        # reconstructing its final fills/exit and may still mark it DATA_ERROR.
+        if not allow_absent_position:
+            return None
+        if tracked_remaining_qty > tracked_initial_qty + tolerance:
+            return None
+
+    # Recover the original setup and identity while preserving live-protection
+    # details, TP execution counters, current PnL history, and BE state.
+    current["event_id"] = source_event_id
+    current["trade_id"] = str(source_record.get("trade_id") or ("TR_" + hashlib.sha256(source_event_id.encode("utf-8")).hexdigest()[:24].upper()))
+    current["symbol"] = current_symbol or symbol
+    current["direction"] = direction
+    current["event_type"] = str(signal.get("event_type") or source_record.get("event_type") or "UNKNOWN")
+    current["timeframe"] = str(signal.get("timeframe") or setup.get("event_timeframe") or current.get("timeframe") or "1h").lower()
+    score = signal.get("score", source_record.get("score"))
+    if score is not None:
+        current["score"] = _safe_float(score, _safe_float(current.get("score"), 50.0))
+    current["entry_order_id"] = str(execution.get("order_id")) if execution.get("order_id") is not None else current.get("entry_order_id")
+    current["entry_price"] = source_price
+    current["actual_entry_price"] = source_price
+    current["initial_qty"] = source_qty
+    current["initial_notional_usdt"] = source_price * source_qty
+    fill_ts = result.get("fill_ts_ms")
+    if fill_ts is None:
+        fill_ts = source_record.get("ts")
+    if fill_ts is not None:
+        current["entry_ts"] = int(_safe_float(fill_ts, _safe_float(current.get("entry_ts"))))
+    current["requested_entry_price"] = _safe_float(execution.get("requested_price"), source_price)
+    current["signal_reference_price"] = _safe_float(setup.get("signal_price", execution.get("signal_price")), source_price)
+    current["pre_order_reference_price"] = _safe_float(execution.get("pre_order_reference_price"), current["requested_entry_price"])
+    current["entry_slippage_pct"] = execution.get("slippage_pct")
+    current["adverse_entry_slippage_pct"] = execution.get("adverse_slippage_pct")
+    current["setup"] = dict(setup)
+
+    metrics = _extract_setup_metrics(setup)
+    current["planned_risk_pct"] = metrics["planned_risk_pct"]
+    current["planned_target_rr"] = metrics["planned_target_rr"]
+    current["planned_weighted_rr"] = metrics["planned_weighted_rr"]
+    current["planned_entry_reference"] = metrics["entry_reference"]
+    current["planned_invalidation_price"] = metrics["invalidation_price"]
+    current["planned_target_price"] = metrics["target_price"]
+    current["tp_levels"] = metrics["tp_levels"]
+    current["effective_tp_levels"] = metrics["effective_tp_levels"]
+    current["tp_mode"] = metrics["tp_mode"]
+    current["effective_weighted_rr"] = metrics["effective_weighted_rr"]
+
+    entry_context = setup.get("entry_context") if isinstance(setup.get("entry_context"), dict) else {}
+    research_keys = (
+        "fr_oiw", "pfr_oiw", "liq_short24", "liq_long24", "ls_accounts", "oi",
+        "oi_chg24_pct", "oi_chg4h_pct", "oi_vol_ratio", "oi_mktcap_ratio",
+        "volume24", "btc_corr7d", "cvd24", "lls24",
+    )
+    recovered_research = {key: entry_context.get(key) for key in research_keys if key in entry_context}
+    if recovered_research:
+        current["research"] = recovered_research
+    current["metadata_recovered_from_journal"] = True
+
+    if isinstance(existing_original, dict) and existing_original.get("closed", False):
+        trades.pop(source_event_id, None)
+    trades.pop(str(reconciled_event_id), None)
+    trades[source_event_id] = current
+    _save_active_trades(trades)
+    return source_event_id
 
 
 def format_tp_hit_message(
@@ -1046,7 +1518,54 @@ def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     return (not failures), ("; ".join(failures) if failures else "cleanup_verified")
 
 
+def _record_early_loss_cut_shadow_observations(
+    trade: dict[str, Any],
+    *,
+    duration_min: float,
+    current_pnl_pct: float,
+    current_price: float | None,
+    now_ms: int,
+    mode: str,
+) -> list[str]:
+    """Record each shadow loss-cut policy independently without executing an exit.
+
+    Older telemetry stored only the first threshold crossed, so an early 2h hit
+    concealed whether the stricter 4h policy later fired. This map is additive;
+    the legacy first-trigger fields and the live enforce decision remain unchanged.
+    """
+    observations = trade.get("early_loss_cut_shadow_triggers")
+    if not isinstance(observations, dict):
+        observations = {}
+    observed_now: list[str] = []
+    policies = (
+        ("EARLY_LOSS_CUT_2H", EARLY_LOSS_CUT_2H_MIN, EARLY_LOSS_CUT_2H_PNL),
+        ("EARLY_LOSS_CUT_4H", EARLY_LOSS_CUT_4H_MIN, EARLY_LOSS_CUT_4H_PNL),
+    )
+    for reason, min_age, pnl_limit in policies:
+        if duration_min < min_age or current_pnl_pct > pnl_limit or reason in observations:
+            continue
+        observations[reason] = {
+            "ts_ms": int(now_ms),
+            "reason": reason,
+            "pnl_pct": float(current_pnl_pct),
+            "price": _safe_float(current_price, 0.0) if current_price is not None else None,
+            "age_min": float(duration_min),
+            "mode": str(mode),
+            "observation_only": str(mode).lower() != "enforce",
+        }
+        observed_now.append(reason)
+    if observed_now:
+        trade["early_loss_cut_shadow_triggers"] = observations
+    return observed_now
+
+
 def update_active_trades() -> None:
+    # Recover historical DATA_ERROR closes even when no positions remain active.
+    # This reads verified fills only; ambiguous/incomplete history stays unknown.
+    try:
+        _recover_data_error_trade_closes()
+    except Exception as exc:
+        log.error("[TRACKER_RECOVERY] DATA_ERROR fill-history recovery failed safely: %s", exc)
     _retry_pending_notifications()
     trades = _load_active_trades()
     if not trades:
@@ -1156,8 +1675,18 @@ def update_active_trades() -> None:
                 elif duration_min >= EARLY_LOSS_CUT_2H_MIN and current_pnl <= EARLY_LOSS_CUT_2H_PNL:
                     early_loss_reason = "EARLY_LOSS_CUT_2H"
                 if early_loss_reason:
-                    # Persist only the first threshold crossing per position. It is a
-                    # shadow observation by default and never changes the live position.
+                    # Record both candidate policies independently for a valid
+                    # forward shadow comparison; keep the legacy first-trigger
+                    # fields for dashboards and old analysis scripts.
+                    newly_observed = _record_early_loss_cut_shadow_observations(
+                        trade, duration_min=duration_min, current_pnl_pct=current_pnl,
+                        current_price=cur_price, now_ms=now_ms, mode=EARLY_LOSS_CUT_MODE,
+                    )
+                    for observed_reason in newly_observed:
+                        log.warning(
+                            "[TRACKER_EARLY_LOSS_CUT_SHADOW] %s %s pnl=%+.2f%% age=%.1fm policy=%s mode=%s; observation only",
+                            symbol, direction, current_pnl, duration_min, observed_reason, EARLY_LOSS_CUT_MODE.upper(),
+                        )
                     if not trade.get("early_loss_cut_shadow_trigger_ts"):
                         trade["early_loss_cut_shadow_trigger_ts"] = now_ms
                         trade["early_loss_cut_shadow_trigger_reason"] = early_loss_reason
@@ -1165,7 +1694,6 @@ def update_active_trades() -> None:
                         trade["early_loss_cut_shadow_trigger_price"] = cur_price
                         trade["early_loss_cut_shadow_trigger_age_min"] = duration_min
                         trade["early_loss_cut_shadow_mode"] = EARLY_LOSS_CUT_MODE
-                        log.warning("[TRACKER_EARLY_LOSS_CUT_%s] %s %s pnl=%+.2f%% age=%.1fm reason=%s; shadow record only unless mode=enforce", EARLY_LOSS_CUT_MODE.upper(), symbol, direction, current_pnl, duration_min, early_loss_reason)
                     if EARLY_LOSS_CUT_MODE == "enforce":
                         cut = {"status": "skipped"}
                         safe_to_close, guard_reason, live_qty = _early_loss_cut_guard(symbol, direction, cur_price, pos_amt)
@@ -1591,6 +2119,15 @@ def update_active_trades() -> None:
                         "early_loss_cut_shadow_trigger_price": trade.get("early_loss_cut_shadow_trigger_price"),
                         "early_loss_cut_shadow_trigger_age_min": trade.get("early_loss_cut_shadow_trigger_age_min"),
                         "early_loss_cut_shadow_mode": trade.get("early_loss_cut_shadow_mode"),
+                        # Persist the full per-policy trigger map in the immutable
+                        # close journal. Without this field, the newer independent
+                        # 2h/4h observations can disappear when the closed trade is
+                        # removed from active_trades.json after protection cleanup.
+                        "early_loss_cut_shadow_triggers": (
+                            dict(trade.get("early_loss_cut_shadow_triggers", {}))
+                            if isinstance(trade.get("early_loss_cut_shadow_triggers"), dict)
+                            else {}
+                        ),
                         "duration_min": duration_min,
                         "hit_legs": sorted(hit_legs),
                         "tp_filled_qty": filled_by_leg,

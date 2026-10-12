@@ -59,6 +59,7 @@ ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+FILL_HISTORY_PATH = "/openApi/swap/v2/trade/fillHistory"
 
 CACHE = {
     "ts": 0.0,
@@ -559,6 +560,121 @@ def get_order(symbol: str, order_id: str | int) -> dict:
 
 def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
     return _query_order(symbol, client_order_id=client_order_id)
+
+
+def get_fill_history(
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    order_id: str | int | None = None,
+    page_index: int = 1,
+    page_size: int = 1000,
+    timeout_sec: float | None = None,
+) -> dict:
+    """Fetch actual BingX swap fills for forensic trade reconciliation.
+
+    This intentionally exposes fill rows (not candle/order trigger prices). A
+    successful but unknown response shape is an error, never an empty history.
+    The caller controls pagination and time-window chunking.
+    """
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        # Historic contracts may have left the current exchange catalog even
+        # though their execution history is still queryable. Use only an
+        # explicit/standard USDT-swap symbol fallback; never return success for
+        # an unrecognized arbitrary symbol.
+        raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+        if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
+            bx = raw_symbol
+        elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
+            bx = raw_symbol.replace("-", "") + "-USDT"
+        else:
+            return {"status": "error", "error": "invalid_or_unknown_historical_symbol", "fills": []}
+    try:
+        start_ts = int(start_ts)
+        end_ts = int(end_ts)
+        page_index = int(page_index)
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "invalid fill-history query parameters", "fills": []}
+    if start_ts <= 0 or end_ts <= start_ts or page_index < 1 or page_size < 1:
+        return {"status": "error", "error": "invalid fill-history time range or pagination", "fills": []}
+    page_size = min(page_size, 1000)
+    params: dict[str, Any] = {
+        "symbol": bx,
+        "startTs": start_ts,
+        "endTs": end_ts,
+        "pageIndex": page_index,
+        "pageSize": page_size,
+    }
+    if order_id not in (None, ""):
+        params["orderId"] = str(order_id)
+    try:
+        resp = _request(
+            "GET", FILL_HISTORY_PATH, params, signed=True,
+            timeout_sec=timeout_sec, retryable=False,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "fills": []}
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        error = resp.get("msg", resp) if isinstance(resp, dict) else resp
+        return {"status": "error", "error": str(error), "code": resp.get("code") if isinstance(resp, dict) else None, "fills": []}
+
+    data = resp.get("data")
+    if isinstance(data, list):
+        rows = data
+        total = None
+    elif isinstance(data, dict):
+        rows = None
+        for key in ("fill_orders", "fillOrders", "fills", "list", "orders"):
+            if key in data:
+                rows = data[key]
+                break
+        total = data.get("total")
+        if rows is None or not isinstance(rows, list) or not all(isinstance(item, dict) for item in rows):
+            return {"status": "error", "error": "fill history returned unexpected data shape", "fills": []}
+    else:
+        return {"status": "error", "error": "fill history response missing data list", "fills": []}
+    if not all(isinstance(item, dict) for item in rows):
+        return {"status": "error", "error": "fill history contains non-object row", "fills": []}
+
+    fills = []
+    for row in rows:
+        def number(*names: str) -> float | None:
+            for name in names:
+                raw = row.get(name)
+                if raw in (None, ""):
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    return value
+            return None
+        ts = number("time", "ts", "tradeTime", "fillTime", "createTime")
+        qty = number("qty", "quantity", "executedQty", "vol", "tradeVolume", "volume")
+        price = number("price", "fillPrice", "avgPrice", "tradePrice")
+        fills.append({
+            "trade_id": str(row.get("tradeId") or row.get("fillId") or row.get("id") or ""),
+            "order_id": str(row.get("orderId") or row.get("orderID") or ""),
+            "symbol": str(row.get("symbol") or bx).upper(),
+            "side": str(row.get("side") or "").upper(),
+            "position_side": str(row.get("positionSide") or row.get("positionSideName") or "").upper(),
+            "price": price,
+            "qty": abs(qty) if qty is not None else None,
+            "time": int(ts) if ts is not None else None,
+            "realized_pnl": number("realizedPnl", "realizedPNL", "realizedProfit"),
+            "fee": number("fee", "commission"),
+            "raw_fill": row,
+        })
+    return {
+        "status": "ok", "fills": fills,
+        "page_index": page_index, "page_size": page_size,
+        "returned": len(fills), "total": total,
+        "has_more": len(fills) >= page_size,
+    }
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
@@ -1978,10 +2094,9 @@ def ensure_directional_protection(
         }
 
     verified = get_open_protection_directional(symbol, direction)
-    verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
-    verified_sl_valid = any(
-        _validate_sl_order_for_position(o, direction, avg_price, expected_price=desired_sl_price, expected_qty=position_qty)
-        for o in verified_sl
+    verified_sl_valid, verified_sl_audit = _audit_exact_single_sl(
+        verified, direction=direction, avg_price=avg_price,
+        expected_price=desired_sl_price, expected_qty=position_qty,
     )
 
     if not verified_sl_valid:
@@ -1995,7 +2110,8 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
-            "error": "SL created but not visible on exchange",
+            "protection_audit": verified_sl_audit,
+            "error": f"SL invariant failed after placement: {verified_sl_audit['audit_reason']}",
             "rolled_back": rollback.get("status") == "closed",
             "emergency_close": rollback,
         }
@@ -2221,6 +2337,7 @@ def ensure_directional_protection(
         "tp_orders": tp_results,
         "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
+        "protection_audit": verified_sl_audit,
     }
 
 
@@ -2262,3 +2379,48 @@ def _validate_sl_order_for_position(
     if expected_qty is not None and not _qty_matches_position(qty, float(expected_qty)):
         return False
     return True
+
+
+def _audit_exact_single_sl(
+    protection_response: dict,
+    *, direction: str, avg_price: float,
+    expected_price: float | None, expected_qty: float,
+) -> tuple[bool, dict]:
+    """Confirm one and only one verified stop matches the residual position."""
+    response = protection_response if isinstance(protection_response, dict) else {}
+    orders = list(response.get("sl_orders", [])) if response.get("status") == "ok" and isinstance(response.get("sl_orders", []), list) else []
+    def order_number(order: dict, *names: str) -> float:
+        for name in names:
+            try:
+                value = float(order.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return 0.0
+
+    valid = [
+        order for order in orders
+        if isinstance(order, dict) and _validate_sl_order_for_position(
+            order, direction, avg_price,
+            expected_price=expected_price, expected_qty=expected_qty,
+        )
+    ]
+    is_valid = response.get("status") == "ok" and len(orders) == 1 and len(valid) == 1
+    audit = {
+        "open_orders_status": response.get("status"),
+        "sl_count": len(orders),
+        "valid_sl_count": len(valid),
+        "sl_order_ids": [str(o.get("orderId") or o.get("order_id") or "") for o in orders if isinstance(o, dict)],
+        "sl_order_qty": [order_number(o, "origQty", "quantity") for o in orders if isinstance(o, dict)],
+        "sl_order_prices": [order_number(o, "stopPrice", "price") for o in orders if isinstance(o, dict)],
+        "expected_position_qty": expected_qty,
+        "expected_sl_price": expected_price,
+        "audit_reason": (
+            "OPEN_ORDERS_UNVERIFIABLE" if response.get("status") != "ok" else
+            "SL_MISSING" if not orders else
+            "SL_MULTIPLE_ORDERS" if len(orders) != 1 else
+            "SL_QTY_OR_PRICE_MISMATCH" if not valid else "OK"
+        ),
+    }
+    return bool(is_valid), audit
