@@ -2109,6 +2109,11 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
     assert journaled[0]["record_type"] == "TRADE_OPEN"
     assert journaled[0]["reconciliation"] is True
     assert journaled[0]["event_id"] == registrations[0]["event_id"]
+    # Target RR is the best terminal leg; weighted RR accounts for every leg
+    # and its actual close fraction (20%, 40%, 60% R weighted by 30/35/35%).
+    assert registrations[0]["setup"]["target_rr"] == pytest.approx(0.6)
+    assert registrations[0]["setup"]["planned_weighted_rr"] == pytest.approx(0.41)
+    assert registrations[0]["setup"]["effective_weighted_rr"] == pytest.approx(0.41)
 
 
 def test_reconciliation_event_id_changes_after_closed_collision(monkeypatch):
@@ -2706,6 +2711,33 @@ def test_liquidation_squeeze_predicate_is_not_used_for_volatility_squeeze_fundin
     ok, reason = run_once.check_funding_filter(row, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
     assert ok is True
     assert "VOLATILITY" in reason or "NORMAL" in reason
+
+
+def test_early_loss_cut_shadow_records_2h_and_4h_independently(monkeypatch):
+    import event_engine.tracker as tracker
+
+    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_2H_MIN", 120.0)
+    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_2H_PNL", -1.5)
+    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_4H_MIN", 240.0)
+    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_4H_PNL", -2.5)
+    trade = {}
+
+    first = tracker._record_early_loss_cut_shadow_observations(
+        trade, duration_min=130.0, current_pnl_pct=-2.0, current_price=98.0,
+        now_ms=1_000, mode="shadow",
+    )
+    assert first == ["EARLY_LOSS_CUT_2H"]
+    assert "EARLY_LOSS_CUT_4H" not in trade["early_loss_cut_shadow_triggers"]
+
+    second = tracker._record_early_loss_cut_shadow_observations(
+        trade, duration_min=250.0, current_pnl_pct=-3.0, current_price=97.0,
+        now_ms=2_000, mode="shadow",
+    )
+    assert second == ["EARLY_LOSS_CUT_4H"]
+    triggers = trade["early_loss_cut_shadow_triggers"]
+    assert triggers["EARLY_LOSS_CUT_2H"]["ts_ms"] == 1_000
+    assert triggers["EARLY_LOSS_CUT_4H"]["ts_ms"] == 2_000
+    assert triggers["EARLY_LOSS_CUT_4H"]["observation_only"] is True
 
 
 def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
@@ -3420,6 +3452,16 @@ def test_tracker_manual_market_close_uses_explicit_execution_price(monkeypatch, 
         "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
         "last_tp_exec_price": None, "be_activated": False, "be_required": False, "closed": False,
         "manual_exit_reason": "MANUAL_MARKET_CLOSE", "manual_exit_price": 99.0,
+        "early_loss_cut_shadow_triggers": {
+            "EARLY_LOSS_CUT_2H": {
+                "ts_ms": 1_500, "reason": "EARLY_LOSS_CUT_2H", "pnl_pct": -1.8,
+                "price": 98.2, "age_min": 130.0, "mode": "shadow", "observation_only": True,
+            },
+            "EARLY_LOSS_CUT_4H": {
+                "ts_ms": 2_500, "reason": "EARLY_LOSS_CUT_4H", "pnl_pct": -2.9,
+                "price": 97.1, "age_min": 250.0, "mode": "shadow", "observation_only": True,
+            },
+        },
         "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625, "effective_weighted_rr": 1.6625,
         "effective_tp_levels": [], "tp_mode": "multi_tp",
     }
@@ -3441,6 +3483,8 @@ def test_tracker_manual_market_close_uses_explicit_execution_price(monkeypatch, 
     assert saved["exit_price_source"] == "MANUAL_EXECUTION"
     assert saved["exit_price"] == pytest.approx(99.0)
     assert saved["realized_pnl_pct"] == pytest.approx(-1.0)
+    assert saved["early_loss_cut_shadow_triggers"]["EARLY_LOSS_CUT_2H"]["pnl_pct"] == pytest.approx(-1.8)
+    assert saved["early_loss_cut_shadow_triggers"]["EARLY_LOSS_CUT_4H"]["pnl_pct"] == pytest.approx(-2.9)
 
 
 def test_tracker_duplicate_close_journal_is_not_duplicated(monkeypatch, tmp_path):
@@ -4136,3 +4180,317 @@ def test_single_tp_micro_position_arms_be_on_its_actual_terminal_leg():
     assert _be_milestone_reached({"tp3"}, True, terminal_leg="tp2") is False
     # Legacy single-TP positions continue to use their persisted TP3 milestone.
     assert _be_milestone_reached({"tp3"}, True, terminal_leg="tp3") is True
+
+
+def test_register_active_trade_accepts_and_persists_entry_order_id(tmp_path, monkeypatch):
+    import json
+    import event_engine.tracker as tracker
+
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    tracker.register_active_trade(
+        event_id="EVT_ENTRY_ID_TEST",
+        symbol="TEST",
+        name="TEST",
+        direction="LONG",
+        entry_price=100.0,
+        qty=1.0,
+        tp_orders=[{"leg": "tp1", "order_id": "TP1", "price": 105.0, "qty": 1.0}],
+        sl_result={"status": "ok", "order_id": "SL1", "stop_price": 95.0, "qty": 1.0},
+        event_type="CRT_BULLISH",
+        timeframe="1h",
+        score=80.0,
+        setup={"risk_pct": 5.0, "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.3625},
+        requested_entry_price=99.9,
+        entry_ts_ms=1_700_000_000_000,
+        entry_order_id="ENTRY-123",
+    )
+    active = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert active["EVT_ENTRY_ID_TEST"]["entry_order_id"] == "ENTRY-123"
+    assert active["EVT_ENTRY_ID_TEST"]["event_type"] == "CRT_BULLISH"
+
+
+def test_restore_reconciled_trade_identity_preserves_runtime_state(tmp_path, monkeypatch):
+    import json
+    import event_engine.tracker as tracker
+
+    path = tmp_path / "active_trades.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
+    path.write_text(json.dumps({
+        "RECON_TEST_LONG_HASH": {
+            "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH",
+            "symbol": "MONAD", "direction": "LONG", "event_type": "RECONCILED_POSITION",
+            "entry_price": 100.0, "actual_entry_price": 100.0,
+            "initial_qty": 1.0, "remaining_qty": 0.65, "entry_ts": 1_700_000_100_000,
+            "score": 50.0, "timeframe": "1h", "setup": {"event_type": "RECONCILED_POSITION"},
+            "tp_orders": [
+                {"leg": "tp2", "order_id": "TP2_LIVE", "price": 108.0, "qty": 0.35},
+                {"leg": "tp3", "order_id": "TP3_LIVE", "price": 112.0, "qty": 0.30},
+            ],
+            "sl_order": {"status": "already_exists", "order_id": "SL_LIVE", "stop_price": 95.0, "qty": 0.65},
+            "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.35},
+            "realized_pnl_qty": 0.35, "realized_pnl_weighted_sum": 36.75,
+            "current_pnl_pct": -0.25, "last_observation_ts": 1_700_000_101_000,
+            "planned_risk_pct": 5.0, "planned_target_rr": 2.0,
+            "planned_weighted_rr": 2.0, "effective_weighted_rr": 2.0,
+            "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 5.0, "close_fraction": 1.0}],
+        }}, indent=2), encoding="utf-8")
+
+    source = {
+        "record_type": "TRADE_OPEN", "trade_id": "TR_ORIGINAL", "event_id": "EVT_ORIGINAL",
+        "symbol": "MON", "direction": "LONG", "ts": 1_700_000_000_000,
+        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 82.0},
+        "execution": {"requested_price": 99.9, "signal_price": 99.9, "pre_order_reference_price": 100.0,
+                      "actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL",
+                      "status": "opened_protected", "slippage_pct": 0.1, "adverse_slippage_pct": 0.1},
+        "result": {"fill_ts_ms": 1_700_000_000_123, "position": {"symbol": "MONAD-USDT"}},
+        "setup": {"event_type": "CRT_BULLISH", "event_timeframe": "1h", "risk_pct": 5.0,
+                  "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.36,
+                  "signal_price": 99.9, "entry_reference": 100.0, "invalidation_price": 95.0,
+                  "target_price": 110.0, "tp_mode": "multi_tp",
+                  "tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.25}],
+                  "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.25}],
+                  "entry_context": {"fr_oiw": 0.01, "volume24": 1234.0}},
+    }
+    migrated = tracker.restore_reconciled_trade_identity("RECON_TEST_LONG_HASH", source, 0.65)
+    assert migrated == "EVT_ORIGINAL"
+    active = json.loads(path.read_text(encoding="utf-8"))
+    assert list(active) == ["EVT_ORIGINAL"]
+    trade = active["EVT_ORIGINAL"]
+    assert trade["trade_id"] == "TR_ORIGINAL"
+    assert trade["event_type"] == "CRT_BULLISH"
+    assert trade["score"] == 82.0
+    assert trade["entry_order_id"] == "ENTRY_ORIGINAL"
+    assert trade["effective_weighted_rr"] == 1.36
+    assert trade["current_pnl_pct"] == -0.25
+    assert trade["initial_qty"] == 1.0
+    assert trade["remaining_qty"] == 0.65
+    assert trade["hit_legs"] == ["tp1"]
+    assert trade["tp_filled_qty"] == {"tp1": 0.35}
+    assert trade["realized_pnl_qty"] == 0.35
+    assert {x["order_id"] for x in trade["tp_orders"]} == {"TP2_LIVE", "TP3_LIVE"}
+    assert trade["sl_order"]["order_id"] == "SL_LIVE"
+    assert trade["research"] == {"fr_oiw": 0.01, "volume24": 1234.0}
+
+    # A successful account query may show that the position has already closed
+    # between workflow runs. Identity-only migration must still preserve local
+    # partial-fill accounting so the next tracker pass closes under EVT_ORIGINAL.
+    absent_state = dict(trade)
+    absent_state["event_id"] = "RECON_TEST_ABSENT"
+    absent_state["trade_id"] = "TR_RECON_ABSENT"
+    absent_state["event_type"] = "RECONCILED_POSITION"
+    path.write_text(json.dumps({"RECON_TEST_ABSENT": absent_state}, indent=2), encoding="utf-8")
+    migrated_absent = tracker.restore_reconciled_trade_identity(
+        "RECON_TEST_ABSENT", source, None, allow_absent_position=True
+    )
+    assert migrated_absent == "EVT_ORIGINAL"
+    absent_active = json.loads(path.read_text(encoding="utf-8"))
+    assert list(absent_active) == ["EVT_ORIGINAL"]
+    assert absent_active["EVT_ORIGINAL"]["remaining_qty"] == 0.65
+    assert absent_active["EVT_ORIGINAL"]["tp_filled_qty"] == {"tp1": 0.35}
+    assert absent_active["EVT_ORIGINAL"]["realized_pnl_qty"] == 0.35
+
+
+def test_restore_reconciled_identity_never_overwrites_existing_original_state(tmp_path, monkeypatch):
+    import json
+    import event_engine.tracker as tracker
+
+    path = tmp_path / "active_trades.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
+    existing_original = {
+        "event_id": "EVT_ORIGINAL", "trade_id": "TR_ORIGINAL", "symbol": "TEST",
+        "direction": "LONG", "event_type": "CRT_BULLISH", "closed": True,
+        "remaining_qty": 0.0, "terminal_reason": "already_closed",
+    }
+    reconciled = {
+        "event_id": "RECON_TEST", "trade_id": "TR_RECON", "symbol": "TEST",
+        "direction": "LONG", "event_type": "RECONCILED_POSITION", "closed": False,
+        "actual_entry_price": 100.0, "entry_price": 100.0,
+        "initial_qty": 1.0, "remaining_qty": 1.0,
+    }
+    path.write_text(json.dumps({"EVT_ORIGINAL": existing_original, "RECON_TEST": reconciled}), encoding="utf-8")
+    source = {
+        "record_type": "TRADE_OPEN", "event_id": "EVT_ORIGINAL", "trade_id": "TR_ORIGINAL",
+        "symbol": "TEST", "direction": "LONG",
+        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 80},
+        "execution": {"actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL"},
+        "result": {"position": {"symbol": "TEST-USDT"}},
+    }
+
+    result = tracker.restore_reconciled_trade_identity("RECON_TEST", source, 1.0)
+
+    assert result is None
+    active = json.loads(path.read_text(encoding="utf-8"))
+    assert active["EVT_ORIGINAL"]["closed"] is True
+    assert active["EVT_ORIGINAL"]["terminal_reason"] == "already_closed"
+    assert active["RECON_TEST"]["event_type"] == "RECONCILED_POSITION"
+
+
+@pytest.mark.parametrize("position_present", [True, False])
+def test_pre_tracker_identity_recovery_uses_unique_journal_match(tmp_path, monkeypatch, position_present):
+    import run_once as ro
+    import event_engine.tracker as tracker
+
+    active_path = tmp_path / "active_trades.json"
+    journal_path = tmp_path / "trades.jsonl"
+    source = {
+        "record_type": "TRADE_OPEN", "trade_id": "TR_SOURCE", "event_id": "EVT_SOURCE",
+        "symbol": "TEST", "direction": "LONG", "ts": 1_700_000_000_000,
+        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 81.0},
+        "execution": {"requested_price": 99.9, "actual_entry_price": 100.0, "actual_qty": 1.0,
+                      "order_id": "ENTRY_SOURCE", "status": "opened_protected"},
+        "result": {"position": {"symbol": "TEST-USDT"}},
+        "setup": {"event_timeframe": "1h", "planned_weighted_rr": 1.36,
+                  "effective_weighted_rr": 1.36, "effective_tp_levels": []},
+    }
+    journal_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    active_path.write_text(json.dumps({"RECON_TEST_LONG": {
+        "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG", "symbol": "TEST",
+        "direction": "LONG", "event_type": "RECONCILED_POSITION", "entry_price": 100.0,
+        "actual_entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.65,
+        "score": 50.0, "entry_ts": 1_700_000_100_000, "hit_legs": ["tp1"],
+        "tp_filled_qty": {"tp1": 0.35}, "realized_pnl_qty": 0.35,
+        "tp_orders": [{"leg": "tp2", "order_id": "TP2_LIVE", "qty": 0.35}],
+        "sl_order": {"status": "already_exists", "order_id": "SL_LIVE", "qty": 0.65},
+    }}), encoding="utf-8")
+
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(ro, "TRADES", journal_path)
+    if position_present:
+        positions = [{"symbol": "TEST-USDT", "positionSide": "LONG",
+                      "positionAmt": "0.65", "avgPrice": "100.0"}]
+    else:
+        positions = []
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: positions)
+    actions = []
+    monkeypatch.setattr(ro, "record_action", lambda row: actions.append(row))
+
+    ro.restore_reconciled_trade_identities_before_tracker()
+
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    assert list(active) == ["EVT_SOURCE"]
+    trade = active["EVT_SOURCE"]
+    assert trade["event_type"] == "CRT_BULLISH"
+    assert trade["entry_order_id"] == "ENTRY_SOURCE"
+    assert trade["remaining_qty"] == 0.65
+    assert trade["tp_filled_qty"] == {"tp1": 0.35}
+    assert trade["sl_order"]["order_id"] == "SL_LIVE"
+    assert len(actions) == 1
+    assert actions[0]["record_type"] == "TRADE_IDENTITY_RECOVERED"
+    assert actions[0]["position_present"] is position_present
+
+
+def test_reconciliation_original_journal_match_and_close_guard(tmp_path, monkeypatch):
+    import json
+    import run_once as ro
+
+    journal = tmp_path / "trades.jsonl"
+    source = {
+        "record_type": "TRADE_OPEN", "trade_id": "TR_SOURCE", "event_id": "EVT_SOURCE",
+        "symbol": "MON", "direction": "SHORT", "ts": 1_700_000_000_000,
+        "signal": {"event_type": "MA_COMPRESSION_BREAKOUT", "timeframe": "1h", "score": 75.0},
+        "execution": {"actual_entry_price": 100.0, "actual_qty": 2.0, "status": "opened_protected"},
+        "result": {"position": {"symbol": "MONAD-USDT"}},
+        "setup": {"risk_pct": 7.0},
+    }
+    journal.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    monkeypatch.setattr(ro, "TRADES", journal)
+    match = ro._find_original_open_trade_record_for_position("MONAD-USDT", "SHORT", 100.0, 2.0)
+    assert match and match["event_id"] == "EVT_SOURCE"
+    partial_match = ro._find_original_open_trade_record_for_position(
+        "MONAD-USDT", "SHORT", 100.0, 1.5, tracked_initial_qty=2.0
+    )
+    assert partial_match and partial_match["event_id"] == "EVT_SOURCE"
+
+    with journal.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"record_type": "TRADE_CLOSE", "event_id": "EVT_SOURCE"}) + "\n")
+    assert ro._find_original_open_trade_record_for_position("MONAD-USDT", "SHORT", 100.0, 2.0) is None
+
+
+def test_reconciliation_recovers_existing_trade_without_duplicate_open_record(tmp_path, monkeypatch):
+    import json
+    import run_once as ro
+    import event_engine.tracker as tracker
+
+    active_path = tmp_path / "active_trades.json"
+    journal_path = tmp_path / "trades.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(ro, "TRADES", journal_path)
+    # Prevent this reconciliation unit test from reaching the real BingX
+    # contract refresh for the synthetic TEST symbol.
+    symbol_normalizer = lambda value: (str(value).upper() if "-USDT" in str(value).upper() else str(value).upper() + "-USDT")
+    monkeypatch.setattr(ro, "to_bx_symbol", symbol_normalizer)
+    monkeypatch.setattr(tracker, "to_bx_symbol", symbol_normalizer)
+
+    source = {
+        "record_type": "TRADE_OPEN", "trade_id": "TR_ORIGINAL", "event_id": "EVT_ORIGINAL",
+        "symbol": "TEST", "direction": "LONG", "ts": 1_700_000_000_000,
+        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 81.0},
+        "execution": {"requested_price": 99.9, "signal_price": 99.9, "pre_order_reference_price": 100.0,
+                      "actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL",
+                      "status": "opened_protected", "slippage_pct": 0.1, "adverse_slippage_pct": 0.1},
+        "result": {"fill_ts_ms": 1_700_000_000_123},
+        "setup": {"event_type": "CRT_BULLISH", "event_timeframe": "1h", "risk_pct": 5.0,
+                  "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.3625,
+                  "signal_price": 99.9, "entry_reference": 100.0, "invalidation_price": 95.0,
+                  "target_price": 110.0, "tp_mode": "multi_tp",
+                  "tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.3},
+                                {"leg": "tp2", "pnl_pct": 4.0, "close_fraction": 0.35},
+                                {"leg": "tp3", "pnl_pct": 6.0, "close_fraction": 0.35}],
+                  "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.3},
+                                          {"leg": "tp2", "pnl_pct": 4.0, "close_fraction": 0.35},
+                                          {"leg": "tp3", "pnl_pct": 6.0, "close_fraction": 0.35}],
+                  "entry_context": {"fr_oiw": 0.01}},
+    }
+    adopted = {
+        "record_type": "TRADE_OPEN", "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH",
+        "symbol": "TEST", "direction": "LONG", "reconciliation": True, "status": "reconciled_adopted",
+        "signal": {"event_type": "RECONCILED_POSITION"},
+        "execution": {"actual_entry_price": 100.0, "actual_qty": 1.0, "status": "reconciled_adopted"},
+    }
+    journal_path.write_text(json.dumps(source) + "\n" + json.dumps(adopted) + "\n", encoding="utf-8")
+    active_path.write_text(json.dumps({
+        "RECON_TEST_LONG_HASH": {
+            "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH", "symbol": "TEST",
+            "direction": "LONG", "event_type": "RECONCILED_POSITION", "entry_price": 100.0,
+            "actual_entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0,
+            "entry_ts": 1_700_000_100_000, "score": 50.0, "timeframe": "1h",
+            "setup": {"event_type": "RECONCILED_POSITION"}, "hit_legs": [], "be_activated": False,
+            "tp_orders": [], "sl_order": {}, "tp_filled_qty": {}, "tp_leg_realized_weighted_sum": {},
+            "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+            "effective_tp_levels": source["setup"]["effective_tp_levels"],
+            "planned_risk_pct": 5.0, "planned_weighted_rr": 2.0, "effective_weighted_rr": 2.0,
+        }
+    }), encoding="utf-8")
+
+    position = {"symbol": "TEST-USDT", "positionSide": "LONG", "positionAmt": "1.0", "avgPrice": "100.0"}
+    sl = {"orderId": "SL_LIVE", "clientOrderId": "EVTSLTEST", "type": "STOP_MARKET", "stopPrice": "95.0", "origQty": "1.0"}
+    tps = [
+        {"orderId": "TP1_LIVE", "clientOrderId": "EVTTP1TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "102.0", "origQty": "0.3"},
+        {"orderId": "TP2_LIVE", "clientOrderId": "EVTTP2TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "104.0", "origQty": "0.35"},
+        {"orderId": "TP3_LIVE", "clientOrderId": "EVTTP3TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.35"},
+    ]
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [position])
+    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *args, **kwargs: {"status": "ok", "tp_orders": tps, "sl_orders": [sl]})
+    journaled = []
+    registered = []
+    recorded_actions = []
+    monkeypatch.setattr(ro, "record_trade", lambda row: journaled.append(row))
+    monkeypatch.setattr(ro, "record_action", lambda row: recorded_actions.append(row))
+    monkeypatch.setattr(ro, "register_active_trade", lambda **kwargs: registered.append(kwargs))
+
+    ro.reconcile_all_open_positions()
+
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    assert list(active) == ["EVT_ORIGINAL"]
+    restored = active["EVT_ORIGINAL"]
+    assert restored["event_type"] == "CRT_BULLISH"
+    assert restored["score"] == 81.0
+    assert restored["trade_id"] == "TR_ORIGINAL"
+    assert restored["entry_order_id"] == "ENTRY_ORIGINAL"
+    assert restored["sl_order"]["order_id"] == "SL_LIVE"
+    assert {x["order_id"] for x in restored["tp_orders"]} == {"TP1_LIVE", "TP2_LIVE", "TP3_LIVE"}
+    assert journaled == []
+    assert registered == []
+    assert len(recorded_actions) == 1
+    assert recorded_actions[0]["record_type"] == "TRADE_IDENTITY_RECOVERED"
+    assert recorded_actions[0]["previous_event_id"] == "RECON_TEST_LONG_HASH"

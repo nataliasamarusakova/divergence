@@ -83,6 +83,7 @@ from event_engine.tracker import (
     update_active_trades,
     register_active_trade,
     update_active_trade_protection,
+    restore_reconciled_trade_identity,
     _load_active_trades,
 )
 
@@ -552,6 +553,76 @@ def _btc_regime_snapshot(btc_1h_df) -> dict[str, Any]:
     except Exception:
         return out
     return out
+
+
+def _journal_safe(value: Any, *, _depth: int = 0) -> Any:
+    """Convert detector/market data to bounded, JSON-safe forensic values."""
+    if _depth > 8:
+        return "<max-depth>"
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _journal_safe(v, _depth=_depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_journal_safe(v, _depth=_depth + 1) for v in value]
+    if hasattr(value, "_asdict"):
+        try:
+            return _journal_safe(value._asdict(), _depth=_depth + 1)
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _journal_safe(value.item(), _depth=_depth + 1)
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)[:500]
+
+
+def _candidate_identifier(event_id: Any, symbol: str, event_type: str, direction: str, detected_at: Any, cycle_ts: int) -> str:
+    """Stable within one cycle, distinct across repeated evaluations."""
+    identity = str(event_id or "")
+    if not identity:
+        identity = "|".join((str(symbol), str(event_type), str(direction), str(detected_at or "")))
+    digest = hashlib.sha256(f"{identity}|{int(cycle_ts)}".encode("utf-8")).hexdigest()[:24].upper()
+    return f"CAND_{digest}"
+
+
+def _record_candidate_decision(
+    *, candidate_id: str, event_id: Any, symbol: str, direction: str, event_type: str,
+    timeframe: str, stage: str, decision: str, reason: str | None = None,
+    evaluation_ts: int | None = None, **details: Any,
+) -> None:
+    """Append one normalized decision record; never let telemetry break screening."""
+    row = {
+        "record_type": "CANDIDATE_FILTER_DECISION",
+        "candidate_id": candidate_id,
+        "event_id": event_id,
+        "symbol": symbol,
+        "direction": direction or None,
+        "event_type": event_type or None,
+        "timeframe": timeframe or None,
+        "stage": stage,
+        "decision": decision,
+        "reason": reason,
+        "evaluation_ts": int(evaluation_ts or time.time() * 1000),
+        **details,
+    }
+    try:
+        record_action(_journal_safe(row))
+    except Exception as exc:
+        log.warning("[CANDIDATE_JOURNAL] failed candidate_id=%s stage=%s decision=%s: %s", candidate_id, stage, decision, exc)
 
 
 def _entry_context(row: Any, ev: dict, btc_regime: dict[str, Any]) -> dict[str, Any]:
@@ -2556,6 +2627,313 @@ def _reconciliation_event_id(
     return candidate
 
 
+def _find_original_open_trade_record_for_position(
+    symbol: str,
+    direction: str,
+    avg_price: float,
+    qty: float,
+    tracked_initial_qty: float | None = None,
+) -> dict[str, Any] | None:
+    """Find the unique, still-open journal entry for a protected exchange position.
+
+    Reconciliation records are excluded: they describe adoption of an existing
+    position, not a second economic trade. A match requires the same symbol/side,
+    a close entry-price match, and an unclosed source event. When trusted local
+    tracker state exists, its initial quantity may identify a partially-closed
+    position; otherwise only an exact live-quantity match is accepted.
+    """
+    if not TRADES.exists():
+        return None
+    want_symbol = str(symbol or "").upper().replace("-USDT", "")
+    want_direction = str(direction or "").upper()
+    if not want_symbol or want_direction not in {"LONG", "SHORT"} or avg_price <= 0 or qty <= 0:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    closed_event_ids: set[str] = set()
+    try:
+        with TRADES.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                event_id = str(row.get("event_id") or "")
+                if row.get("record_type") == "TRADE_CLOSE" and event_id:
+                    closed_event_ids.add(event_id)
+                elif row.get("record_type") == "TRADE_OPEN":
+                    rows.append(row)
+    except OSError as exc:
+        log.warning("[RECONCILIATION] Cannot inspect trade journal for source recovery: %s", exc)
+        return None
+
+    tracked_initial = abs(_safe_float(tracked_initial_qty, 0.0)) if tracked_initial_qty is not None else 0.0
+    expected_source_qty = tracked_initial if tracked_initial > 0 else qty
+    if expected_source_qty + max(expected_source_qty * 1e-6, 1e-12) < qty:
+        return None
+
+    candidates: list[tuple[float, int, dict[str, Any]]] = []
+    for row in rows:
+        if row.get("reconciliation") or str(row.get("status") or "").lower() == "reconciled_adopted":
+            continue
+        event_id = str(row.get("event_id") or "")
+        if not event_id or event_id in closed_event_ids:
+            continue
+        execution = row.get("execution") if isinstance(row.get("execution"), dict) else {}
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        position = result.get("position") if isinstance(result.get("position"), dict) else {}
+        open_result = result.get("open_result") if isinstance(result.get("open_result"), dict) else {}
+        protection = result.get("protection") if isinstance(result.get("protection"), dict) else {}
+        # The detector's symbol can differ from the exchange's canonical symbol
+        # (e.g. signal symbol MON, executed contract MONAD-USDT). Prefer explicit
+        # exchange symbols recorded at fill/protection time, but retain the
+        # detector alias as a candidate for older journal rows.
+        row_symbols = {
+            str(value or "").upper().replace("-USDT", "")
+            for value in (
+                row.get("symbol"), position.get("symbol"), open_result.get("symbol"),
+                protection.get("bx_symbol"), execution.get("symbol"),
+            )
+            if str(value or "").strip()
+        }
+        if want_symbol not in row_symbols or str(row.get("direction") or "").upper() != want_direction:
+            continue
+        status = str(execution.get("status") or result.get("status") or "").lower()
+        if status not in {"opened", "opened_protected", "opened_protection_check_required", "opened_protection_failed"}:
+            continue
+        entry = _safe_float(execution.get("actual_entry_price"), 0.0)
+        entry_qty = abs(_safe_float(execution.get("actual_qty"), 0.0))
+        if entry <= 0 or entry_qty <= 0:
+            continue
+        price_error = abs(entry - avg_price) / max(avg_price, 1e-12)
+        if price_error > 0.0025:
+            continue
+        qty_tol = max(entry_qty * 1e-6, expected_source_qty * 1e-6, qty * 1e-6, 1e-12)
+        if abs(entry_qty - expected_source_qty) > qty_tol or entry_qty + qty_tol < qty:
+            continue
+        candidates.append((price_error, int(_safe_float(row.get("ts"), 0.0)), row))
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            log.warning(
+                "[RECONCILIATION] Ambiguous original journal match for %s %s (candidates=%d); keeping conservative state.",
+                want_symbol, want_direction, len(candidates),
+            )
+        return None
+    return candidates[0][2]
+
+
+def restore_reconciled_trade_identities_before_tracker() -> None:
+    """Read-only identity recovery before lifecycle processing.
+
+    The first reconciliation pass used to run after update_active_trades(). If an
+    adopted RECONCILED_POSITION disappeared between runs, the tracker could write
+    TRADE_CLOSE under the synthetic RECON id before restoring the original event id.
+    This pass only reads exchange positions and the journal; it never places, edits,
+    or cancels exchange orders. Ambiguous matches are left untouched.
+    """
+    try:
+        positions = get_positions(timeout_sec=5.0, retryable=False)
+    except Exception as exc:
+        # Fail closed: when account state is unknown, do not infer that a position
+        # is absent and do not mutate the local identity. Normal tracker/reconcile
+        # calls will keep their existing guarded error handling.
+        log.warning("[TRADE_IDENTITY_RECOVERY] Positions unavailable; skipping pre-tracker recovery: %s", exc)
+        return
+
+    # A close may have been appended before a crash while the active-state file
+    # still says open. Never remap such a state to a second event id: the tracker
+    # already has idempotency for the existing RECON close record.
+    closed_event_ids: set[str] = set()
+    try:
+        if TRADES.exists():
+            with TRADES.open("r", encoding="utf-8") as journal:
+                for line in journal:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(row, dict) and row.get("record_type") == "TRADE_CLOSE":
+                        closed_id = str(row.get("event_id") or "").strip()
+                        if closed_id:
+                            closed_event_ids.add(closed_id)
+    except OSError as exc:
+        log.warning("[TRADE_IDENTITY_RECOVERY] Cannot inspect close journal; skipping pre-tracker recovery: %s", exc)
+        return
+
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        raw_symbol = str(position.get("symbol") or "").strip().upper()
+        if not raw_symbol:
+            continue
+        try:
+            amt = float(position.get("positionAmt", 0) or 0)
+            avg_price = float(position.get("avgPrice", 0) or position.get("entryPrice", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(amt) <= 0 or avg_price <= 0:
+            continue
+        side = str(position.get("positionSide") or "").upper()
+        direction = side if side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
+        by_key.setdefault((raw_symbol.replace("-USDT", ""), direction), []).append(position)
+
+    active_trades = _load_active_trades()
+    if not isinstance(active_trades, dict) or not active_trades:
+        return
+
+    for previous_event_id, trade in list(active_trades.items()):
+        if not isinstance(trade, dict) or trade.get("closed", False):
+            continue
+        if str(trade.get("event_type") or "").upper() != "RECONCILED_POSITION":
+            continue
+        if str(previous_event_id) in closed_event_ids:
+            log.warning(
+                "[TRADE_IDENTITY_RECOVERY] %s already has TRADE_CLOSE in the journal; skipping identity migration to avoid a duplicate economic close.",
+                previous_event_id,
+            )
+            continue
+
+        symbol_raw = str(trade.get("symbol") or "").strip().upper()
+        if not symbol_raw:
+            continue
+        # Avoid to_bx_symbol() here: a cold contract cache can trigger another
+        # exchange request for every symbol. The saved tracker symbol is already
+        # enough for normalized SYMBOL-USDT identity matching.
+        symbol_key = symbol_raw.replace("-USDT", "")
+        bx_symbol = f"{symbol_key}-USDT"
+        direction = str(trade.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            continue
+        matches = by_key.get((symbol_key, direction), [])
+        if len(matches) > 1:
+            log.warning(
+                "[TRADE_IDENTITY_RECOVERY] Ambiguous exchange positions for %s %s; keeping %s unchanged.",
+                symbol_key, direction, previous_event_id,
+            )
+            continue
+
+        if matches:
+            position = matches[0]
+            try:
+                live_qty = abs(float(position.get("positionAmt", 0) or 0))
+                entry_price = float(position.get("avgPrice", 0) or position.get("entryPrice", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if live_qty <= 0 or entry_price <= 0:
+                continue
+            source_record = _find_original_open_trade_record_for_position(
+                bx_symbol, direction, entry_price, live_qty,
+                tracked_initial_qty=_safe_float(trade.get("initial_qty"), 0.0),
+            )
+            absent_position = False
+        else:
+            # A successful account-wide position query confirmed the symbol/side is
+            # absent. Match from the local immutable entry identity and full initial
+            # quantity; the tracker will still query order history/fills and can keep
+            # the final outcome as DATA_ERROR if execution price cannot be proven.
+            entry_price = _safe_float(trade.get("actual_entry_price", trade.get("entry_price")), 0.0)
+            initial_qty = abs(_safe_float(trade.get("initial_qty"), 0.0))
+            if entry_price <= 0 or initial_qty <= 0:
+                continue
+            source_record = _find_original_open_trade_record_for_position(
+                bx_symbol, direction, entry_price, initial_qty,
+                tracked_initial_qty=initial_qty,
+            )
+            absent_position = True
+            live_qty = None
+
+        if not source_record:
+            continue
+        restored_event_id = restore_reconciled_trade_identity(
+            str(previous_event_id), source_record, live_qty,
+            allow_absent_position=absent_position,
+        )
+        if not restored_event_id:
+            continue
+        execution = source_record.get("execution") if isinstance(source_record.get("execution"), dict) else {}
+        record_action({
+            "record_type": "TRADE_IDENTITY_RECOVERED",
+            "event_id": restored_event_id,
+            "previous_event_id": str(previous_event_id),
+            "trade_id": source_record.get("trade_id"),
+            "symbol": symbol_key,
+            "direction": direction,
+            "entry_price": entry_price,
+            "qty": live_qty if live_qty is not None else abs(_safe_float(trade.get("remaining_qty"), 0.0)),
+            "entry_order_id": execution.get("order_id"),
+            "source": "pre_tracker_journal_recovery",
+            "position_present": not absent_position,
+            "ts": int(time.time() * 1000),
+        })
+        log.warning(
+            "[TRADE_IDENTITY_RECOVERY] Restored %s -> %s before tracker lifecycle update (position_present=%s).",
+            previous_event_id, restored_event_id, not absent_position,
+        )
+
+
+def _register_active_trade_from_journal(
+    source_record: dict[str, Any],
+    symbol: str,
+    direction: str,
+    qty: float,
+    tp_orders: list[dict],
+    sl_result: dict,
+) -> bool:
+    """Register current protection under the original trade identity without journaling a second entry."""
+    signal = source_record.get("signal") if isinstance(source_record.get("signal"), dict) else {}
+    execution = source_record.get("execution") if isinstance(source_record.get("execution"), dict) else {}
+    result = source_record.get("result") if isinstance(source_record.get("result"), dict) else {}
+    setup = source_record.get("setup") if isinstance(source_record.get("setup"), dict) else {}
+    event_id = str(source_record.get("event_id") or "")
+    entry_price = _safe_float(execution.get("actual_entry_price"), 0.0)
+    source_qty = abs(_safe_float(execution.get("actual_qty"), 0.0))
+    if not event_id or entry_price <= 0 or source_qty <= 0 or abs(source_qty - qty) > max(source_qty * 1e-6, 1e-12):
+        return False
+    try:
+        register_active_trade(
+            event_id=event_id,
+            symbol=str(symbol).replace("-USDT", ""),
+            name=str(symbol).replace("-USDT", ""),
+            direction=direction,
+            entry_price=entry_price,
+            qty=source_qty,
+            tp_orders=tp_orders,
+            sl_result=sl_result,
+            event_type=str(signal.get("event_type") or source_record.get("event_type") or "UNKNOWN"),
+            timeframe=str(signal.get("timeframe") or setup.get("event_timeframe") or "1h"),
+            score=_safe_float(signal.get("score", source_record.get("score")), 50.0),
+            setup=setup,
+            requested_entry_price=_safe_float(execution.get("requested_price"), entry_price),
+            entry_ts_ms=_safe_float(result.get("fill_ts_ms"), _safe_float(source_record.get("ts"), 0.0)),
+            entry_order_id=execution.get("order_id"),
+        )
+    except Exception as exc:
+        log.error("[RECONCILIATION] Could not restore source trade %s for %s %s: %s", event_id, symbol, direction, exc)
+        return False
+    record_action({
+        "record_type": "TRADE_STATE_RESTORED_FROM_JOURNAL",
+        "event_id": event_id,
+        "trade_id": source_record.get("trade_id"),
+        "symbol": str(symbol).upper().replace("-USDT", ""),
+        "direction": str(direction).upper(),
+        "entry_price": entry_price,
+        "qty": source_qty,
+        "entry_order_id": execution.get("order_id"),
+        "source": "original_trade_journal",
+        "ts": int(time.time() * 1000),
+    })
+    log.warning("[RECONCILIATION] Restored original trade identity %s for protected position %s %s; no duplicate TRADE_OPEN appended.", event_id, symbol, direction)
+    return True
+
+
 def reconcile_all_open_positions() -> None:
     # Reconciliation must never monopolize the 5-minute event loop. The normal
     # BingX session intentionally retries GETs, but that can turn one network
@@ -2624,17 +3002,59 @@ def reconcile_all_open_positions() -> None:
             retryable=False,
         )
         if prot.get("status") != "ok":
-            log.warning("[RECONCILIATION] Cannot inspect protection for %s: %s", bx_symbol, prot.get("error"))
+            log.critical("[PROTECTION_AUDIT] %s %s cannot inspect live protection; state remains UNKNOWN, no blind repair/close: %s", bx_symbol, position_side, prot.get("error"))
+            record_action({
+                "record_type": "PROTECTION_STATE_UNKNOWN",
+                "symbol": bx_symbol, "position_side": position_side,
+                "position_qty": abs(amt), "entry_price": avg_price,
+                "reason": "OPEN_ORDERS_QUERY_FAILED", "error": prot.get("error"),
+                "ts": int(time.time() * 1000),
+            })
             continue
 
         sl_orders = list(prot.get("sl_orders", []))
         tp_orders = list(prot.get("tp_orders", []))
 
         matched_trade = _find_active_trade_for_position(bx_symbol, direction, active_trades)
+        source_record = None
+        if matched_trade is None or str(matched_trade.get("event_type", "")).upper() == "RECONCILED_POSITION":
+            tracked_initial_qty = _safe_float(matched_trade.get("initial_qty"), 0.0) if matched_trade else 0.0
+            source_record = _find_original_open_trade_record_for_position(
+                bx_symbol, direction, avg_price, qty,
+                tracked_initial_qty=tracked_initial_qty if tracked_initial_qty > 0 else None,
+            )
+        if matched_trade and str(matched_trade.get("event_type", "")).upper() == "RECONCILED_POSITION" and source_record:
+            old_event_id = str(matched_trade.get("event_id") or "")
+            migrated_event_id = restore_reconciled_trade_identity(old_event_id, source_record, qty)
+            if migrated_event_id:
+                active_trades = _load_active_trades()
+                matched_trade = _find_active_trade_for_position(bx_symbol, direction, active_trades)
+                record_action({
+                    "record_type": "TRADE_IDENTITY_RECOVERED",
+                    "event_id": migrated_event_id,
+                    "previous_event_id": old_event_id,
+                    "trade_id": source_record.get("trade_id"),
+                    "symbol": bx_symbol.replace("-USDT", ""),
+                    "direction": direction,
+                    "entry_price": avg_price,
+                    "qty": qty,
+                    "entry_order_id": (source_record.get("execution") or {}).get("order_id")
+                    if isinstance(source_record.get("execution"), dict) else None,
+                    "ts": int(time.time() * 1000),
+                })
+                log.warning(
+                    "[RECONCILIATION] Recovered original signal metadata for %s %s: event_id=%s",
+                    bx_symbol, direction, migrated_event_id,
+                )
+                source_record = None
+
         hit_legs = {str(x).lower() for x in (matched_trade.get("hit_legs", []) if matched_trade else set())}
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
 
         effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
+        if effective_levels is None and source_record:
+            source_setup = source_record.get("setup") if isinstance(source_record.get("setup"), dict) else {}
+            effective_levels = source_setup.get("effective_tp_levels") if isinstance(source_setup.get("effective_tp_levels"), list) else None
         configured_legs = {str(x.get("leg")).lower() for x in effective_levels if isinstance(x, dict) and x.get("leg")} if isinstance(effective_levels, list) and effective_levels else {"tp1", "tp2", "tp3"}
         remaining_expected_legs = configured_legs - hit_legs
 
@@ -2669,7 +3089,7 @@ def reconcile_all_open_positions() -> None:
         # TP orders together with a valid SL instead of endlessly creating
         # duplicate/rewritten protection on every cycle. Once registered, the
         # inferred live profile becomes authoritative for future reconciliation.
-        if matched_trade is None:
+        if matched_trade is None and source_record is None:
             protection_complete = sl_valid and bool(tracker_tp_probe)
         else:
             protection_complete = sl_valid and remaining_expected_legs.issubset(known_tp_legs)
@@ -2692,7 +3112,13 @@ def reconcile_all_open_positions() -> None:
                     tp_mode=matched_trade.get("tp_mode") if matched_trade else None,
                     effective_weighted_rr=matched_trade.get("effective_weighted_rr") if matched_trade else None,
                 )
-                if not tracked and not matched_trade:
+                if not tracked and not matched_trade and source_record:
+                    tracked = _register_active_trade_from_journal(
+                        source_record, bx_symbol, direction, qty, tracker_tp, tracker_sl
+                    )
+                    if tracked:
+                        active_trades = _load_active_trades()
+                if not tracked and not matched_trade and not source_record:
                     try:
                         sl_price = _safe_float(sl_orders[0].get("stopPrice") or sl_orders[0].get("price"), 0.0)
                         inferred_risk = abs(avg_price - sl_price) / avg_price * 100.0 if sl_price > 0 else 2.0
@@ -2719,11 +3145,16 @@ def reconcile_all_open_positions() -> None:
                             for level in inferred_levels:
                                 level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
                         max_rr = max(abs(_safe_float(tp.get("pnl_pct"), 0.0)) / inferred_risk for tp in inferred_levels)
+                        weighted_rr = sum(
+                            (abs(_safe_float(level.get("pnl_pct"), 0.0)) / inferred_risk)
+                            * max(_safe_float(level.get("close_fraction"), 0.0), 0.0)
+                            for level in inferred_levels
+                        )
                         inferred_setup = {
                             "risk_pct": inferred_risk,
                             "target_rr": max_rr,
-                            "planned_weighted_rr": max_rr,
-                            "effective_weighted_rr": max_rr,
+                            "planned_weighted_rr": weighted_rr,
+                            "effective_weighted_rr": weighted_rr,
                             "tp_mode": "single_tp" if len(inferred_levels) == 1 else "multi_tp",
                             "effective_tp_levels": inferred_levels,
                             "tp_levels": inferred_levels,
@@ -2834,18 +3265,20 @@ def reconcile_all_open_positions() -> None:
                 log.info("[RECONCILIATION] %s (%s) complete on re-check; skipping repair.", bx_symbol, direction)
                 continue
 
-        sl_pct = _safe_float(matched_trade.get("planned_risk_pct"), 0.0) if matched_trade else 0.0
+        source_setup = source_record.get("setup") if source_record and isinstance(source_record.get("setup"), dict) else {}
+        sl_pct = _safe_float(matched_trade.get("planned_risk_pct"), 0.0) if matched_trade else _safe_float(source_setup.get("risk_pct"), 0.0)
         if sl_pct <= 0:
             # For an orphan/unmatched current position, use the shipped fixed stop
             # policy rather than inventing a legacy ATR-based risk profile.
             sl_pct = float(FIXED_STOP_LOSS_PCT)
 
         tp_levels = []
-        if matched_trade and isinstance(matched_trade.get("effective_tp_levels"), list) and matched_trade.get("effective_tp_levels"):
+        source_levels = matched_trade.get("effective_tp_levels") if matched_trade else source_setup.get("effective_tp_levels")
+        if isinstance(source_levels, list) and source_levels:
             # Preserve the exact original protection profile, including squeeze and normal
             # TP distances and micro-position single-TP mode. Never silently rewrite a
-            # matched trade during restart repair.
-            for level in matched_trade.get("effective_tp_levels", []):
+            # matched/journal-recovered trade during restart repair.
+            for level in source_levels:
                 if not isinstance(level, dict):
                     continue
                 leg = str(level.get("leg", ""))
@@ -2859,8 +3292,9 @@ def reconcile_all_open_positions() -> None:
                 if pnl_pct > 0 and fraction > 0:
                     tp_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
+        source_event_type = str((matched_trade or {}).get("event_type") or (source_record or {}).get("event_type") or ((source_record or {}).get("signal") or {}).get("event_type", ""))
         if not tp_levels:
-            if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))):
+            if _is_squeeze_event(source_event_type):
                 default_levels = [
                     {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
                     for i, (rr, fraction) in enumerate(zip(SQUEEZE_TP_RR, SQUEEZE_TP_FRACTIONS), start=1)
@@ -2873,7 +3307,7 @@ def reconcile_all_open_positions() -> None:
             tp_levels.extend([x for x in default_levels if x["leg"] not in hit_legs])
 
         if not tp_levels:
-            final_rr = LEGACY_SQUEEZE_FINAL_TP_RR if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))) else LEGACY_NORMAL_FINAL_TP_RR
+            final_rr = LEGACY_SQUEEZE_FINAL_TP_RR if _is_squeeze_event(source_event_type) else LEGACY_NORMAL_FINAL_TP_RR
             tp_levels = [{"leg": "tp3", "pnl_pct": round(sl_pct * final_rr, 6), "close_fraction": 1.0}]
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
@@ -2893,6 +3327,92 @@ def reconcile_all_open_positions() -> None:
         repaired_tp = res.get("tp_orders", [])
         repaired_sl = res.get("sl_result", {})
 
+        # Verify the actual exchange state after every attempted repair; a
+        # successful function return alone is not proof that the residual SL is
+        # live at exactly the remaining position quantity.
+        post_repair_protection = get_open_protection_directional(
+            bx_symbol, direction, timeout_sec=recon_timeout, retryable=False,
+        )
+        post_sl_orders = list(post_repair_protection.get("sl_orders", [])) if post_repair_protection.get("status") == "ok" else []
+        post_sl_valid = False
+        post_sl_diagnostics = []
+        if post_repair_protection.get("status") == "ok":
+            for observed_sl in post_sl_orders:
+                sl_qty_observed = _safe_float(observed_sl.get("origQty", 0) or observed_sl.get("quantity", 0), 0.0)
+                sl_price_observed = _safe_float(observed_sl.get("stopPrice", 0) or observed_sl.get("price", 0), 0.0)
+                qty_ok = sl_qty_observed > 0 and abs(sl_qty_observed - qty) <= max(qty * 1e-6, 1e-12)
+                if direction == "LONG":
+                    price_ok = sl_price_observed > 0 and ((sl_price_observed <= avg_price * 1.003) if be_activated else (sl_price_observed < avg_price))
+                else:
+                    price_ok = sl_price_observed > 0 and ((sl_price_observed >= avg_price * 0.997) if be_activated else (sl_price_observed > avg_price))
+                post_sl_diagnostics.append({
+                    "order_id": str(observed_sl.get("orderId") or observed_sl.get("order_id") or ""),
+                    "qty": sl_qty_observed, "price": sl_price_observed,
+                    "qty_matches_position": bool(qty_ok), "price_is_protective": bool(price_ok),
+                })
+            post_sl_valid = len(post_sl_orders) == 1 and bool(post_sl_diagnostics) and post_sl_diagnostics[0]["qty_matches_position"] and post_sl_diagnostics[0]["price_is_protective"]
+
+        record_action({
+            "record_type": "PROTECTION_REPAIR_RESULT",
+            "event_id": (matched_trade or {}).get("event_id"),
+            "symbol": bx_symbol, "direction": direction, "position_qty": qty,
+            "repair_status": status, "repair_error": res.get("error"),
+            "post_repair_open_orders_status": post_repair_protection.get("status"),
+            "post_repair_sl_count": len(post_sl_orders),
+            "post_repair_sl_valid": bool(post_sl_valid),
+            "post_repair_sl_diagnostics": post_sl_diagnostics,
+            "tp_count_returned": len(repaired_tp) if isinstance(repaired_tp, list) else None,
+            "protection_audit": res.get("protection_audit"),
+            "ts": int(time.time() * 1000),
+        })
+
+        if post_repair_protection.get("status") != "ok":
+            # Do not issue an emergency close from an unknown openOrders response:
+            # query failures must not be mistaken for proof that the SL is absent.
+            log.critical("[PROTECTION_AUDIT] %s %s post-repair SL state UNKNOWN; no blind close. Repair status=%s error=%s", bx_symbol, direction, status, post_repair_protection.get("error"))
+            continue
+
+        if not post_sl_valid:
+            mismatch_reason = (
+                "SL_MISSING_AFTER_REPAIR" if not post_sl_orders else
+                "SL_MULTIPLE_ORDERS_AFTER_REPAIR" if len(post_sl_orders) != 1 else
+                "SL_QTY_OR_PRICE_MISMATCH_AFTER_REPAIR"
+            )
+            log.critical("[PROTECTION_AUDIT] %s %s %s; exchange confirms no single SL matching residual qty %.12g; attempting emergency close", bx_symbol, direction, mismatch_reason, qty)
+            emergency_result = emergency_close_position(
+                bx_symbol, direction, qty,
+                reason_token=f"RECONSL:{str(trade_event_id).replace('EVT_', '')}",
+            )
+            record_action({
+                "record_type": "PROTECTION_REPAIR_FAILED_UNPROTECTED",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "reason": mismatch_reason, "position_qty": qty,
+                "sl_orders": post_sl_diagnostics,
+                "repair_status": status, "repair_error": res.get("error"),
+                "emergency_close": emergency_result,
+                "ts": int(time.time() * 1000),
+            })
+            continue
+
+        if status != "PROTECTED" or not repaired_sl or not repaired_tp:
+            # SL is confirmed, so keep the position rather than blind-closing it;
+            # explicitly journal incomplete TP/repair state for a later retry.
+            # SL_ONLY may still return a subset of working TPs; record the gap,
+            # but retain those verified order ids in the trade tracker below.
+            log.error("[PROTECTION_AUDIT] %s %s SL is confirmed but protection repair incomplete: status=%s error=%s", bx_symbol, direction, status, res.get("error"))
+            record_action({
+                "record_type": "PROTECTION_REPAIR_INCOMPLETE", "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction, "position_qty": qty,
+                "reason": "SL_CONFIRMED_TP_OR_REPAIR_INCOMPLETE", "repair_status": status,
+                "repair_error": res.get("error"), "sl_orders": post_sl_diagnostics,
+                "tp_count_returned": len(repaired_tp) if isinstance(repaired_tp, list) else None,
+                "tp_order_results": repaired_tp if isinstance(repaired_tp, list) else None,
+                "ts": int(time.time() * 1000),
+            })
+            if status not in {"PROTECTED", "SL_ONLY"} or not repaired_sl or not repaired_tp:
+                continue
+
         if status in {"PROTECTED", "SL_ONLY"} and repaired_tp and repaired_sl:
             tracked = update_active_trade_protection(
                 symbol=bx_symbol,
@@ -2903,7 +3423,13 @@ def reconcile_all_open_positions() -> None:
                 tp_mode=res.get("tp_mode"),
                 effective_weighted_rr=res.get("effective_weighted_rr"),
             )
-            if not tracked and not matched_trade:
+            if not tracked and not matched_trade and source_record:
+                tracked = _register_active_trade_from_journal(
+                    source_record, bx_symbol, direction, qty, repaired_tp, repaired_sl
+                )
+                if tracked:
+                    active_trades = _load_active_trades()
+            if not tracked and not matched_trade and not source_record:
                 reconciliation_event_id = _reconciliation_event_id(
                     bx_symbol, direction, avg_price, qty, p, active_trades
                 )
@@ -2955,6 +3481,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     try:
         # Execution remains on BingX; this reference is the actual BingX market price.
         live_reference = _current_close_price(symbol)
+        bingx_price_observed_ts = int(time.time() * 1000)
     except Exception as exc:
         return {"status": "PRE_ORDER_PRICE_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "error": str(exc)}
 
@@ -2962,6 +3489,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     if CROSS_EXCHANGE_PRICE_GUARD_ENABLED and MARKET_DATA_SOURCE == "binance":
         try:
             binance_live_price = fetch_binance_price(symbol)
+            binance_price_observed_ts = int(time.time() * 1000)
         except BinanceRateLimitError as exc:
             _set_binance_rate_limit_cooldown(exc)
             return {
@@ -2986,11 +3514,29 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "error": str(exc),
             }
         if live_reference is None or float(live_reference) <= 0 or binance_live_price <= 0:
+            price_error = f"invalid BingX/Binance reference prices: bingx={live_reference}, binance={binance_live_price}"
+            unavailable_quality = {
+                "binance_live_price": _safe_float(binance_live_price, 0.0) or None,
+                "bingx_live_price": _safe_float(live_reference, 0.0) or None,
+                "binance_price_observed_ts": binance_price_observed_ts,
+                "bingx_price_observed_ts": bingx_price_observed_ts,
+                "price_observation_skew_ms": abs(binance_price_observed_ts - bingx_price_observed_ts),
+                "price_reference_symbol": symbol,
+                "drift_denominator": "BINANCE_PRICE",
+                "guard_limit_pct": MAX_CROSS_EXCHANGE_DRIFT_PCT,
+            }
+            record_action({
+                "record_type": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "reason": "INVALID_REFERENCE_PRICE", "error": price_error,
+                "execution_quality": unavailable_quality, "ts": int(time.time() * 1000),
+            })
             return {
                 "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
                 "mode": EXECUTION_MODE,
                 "order_id": None,
-                "error": f"invalid BingX/Binance reference prices: bingx={live_reference}, binance={binance_live_price}",
+                "error": price_error,
+                "execution_quality": unavailable_quality,
             }
         cross_exchange_drift_pct = abs(float(live_reference) - float(binance_live_price)) / float(binance_live_price) * 100.0
         execution_quality_guard = {
@@ -2998,13 +3544,31 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "bingx_live_price": float(live_reference),
             "cross_exchange_drift_pct": float(cross_exchange_drift_pct),
             "cross_exchange_drift_limit_pct": float(MAX_CROSS_EXCHANGE_DRIFT_PCT),
+            "price_reference_symbol": symbol,
+            "binance_price_source": "binance.fetch_price",
+            "bingx_price_source": "bingx.current_close_price",
+            "binance_price_observed_ts": binance_price_observed_ts,
+            "bingx_price_observed_ts": bingx_price_observed_ts,
+            "price_observation_skew_ms": abs(binance_price_observed_ts - bingx_price_observed_ts),
+            "drift_denominator": "BINANCE_PRICE",
         }
         if MAX_CROSS_EXCHANGE_DRIFT_PCT > 0 and cross_exchange_drift_pct > MAX_CROSS_EXCHANGE_DRIFT_PCT:
+            drift_error = f"Binance/BingX price drift={cross_exchange_drift_pct:.6f}% > limit={MAX_CROSS_EXCHANGE_DRIFT_PCT:.6f}%"
+            record_action({
+                "record_type": "CROSS_EXCHANGE_DRIFT_REJECTED",
+                "event_id": event_id,
+                "symbol": symbol,
+                "direction": direction,
+                "reason": "CROSS_EXCHANGE_DRIFT_EXCEEDED",
+                "error": drift_error,
+                "execution_quality": execution_quality_guard,
+                "ts": int(time.time() * 1000),
+            })
             return {
                 "status": "CROSS_EXCHANGE_DRIFT_EXCEEDED",
                 "mode": EXECUTION_MODE,
                 "order_id": None,
-                "error": f"Binance/BingX price drift={cross_exchange_drift_pct:.6f}% > limit={MAX_CROSS_EXCHANGE_DRIFT_PCT:.6f}%",
+                "error": drift_error,
                 "execution_quality": execution_quality_guard,
             }
 
@@ -3426,6 +3990,19 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         setup_for_fill["effective_weighted_rr"] = protection["effective_weighted_rr"]
 
     protection_status = str(protection.get("status", "")).upper()
+    record_action({
+        "record_type": "PROTECTION_INSTALL_RESULT",
+        "event_id": event_id,
+        "symbol": to_bx_symbol(symbol), "direction": direction,
+        "position_qty": actual_qty,
+        "protection_status": protection_status,
+        "protection_error": protection.get("error"),
+        "rolled_back": bool(protection.get("rolled_back")),
+        "protection_audit": protection.get("protection_audit"),
+        "sl_result": protection.get("sl_result"),
+        "tp_order_count": len(protection.get("tp_orders", [])) if isinstance(protection.get("tp_orders"), list) else None,
+        "ts": int(time.time() * 1000),
+    })
     if protection_status not in {"PROTECTED", "SL_ONLY"} and not protection.get("rolled_back"):
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"PROTECTIONFAIL:{trade_id}")
         protection["emergency_close"] = rollback
@@ -3499,6 +4076,12 @@ def main() -> None:
         return
 
     if EXECUTION_ENABLED:
+        try:
+            log.info("[TRADE_IDENTITY_RECOVERY] Restoring original identities before lifecycle processing...")
+            restore_reconciled_trade_identities_before_tracker()
+        except Exception as exc:
+            log.error("[TRADE_IDENTITY_RECOVERY] Pre-tracker recovery error: %s", exc)
+
         try:
             log.info("[TRACKER] Checking active trades lifecycle & TP execution...")
             update_active_trades()
@@ -3698,54 +4281,115 @@ def main() -> None:
     candidates: List[Any] = []
     if not coinalyze_complete:
         stats["coinalyze_new_entries_frozen"] = True
+        _record_candidate_decision(
+            candidate_id=f"CAND_UNIVERSE_FREEZE_{int(now_ms)}", event_id=None, symbol="<ALL>",
+            direction="", event_type="CONTRACT_UNIVERSE", timeframe="", stage="CONTRACT_UNIVERSE",
+            decision="FROZEN", reason="COINALYZE_CONTEXT_INCOMPLETE", evaluation_ts=now_ms,
+            new_entries_frozen=True,
+        )
+        for frozen_row in rows:
+            frozen_symbol = str(getattr(frozen_row, "symbol", "<unknown>"))
+            frozen_id = _candidate_identifier(None, frozen_symbol, "CONTRACT_UNIVERSE", "", now_ms, now_ms)
+            _record_candidate_decision(
+                candidate_id=frozen_id, event_id=None, symbol=frozen_symbol, direction="",
+                event_type="CONTRACT_UNIVERSE", timeframe="", stage="COINALYZE_COMPLETENESS",
+                decision="FROZEN", reason="COINALYZE_CONTEXT_INCOMPLETE", evaluation_ts=now_ms,
+                raw_market_features=_journal_safe(frozen_row),
+            )
         log.warning(
             "[UNIVERSE] Coinalyze context is incomplete; NEW ENTRIES are frozen for this cycle. "
             "Existing-position reconciliation/protection already ran before the derivatives fetch."
         )
     for r in _coinalyze_rows_for_new_entries(rows, coinalyze_complete):
+        universe_symbol = str(getattr(r, "symbol", "<unknown>"))
+        universe_id = _candidate_identifier(None, universe_symbol, "CONTRACT_UNIVERSE", "", now_ms, now_ms)
+        universe_row = _journal_safe(r)
+        _record_candidate_decision(
+            candidate_id=universe_id, event_id=None, symbol=universe_symbol, direction="",
+            event_type="CONTRACT_UNIVERSE", timeframe="", stage="CONTRACT_UNIVERSE",
+            decision="SEEN", evaluation_ts=now_ms, raw_market_features=universe_row,
+            minimum_volume24=MIN_VOL, minimum_open_interest=MIN_OI,
+        )
+
+        def reject_universe(reason: str, **details: Any) -> None:
+            _record_candidate_decision(
+                candidate_id=universe_id, event_id=None, symbol=universe_symbol, direction="",
+                event_type="CONTRACT_UNIVERSE", timeframe="", stage="CONTRACT_UNIVERSE",
+                decision="REJECTED", reason=reason, evaluation_ts=now_ms, **details,
+            )
+
         try:
-            if (
-                r.price is None
-                or r.price <= 0
-                or r.volume24 is None
-                or r.volume24 < MIN_VOL
-                or r.oi is None
-                or r.oi < MIN_OI
-            ):
+            if getattr(r, "price", None) is None:
+                reject_universe("MISSING_PRICE")
+                continue
+            if _safe_float(getattr(r, "price", None), 0.0) <= 0:
+                reject_universe("PRICE_NON_POSITIVE_OR_INVALID", price=getattr(r, "price", None))
+                continue
+            if getattr(r, "volume24", None) is None:
+                reject_universe("MISSING_VOLUME24", minimum_volume24=MIN_VOL)
+                continue
+            if _safe_float(getattr(r, "volume24", None), 0.0) < MIN_VOL:
+                reject_universe("VOLUME24_BELOW_MINIMUM", volume24=getattr(r, "volume24", None), minimum_volume24=MIN_VOL)
+                continue
+            if getattr(r, "oi", None) is None:
+                reject_universe("MISSING_OPEN_INTEREST", minimum_open_interest=MIN_OI)
+                continue
+            if _safe_float(getattr(r, "oi", None), 0.0) < MIN_OI:
+                reject_universe("OPEN_INTEREST_BELOW_MINIMUM", open_interest=getattr(r, "oi", None), minimum_open_interest=MIN_OI)
                 continue
 
             stats["liquidity_candidates"] += 1
             if not bingx_contract_catalog_fresh:
                 stats["rejected_bingx_contract"] += 1
+                reject_universe("BINGX_CONTRACT_CATALOG_STALE")
                 continue
             if not bingx_contract_exists(r.symbol):
                 # A symbol may remain visible in cached/Coinalyze universe data
                 # while BingX has paused trading. Never create a candidate that
                 # can only fail later at execution time.
                 stats["rejected_bingx_contract"] += 1
+                reject_universe("BINGX_CONTRACT_UNAVAILABLE")
                 continue
             if MARKET_DATA_SOURCE == "binance":
                 try:
                     if not binance_contract_exists(r.symbol):
                         stats["rejected_binance_contract"] += 1
+                        reject_universe("BINANCE_CONTRACT_UNAVAILABLE")
                         continue
                 except BinanceRateLimitError as exc:
                     _set_binance_rate_limit_cooldown(exc)
                     _record_scan_error(stats, "candidate_binance_exchangeinfo_rate_limit")
                     log.error("[BINANCE] exchangeInfo rate limit reached while building candidate universe; stopping candidate build: %s", exc)
+                    reject_universe("BINANCE_EXCHANGEINFO_RATE_LIMIT", error=str(exc), remaining_symbols_not_checked=True)
                     break
-                except BinanceSymbolUnavailableError:
+                except BinanceSymbolUnavailableError as exc:
                     stats["rejected_binance_contract"] += 1
+                    reject_universe("BINANCE_SYMBOL_UNAVAILABLE", error=str(exc))
                     continue
 
             stats["contract_candidates"] += 1
             candidates.append(r)
+            _record_candidate_decision(
+                candidate_id=universe_id, event_id=None, symbol=universe_symbol, direction="",
+                event_type="CONTRACT_UNIVERSE", timeframe="", stage="CONTRACT_UNIVERSE",
+                decision="PASSED", reason=None, evaluation_ts=now_ms,
+            )
         except Exception as exc:
             _record_scan_error(stats, "candidate_build_exception")
-            log.warning("[UNIVERSE] Candidate build error for %s: %s", getattr(r, "symbol", "<unknown>"), exc)
+            reject_universe("CANDIDATE_BUILD_EXCEPTION", error=str(exc))
+            log.warning("[UNIVERSE] Candidate build error for %s: %s", universe_symbol, exc)
             continue
 
-    if MAX_CANDIDATES > 0:
+    if MAX_CANDIDATES > 0 and len(candidates) > MAX_CANDIDATES:
+        for omitted in candidates[MAX_CANDIDATES:]:
+            omitted_symbol = str(getattr(omitted, "symbol", "<unknown>"))
+            omitted_id = _candidate_identifier(None, omitted_symbol, "CONTRACT_UNIVERSE", "", now_ms, now_ms)
+            _record_candidate_decision(
+                candidate_id=omitted_id, event_id=None, symbol=omitted_symbol, direction="",
+                event_type="CONTRACT_UNIVERSE", timeframe="", stage="CANDIDATE_CAP",
+                decision="REJECTED", reason="MAX_CANDIDATES_CAP", evaluation_ts=now_ms,
+                max_candidates=MAX_CANDIDATES,
+            )
         candidates = candidates[:MAX_CANDIDATES]
 
     stats["candidates_scanned"] = len(candidates)
@@ -3808,8 +4452,28 @@ def main() -> None:
         int(_tf_stats(stats, "4h").get("scanned", 0)),
         len(scan_klines_cache),
     )
-    event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
-    event_cache = [ev for ev in event_cache if _event_is_fresh(ev, now_ms, _event_max_age_min(ev))]
+    merged_event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
+    retained_event_cache = []
+    for cached_event in merged_event_cache:
+        if _event_is_fresh(cached_event, now_ms, _event_max_age_min(cached_event)):
+            retained_event_cache.append(cached_event)
+            continue
+        stale_type = str(cached_event.get("event_type", "")).upper()
+        stale_symbol = str(cached_event.get("symbol", "<unknown>"))
+        stale_direction = str(cached_event.get("direction", "")).upper()
+        stale_ts_map = cached_event.get("timestamps") if isinstance(cached_event.get("timestamps"), dict) else {}
+        stale_detected_at = stale_ts_map.get("detected_at_ts")
+        stale_candidate_id = _candidate_identifier(cached_event.get("event_id"), stale_symbol, stale_type, stale_direction, stale_detected_at, now_ms)
+        _record_candidate_decision(
+            candidate_id=stale_candidate_id, event_id=cached_event.get("event_id"),
+            symbol=stale_symbol, direction=stale_direction, event_type=stale_type,
+            timeframe=str(cached_event.get("timeframe", "")), stage="EVENT_CACHE_FRESHNESS",
+            decision="REJECTED", reason="EVENT_EXPIRED_BEFORE_CANDIDATE_EVALUATION",
+            evaluation_ts=now_ms, detected_at_ts=stale_detected_at,
+            raw_event=_journal_safe(cached_event),
+            max_age_min=_event_max_age_min(cached_event),
+        )
+    event_cache = retained_event_cache
     _save_json_atomic(EVENT_CACHE, {"updated_ts": now_ms, "events": event_cache})
     _save_timeframe_scan_state(scan_state)
 
@@ -3841,34 +4505,72 @@ def main() -> None:
 
         d15 = None
         d15_rate_limited = False
-        for ev in sorted(all_events, key=lambda x: int(x.get("timestamps", {}).get("detected_at_ts", 0) or 0), reverse=True):
+        for ev in sorted(all_events, key=lambda x: _safe_float((x.get("timestamps") if isinstance(x.get("timestamps"), dict) else {}).get("detected_at_ts"), 0.0), reverse=True):
             event_id = ev.get("event_id")
-            if not event_id or event_id in executed_event_ids or event_id in terminal_event_ids:
+            event_type_name = str(ev.get("event_type", "")).upper()
+            direction = str(ev.get("direction", "")).upper()
+            tf = str(ev.get("timeframe", "1h")).lower()
+            _candidate_timestamps = ev.get("timestamps") if isinstance(ev.get("timestamps"), dict) else {}
+            try:
+                _candidate_detected_at = int(_candidate_timestamps.get("detected_at_ts", 0) or 0)
+            except (TypeError, ValueError):
+                _candidate_detected_at = 0
+            candidate_id = _candidate_identifier(event_id, symbol, event_type_name, direction, _candidate_detected_at, now_ms)
+            candidate_features = _journal_safe(_entry_context(r, ev, btc_regime_snapshot))
+            candidate_market_row = _journal_safe(r)
+            _record_candidate_decision(
+                candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
+                event_type=event_type_name, timeframe=tf, stage="SIGNAL_DISCOVERED", decision="SEEN",
+                evaluation_ts=now_ms, detected_at_ts=_candidate_detected_at,
+                raw_event=_journal_safe(ev), raw_market_features=candidate_market_row,
+                features=candidate_features,
+            )
+
+            def reject_candidate(stage: str, reason: str, **details: Any) -> None:
+                _record_candidate_decision(
+                    candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
+                    event_type=event_type_name, timeframe=tf, stage=stage, decision="REJECTED",
+                    reason=reason, evaluation_ts=now_ms, **details,
+                )
+
+            if not event_id:
+                reject_candidate("EVENT_LIFECYCLE", "MISSING_EVENT_ID")
+                continue
+            event_id = str(event_id)
+            if event_id in executed_event_ids:
+                reject_candidate("EVENT_LIFECYCLE", "ALREADY_EXECUTED")
+                continue
+            if event_id in terminal_event_ids:
+                reject_candidate("EVENT_LIFECYCLE", "TERMINAL_EVENT")
                 continue
 
-            event_type_name = str(ev.get("event_type", "")).upper()
             if _is_divergence_event(ev) and not ENABLE_DIVERGENCE_ENGINE:
+                reject_candidate("ENGINE_ENABLED", "DIVERGENCE_ENGINE_DISABLED")
                 continue
-            direction = str(ev.get("direction", "")).upper()
             if direction not in {"LONG", "SHORT"}:
                 stats["trigger_direction_failed"] += 1
+                reject_candidate("DIRECTION_VALIDATION", "INVALID_DIRECTION", observed_direction=direction)
                 continue
             bx_symbol = to_bx_symbol(symbol)
             if bx_symbol and current_open_positions.get((bx_symbol, direction)):
+                reject_candidate("POSITION_GUARD", "POSITION_ALREADY_OPEN", exchange_symbol=bx_symbol)
                 continue
-            tf = str(ev.get("timeframe", "1h")).lower()
             tf_stats = _tf_stats(stats, tf)
+            timestamps = ev.get("timestamps") if isinstance(ev.get("timestamps"), dict) else {}
             try:
-                detected_at = int(ev.get("timestamps", {}).get("detected_at_ts", 0) or 0)
+                detected_at = int(timestamps.get("detected_at_ts", 0) or 0)
             except (TypeError, ValueError):
                 stats["trigger_data_failed"] += 1
+                reject_candidate("EVENT_FRESHNESS", "INVALID_DETECTED_AT_TIMESTAMP")
                 continue
             if detected_at <= 0:
                 stats["trigger_data_failed"] += 1
+                reject_candidate("EVENT_FRESHNESS", "MISSING_DETECTED_AT_TIMESTAMP")
                 continue
             age = (now_ms - detected_at) / 60_000.0
             event_max_age = _event_max_age_min(ev)
             if age < 0 or age > event_max_age:
+                reject_candidate("EVENT_FRESHNESS", "EVENT_TOO_OLD_OR_FUTURE", age_min=age, max_age_min=event_max_age)
                 continue
             # Divergence pivots are inherently confirmed only after `right` bars.
             # Freshness therefore applies to the post-confirmation lifetime, not
@@ -3881,6 +4583,7 @@ def main() -> None:
                     stats["rejected_stale_formation"] = stats.get("rejected_stale_formation", 0) + 1
                     tf_stats = _tf_stats(stats, str(ev.get("timeframe", "1h")))
                     tf_stats["rejected_stale_formation"] = tf_stats.get("rejected_stale_formation", 0) + 1
+                    reject_candidate("DIVERGENCE_TIMING", "POST_CONFIRMATION_AGE_INVALID_OR_STALE", valid_timing=valid_timing, formation_age_min=formation_age, post_confirmation_age_min=post_confirmation_age, max_post_confirmation_age_min=max_post_confirm_age)
                     continue
                 ev.setdefault("event_fact", {})["confirmation_lag_min"] = round(confirmation_lag_min, 3)
                 ev["event_fact"]["formation_age_min"] = round(formation_age, 3)
@@ -3900,6 +4603,7 @@ def main() -> None:
                 record_action({
                     "record_type": "CANDIDATE_SNAPSHOT",
                     "snapshot_stage": "POST_PREFILTER_PRE_STRATEGY_GATES",
+                    "candidate_id": candidate_id,
                     "event_id": event_id,
                     "symbol": symbol,
                     "direction": direction,
@@ -3950,11 +4654,13 @@ def main() -> None:
                 stats["rejected_funding"] += 1
                 tf_stats["rejected_funding"] += 1
                 log.info("[SIGNALS] %s %s (%s/%s) rejected by funding filter: %s", direction, symbol, tf, event_type, funding_reason)
+                reject_candidate("FUNDING_FILTER", str(funding_reason or "FUNDING_REJECTED"), features=candidate_features)
                 continue
 
             if d15 is None:
                 if d15_rate_limited:
                     stats["trigger_data_failed"] += 1
+                    reject_candidate("MARKET_DATA_15M", "RATE_LIMIT_ALREADY_HIT_FOR_SYMBOL_CYCLE")
                     continue
                 try:
                     k15 = _fetch_market_klines_scan(symbol, "15m", int(os.environ.get("KLINE_LIMIT_15M", "250")))
@@ -3963,30 +4669,36 @@ def main() -> None:
                     stats["trigger_data_failed"] += 1
                     _record_scan_error(stats, "trigger_15m_rate_limit")
                     log.warning("[SIGNALS] 15M market-data rate limited for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
+                    reject_candidate("MARKET_DATA_15M", "RATE_LIMIT", error=str(exc))
                     continue
                 except BinanceSymbolUnavailableError as exc:
                     d15_rate_limited = True
                     stats["trigger_data_failed"] += 1
                     log.warning("[SIGNALS] 15M Binance symbol unavailable for %s; suppressing further 15M requests for this symbol/cycle: %s", symbol, exc)
+                    reject_candidate("MARKET_DATA_15M", "BINANCE_SYMBOL_UNAVAILABLE", error=str(exc))
                     continue
                 except Exception as exc:
                     stats["trigger_data_failed"] += 1
                     _record_scan_error(stats, "trigger_15m_fetch")
                     log.warning("[SIGNALS] 15M fetch error for %s: %s", symbol, exc)
+                    reject_candidate("MARKET_DATA_15M", "FETCH_EXCEPTION", error=str(exc))
                     continue
                 if len(k15) < 20:
                     stats["trigger_data_failed"] += 1
+                    reject_candidate("MARKET_DATA_15M", "INSUFFICIENT_CANDLES", candle_count=len(k15), required_candles=20)
                     continue
                 d15 = pd.DataFrame(k15)
 
             if not {"close_time", "close", "high", "low", "volume"}.issubset(d15.columns):
                 stats["trigger_data_failed"] += 1
+                reject_candidate("MARKET_DATA_15M", "REQUIRED_COLUMNS_MISSING", observed_columns=list(d15.columns), required_columns=["close_time", "close", "high", "low", "volume"])
                 continue
 
             signal_price = _safe_float(ev.get("event_fact", {}).get("detection_close_price") or r.price, 0.0)
             if signal_price <= 0:
                 _record_scan_error(stats, "signal_price_invalid")
                 log.warning("[SIGNALS] Invalid signal price for %s %s (%s/%s): %.8f", direction, symbol, tf, event_type, signal_price)
+                reject_candidate("SIGNAL_PRICE", "SIGNAL_PRICE_INVALID", signal_price=signal_price)
                 continue
 
             # 1H divergences require a 4H directional context; hidden divergences
@@ -4040,6 +4752,7 @@ def main() -> None:
                         stats["rejected_context"] = stats.get("rejected_context", 0) + 1
                         tf_stats["rejected_context"] = tf_stats.get("rejected_context", 0) + 1
                         log.info("[SIGNALS] %s %s (%s/%s) rejected by HTF context: %s", direction, symbol, tf, event_type, ctx_reason)
+                        reject_candidate("HTF_CONTEXT", str(ctx_reason or "HTF_CONTEXT_REJECTED"), context_timeframe=context_tf, context_metadata=_journal_safe(ctx_meta))
                         continue
                 ev.setdefault("event_fact", {}).update(ctx_meta)
 
@@ -4049,6 +4762,7 @@ def main() -> None:
                     ref_level = _safe_float(ev.get("event_fact", {}).get("trigger_level"), 0.0)
                     if ref_level <= 0:
                         stats["trigger_data_failed"] += 1
+                        reject_candidate("15M_RETEST_TRIGGER", "MISSING_OR_INVALID_TRIGGER_LEVEL", trigger_level=ref_level)
                         continue
                     trigger_diag = diagnose_15m_retest_trigger(
                         d15, direction, ref_level, detected_at,
@@ -4060,22 +4774,26 @@ def main() -> None:
                     reason = trigger_diag.get("reason") or "failed"
                     _record_trigger_failure(stats, tf_stats, reason)
                     log.info("[SIGNALS] %s %s (%s/%s) failed 15m trigger: %s", direction, symbol, tf, event_type, reason)
+                    reject_candidate("15M_TRIGGER", str(reason), trigger_diagnostics=_journal_safe(trigger_diag))
                     continue
                 trigger_price = _safe_float(trigger_diag.get("trigger_price") or trigger_diag.get("current_close"), 0.0)
                 if trigger_price <= 0:
                     stats["trigger_data_failed"] += 1
                     tf_stats["trigger_data_failed"] += 1
+                    reject_candidate("15M_TRIGGER", "INVALID_TRIGGER_PRICE", trigger_price=trigger_price, trigger_diagnostics=_journal_safe(trigger_diag))
                     continue
                 drift_pct = _entry_drift_pct(signal_price, trigger_price, direction)
                 drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type) else MAX_ENTRY_DRIFT_PCT
                 if drift_pct is None:
                     stats["trigger_data_failed"] += 1
                     tf_stats["trigger_data_failed"] += 1
+                    reject_candidate("ENTRY_DRIFT", "DRIFT_UNAVAILABLE", signal_price=signal_price, trigger_price=trigger_price)
                     continue
                 if drift_pct > max(0.0, drift_limit):
                     stats["rejected_entry_drift"] += 1
                     tf_stats["rejected_entry_drift"] = tf_stats.get("rejected_entry_drift", 0) + 1
                     log.info("[SIGNALS] %s %s (%s/%s) rejected: entry drift %.2f%% > %.2f%%", direction, symbol, tf, event_type, drift_pct, drift_limit)
+                    reject_candidate("ENTRY_DRIFT", "SIGNAL_TO_TRIGGER_DRIFT_EXCEEDED", drift_pct=drift_pct, drift_limit_pct=drift_limit, signal_price=signal_price, trigger_price=trigger_price)
                     continue
                 trigger_diag["signal_to_trigger_drift_pct"] = round(drift_pct, 6)
                 # Capture the trigger observation time at the moment the trigger
@@ -4163,6 +4881,7 @@ def main() -> None:
                     log.warning("[TREND_SHADOW] %s %s (%s/%s) unavailable: %s", direction, symbol, tf, event_type, exc)
                     if _trend_filter_enforce_reject(trend_snapshot, TREND_FILTER_MODE):
                         log.info("[TREND_FILTER] %s %s rejected for current evaluation: TREND_DATA_ERROR", direction, symbol)
+                        reject_candidate("TREND_FILTER", "TREND_DATA_ERROR", trend_filter=_journal_safe(trend_snapshot))
                         continue
                 else:
                     stats["trend_shadow_candidates"] += 1
@@ -4194,6 +4913,7 @@ def main() -> None:
                         _format_execution_ts(trend_snapshot.get("trend_1h_bar_close_ts")),
                     )
                     record_action({
+                        "record_type": "CANDIDATE_TREND_TELEMETRY", "candidate_id": candidate_id,
                         "event_id": event_id, "symbol": symbol, "direction": direction,
                         "event_type": event_type,
                         "execution_status": "TREND_SHADOW_" + {
@@ -4207,16 +4927,22 @@ def main() -> None:
                         # Even in enforce mode this is a retryable current-evaluation veto;
                         # do not terminalize the parent event because the trend can change.
                         log.info("[TREND_FILTER] %s %s rejected for current evaluation: %s", direction, symbol, reason or "trend_not_aligned")
+                        reject_candidate("TREND_FILTER", str(reason or "TREND_NOT_ALIGNED"), trend_filter=_journal_safe(trend_snapshot))
                         continue
             else:
                 trend_snapshot = None
 
             if REQUIRE_CVD:
-                try: cvd24_value = float(getattr(r, "cvd24", 0.0))
-                except (TypeError, ValueError): stats["rejected_cvd"] += 1; continue
+                try:
+                    cvd24_value = float(getattr(r, "cvd24", 0.0))
+                except (TypeError, ValueError):
+                    stats["rejected_cvd"] += 1
+                    reject_candidate("CVD_FILTER", "CVD_VALUE_INVALID", cvd24=getattr(r, "cvd24", None))
+                    continue
                 if not pd.notna(cvd24_value) or cvd24_value <= CVD_MIN_CONFIRMATION:
                     stats["rejected_cvd"] += 1
                     tf_stats["rejected_cvd"] += 1
+                    reject_candidate("CVD_FILTER", "CVD_BELOW_CONFIRMATION_THRESHOLD", cvd24=cvd24_value, minimum_cvd=CVD_MIN_CONFIRMATION)
                     continue
 
             if REQUIRE_TRIGGER and trigger_diag.get("signal_to_trigger_drift_pct") is not None:
@@ -4228,6 +4954,7 @@ def main() -> None:
                 stats["rejected_symbol_quarantine"] += 1
                 tf_stats["rejected_symbol_quarantine"] = tf_stats.get("rejected_symbol_quarantine", 0) + 1
                 log.info("[RISK] %s %s rejected: symbol quarantine active until %s", direction, symbol, pd.to_datetime(symbol_quarantines.get(symbol.upper()), unit="ms", utc=True).isoformat())
+                reject_candidate("SYMBOL_QUARANTINE", "SYMBOL_QUARANTINE_ACTIVE", quarantine_until_ts=symbol_quarantines.get(symbol.upper()))
                 continue
 
             oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", 0.0), 0.0)
@@ -4241,6 +4968,12 @@ def main() -> None:
             ev["event_fact"]["entry_quality_reasons"] = list(entry_quality_reasons)
             if not entry_allowed:
                 if ENTRY_QUALITY_MODE == "shadow":
+                    _record_candidate_decision(
+                        candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
+                        event_type=event_type, timeframe=tf, stage="ENTRY_QUALITY", decision="FLAGGED_SHADOW",
+                        reason="ENTRY_QUALITY_SHADOW_FLAGGED", evaluation_ts=now_ms,
+                        entry_quality_reasons=list(entry_quality_reasons), terminal=bool(entry_quality_terminal),
+                    )
                     stats["entry_quality_shadow_flags"] += 1
                     tf_stats["entry_quality_shadow_flags"] = tf_stats.get("entry_quality_shadow_flags", 0) + 1
                     log.info("[ENTRY_QUALITY_SHADOW] %s %s (%s/%s) flagged but NOT rejected: %s", direction, symbol, tf, event_type, ";".join(entry_quality_reasons))
@@ -4274,6 +5007,7 @@ def main() -> None:
                         "entry_quality_terminal": bool(entry_quality_terminal),
                         "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                     })
+                    reject_candidate("ENTRY_QUALITY", "ENTRY_QUALITY_REJECTED", entry_quality_reasons=list(entry_quality_reasons), terminal=bool(entry_quality_terminal))
                     if entry_quality_terminal:
                         terminal_event_ids.add(event_id)
                         executed_event_ids.add(event_id)
@@ -4308,11 +5042,14 @@ def main() -> None:
                     direction, symbol, tf, event_type, score, min_score_for_direction,
                 )
                 record_action({
+                    "record_type": "CANDIDATE_SCORE_REJECTION",
+                    "candidate_id": candidate_id,
                     "event_id": event_id, "symbol": symbol, "direction": direction,
                     "event_type": event_type, "execution_status": "SCORE_REJECTED",
                     "score": score, "score_gate_threshold": min_score_for_direction,
                     "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                 })
+                reject_candidate("SCORE_GATE", "SCORE_BELOW_DIRECTION_THRESHOLD", score=score, score_threshold=min_score_for_direction)
                 continue
 
             if symbol not in risk_1h_cache:
@@ -4322,11 +5059,13 @@ def main() -> None:
                         k1_risk = _fetch_market_klines_scan(symbol, "1h", int(os.environ.get("KLINE_LIMIT_1H", "250")))
                     if len(k1_risk) < 20:
                         stats["trigger_data_failed"] += 1
+                        reject_candidate("RISK_1H_DATA", "INSUFFICIENT_CANDLES", candle_count=len(k1_risk), required_candles=20)
                         continue
                     risk_1h_cache[symbol] = pd.DataFrame(k1_risk)
                 except Exception as exc:
                     _record_scan_error(stats, "risk_1h_fetch")
                     log.warning("[RISK] Fresh 1H ATR fetch error for %s: %s", symbol, exc)
+                    reject_candidate("RISK_1H_DATA", "FETCH_EXCEPTION", error=str(exc))
                     continue
 
             try:
@@ -4336,10 +5075,12 @@ def main() -> None:
                     stats["rejected_risk_too_wide"] += 1
                     tf_stats["rejected_risk_too_wide"] = tf_stats.get("rejected_risk_too_wide", 0) + 1
                     record_action({
+                        "record_type": "CANDIDATE_RISK_REJECTION", "candidate_id": candidate_id,
                         "event_id": event_id, "symbol": symbol, "direction": direction,
                         "event_type": event_type, "execution_status": "ENTRY_RISK_TOO_WIDE",
                         "error": str(exc), "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
                     })
+                    reject_candidate("ENTRY_RISK", "ENTRY_RISK_TOO_WIDE", error=str(exc))
                     terminal_event_ids.add(event_id)
                     executed_event_ids.add(event_id)
                     record_trade({
@@ -4351,10 +5092,12 @@ def main() -> None:
                     continue
                 stats["trigger_data_failed"] += 1
                 log.warning("[RISK] Invalid setup for %s %s (%s/%s): %s", direction, symbol, tf, event_type, exc)
+                reject_candidate("SETUP_BUILD", "INVALID_SETUP", error=str(exc))
                 continue
             except Exception as exc:
                 _record_scan_error(stats, "risk_setup_unexpected")
                 log.exception("[RISK] Unexpected setup error for %s %s (%s/%s)", direction, symbol, tf, event_type)
+                reject_candidate("SETUP_BUILD", "UNEXPECTED_EXCEPTION", error=str(exc))
                 continue
             setup["trigger"] = {
                 "event_detected_at_ts": detected_at,
@@ -4389,10 +5132,21 @@ def main() -> None:
                 "detected_at_ts": detected_at,
             }
             cand = {
+                "candidate_id": candidate_id,
                 "event": ev, "event_id": event_id, "symbol": symbol, "direction": direction,
                 "price": signal_price, "setup": setup, "score": score, "coinalyze_row": r,
                 "confluence_events": [evidence],
             }
+            _record_candidate_decision(
+                candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
+                event_type=event_type, timeframe=tf, stage="STRATEGY_FILTERS", decision="PASSED",
+                reason=None, evaluation_ts=now_ms, score=score, signal_price=signal_price,
+                score_threshold=min_score_for_direction,
+                trigger_diagnostics=_journal_safe(trigger_diag),
+                trend_filter=_journal_safe(trend_snapshot),
+                entry_quality_reasons=list(entry_quality_reasons),
+                features=candidate_features,
+            )
             if key not in best_opportunities_map:
                 best_opportunities_map[key] = cand
             else:
@@ -4440,6 +5194,15 @@ def main() -> None:
         loser = rejected.get("direction")
         symbol = rejected.get("symbol")
         against = rejected.get("conflict_rejected_against", {})
+        rejected_event = rejected.get("event") if isinstance(rejected.get("event"), dict) else {}
+        _record_candidate_decision(
+            candidate_id=str(rejected.get("candidate_id") or _candidate_identifier(rejected.get("event_id"), str(symbol or ""), str(rejected_event.get("event_type", "")), str(loser or ""), (rejected_event.get("timestamps") or {}).get("detected_at_ts"), now_ms)),
+            event_id=rejected.get("event_id"), symbol=str(symbol or ""), direction=str(loser or ""),
+            event_type=str(rejected_event.get("event_type", "")), timeframe=str(rejected_event.get("timeframe", "")),
+            stage="SYMBOL_DIRECTION_CONFLICT", decision="REJECTED",
+            reason="CONFLICT_WITH_HIGHER_PRIORITY_OPPOSITE_DIRECTION", evaluation_ts=now_ms,
+            conflict_rejected_against=_journal_safe(against), rejected_score=rejected.get("score"),
+        )
         log.info("[RANKING] Conflict rejected: %s %s (Score %.0f, TF %s) vs %s %s (Score %.0f, TF %s).",
                  loser, symbol, float(rejected.get("score", 0)), rejected.get("event", {}).get("timeframe"),
                  against.get("direction"), symbol, float(against.get("score", 0)), against.get("timeframe"))
@@ -4462,6 +5225,7 @@ def main() -> None:
         setup_obj["conflict_events"] = conflicts
         opp["setup"] = setup_obj
         event_id = opp["event_id"]
+        candidate_id = str(opp.get("candidate_id") or _candidate_identifier(event_id, str(opp.get("symbol", "")), str(opp.get("event", {}).get("event_type", "")), str(opp.get("direction", "")), (opp.get("event", {}).get("timestamps") or {}).get("detected_at_ts"), now_ms))
         symbol = opp["symbol"]
         direction = opp["direction"]
         price = opp["price"]
@@ -4718,6 +5482,7 @@ def main() -> None:
                     {
                         "record_type": "TRADE_OPEN" if confirmed_trade else "EXECUTION_ATTEMPT",
                         "trade_id": "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper(),
+                        "candidate_id": candidate_id,
                         "event_id": event_id,
                         "symbol": symbol,
                         "direction": direction,
@@ -4849,20 +5614,37 @@ def main() -> None:
                 log.error("[TELEGRAM] Notification NOT sent for %s %s (%s); will retry on a later cycle.", direction, symbol, event_id)
 
         record_action(
-            {
+            _journal_safe({
+                "record_type": "CANDIDATE_EXECUTION_RESULT",
+                "candidate_id": candidate_id,
                 "event_id": event_id,
                 "symbol": symbol,
                 "direction": direction,
                 "score": score,
                 "event_type": ev.get("event_type"),
+                "timeframe": ev.get("timeframe"),
                 "telegram_sent": bool(sent),
                 "telegram_required": bool(is_real_execution),
                 "telegram_attempted": bool(is_real_execution and event_id not in telegram_attempted_this_cycle),
                 "execution_status": execution_result.get("status"),
                 "error": execution_result.get("error"),
+                "execution_quality": execution_result.get("execution_quality") if isinstance(execution_result.get("execution_quality"), dict) else None,
+                "protection": execution_result.get("protection") if isinstance(execution_result.get("protection"), dict) else None,
+                "emergency_close": execution_result.get("emergency_close") if isinstance(execution_result.get("emergency_close"), dict) else None,
                 "sr_room": execution_result.get("sr_room") if isinstance(execution_result.get("sr_room"), dict) else None,
+                "entry_context": setup.get("entry_context") if isinstance(setup.get("entry_context"), dict) else None,
+                "trigger": setup.get("trigger") if isinstance(setup.get("trigger"), dict) else None,
+                "setup": setup,
                 "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
-            }
+            })
+        )
+        _record_candidate_decision(
+            candidate_id=candidate_id, event_id=event_id, symbol=symbol, direction=direction,
+            event_type=str(ev.get("event_type", "")), timeframe=str(ev.get("timeframe", "")),
+            stage="EXECUTION", decision="RESULT", reason=str(execution_result.get("status", "UNKNOWN")),
+            evaluation_ts=int(pd.Timestamp.utcnow().timestamp() * 1000),
+            execution_status=execution_result.get("status"), error=execution_result.get("error"),
+            execution_quality=_journal_safe(execution_result.get("execution_quality")),
         )
 
     try:

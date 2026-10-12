@@ -659,6 +659,7 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
 
     monkeypatch.setattr(run_once, "EXECUTION_ENABLED", True)
     monkeypatch.setattr(run_once, "_validate_execution_config", lambda: (True, ""))
+    monkeypatch.setattr(run_once, "restore_reconciled_trade_identities_before_tracker", lambda: trace.append("identity_recovery"))
     monkeypatch.setattr(run_once, "update_active_trades", lambda: trace.append("tracker"))
     monkeypatch.setattr(run_once, "reconcile_all_open_positions", lambda: trace.append("reconcile"))
     monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: [])
@@ -684,7 +685,7 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
 
     run_once.main()
 
-    assert trace == ["tracker", "reconcile"]
+    assert trace == ["identity_recovery", "tracker", "reconcile"]
 
 
 def _set_execution_config(monkeypatch, *, mode, base, allow_live="false"):
