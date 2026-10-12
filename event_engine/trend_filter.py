@@ -72,7 +72,20 @@ def _snapshot_frame(df: pd.DataFrame, *, ema_periods: tuple[int, ...], slope_loo
 
 
 def _classify_btc(df: pd.DataFrame, decision_ts_ms: int | float | None) -> dict[str, Any]:
-    work = _clean_closed_frame(df, decision_ts_ms)
+    # Do not classify BTC from the latest available bars if there is no valid
+    # decision timestamp: doing so would leak current/future context into a
+    # historical candidate. Unknown timestamp means unknown BTC context.
+    try:
+        decision_ts = int(decision_ts_ms or 0)
+    except (TypeError, ValueError):
+        decision_ts = 0
+    if decision_ts <= 0:
+        return {
+            "state": "UNKNOWN", "bars": 0, "bar_close_ts": None,
+            "chg_1h_pct": None, "chg_4h_pct": None,
+        }
+
+    work = _clean_closed_frame(df, decision_ts)
     out: dict[str, Any] = {
         "state": "UNKNOWN",
         "bars": int(len(work)),
@@ -142,7 +155,9 @@ def evaluate_trend_filter(
         "event_direction": d,
         "event_type": event_u or None,
         "decision_ts": decision_ts,
-        "trend_decision": "REJECT",
+        # UNKNOWN is distinct from a directional rejection. It is never counted
+        # as a failed trend match merely because history/causal inputs are absent.
+        "trend_decision": "UNKNOWN",
         "trend_reject_reason": None,
         "trend_4h": "UNKNOWN",
         "trend_1h": "UNKNOWN",
@@ -252,9 +267,11 @@ def evaluate_trend_filter(
         return base
     expected_4h = "BULL" if d == "LONG" else "BEAR"
     if base["trend_4h"] == "TRANSITION":
+        base["trend_decision"] = "REJECT"
         base["trend_reject_reason"] = "TREND_4H_TRANSITION"
         return base
     if base["trend_4h"] != expected_4h:
+        base["trend_decision"] = "REJECT"
         base["trend_reject_reason"] = "TREND_4H_DIRECTION_MISMATCH"
         return base
 
@@ -262,13 +279,16 @@ def evaluate_trend_filter(
         base["trend_reject_reason"] = "TREND_1H_UNKNOWN"
         return base
     if base["trend_1h"] == "TRANSITION":
+        base["trend_decision"] = "REJECT"
         base["trend_reject_reason"] = "TREND_1H_TRANSITION"
         return base
     if base["trend_1h"] != d:
+        base["trend_decision"] = "REJECT"
         base["trend_reject_reason"] = "TREND_1H_DIRECTION_MISMATCH"
         return base
 
     if require_persistence and not persistence_ok:
+        base["trend_decision"] = "REJECT"
         base["trend_reject_reason"] = "TREND_PERSISTENCE_TRANSITION"
         return base
 

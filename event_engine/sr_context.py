@@ -386,7 +386,7 @@ def evaluate_sr_room(
     entry_price: float,
     direction: str,
     risk_pct: float,
-    target_rrs: tuple[float, float, float],
+    target_rrs: tuple[float, ...],
 ) -> dict[str, Any]:
     """Evaluate opposing-zone room and supporting-zone context.
 
@@ -402,6 +402,13 @@ def evaluate_sr_room(
         raise ValueError(f"Invalid direction={direction}")
     if entry_price <= 0 or risk_pct <= 0:
         raise ValueError("Invalid entry/risk for SR room")
+    try:
+        rr_values = tuple(float(rr) for rr in target_rrs)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("target_rrs must contain two or three finite positive RR targets") from exc
+    if len(rr_values) not in {2, 3} or any(not math.isfinite(rr) or rr <= 0 for rr in rr_values):
+        raise ValueError("target_rrs must contain two or three finite positive RR targets")
+    target_rrs = rr_values
 
     risk_distance = entry_price * risk_pct / 100.0
     buffer = _room_buffer(entry_price, risk_distance)
@@ -498,7 +505,7 @@ def evaluate_sr_room(
         "reject": False,
         "reject_reason": None,
         "tp3_capped": False,
-        "effective_tp3_price": target_prices[2],
+        "effective_tp3_price": target_prices[2] if len(target_prices) >= 3 else None,
         "supporting_zone_confirmation": False,
         "directional_zone_alignment": None,
     }
@@ -544,7 +551,8 @@ def evaluate_sr_room(
     result["opposing_zone_distance_r"] = distance_r
     result["room_margin_to_tp1_r"] = distance_r - float(target_rrs[0])
     result["room_margin_to_tp2_r"] = distance_r - float(target_rrs[1])
-    result["room_margin_to_tp3_r"] = distance_r - float(target_rrs[2])
+    if len(target_rrs) >= 3:
+        result["room_margin_to_tp3_r"] = distance_r - float(target_rrs[2])
 
     # The trading rule is intentionally literal: only an opposing zone that reaches
     # the FIRST take-profit invalidates the entry. A safety buffer is reported for

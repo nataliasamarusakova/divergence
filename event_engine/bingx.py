@@ -426,18 +426,46 @@ def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> boo
     return False
 
 
-def _normalize_orders_list(resp: dict) -> list[dict]:
+def _normalize_orders_list(
+    resp: dict,
+    *,
+    list_keys: tuple[str, ...] = ("orders", "positions", "order", "position"),
+    allow_singleton: bool = True,
+) -> list[dict]:
+    """Normalize an exchange list response without hiding unknown payloads.
+
+    An empty *recognized* list is valid. A successful HTTP/API code with an
+    unexpected ``data`` shape is not an empty result: callers use these lists
+    for position discovery, protection reconciliation, and order-capacity
+    checks, so silently returning ``[]`` can turn an API/schema problem into a
+    false statement that no positions or orders exist.
+    """
+    if not isinstance(resp, dict) or "data" not in resp:
+        raise ValueError("exchange response has no data field")
+
     data = resp.get("data")
     if isinstance(data, list):
+        if not all(isinstance(item, dict) for item in data):
+            raise ValueError("exchange data list contains a non-object item")
         return data
+
     if isinstance(data, dict):
-        for key in ("orders", "positions", "order", "position"):
-            val = data.get(key)
-            if isinstance(val, list):
-                return val
-            if isinstance(val, dict):
-                return [val]
-    return []
+        for key in list_keys:
+            if key not in data:
+                continue
+            value = data[key]
+            if isinstance(value, list):
+                if not all(isinstance(item, dict) for item in value):
+                    raise ValueError(f"exchange data.{key} list contains a non-object item")
+                return value
+            if isinstance(value, dict) and allow_singleton:
+                return [value]
+            raise ValueError(f"exchange data.{key} has an unexpected type")
+
+    raise ValueError(
+        f"unrecognized exchange data shape: {type(data).__name__}; "
+        f"expected list or object containing {', '.join(list_keys)}"
+    )
 
 
 def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
@@ -449,9 +477,14 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"[BINGX] get_positions returned non-object response: {type(resp).__name__}")
     if resp.get("code") not in (0, "0"):
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
-    return _normalize_orders_list(resp)
+    try:
+        return _normalize_orders_list(resp, list_keys=("positions", "position"))
+    except ValueError as exc:
+        raise RuntimeError(f"[BINGX] get_positions returned unexpected payload: {exc}") from exc
 
 
 def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
@@ -615,7 +648,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     # quantity. Do not reject a valid market entry merely because the position
     # cannot support the full TP ladder. The protection layer will choose the
     # largest executable profile: 3 legs when possible, otherwise 2, otherwise
-    # one terminal TP3 leg.
+    # one terminal leg using the last supplied target.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -1060,10 +1093,17 @@ def get_position_directional(symbol: str, direction: str) -> dict:
         return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
 
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
+    if not isinstance(resp, dict):
+        return {"status": "error", "error": f"get_position returned non-object response: {type(resp).__name__}", "symbol": bx_symbol}
     if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
 
-    for p in _normalize_orders_list(resp):
+    try:
+        positions = _normalize_orders_list(resp, list_keys=("positions", "position"))
+    except ValueError as exc:
+        return {"status": "error", "error": f"get_position returned unexpected payload: {exc}", "symbol": bx_symbol}
+
+    for p in positions:
         position_side = str(p.get("positionSide", "")).upper()
         if position_side not in (direction, "BOTH"):
             continue
@@ -1110,6 +1150,35 @@ def wait_for_position_fill_directional(symbol: str, direction: str, timeout_sec:
     return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper()}
 
 
+def get_open_orders_account_wide(*, timeout_sec: float | None = None, retryable: bool = True) -> dict:
+    """Fetch account-wide open orders for conservative order-capacity checks.
+
+    BingX's openOrders endpoint accepts an omitted symbol for account-wide results.
+    Callers must fail closed when this endpoint cannot be verified; a symbol-scoped
+    list is not a safe substitute for the account-wide 200-order limit.
+    """
+    resp = _request(
+        "GET",
+        OPEN_ORDERS_PATH,
+        {},
+        signed=True,
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
+    if not isinstance(resp, dict):
+        return {"status": "error", "error": f"openOrders account-wide returned non-object response: {type(resp).__name__}", "orders": []}
+    if resp.get("code") not in (0, "0"):
+        return {"status": "error", "error": f"openOrders account-wide failed: {resp.get('msg', resp)}", "orders": []}
+    try:
+        # The documented openOrders response is data: [order, ...]. Keep the
+        # historical data.orders wrapper for compatibility, but do not accept
+        # position-shaped or arbitrary objects as a successful empty count.
+        orders = _normalize_orders_list(resp, list_keys=("orders",), allow_singleton=False)
+    except ValueError as exc:
+        return {"status": "error", "error": f"openOrders account-wide returned unexpected payload: {exc}", "orders": []}
+    return {"status": "ok", "orders": orders, "count": len(orders)}
+
+
 def get_open_protection_directional(
     symbol: str,
     direction: str,
@@ -1129,13 +1198,20 @@ def get_open_protection_directional(
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
+    if not isinstance(resp, dict):
+        return {"status": "error", "error": f"openOrders returned non-object response: {type(resp).__name__}", "tp_orders": [], "sl_orders": []}
     if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
+
+    try:
+        response_orders = _normalize_orders_list(resp, list_keys=("orders",), allow_singleton=False)
+    except ValueError as exc:
+        return {"status": "error", "error": f"openOrders returned unexpected payload: {exc}", "tp_orders": [], "sl_orders": []}
 
     tp_orders = []
     sl_orders = []
 
-    for order in _normalize_orders_list(resp):
+    for order in response_orders:
         position_side = str(order.get("positionSide", "")).upper()
         if position_side not in (direction, "BOTH"):
             continue
@@ -1185,8 +1261,8 @@ def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float,
     quantity/precision constraints apply to the actual filled quantity. The
     candidate profiles are tried from largest to smallest:
       3 legs -> TP1/TP2/TP3 when allocation is executable
-      2 legs -> TP1/TP2 when a 3-leg allocation is not executable
-      1 leg  -> terminal TP3 (or the last supplied level) as the final fallback
+      2 legs -> TP1/TP2 when the full ladder is too small to allocate safely
+      1 leg  -> the last supplied level as the terminal fallback
 
     Feasibility is tested with the same allocator used for the real TP orders,
     rather than only comparing ``position_qty`` with ``min_qty * n``. This also
@@ -1924,11 +2000,10 @@ def ensure_directional_protection(
             "emergency_close": rollback,
         }
 
-    # Adapt the TP profile to the confirmed exchange position size. Use all 3
-    # independent legs when executable; otherwise fall back to TP1/TP2, and
-    # finally to one terminal TP3 leg. This is intentionally independent of
-    # REQUIRE_MULTI_TP: a valid entry must not be discarded merely because the
-    # account is too small for the full 3-leg profile.
+    # Adapt the TP profile to the confirmed exchange position size: prefer the
+    # configured 3-leg ladder, then 2 legs, then a single terminal TP. This is
+    # intentionally independent of REQUIRE_MULTI_TP: a valid entry must not be
+    # discarded merely because the account is too small for the full 3-leg profile.
     tp_levels_norm = _select_supported_tp_levels(
         tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
     )
