@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791785526610,
+  "updated_ts": 1791785870197,
   "events": [
     {
       "event_id": "EVT_FDCCC68FC14A9131",
@@ -3982,6 +3982,111 @@
         "displacement_atr": 1.800287609716835,
         "volume_ratio": 4.827940420050002,
         "body_fraction": 0.8673469387755096,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_8FFEA97F2DDBBFA2",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791781199999,
+        "pivot_2_ts": 1791781199999,
+        "detected_at_ts": 1791781199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04936,
+        "compression_ratio": 0.7151722468762548,
+        "ma_spread_atr": 0.24814732914315007,
+        "compression_threshold": 0.34697561353507983,
+        "breakout_atr": 1.0412577129667941,
+        "volume_ratio": 0.8973514998765606,
+        "requires_retest": true,
+        "trigger_level": 0.04868,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "VP_9353B9AB6A244BF3",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLUME_PROFILE_DISTRIBUTION",
+      "timestamps": {
+        "detected_at_ts": 1791784799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05018,
+        "hvn_center": 0.049178125,
+        "hvn_bin": 17,
+        "hvn_volume": 176542475.0,
+        "baseline_hvn_volume_projected": 30966306.75,
+        "recent_hvn_volume": 52677248.0,
+        "hvn_growth_ratio": 1.7011149707092532,
+        "distance_from_hvn_bins": 2.092689295039163,
+        "price_left_hvn": true,
+        "atr": 0.0008019699408992745,
+        "volume_profile_method": "ohlcv_typical_price_proxy",
+        "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_CA004252F2E4FC17",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791784799999,
+        "pivot_2_ts": 1791784799999,
+        "detected_at_ts": 1791784799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05018,
+        "compression_ratio": 0.03791623129785656,
+        "ma_spread_atr": 0.013156007617511775,
+        "compression_threshold": 0.34697561353507983,
+        "breakout_atr": 1.0224785638649945,
+        "volume_ratio": 1.6682412777837687,
+        "requires_retest": true,
+        "trigger_level": 0.04943,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_EAFAB42944BE9F6D",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1791770399999,
+        "pivot_2_ts": 1791784799999,
+        "detected_at_ts": 1791784799999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.04922,
+        "zone_high": 0.04922,
+        "zone_low": 0.04836,
+        "bos_level": 0.04955,
+        "ob_ts": 1791773999999,
+        "displacement_atr": 1.0224785638649945,
+        "volume_ratio": 1.6682412777837687,
+        "body_fraction": 0.8282828282828314,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
