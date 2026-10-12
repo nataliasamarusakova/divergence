@@ -176,7 +176,7 @@ def format_signal(
             f"SL: <code>{esc(format_price(invalidation_price))}</code> <code>({esc(format_percent(-abs(float(risk_pct)), decimals=2, signed=True)) if risk_pct is not None else '—'})</code>",
         ])
 
-        for index, level in enumerate(tp_levels[:3], start=1):
+        for index, level in enumerate(tp_levels[:2], start=1):
             if not isinstance(level, dict):
                 continue
             pnl_pct = level.get("pnl_pct")
@@ -199,33 +199,22 @@ def format_signal(
 
         if not tp_levels:
             target_price = setup.get("target_price")
-            lines.append(f"TP3: <code>{esc(format_price(target_price))}</code>")
+            lines.append(f"TP2: <code>{esc(format_price(target_price))}</code>")
 
         rr_value = setup.get("effective_weighted_rr")
         if rr_value is None:
             rr_value = setup.get("planned_weighted_rr")
         if rr_value is None:
             rr_value = setup.get("realized_rr")
-        tp_mode = setup.get("tp_mode") or "multi_tp"
+        tp_mode = setup.get("tp_mode") or ("single_tp" if len(tp_levels) == 1 else ("two_tp" if len(tp_levels) == 2 else "multi_tp"))
         lines.extend([
             f"R:R: <code>{esc(str(rr_value))}</code>",
             f"TP Mode: <code>{esc(tp_mode)}</code>",
         ])
 
-        sr_context = setup.get("sr_context") if isinstance(setup.get("sr_context"), dict) else {}
-        alignment = str(sr_context.get("directional_zone_alignment") or "").upper()
-        if alignment == "LONG_IN_DEMAND":
-            confirmation = f"🟢 <b>2/2</b> — {direction} {event_type} + <b>DEMAND</b>"
-        elif alignment == "SHORT_IN_SUPPLY":
-            confirmation = f"🔴 <b>2/2</b> — {direction} {event_type} + <b>SUPPLY</b>"
-        elif str(sr_context.get("supporting_zone_context") or "").upper().startswith("SUPPORTIVE_"):
-            zone_kind = "DEMAND" if direction == "LONG" else "SUPPLY"
-            confirmation = f"🟡 <b>1/2</b> — {direction} {event_type} + {zone_kind} nearby"
-        else:
-            confirmation = f"⚪ <b>1/2</b> — {direction} {event_type} only"
-
+        # Directional SR alignment remains available in structured setup metadata,
+        # but the redundant CONFIRMATION field is intentionally omitted from Telegram.
         lines.extend([
-            f"<b>CONFIRMATION:</b> {confirmation}",
             f"Trigger Price: <code>{esc(format_price(trigger.get('trigger_price')))}</code>",
             f"Trigger Delay: <code>{esc(format_number(trigger.get('trigger_delay_min'), decimals=2))} min</code>",
         ])

@@ -402,13 +402,8 @@ def evaluate_sr_room(
         raise ValueError(f"Invalid direction={direction}")
     if entry_price <= 0 or risk_pct <= 0:
         raise ValueError("Invalid entry/risk for SR room")
-    try:
-        rr_values = tuple(float(rr) for rr in target_rrs)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("target_rrs must contain two or three finite positive RR targets") from exc
-    if len(rr_values) not in {2, 3} or any(not math.isfinite(rr) or rr <= 0 for rr in rr_values):
-        raise ValueError("target_rrs must contain two or three finite positive RR targets")
-    target_rrs = rr_values
+    if len(target_rrs) < 2 or any(not math.isfinite(float(rr)) or float(rr) <= 0 for rr in target_rrs):
+        raise ValueError("SR room requires at least two positive finite TP targets")
 
     risk_distance = entry_price * risk_pct / 100.0
     buffer = _room_buffer(entry_price, risk_distance)
@@ -504,7 +499,9 @@ def evaluate_sr_room(
         "room_status": "FULL_ROOM",
         "reject": False,
         "reject_reason": None,
-        "tp3_capped": False,
+        "tp3_capped": False,  # legacy diagnostic field; new ladders contain only TP1/TP2
+        "effective_tp2_price": target_prices[1],
+        "effective_final_tp_price": target_prices[-1],
         "effective_tp3_price": target_prices[2] if len(target_prices) >= 3 else None,
         "supporting_zone_confirmation": False,
         "directional_zone_alignment": None,

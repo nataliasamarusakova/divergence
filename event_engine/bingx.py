@@ -427,46 +427,18 @@ def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> boo
     return False
 
 
-def _normalize_orders_list(
-    resp: dict,
-    *,
-    list_keys: tuple[str, ...] = ("orders", "positions", "order", "position"),
-    allow_singleton: bool = True,
-) -> list[dict]:
-    """Normalize an exchange list response without hiding unknown payloads.
-
-    An empty *recognized* list is valid. A successful HTTP/API code with an
-    unexpected ``data`` shape is not an empty result: callers use these lists
-    for position discovery, protection reconciliation, and order-capacity
-    checks, so silently returning ``[]`` can turn an API/schema problem into a
-    false statement that no positions or orders exist.
-    """
-    if not isinstance(resp, dict) or "data" not in resp:
-        raise ValueError("exchange response has no data field")
-
+def _normalize_orders_list(resp: dict) -> list[dict]:
     data = resp.get("data")
     if isinstance(data, list):
-        if not all(isinstance(item, dict) for item in data):
-            raise ValueError("exchange data list contains a non-object item")
         return data
-
     if isinstance(data, dict):
-        for key in list_keys:
-            if key not in data:
-                continue
-            value = data[key]
-            if isinstance(value, list):
-                if not all(isinstance(item, dict) for item in value):
-                    raise ValueError(f"exchange data.{key} list contains a non-object item")
-                return value
-            if isinstance(value, dict) and allow_singleton:
-                return [value]
-            raise ValueError(f"exchange data.{key} has an unexpected type")
-
-    raise ValueError(
-        f"unrecognized exchange data shape: {type(data).__name__}; "
-        f"expected list or object containing {', '.join(list_keys)}"
-    )
+        for key in ("orders", "positions", "order", "position"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                return [val]
+    return []
 
 
 def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
@@ -478,14 +450,9 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if not isinstance(resp, dict):
-        raise RuntimeError(f"[BINGX] get_positions returned non-object response: {type(resp).__name__}")
     if resp.get("code") not in (0, "0"):
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
-    try:
-        return _normalize_orders_list(resp, list_keys=("positions", "position"))
-    except ValueError as exc:
-        raise RuntimeError(f"[BINGX] get_positions returned unexpected payload: {exc}") from exc
+    return _normalize_orders_list(resp)
 
 
 def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
@@ -570,21 +537,20 @@ def get_fill_history(
     order_id: str | int | None = None,
     page_index: int = 1,
     page_size: int = 1000,
+    currency: str | None = None,
     timeout_sec: float | None = None,
-) -> dict:
-    """Fetch actual BingX swap fills for forensic trade reconciliation.
+) -> dict[str, Any]:
+    """Query actual swap fill history and normalize documented/observed field aliases.
 
-    This intentionally exposes fill rows (not candle/order trigger prices). A
-    successful but unknown response shape is an error, never an empty history.
-    The caller controls pagination and time-window chunking.
+    Endpoint: GET /openApi/swap/v2/trade/fillHistory. Unknown response shapes fail
+    closed; callers must never confuse an API/format error with zero fills.
     """
-    bx = to_bx_symbol(symbol)
+    raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    bx = to_bx_symbol(raw_symbol) if raw_symbol else None
     if not bx:
-        # Historic contracts may have left the current exchange catalog even
-        # though their execution history is still queryable. Use only an
-        # explicit/standard USDT-swap symbol fallback; never return success for
-        # an unrecognized arbitrary symbol.
-        raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+        # Older/delisted contracts may no longer be in the live contracts catalog,
+        # while their account history can still be queried. Use only a conservative
+        # syntactic USDT swap fallback; no fabricated current-market metadata is used.
         if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
             bx = raw_symbol
         elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
@@ -592,35 +558,28 @@ def get_fill_history(
         else:
             return {"status": "error", "error": "invalid_or_unknown_historical_symbol", "fills": []}
     try:
-        start_ts = int(start_ts)
-        end_ts = int(end_ts)
-        page_index = int(page_index)
-        page_size = int(page_size)
+        start_ts, end_ts = int(start_ts), int(end_ts)
+        page_index, page_size = int(page_index), int(page_size)
     except (TypeError, ValueError):
-        return {"status": "error", "error": "invalid fill-history query parameters", "fills": []}
+        return {"status": "error", "error": "invalid_fill_history_parameters", "fills": []}
     if start_ts <= 0 or end_ts <= start_ts or page_index < 1 or page_size < 1:
-        return {"status": "error", "error": "invalid fill-history time range or pagination", "fills": []}
+        return {"status": "error", "error": "invalid_fill_history_range_or_pagination", "fills": []}
     page_size = min(page_size, 1000)
     params: dict[str, Any] = {
-        "symbol": bx,
-        "startTs": start_ts,
-        "endTs": end_ts,
-        "pageIndex": page_index,
-        "pageSize": page_size,
+        "symbol": bx, "startTs": start_ts, "endTs": end_ts,
+        "pageIndex": page_index, "pageSize": page_size,
     }
     if order_id not in (None, ""):
         params["orderId"] = str(order_id)
+    if str(currency or "").upper() in {"USDT", "USDC"}:
+        params["currency"] = str(currency).upper()
     try:
-        resp = _request(
-            "GET", FILL_HISTORY_PATH, params, signed=True,
-            timeout_sec=timeout_sec, retryable=False,
-        )
+        resp = _request("GET", FILL_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
     except Exception as exc:
-        return {"status": "error", "error": str(exc), "fills": []}
+        return {"status": "error", "error": f"request_exception:{exc}", "fills": []}
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         error = resp.get("msg", resp) if isinstance(resp, dict) else resp
         return {"status": "error", "error": str(error), "code": resp.get("code") if isinstance(resp, dict) else None, "fills": []}
-
     data = resp.get("data")
     if isinstance(data, list):
         rows = data
@@ -629,33 +588,36 @@ def get_fill_history(
         rows = None
         for key in ("fill_orders", "fillOrders", "fills", "list", "orders"):
             if key in data:
-                rows = data[key]
+                rows = data.get(key)
                 break
         total = data.get("total")
-        if rows is None or not isinstance(rows, list) or not all(isinstance(item, dict) for item in rows):
-            return {"status": "error", "error": "fill history returned unexpected data shape", "fills": []}
+        if not isinstance(rows, list):
+            return {"status": "error", "error": "fill_history_unexpected_data_shape", "fills": []}
     else:
-        return {"status": "error", "error": "fill history response missing data list", "fills": []}
-    if not all(isinstance(item, dict) for item in rows):
-        return {"status": "error", "error": "fill history contains non-object row", "fills": []}
+        return {"status": "error", "error": "fill_history_missing_data", "fills": []}
+    if not all(isinstance(row, dict) for row in rows):
+        return {"status": "error", "error": "fill_history_non_object_row", "fills": []}
 
-    fills = []
+    def first_number(row: dict, names: tuple[str, ...]) -> float | None:
+        for key in names:
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(number):
+                return number
+        return None
+
+    fills: list[dict[str, Any]] = []
     for row in rows:
-        def number(*names: str) -> float | None:
-            for name in names:
-                raw = row.get(name)
-                if raw in (None, ""):
-                    continue
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(value):
-                    return value
-            return None
-        ts = number("time", "ts", "tradeTime", "fillTime", "createTime")
-        qty = number("qty", "quantity", "executedQty", "vol", "tradeVolume", "volume")
-        price = number("price", "fillPrice", "avgPrice", "tradePrice")
+        fill_ts = first_number(row, ("time", "tradeTime", "fillTime", "closeTime", "tradeTimestamp", "ts", "createTime"))
+        if fill_ts is not None and 0 < fill_ts < 100_000_000_000:
+            fill_ts *= 1000.0
+        qty = first_number(row, ("qty", "quantity", "volume", "tradeVolume", "executedQty", "fillQty"))
+        price = first_number(row, ("price", "tradePrice", "fillPrice", "avgPrice"))
         fills.append({
             "trade_id": str(row.get("tradeId") or row.get("fillId") or row.get("id") or ""),
             "order_id": str(row.get("orderId") or row.get("orderID") or ""),
@@ -664,15 +626,14 @@ def get_fill_history(
             "position_side": str(row.get("positionSide") or row.get("positionSideName") or "").upper(),
             "price": price,
             "qty": abs(qty) if qty is not None else None,
-            "time": int(ts) if ts is not None else None,
-            "realized_pnl": number("realizedPnl", "realizedPNL", "realizedProfit"),
-            "fee": number("fee", "commission"),
+            "time": int(fill_ts) if fill_ts is not None else None,
+            "realized_pnl": first_number(row, ("realizedPnl", "realizedPNL", "realizedProfit")),
+            "fee": first_number(row, ("fee", "commission", "tradingFee")),
             "raw_fill": row,
         })
     return {
-        "status": "ok", "fills": fills,
-        "page_index": page_index, "page_size": page_size,
-        "returned": len(fills), "total": total,
+        "status": "ok", "fills": fills, "page_index": page_index,
+        "page_size": page_size, "returned": len(fills), "total": total,
         "has_more": len(fills) >= page_size,
     }
 
@@ -761,10 +722,8 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     qty = float(q)
 
     # TP count is selected after the confirmed fill from the actual position
-    # quantity. Do not reject a valid market entry merely because the position
-    # cannot support the full TP ladder. The protection layer will choose the
-    # largest executable profile: 3 legs when possible, otherwise 2, otherwise
-    # one terminal leg using the last supplied target.
+    # quantity. New entries use two TP legs when executable, otherwise one
+    # terminal TP2 leg; no new position may install three TP orders.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -1209,17 +1168,10 @@ def get_position_directional(symbol: str, direction: str) -> dict:
         return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
 
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if not isinstance(resp, dict):
-        return {"status": "error", "error": f"get_position returned non-object response: {type(resp).__name__}", "symbol": bx_symbol}
     if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
 
-    try:
-        positions = _normalize_orders_list(resp, list_keys=("positions", "position"))
-    except ValueError as exc:
-        return {"status": "error", "error": f"get_position returned unexpected payload: {exc}", "symbol": bx_symbol}
-
-    for p in positions:
+    for p in _normalize_orders_list(resp):
         position_side = str(p.get("positionSide", "")).upper()
         if position_side not in (direction, "BOTH"):
             continue
@@ -1266,35 +1218,6 @@ def wait_for_position_fill_directional(symbol: str, direction: str, timeout_sec:
     return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper()}
 
 
-def get_open_orders_account_wide(*, timeout_sec: float | None = None, retryable: bool = True) -> dict:
-    """Fetch account-wide open orders for conservative order-capacity checks.
-
-    BingX's openOrders endpoint accepts an omitted symbol for account-wide results.
-    Callers must fail closed when this endpoint cannot be verified; a symbol-scoped
-    list is not a safe substitute for the account-wide 200-order limit.
-    """
-    resp = _request(
-        "GET",
-        OPEN_ORDERS_PATH,
-        {},
-        signed=True,
-        timeout_sec=timeout_sec,
-        retryable=retryable,
-    )
-    if not isinstance(resp, dict):
-        return {"status": "error", "error": f"openOrders account-wide returned non-object response: {type(resp).__name__}", "orders": []}
-    if resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": f"openOrders account-wide failed: {resp.get('msg', resp)}", "orders": []}
-    try:
-        # The documented openOrders response is data: [order, ...]. Keep the
-        # historical data.orders wrapper for compatibility, but do not accept
-        # position-shaped or arbitrary objects as a successful empty count.
-        orders = _normalize_orders_list(resp, list_keys=("orders",), allow_singleton=False)
-    except ValueError as exc:
-        return {"status": "error", "error": f"openOrders account-wide returned unexpected payload: {exc}", "orders": []}
-    return {"status": "ok", "orders": orders, "count": len(orders)}
-
-
 def get_open_protection_directional(
     symbol: str,
     direction: str,
@@ -1314,20 +1237,13 @@ def get_open_protection_directional(
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if not isinstance(resp, dict):
-        return {"status": "error", "error": f"openOrders returned non-object response: {type(resp).__name__}", "tp_orders": [], "sl_orders": []}
     if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
-
-    try:
-        response_orders = _normalize_orders_list(resp, list_keys=("orders",), allow_singleton=False)
-    except ValueError as exc:
-        return {"status": "error", "error": f"openOrders returned unexpected payload: {exc}", "tp_orders": [], "sl_orders": []}
 
     tp_orders = []
     sl_orders = []
 
-    for order in response_orders:
+    for order in _normalize_orders_list(resp):
         position_side = str(order.get("positionSide", "")).upper()
         if position_side not in (direction, "BOTH"):
             continue
@@ -1371,19 +1287,13 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
 
 
 def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
-    """Select the largest TP profile the confirmed filled position can execute.
+    """Select at most two TP legs using actual filled quantity constraints.
 
-    Selection is intentionally done after the market fill because the exchange
-    quantity/precision constraints apply to the actual filled quantity. The
-    candidate profiles are tried from largest to smallest:
-      3 legs -> TP1/TP2/TP3 when allocation is executable
-      2 legs -> TP1/TP2 when the full ladder is too small to allocate safely
-      1 leg  -> the last supplied level as the terminal fallback
-
-    Feasibility is tested with the same allocator used for the real TP orders,
-    rather than only comparing ``position_qty`` with ``min_qty * n``. This also
-    covers quantity precision and cases where the configured fractional split
-    itself cannot be represented safely across all legs.
+    New strategy profiles already contain TP1 and terminal TP2. If a legacy or
+    custom caller supplies three levels, keep its first and final target and drop
+    the obsolete middle milestone; the final target is relabelled TP2. If the
+    position cannot support both legs, use only the terminal target. Feasibility
+    is tested with the same allocator used for real TP orders.
     """
     if not tp_levels_norm or position_qty <= 0:
         return []
@@ -1399,11 +1309,14 @@ def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float,
     except (TypeError, ValueError, ArithmeticError):
         return []
 
-    # The strategy defines at most three milestones. Keep that ceiling explicit
-    # even if an old/custom state contains additional TP-like entries.
-    available_levels = [dict(x) for x in tp_levels_norm[:3]]
+    available_levels = [dict(x) for x in tp_levels_norm if isinstance(x, dict)]
     if not available_levels:
         return []
+    if len(available_levels) > 2:
+        # Keep the early partial and final target, remove the former middle TP.
+        final_level = dict(available_levels[-1])
+        final_level["leg"] = "tp2"
+        available_levels = [available_levels[0], final_level]
 
     # Try the largest executable profile first. The allocator is the single
     # source of truth for whether the selected fractions can be represented by
@@ -1997,7 +1910,17 @@ def ensure_directional_protection(
 
     existing = get_open_protection_directional(symbol, direction)
     if existing.get("status") != "ok":
-        return {"status": "PROTECTION_FAILED", "error": existing.get("error", "openOrders unavailable")}
+        return {
+            "status": "PROTECTION_FAILED",
+            "error": existing.get("error", "openOrders unavailable"),
+            "protection_audit": {
+                "open_orders_status": existing.get("status"),
+                "open_orders_error": existing.get("error"),
+                "audit_reason": "OPEN_ORDERS_UNVERIFIABLE",
+                "sl_count": None, "tp_count": None,
+                "expected_position_qty": position_qty,
+            },
+        }
 
     existing_tp = list(existing.get("tp_orders", []))
     existing_sl = list(existing.get("sl_orders", []))
@@ -2094,12 +2017,16 @@ def ensure_directional_protection(
         }
 
     verified = get_open_protection_directional(symbol, direction)
-    verified_sl_valid, verified_sl_audit = _audit_exact_single_sl(
+    verified_sl_valid, protection_audit = _audit_exact_single_sl(
         verified, direction=direction, avg_price=avg_price,
         expected_price=desired_sl_price, expected_qty=position_qty,
     )
 
     if not verified_sl_valid:
+        # Preserve the existing fail-safe post-entry policy: if the exchange
+        # confirms missing/duplicate/mismatched protection, try to flatten the
+        # just-opened residual. A query error is explicitly identified as UNKNOWN
+        # in the journal payload rather than described as proof that SL is absent.
         rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLVERIFY:{trade_id or bx_symbol}")
         return {
             "status": "SL_UNVERIFIED",
@@ -2110,16 +2037,15 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
-            "protection_audit": verified_sl_audit,
-            "error": f"SL invariant failed after placement: {verified_sl_audit['audit_reason']}",
+            "protection_audit": protection_audit,
+            "error": f"SL invariant failed after placement: {protection_audit.get('audit_reason')}",
             "rolled_back": rollback.get("status") == "closed",
             "emergency_close": rollback,
         }
 
-    # Adapt the TP profile to the confirmed exchange position size: prefer the
-    # configured 3-leg ladder, then 2 legs, then a single terminal TP. This is
-    # intentionally independent of REQUIRE_MULTI_TP: a valid entry must not be
-    # discarded merely because the account is too small for the full 3-leg profile.
+    # Adapt the two-TP profile to the confirmed exchange position size. New
+    # positions never receive three TP orders; if two legs are not executable,
+    # retain one terminal TP2 leg rather than place invalid partial orders.
     tp_levels_norm = _select_supported_tp_levels(
         tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
     )
@@ -2134,9 +2060,10 @@ def ensure_directional_protection(
             "sl_result": sl_result,
             "tp_orders": [],
             "error": "no TP profile can be supported by the filled position quantity",
+            "protection_audit": protection_audit,
             "rolled_back": False,
         }
-    tp_mode = "single_tp" if len(tp_levels_norm) == 1 else ("two_tp" if len(tp_levels_norm) == 2 else "multi_tp")
+    tp_mode = "single_tp" if len(tp_levels_norm) == 1 else "two_tp"
     log.info(
         "[BINGX] %s %s TP profile selected: mode=%s legs=%s qty=%s min_qty=%s",
         symbol, direction, tp_mode, ",".join(str(x.get("leg", "")).upper() for x in tp_levels_norm),
@@ -2161,6 +2088,7 @@ def ensure_directional_protection(
             "sl_result": sl_result,
             "tp_orders": [],
             "error": str(exc),
+            "protection_audit": protection_audit,
         }
 
     tp_results = []
@@ -2285,7 +2213,7 @@ def ensure_directional_protection(
         })
 
     # Reconcile the complete desired TP set, not only its members. When a
-    # position changes profile (e.g. 3 TPs -> single TP), any live conditional
+    # position changes profile (e.g. two TPs -> single TP), any live conditional
     # order that was not consumed by the current desired set is stale and must
     # be cancelled and verified. This deliberately runs after desired orders
     # are healthy so there is no intentional protection gap.
@@ -2337,7 +2265,7 @@ def ensure_directional_protection(
         "tp_orders": tp_results,
         "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
-        "protection_audit": verified_sl_audit,
+        "protection_audit": protection_audit,
     }
 
 
@@ -2383,17 +2311,22 @@ def _validate_sl_order_for_position(
 
 def _audit_exact_single_sl(
     protection_response: dict,
-    *, direction: str, avg_price: float,
-    expected_price: float | None, expected_qty: float,
-) -> tuple[bool, dict]:
-    """Confirm one and only one verified stop matches the residual position."""
+    *,
+    direction: str,
+    avg_price: float,
+    expected_price: float | None,
+    expected_qty: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Require exactly one exchange-visible SL whose price and qty protect the residual."""
     response = protection_response if isinstance(protection_response, dict) else {}
-    orders = list(response.get("sl_orders", [])) if response.get("status") == "ok" and isinstance(response.get("sl_orders", []), list) else []
-    def order_number(order: dict, *names: str) -> float:
-        for name in names:
+    orders = response.get("sl_orders", [])
+    orders = list(orders) if response.get("status") == "ok" and isinstance(orders, list) else []
+
+    def _num(order: dict, *keys: str) -> float:
+        for key in keys:
             try:
-                value = float(order.get(name, 0) or 0)
-            except (TypeError, ValueError):
+                value = float(order.get(key, 0) or 0)
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(value):
                 return value
@@ -2406,21 +2339,37 @@ def _audit_exact_single_sl(
             expected_price=expected_price, expected_qty=expected_qty,
         )
     ]
-    is_valid = response.get("status") == "ok" and len(orders) == 1 and len(valid) == 1
+    passed = response.get("status") == "ok" and len(orders) == 1 and len(valid) == 1
+    if response.get("status") != "ok":
+        reason = "OPEN_ORDERS_UNVERIFIABLE"
+    elif not orders:
+        reason = "SL_MISSING"
+    elif len(orders) > 1:
+        reason = "SL_MULTIPLE_ORDERS"
+    elif not valid:
+        observed = orders[0] if isinstance(orders[0], dict) else {}
+        observed_qty = _num(observed, "origQty", "quantity")
+        observed_price = _num(observed, "stopPrice", "price")
+        if expected_qty > 0 and not _qty_matches_position(observed_qty, expected_qty):
+            reason = "SL_QTY_MISMATCH"
+        elif expected_price is not None and expected_price > 0 and not _sl_price_matches(observed_price, expected_price):
+            reason = "SL_PRICE_MISMATCH"
+        elif str(observed.get("type", "")).upper() not in {"STOP", "STOP_MARKET"}:
+            reason = "SL_ORDER_TYPE_INVALID"
+        else:
+            reason = "SL_NOT_PROTECTIVE_OR_INVALID"
+    else:
+        reason = "OK"
     audit = {
         "open_orders_status": response.get("status"),
+        "open_orders_error": response.get("error"),
         "sl_count": len(orders),
         "valid_sl_count": len(valid),
-        "sl_order_ids": [str(o.get("orderId") or o.get("order_id") or "") for o in orders if isinstance(o, dict)],
-        "sl_order_qty": [order_number(o, "origQty", "quantity") for o in orders if isinstance(o, dict)],
-        "sl_order_prices": [order_number(o, "stopPrice", "price") for o in orders if isinstance(o, dict)],
-        "expected_position_qty": expected_qty,
-        "expected_sl_price": expected_price,
-        "audit_reason": (
-            "OPEN_ORDERS_UNVERIFIABLE" if response.get("status") != "ok" else
-            "SL_MISSING" if not orders else
-            "SL_MULTIPLE_ORDERS" if len(orders) != 1 else
-            "SL_QTY_OR_PRICE_MISMATCH" if not valid else "OK"
-        ),
+        "sl_order_ids": [str(order.get("orderId") or order.get("order_id") or "") for order in orders if isinstance(order, dict)],
+        "sl_order_qty": [_num(order, "origQty", "quantity") for order in orders if isinstance(order, dict)],
+        "sl_order_prices": [_num(order, "stopPrice", "price") for order in orders if isinstance(order, dict)],
+        "expected_position_qty": float(expected_qty),
+        "expected_sl_price": float(expected_price) if expected_price is not None else None,
+        "audit_reason": reason,
     }
-    return bool(is_valid), audit
+    return bool(passed), audit
