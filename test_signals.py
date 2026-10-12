@@ -17,7 +17,6 @@ def _legacy_divergence_defaults(monkeypatch):
     import run_once as _ro
     monkeypatch.setattr(_ro, "MARKET_DATA_SOURCE", "bingx")
     monkeypatch.setattr(_ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
-    monkeypatch.setattr(_ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", False)
 
 
 from event_engine.coinalyze import parse_number, CoinalyzeRow
@@ -223,22 +222,23 @@ def test_select_supported_tp_levels_adapts_to_position_size():
         {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
     ]
 
-    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2", "tp3"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2"]
+    assert [x["pnl_pct"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == [5.0, 14.0]
     assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 2.0, 0, 1.0)] == ["tp1", "tp2"]
-    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)] == ["tp3"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)] == ["tp2"]
 
 
 def test_select_supported_tp_levels_uses_allocator_feasibility():
     from event_engine import bingx as bx
 
-    # Three legs are quantity-feasible even though the fractional split must be
-    # lifted to the exchange minimum; the selector must still retain all three.
+    # Legacy three-leg input is capped to TP1 + final TP2 even when quantity
+    # would support all three legs.
     levels = [
         {"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 0.90},
         {"leg": "tp2", "pnl_pct": 2.0, "close_fraction": 0.05},
         {"leg": "tp3", "pnl_pct": 3.0, "close_fraction": 0.05},
     ]
-    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2", "tp3"]
+    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2"]
 
 
 def test_allocate_tp_quantities_exact_sum():
@@ -326,23 +326,21 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == pytest.approx(1.3625)
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
-    assert len(tp_levels_l) == 3
-    assert [x["leg"] for x in tp_levels_l] == ["tp1", "tp2", "tp3"]
-    assert [x["close_fraction"] for x in tp_levels_l] == pytest.approx([0.25, 0.40, 0.35])
-    assert tp_levels_l[0]["pnl_pct"] < tp_levels_l[1]["pnl_pct"] < tp_levels_l[2]["pnl_pct"]
+    assert len(tp_levels_l) == 2
+    assert tp_levels_l[0]["pnl_pct"] < tp_levels_l[1]["pnl_pct"]
 
     # Short setup
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == pytest.approx(1.3625)
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
-    assert len(tp_levels_s) == 3
-    assert tp_levels_s[0]["pnl_pct"] < tp_levels_s[1]["pnl_pct"] < tp_levels_s[2]["pnl_pct"]
+    assert len(tp_levels_s) == 2
+    assert tp_levels_s[0]["pnl_pct"] < tp_levels_s[1]["pnl_pct"]
 
 
 def test_rsi_warmup_preserves_nan():
@@ -446,13 +444,23 @@ def test_failed_telegram_delivery_is_retryable(tmp_path: Path):
     assert "EVT_OK" in ids
 
 
-def test_default_setup_rr_matches_three_tp_profile():
+def test_default_setup_rr_is_v2_1_05():
     metrics = _extract_setup_metrics(None)
-    assert metrics["planned_weighted_rr"] == pytest.approx(1.3625)
-    assert metrics["effective_weighted_rr"] == pytest.approx(1.3625)
+    assert metrics["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert metrics["effective_weighted_rr"] == pytest.approx(1.6625)
 
 
-def test_telegram_message_uses_clean_setup_values_and_directional_confirmation():
+def test_disabled_event_type_policy_is_narrow_and_case_insensitive(monkeypatch):
+    import run_once as _ro
+
+    monkeypatch.setattr(_ro, "DISABLED_EVENT_TYPES", {"CRT_BEARISH"})
+    assert _ro._event_type_is_disabled("CRT_BEARISH")
+    assert _ro._event_type_is_disabled("  crt_bearish  ")
+    assert not _ro._event_type_is_disabled("CRT_BULLISH")
+    assert not _ro._event_type_is_disabled("DONCHIAN_RETEST_BREAKOUT")
+
+
+def test_telegram_message_uses_clean_setup_values_and_omits_confirmation_field():
     from event_engine.telegram import format_signal
     msg = format_signal(
         {
@@ -469,11 +477,10 @@ def test_telegram_message_uses_clean_setup_values_and_directional_confirmation()
             "risk_pct": 7.0,
             "tp_levels": [
                 {"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 0.25},
-                {"leg": "tp2", "pnl_pct": 8.75, "close_fraction": 0.40},
-                {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
+                {"leg": "tp2", "pnl_pct": 14.0, "close_fraction": 0.75},
             ],
-            "effective_weighted_rr": 1.387456687456686,
-            "tp_mode": "multi_tp",
+            "effective_weighted_rr": 1.6625,
+            "tp_mode": "two_tp",
             "sr_context": {"directional_zone_alignment": "LONG_IN_DEMAND"},
             "trigger": {"trigger_price": 0.6929, "trigger_delay_min": 15.0},
         },
@@ -483,18 +490,18 @@ def test_telegram_message_uses_clean_setup_values_and_directional_confirmation()
     assert "SL: <code>0.64449</code>" in msg
     assert "TP1: <code>0.7245315</code>" in msg
     assert "+4.55%" in msg and "0.65R" in msg
-    assert "TP2: <code>0.7536375</code>" in msg
-    assert "TP3: <code>0.79002</code>" in msg
+    assert "TP2: <code>0.79002</code>" in msg
+    assert "TP3:" not in msg
     assert "+14%" in msg and "2R" in msg
-    assert "CONFIRMATION:" in msg
-    assert "2/2" in msg
-    assert "VOLUME_PROFILE_ACCUMULATION + <b>DEMAND</b>" in msg
+    assert "CONFIRMATION:" not in msg
+    assert "Trigger Price:" in msg
+    assert "Trigger Delay:" in msg
     assert "R:R (Effective Weighted)" not in msg
-    assert "R:R: <code>1.387456687456686</code>" in msg
-    assert "TP Mode: <code>multi_tp</code>" in msg
+    assert "R:R: <code>1.6625</code>" in msg
+    assert "TP Mode: <code>two_tp</code>" in msg
 
 
-def test_telegram_directional_confirmation_is_not_2_of_2_without_in_zone_support():
+def test_telegram_message_omits_confirmation_for_nearby_support_context():
     from event_engine.telegram import format_signal
     msg = format_signal(
         {"direction": "SHORT", "symbol": "TEST", "event_type": "VOLUME_PROFILE_DISTRIBUTION", "event_fact": {}, "timestamps": {}},
@@ -504,12 +511,13 @@ def test_telegram_directional_confirmation_is_not_2_of_2_without_in_zone_support
             "risk_pct": 7.0,
             "tp_levels": [{"leg": "tp1", "pnl_pct": 5.25, "close_fraction": 1.0}],
             "sr_context": {"supporting_zone_context": "SUPPORTIVE_NEAR"},
+            "trigger": {"trigger_price": 99.8, "trigger_delay_min": 4.0},
         },
         score=80,
     )
-    assert "1/2" in msg
-    assert "SHORT VOLUME_PROFILE_DISTRIBUTION + SUPPLY nearby" in msg
-    assert "2/2" not in msg
+    assert "CONFIRMATION:" not in msg
+    assert "Trigger Price: <code>99.8</code>" in msg
+    assert "Trigger Delay: <code>4 min</code>" in msg
 
 
 def test_score_call_source_is_trigger_diagnostic():
@@ -529,7 +537,7 @@ def test_telegram_message_contains_trigger_fields():
     assert "Trigger Price" in msg and "100.5" in msg
     assert "TP1" in msg
     assert "R:R:" in msg
-    assert "TP Mode: <code>multi_tp</code>" in msg
+    assert "TP Mode: <code>single_tp</code>" in msg
 
 
 def test_build_event_setup_uses_fixed_seven_percent_stop():
@@ -1576,7 +1584,7 @@ def test_tp_leg_identity_works_without_client_order_id():
     assert bx._tp_leg_from_order(order, "tp1", 106.0, 2, None) is False
 
 
-def test_ensure_protection_uses_three_tp_legs_when_filled_qty_supports_them(monkeypatch):
+def test_ensure_protection_caps_legacy_three_tp_input_to_two_orders(monkeypatch):
     from event_engine import bingx as bx
 
     posted = []
@@ -1623,16 +1631,16 @@ def test_ensure_protection_uses_three_tp_legs_when_filled_qty_supports_them(monk
         {"leg": "tp3", "pnl_pct": 14.0, "close_fraction": 0.35},
     ]
     out = bx.ensure_directional_protection(
-        "ABC", "LONG", 100.0, 100.0, 7.0, levels, trade_id="TR_TEST_3TP"
+        "ABC", "LONG", 100.0, 100.0, 7.0, levels, trade_id="TR_TEST_LEGACY_3TP"
     )
 
     assert out["status"] == "PROTECTED"
-    assert out["tp_mode"] == "multi_tp"
-    assert [x["leg"] for x in out["effective_tp_levels"]] == ["tp1", "tp2", "tp3"]
-    assert [x["leg"] for x in out["tp_orders"]] == ["tp1", "tp2", "tp3"]
-    assert [x["qty"] for x in out["effective_tp_levels"]] == [25.0, 40.0, 35.0]
-    assert out["effective_weighted_rr"] == pytest.approx(1.3625)
-    assert len(posted) == 4  # one SL + three TP orders
+    assert out["tp_mode"] == "two_tp"
+    assert [x["leg"] for x in out["effective_tp_levels"]] == ["tp1", "tp2"]
+    assert [x["leg"] for x in out["tp_orders"]] == ["tp1", "tp2"]
+    assert [x["price"] for x in out["tp_orders"]] == pytest.approx([104.55, 114.0])
+    assert sum(x["qty"] for x in out["effective_tp_levels"]) == pytest.approx(100.0)
+    assert len(posted) == 3  # one SL + exactly two TP orders
 
 
 def test_ensure_protection_refuses_second_sl_and_cleans_stale(monkeypatch):
@@ -1826,25 +1834,30 @@ def test_check_funding_filter_only_blocks_aggressive_squeeze_funding():
     assert check_funding_filter(SimpleNamespace(fr_oiw="bad"), "SHORT", event_type="LONG_SQUEEZE")[0] is True
 
 
-def test_tp_ladders_are_consistent_for_normal_and_squeeze():
+def test_tighter_tp_levels_are_consistent_for_normal_and_squeeze():
     from run_once import build_event_setup, build_tp_levels
     df = _generate_synthetic_candles(60)
 
-    # Regular divergence setup: 0.65R / 1.25R / 2.00R.
+    # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
     assert div_setup["target_rr"] == 2.00
-    assert div_setup["planned_weighted_rr"] == pytest.approx(1.3625)
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.6625)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
-    assert [x["pnl_pct"] for x in tp_div] == pytest.approx([sl_pct_div * 0.65, sl_pct_div * 1.25, sl_pct_div * 2.00])
-    assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.40, 0.35])
+    assert [x["leg"] for x in tp_div] == ["tp1", "tp2"]
+    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.65)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 2.00)
+    assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.75])
 
-    # Squeeze setup: 1.00R / 1.50R / 2.00R.
+    # Squeeze setup
     sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
-    assert sq_setup["target_rr"] == 2.00
-    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.525)
+    assert sq_setup["target_rr"] == 2.0
+    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.70)
     sl_pct_sq, tp_sq = build_tp_levels(sq_setup, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
-    assert [x["pnl_pct"] for x in tp_sq] == pytest.approx([sl_pct_sq * 1.00, sl_pct_sq * 1.50, sl_pct_sq * 2.00])
-    assert [x["close_fraction"] for x in tp_sq] == pytest.approx([0.30, 0.35, 0.35])
+    assert [x["leg"] for x in tp_sq] == ["tp1", "tp2"]
+    assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.00)
+    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 2.00)
+    assert tp_sq[0]["close_fraction"] == 0.30
+    assert tp_sq[1]["close_fraction"] == 0.70
 
 
 def _be_trade_record(hit_legs, event_id="EVT_TEST"):
@@ -1907,7 +1920,7 @@ def test_be_tp1_policy_is_still_selectable(monkeypatch, tmp_path):
 
 
 def test_be_single_tp_position_arms_only_at_terminal_leg(monkeypatch, tmp_path):
-    """A micro-position collapses to one TP3 leg; it cannot wait for a tp2."""
+    """A micro-position collapses to terminal TP2; legacy TP3 remains accepted."""
     be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp2", tp_mode="single_tp")
     assert be_calls == []
     assert trade["be_activated"] is False
@@ -2109,11 +2122,6 @@ def test_reconciliation_registers_orphan_position_with_complete_protection(monke
     assert journaled[0]["record_type"] == "TRADE_OPEN"
     assert journaled[0]["reconciliation"] is True
     assert journaled[0]["event_id"] == registrations[0]["event_id"]
-    # Target RR is the best terminal leg; weighted RR accounts for every leg
-    # and its actual close fraction (20%, 40%, 60% R weighted by 30/35/35%).
-    assert registrations[0]["setup"]["target_rr"] == pytest.approx(0.6)
-    assert registrations[0]["setup"]["planned_weighted_rr"] == pytest.approx(0.41)
-    assert registrations[0]["setup"]["effective_weighted_rr"] == pytest.approx(0.41)
 
 
 def test_reconciliation_event_id_changes_after_closed_collision(monkeypatch):
@@ -2713,36 +2721,9 @@ def test_liquidation_squeeze_predicate_is_not_used_for_volatility_squeeze_fundin
     assert "VOLATILITY" in reason or "NORMAL" in reason
 
 
-def test_early_loss_cut_shadow_records_2h_and_4h_independently(monkeypatch):
-    import event_engine.tracker as tracker
-
-    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_2H_MIN", 120.0)
-    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_2H_PNL", -1.5)
-    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_4H_MIN", 240.0)
-    monkeypatch.setattr(tracker, "EARLY_LOSS_CUT_4H_PNL", -2.5)
-    trade = {}
-
-    first = tracker._record_early_loss_cut_shadow_observations(
-        trade, duration_min=130.0, current_pnl_pct=-2.0, current_price=98.0,
-        now_ms=1_000, mode="shadow",
-    )
-    assert first == ["EARLY_LOSS_CUT_2H"]
-    assert "EARLY_LOSS_CUT_4H" not in trade["early_loss_cut_shadow_triggers"]
-
-    second = tracker._record_early_loss_cut_shadow_observations(
-        trade, duration_min=250.0, current_pnl_pct=-3.0, current_price=97.0,
-        now_ms=2_000, mode="shadow",
-    )
-    assert second == ["EARLY_LOSS_CUT_4H"]
-    triggers = trade["early_loss_cut_shadow_triggers"]
-    assert triggers["EARLY_LOSS_CUT_2H"]["ts_ms"] == 1_000
-    assert triggers["EARLY_LOSS_CUT_4H"]["ts_ms"] == 2_000
-    assert triggers["EARLY_LOSS_CUT_4H"]["observation_only"] is True
-
-
 def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
     import event_engine.tracker as tr
-    monkeypatch.setattr(tr, "EARLY_LOSS_CUT_MODE", "enforce")
+    monkeypatch.setattr(tr, "EARLY_LOSS_CUT_ENABLED", True)
     monkeypatch.setattr(tr, "_early_loss_cut_guard", lambda *args, **kwargs: (False, "near_live_sl:0.1%", 1.0))
     # The regression target is the initialization pattern used by update_active_trades:
     # a blocked guard must still yield a defined cut result rather than NameError.
@@ -3195,7 +3176,6 @@ def test_tracker_residual_close_does_not_reuse_last_tp_price(monkeypatch, tmp_pa
     monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
     monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
     monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
-    monkeypatch.setattr(tr, "_move_sl_to_break_even", lambda *a, **k: {"status": "error", "error": "not under test"})
     monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
     monkeypatch.setattr(
         tr,
@@ -3223,115 +3203,10 @@ def test_tracker_residual_close_does_not_reuse_last_tp_price(monkeypatch, tmp_pa
     assert saved["realized_pnl_pct"] is None
     assert saved["exit_reason"] == "DATA_ERROR"
     assert saved["realized_pnl_usdt"] is None
-    assert saved["booked_realized_pnl_qty"] == pytest.approx(25.0)
-    assert saved["booked_realized_pnl_usdt"] == pytest.approx(25.0)
-    assert saved["known_realized_pnl_status"] == "TOTAL_UNKNOWN_PARTIAL_KNOWN"
-    # The journal preserves the known partial TP amount separately; it does not
-    # report that amount as the full trade PnL because the residual execution is unknown.
+    # The journal stores only the known partial TP state; the residual execution
+    # and therefore total realized PnL remain explicitly unknown.
     assert saved["exit_price"] != pytest.approx(101.0)
     assert not json.loads(active_path.read_text(encoding="utf-8"))
-
-
-def test_tracker_unpriced_tp_does_not_get_misattributed_to_known_sl_fill(monkeypatch, tmp_path):
-    """An unpriced TP fill must not be double-counted as if all quantity exited at SL."""
-    import event_engine.tracker as tr
-
-    active_path = tmp_path / "active_trades.json"
-    trades_path = tmp_path / "trades.jsonl"
-    trade = {
-        "trade_id": "TR_UNPRICED_TP", "event_id": "EVT_UNPRICED_TP",
-        "symbol": "TEST", "direction": "LONG", "entry_price": 100.0,
-        "initial_qty": 100.0, "remaining_qty": 100.0, "entry_ts": 1_000,
-        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}],
-        "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
-        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
-        "realized_pnl_weighted_sum": 0.0, "tp_leg_realized_weighted_sum": {},
-        "tp_leg_avg_price": {}, "last_tp_exec_price": None,
-        "be_activated": False, "be_required": False, "closed": False,
-        "manual_exit_reason": None, "planned_risk_pct": 5.0,
-        "planned_weighted_rr": 1.0, "effective_weighted_rr": 1.0,
-        "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 0.25}],
-        "tp_mode": "multi_tp",
-    }
-    active_path.write_text(json.dumps({"EVT_UNPRICED_TP": trade}), encoding="utf-8")
-    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
-    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
-    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
-    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
-    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
-    def order_lookup(symbol, order_id):
-        if order_id == "TP1":
-            return {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 0.0}
-        return {"status": "ok", "order_status": "FILLED", "executed_qty": 75.0, "avg_price": 95.0}
-    monkeypatch.setattr(tr, "get_order", order_lookup)
-    monkeypatch.setattr(
-        tr, "fetch_klines",
-        lambda symbol, timeframe, limit=60: [{"open_time": 1_000, "close_time": 2_000, "high": 96.0, "low": 94.0, "close": 95.0}],
-    )
-    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-
-    tr.update_active_trades()
-    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
-
-    assert saved["exit_price"] == pytest.approx(95.0)
-    assert saved["exit_price_source"] == "SL_FILL"
-    assert saved["exit_reason"] == "DATA_ERROR"
-    assert saved["realized_pnl_pct"] is None
-    assert saved["realized_pnl_usdt"] is None
-    assert saved["booked_realized_pnl_qty"] == pytest.approx(0.0)
-    assert saved["booked_realized_pnl_usdt"] is None
-    assert saved["unpriced_tp_execution_detected"] is True
-    assert saved["unpriced_tp_execution_qty_by_leg"]["tp1"] == pytest.approx(25.0)
-    assert saved["sl_closed_qty"] is None
-
-
-def test_tracker_books_partial_tp_execution_when_order_is_later_cancelled(monkeypatch, tmp_path):
-    """A canceled TP may still have real fills; book them before pricing the SL residual."""
-    import event_engine.tracker as tr
-
-    active_path = tmp_path / "active_trades.json"
-    trades_path = tmp_path / "trades.jsonl"
-    trade = {
-        "trade_id": "TR_CANCELLED_PARTIAL_TP", "event_id": "EVT_CANCELLED_PARTIAL_TP",
-        "symbol": "TEST", "direction": "LONG", "entry_price": 100.0,
-        "initial_qty": 100.0, "remaining_qty": 100.0, "entry_ts": 1_000,
-        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}],
-        "sl_order": {"order_id": "SL1", "stop_price": 95.0}, "sl_order_history": [],
-        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
-        "realized_pnl_weighted_sum": 0.0, "tp_leg_realized_weighted_sum": {},
-        "tp_leg_avg_price": {}, "last_tp_exec_price": None,
-        "be_activated": False, "be_required": False, "closed": False,
-        "manual_exit_reason": None, "planned_risk_pct": 5.0,
-        "planned_weighted_rr": 1.0, "effective_weighted_rr": 1.0,
-        "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0}],
-        "tp_mode": "multi_tp",
-    }
-    active_path.write_text(json.dumps({"EVT_CANCELLED_PARTIAL_TP": trade}), encoding="utf-8")
-
-    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
-    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
-    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
-    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
-    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found", "positionAmt": "0"})
-    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
-    monkeypatch.setattr(tr, "get_order", lambda _symbol, order_id: (
-        {"status": "ok", "order_status": "CANCELED", "executed_qty": 20.0, "avg_price": 101.0}
-        if order_id == "TP1" else
-        {"status": "ok", "order_status": "FILLED", "executed_qty": 80.0, "avg_price": 94.0}
-    ))
-    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"open_time": 1_000, "close_time": 2_000, "high": 95.0, "low": 93.0, "close": 94.0}])
-    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-
-    tr.update_active_trades()
-
-    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
-    assert saved["exit_reason"] == "STOP_LOSS"
-    assert saved["tp_closed_qty"] == pytest.approx(20.0)
-    assert saved["sl_closed_qty"] == pytest.approx(80.0)
-    assert saved["total_closed_qty"] == pytest.approx(100.0)
-    assert saved["realized_pnl_pct"] == pytest.approx(-4.6)
-    assert saved["realized_pnl_usdt"] == pytest.approx(-460.0)
-    assert saved["tp_filled_qty"]["tp1"] == pytest.approx(20.0)
 
 
 def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypatch, tmp_path):
@@ -3452,16 +3327,6 @@ def test_tracker_manual_market_close_uses_explicit_execution_price(monkeypatch, 
         "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
         "last_tp_exec_price": None, "be_activated": False, "be_required": False, "closed": False,
         "manual_exit_reason": "MANUAL_MARKET_CLOSE", "manual_exit_price": 99.0,
-        "early_loss_cut_shadow_triggers": {
-            "EARLY_LOSS_CUT_2H": {
-                "ts_ms": 1_500, "reason": "EARLY_LOSS_CUT_2H", "pnl_pct": -1.8,
-                "price": 98.2, "age_min": 130.0, "mode": "shadow", "observation_only": True,
-            },
-            "EARLY_LOSS_CUT_4H": {
-                "ts_ms": 2_500, "reason": "EARLY_LOSS_CUT_4H", "pnl_pct": -2.9,
-                "price": 97.1, "age_min": 250.0, "mode": "shadow", "observation_only": True,
-            },
-        },
         "planned_risk_pct": 1.0, "planned_weighted_rr": 1.6625, "effective_weighted_rr": 1.6625,
         "effective_tp_levels": [], "tp_mode": "multi_tp",
     }
@@ -3483,8 +3348,6 @@ def test_tracker_manual_market_close_uses_explicit_execution_price(monkeypatch, 
     assert saved["exit_price_source"] == "MANUAL_EXECUTION"
     assert saved["exit_price"] == pytest.approx(99.0)
     assert saved["realized_pnl_pct"] == pytest.approx(-1.0)
-    assert saved["early_loss_cut_shadow_triggers"]["EARLY_LOSS_CUT_2H"]["pnl_pct"] == pytest.approx(-1.8)
-    assert saved["early_loss_cut_shadow_triggers"]["EARLY_LOSS_CUT_4H"]["pnl_pct"] == pytest.approx(-2.9)
 
 
 def test_tracker_duplicate_close_journal_is_not_duplicated(monkeypatch, tmp_path):
@@ -3999,498 +3862,3 @@ def test_tracker_live_pnl_extrema_updates_mae_and_drawdown():
     assert trade["peak_pnl_pct"] == pytest.approx(2.0)
     assert trade["mae_pct"] == pytest.approx(-1.5)
     assert trade["max_drawdown_pct"] == pytest.approx(-3.5)
-
-
-def test_three_tp_profiles_preserve_planned_weighted_rr():
-    from run_once import build_tp_levels
-
-    normal = {"entry_reference": 100.0, "invalidation_price": 93.0, "risk_pct": 7.0}
-    risk, levels = build_tp_levels(normal, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
-    assert [x["leg"] for x in levels] == ["tp1", "tp2", "tp3"]
-    assert [x["close_fraction"] for x in levels] == pytest.approx([0.25, 0.40, 0.35])
-    weighted = sum((x["pnl_pct"] / risk) * x["close_fraction"] for x in levels)
-    assert weighted == pytest.approx(1.3625)
-
-    squeeze = {"entry_reference": 100.0, "invalidation_price": 93.0, "risk_pct": 7.0}
-    risk_sq, levels_sq = build_tp_levels(squeeze, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
-    assert [x["leg"] for x in levels_sq] == ["tp1", "tp2", "tp3"]
-    assert [x["close_fraction"] for x in levels_sq] == pytest.approx([0.30, 0.35, 0.35])
-    weighted_sq = sum((x["pnl_pct"] / risk_sq) * x["close_fraction"] for x in levels_sq)
-    assert weighted_sq == pytest.approx(1.525)
-
-
-
-
-def test_order_capacity_reserves_sl_plus_three_tp_orders_by_default():
-    import run_once as ro
-    assert ro.BINGX_EXPECTED_NEW_PROTECTION_ORDERS == 4
-
-
-def test_account_open_orders_helper_returns_account_wide_list(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {
-        "code": 0,
-        "data": {"orders": [{"orderId": "A"}, {"orderId": "B"}]},
-    })
-    out = bx.get_open_orders_account_wide(retryable=False)
-    assert out["status"] == "ok"
-    assert out["count"] == 2
-    assert [x["orderId"] for x in out["orders"]] == ["A", "B"]
-
-
-def test_account_open_orders_helper_fails_closed_on_unrecognized_payload(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"unexpected": []}})
-    out = bx.get_open_orders_account_wide(retryable=False)
-    assert out["status"] == "error"
-    assert "unexpected payload" in out["error"]
-    assert out["orders"] == []
-
-
-def test_account_open_orders_helper_rejects_malformed_order_items(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": [{"orderId": "A"}, "not-an-order"]})
-    out = bx.get_open_orders_account_wide(retryable=False)
-    assert out["status"] == "error"
-    assert "non-object item" in out["error"]
-
-
-def test_account_open_orders_helper_accepts_a_recognized_empty_list(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": []})
-    out = bx.get_open_orders_account_wide(retryable=False)
-    assert out["status"] == "ok"
-    assert out["orders"] == []
-    assert out["count"] == 0
-
-
-def test_get_positions_does_not_convert_unknown_payload_to_no_positions(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"unexpected": []}})
-    with pytest.raises(RuntimeError, match="unexpected payload"):
-        bx.get_positions(retryable=False)
-
-
-def test_open_orders_helper_handles_non_object_api_response(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: ["unexpected", "payload"])
-    out = bx.get_open_orders_account_wide(retryable=False)
-    assert out["status"] == "error"
-    assert "non-object response" in out["error"]
-
-
-def test_get_positions_handles_non_object_api_response(monkeypatch):
-    import event_engine.bingx as bx
-    monkeypatch.setattr(bx, "_request", lambda *args, **kwargs: ["unexpected", "payload"])
-    with pytest.raises(RuntimeError, match="non-object response"):
-        bx.get_positions(retryable=False)
-
-
-def test_order_capacity_guard_fails_closed_on_non_object_helper_response(monkeypatch):
-    import run_once as ro
-    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", True)
-    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(ro, "get_open_orders_account_wide", lambda **kwargs: ["invalid"])
-    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("market entry must be blocked by non-object order snapshot"))
-    out = ro.execute_new_position(
-        "TEST", "LONG", 100.0,
-        {"risk_pct": 7.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"},
-        "EVT_ORDER_CAPACITY_NON_OBJECT",
-    )
-    assert out["status"] == "ORDER_CAPACITY_UNKNOWN"
-    assert "non-object payload" in out["error"]
-
-
-def test_order_capacity_guard_fails_closed_on_inconsistent_snapshot(monkeypatch):
-    import run_once as ro
-    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", True)
-    monkeypatch.setattr(ro, "BINGX_MAX_OPEN_ORDERS", 200)
-    monkeypatch.setattr(ro, "BINGX_OPEN_ORDER_RESERVE", 20)
-    monkeypatch.setattr(ro, "BINGX_EXPECTED_NEW_PROTECTION_ORDERS", 4)
-    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(ro, "get_open_orders_account_wide", lambda **kwargs: {
-        "status": "ok", "orders": [], "count": 1,
-    })
-    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("market entry must be blocked by inconsistent order snapshot"))
-    out = ro.execute_new_position(
-        "TEST", "LONG", 100.0,
-        {"risk_pct": 7.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"},
-        "EVT_ORDER_CAPACITY_BAD_SNAPSHOT",
-    )
-    assert out["status"] == "ORDER_CAPACITY_UNKNOWN"
-    assert "invalid orders/count payload" in out["error"]
-
-
-def test_trend_shadow_action_does_not_label_unknown_as_rejected():
-    import inspect
-    import run_once as ro
-    source = inspect.getsource(ro.main)
-    assert '"UNKNOWN": "UNKNOWN"' in source
-    assert '"REJECT": "REJECTED"' in source
-
-
-def test_order_capacity_guard_blocks_entry_before_market_order(monkeypatch):
-    import run_once as ro
-    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", True)
-    monkeypatch.setattr(ro, "BINGX_MAX_OPEN_ORDERS", 200)
-    monkeypatch.setattr(ro, "BINGX_OPEN_ORDER_RESERVE", 20)
-    monkeypatch.setattr(ro, "BINGX_EXPECTED_NEW_PROTECTION_ORDERS", 4)
-    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(ro, "get_open_orders_account_wide", lambda **kwargs: {
-        "status": "ok", "orders": [{"orderId": str(i)} for i in range(178)], "count": 178,
-    })
-    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("market entry must be blocked by order capacity"))
-    out = ro.execute_new_position(
-        "TEST", "LONG", 100.0,
-        {"risk_pct": 7.0, "signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"},
-        "EVT_ORDER_CAPACITY_TEST",
-    )
-    assert out["status"] == "ORDER_CAPACITY_REACHED"
-    assert "open_orders=178" in out["error"]
-
-
-def test_mfe_mae_extrema_record_candle_intervals():
-    trade = {"entry_price": 100.0, "direction": "LONG", "entry_ts": 1_000, "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0}
-    _update_mfe_mae(trade, [{"open_time": 1_000, "close_time": 61_000, "high": 103.0, "low": 98.0, "close": 101.0}])
-    assert trade["peak_pnl_pct"] == pytest.approx(3.0)
-    assert trade["mae_pct"] == pytest.approx(-2.0)
-    assert trade["peak_pnl_interval_start_ts"] == 1_000
-    assert trade["peak_pnl_interval_end_ts"] == 61_000
-    assert trade["peak_pnl_ts_precision"] == "candle_interval"
-    assert trade["mae_ts_precision"] == "candle_interval"
-
-
-def test_tp_execution_progress_never_marks_zero_quantity_filled_and_preserves_cancelled_fills():
-    from event_engine.tracker import _tp_execution_progress
-    assert _tp_execution_progress("FILLED", 0.0, 0.0, 1e-9) == (0.0, False)
-    assert _tp_execution_progress("FILLED", 1.0, 1.0, 1e-9) == (0.0, True)
-    assert _tp_execution_progress("PARTIALLY_FILLED", 0.4, 0.0, 1e-9) == pytest.approx((0.4, False))
-    assert _tp_execution_progress("CANCELED", 0.4, 0.0, 1e-9) == pytest.approx((0.4, False))
-    assert _tp_execution_progress("EXPIRED", 0.7, 0.4, 1e-9) == pytest.approx((0.3, False))
-    assert _tp_execution_progress("CANCELLED", 0.5, 1.0, 1e-9) == (None, False)
-    assert _tp_execution_progress("FILLED", 0.5, 1.0, 1e-9) == (None, False)
-
-
-def test_single_tp_micro_position_arms_be_on_its_actual_terminal_leg():
-    from event_engine.tracker import _be_milestone_reached
-    assert _be_milestone_reached({"tp2"}, True, terminal_leg="tp2") is True
-    assert _be_milestone_reached({"tp3"}, True, terminal_leg="tp2") is False
-    # Legacy single-TP positions continue to use their persisted TP3 milestone.
-    assert _be_milestone_reached({"tp3"}, True, terminal_leg="tp3") is True
-
-
-def test_register_active_trade_accepts_and_persists_entry_order_id(tmp_path, monkeypatch):
-    import json
-    import event_engine.tracker as tracker
-
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
-    tracker.register_active_trade(
-        event_id="EVT_ENTRY_ID_TEST",
-        symbol="TEST",
-        name="TEST",
-        direction="LONG",
-        entry_price=100.0,
-        qty=1.0,
-        tp_orders=[{"leg": "tp1", "order_id": "TP1", "price": 105.0, "qty": 1.0}],
-        sl_result={"status": "ok", "order_id": "SL1", "stop_price": 95.0, "qty": 1.0},
-        event_type="CRT_BULLISH",
-        timeframe="1h",
-        score=80.0,
-        setup={"risk_pct": 5.0, "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.3625},
-        requested_entry_price=99.9,
-        entry_ts_ms=1_700_000_000_000,
-        entry_order_id="ENTRY-123",
-    )
-    active = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
-    assert active["EVT_ENTRY_ID_TEST"]["entry_order_id"] == "ENTRY-123"
-    assert active["EVT_ENTRY_ID_TEST"]["event_type"] == "CRT_BULLISH"
-
-
-def test_restore_reconciled_trade_identity_preserves_runtime_state(tmp_path, monkeypatch):
-    import json
-    import event_engine.tracker as tracker
-
-    path = tmp_path / "active_trades.json"
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
-    path.write_text(json.dumps({
-        "RECON_TEST_LONG_HASH": {
-            "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH",
-            "symbol": "MONAD", "direction": "LONG", "event_type": "RECONCILED_POSITION",
-            "entry_price": 100.0, "actual_entry_price": 100.0,
-            "initial_qty": 1.0, "remaining_qty": 0.65, "entry_ts": 1_700_000_100_000,
-            "score": 50.0, "timeframe": "1h", "setup": {"event_type": "RECONCILED_POSITION"},
-            "tp_orders": [
-                {"leg": "tp2", "order_id": "TP2_LIVE", "price": 108.0, "qty": 0.35},
-                {"leg": "tp3", "order_id": "TP3_LIVE", "price": 112.0, "qty": 0.30},
-            ],
-            "sl_order": {"status": "already_exists", "order_id": "SL_LIVE", "stop_price": 95.0, "qty": 0.65},
-            "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.35},
-            "realized_pnl_qty": 0.35, "realized_pnl_weighted_sum": 36.75,
-            "current_pnl_pct": -0.25, "last_observation_ts": 1_700_000_101_000,
-            "planned_risk_pct": 5.0, "planned_target_rr": 2.0,
-            "planned_weighted_rr": 2.0, "effective_weighted_rr": 2.0,
-            "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 5.0, "close_fraction": 1.0}],
-        }}, indent=2), encoding="utf-8")
-
-    source = {
-        "record_type": "TRADE_OPEN", "trade_id": "TR_ORIGINAL", "event_id": "EVT_ORIGINAL",
-        "symbol": "MON", "direction": "LONG", "ts": 1_700_000_000_000,
-        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 82.0},
-        "execution": {"requested_price": 99.9, "signal_price": 99.9, "pre_order_reference_price": 100.0,
-                      "actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL",
-                      "status": "opened_protected", "slippage_pct": 0.1, "adverse_slippage_pct": 0.1},
-        "result": {"fill_ts_ms": 1_700_000_000_123, "position": {"symbol": "MONAD-USDT"}},
-        "setup": {"event_type": "CRT_BULLISH", "event_timeframe": "1h", "risk_pct": 5.0,
-                  "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.36,
-                  "signal_price": 99.9, "entry_reference": 100.0, "invalidation_price": 95.0,
-                  "target_price": 110.0, "tp_mode": "multi_tp",
-                  "tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.25}],
-                  "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.25}],
-                  "entry_context": {"fr_oiw": 0.01, "volume24": 1234.0}},
-    }
-    migrated = tracker.restore_reconciled_trade_identity("RECON_TEST_LONG_HASH", source, 0.65)
-    assert migrated == "EVT_ORIGINAL"
-    active = json.loads(path.read_text(encoding="utf-8"))
-    assert list(active) == ["EVT_ORIGINAL"]
-    trade = active["EVT_ORIGINAL"]
-    assert trade["trade_id"] == "TR_ORIGINAL"
-    assert trade["event_type"] == "CRT_BULLISH"
-    assert trade["score"] == 82.0
-    assert trade["entry_order_id"] == "ENTRY_ORIGINAL"
-    assert trade["effective_weighted_rr"] == 1.36
-    assert trade["current_pnl_pct"] == -0.25
-    assert trade["initial_qty"] == 1.0
-    assert trade["remaining_qty"] == 0.65
-    assert trade["hit_legs"] == ["tp1"]
-    assert trade["tp_filled_qty"] == {"tp1": 0.35}
-    assert trade["realized_pnl_qty"] == 0.35
-    assert {x["order_id"] for x in trade["tp_orders"]} == {"TP2_LIVE", "TP3_LIVE"}
-    assert trade["sl_order"]["order_id"] == "SL_LIVE"
-    assert trade["research"] == {"fr_oiw": 0.01, "volume24": 1234.0}
-
-    # A successful account query may show that the position has already closed
-    # between workflow runs. Identity-only migration must still preserve local
-    # partial-fill accounting so the next tracker pass closes under EVT_ORIGINAL.
-    absent_state = dict(trade)
-    absent_state["event_id"] = "RECON_TEST_ABSENT"
-    absent_state["trade_id"] = "TR_RECON_ABSENT"
-    absent_state["event_type"] = "RECONCILED_POSITION"
-    path.write_text(json.dumps({"RECON_TEST_ABSENT": absent_state}, indent=2), encoding="utf-8")
-    migrated_absent = tracker.restore_reconciled_trade_identity(
-        "RECON_TEST_ABSENT", source, None, allow_absent_position=True
-    )
-    assert migrated_absent == "EVT_ORIGINAL"
-    absent_active = json.loads(path.read_text(encoding="utf-8"))
-    assert list(absent_active) == ["EVT_ORIGINAL"]
-    assert absent_active["EVT_ORIGINAL"]["remaining_qty"] == 0.65
-    assert absent_active["EVT_ORIGINAL"]["tp_filled_qty"] == {"tp1": 0.35}
-    assert absent_active["EVT_ORIGINAL"]["realized_pnl_qty"] == 0.35
-
-
-def test_restore_reconciled_identity_never_overwrites_existing_original_state(tmp_path, monkeypatch):
-    import json
-    import event_engine.tracker as tracker
-
-    path = tmp_path / "active_trades.json"
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
-    existing_original = {
-        "event_id": "EVT_ORIGINAL", "trade_id": "TR_ORIGINAL", "symbol": "TEST",
-        "direction": "LONG", "event_type": "CRT_BULLISH", "closed": True,
-        "remaining_qty": 0.0, "terminal_reason": "already_closed",
-    }
-    reconciled = {
-        "event_id": "RECON_TEST", "trade_id": "TR_RECON", "symbol": "TEST",
-        "direction": "LONG", "event_type": "RECONCILED_POSITION", "closed": False,
-        "actual_entry_price": 100.0, "entry_price": 100.0,
-        "initial_qty": 1.0, "remaining_qty": 1.0,
-    }
-    path.write_text(json.dumps({"EVT_ORIGINAL": existing_original, "RECON_TEST": reconciled}), encoding="utf-8")
-    source = {
-        "record_type": "TRADE_OPEN", "event_id": "EVT_ORIGINAL", "trade_id": "TR_ORIGINAL",
-        "symbol": "TEST", "direction": "LONG",
-        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 80},
-        "execution": {"actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL"},
-        "result": {"position": {"symbol": "TEST-USDT"}},
-    }
-
-    result = tracker.restore_reconciled_trade_identity("RECON_TEST", source, 1.0)
-
-    assert result is None
-    active = json.loads(path.read_text(encoding="utf-8"))
-    assert active["EVT_ORIGINAL"]["closed"] is True
-    assert active["EVT_ORIGINAL"]["terminal_reason"] == "already_closed"
-    assert active["RECON_TEST"]["event_type"] == "RECONCILED_POSITION"
-
-
-@pytest.mark.parametrize("position_present", [True, False])
-def test_pre_tracker_identity_recovery_uses_unique_journal_match(tmp_path, monkeypatch, position_present):
-    import run_once as ro
-    import event_engine.tracker as tracker
-
-    active_path = tmp_path / "active_trades.json"
-    journal_path = tmp_path / "trades.jsonl"
-    source = {
-        "record_type": "TRADE_OPEN", "trade_id": "TR_SOURCE", "event_id": "EVT_SOURCE",
-        "symbol": "TEST", "direction": "LONG", "ts": 1_700_000_000_000,
-        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 81.0},
-        "execution": {"requested_price": 99.9, "actual_entry_price": 100.0, "actual_qty": 1.0,
-                      "order_id": "ENTRY_SOURCE", "status": "opened_protected"},
-        "result": {"position": {"symbol": "TEST-USDT"}},
-        "setup": {"event_timeframe": "1h", "planned_weighted_rr": 1.36,
-                  "effective_weighted_rr": 1.36, "effective_tp_levels": []},
-    }
-    journal_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
-    active_path.write_text(json.dumps({"RECON_TEST_LONG": {
-        "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG", "symbol": "TEST",
-        "direction": "LONG", "event_type": "RECONCILED_POSITION", "entry_price": 100.0,
-        "actual_entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.65,
-        "score": 50.0, "entry_ts": 1_700_000_100_000, "hit_legs": ["tp1"],
-        "tp_filled_qty": {"tp1": 0.35}, "realized_pnl_qty": 0.35,
-        "tp_orders": [{"leg": "tp2", "order_id": "TP2_LIVE", "qty": 0.35}],
-        "sl_order": {"status": "already_exists", "order_id": "SL_LIVE", "qty": 0.65},
-    }}), encoding="utf-8")
-
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
-    monkeypatch.setattr(ro, "TRADES", journal_path)
-    if position_present:
-        positions = [{"symbol": "TEST-USDT", "positionSide": "LONG",
-                      "positionAmt": "0.65", "avgPrice": "100.0"}]
-    else:
-        positions = []
-    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: positions)
-    actions = []
-    monkeypatch.setattr(ro, "record_action", lambda row: actions.append(row))
-
-    ro.restore_reconciled_trade_identities_before_tracker()
-
-    active = json.loads(active_path.read_text(encoding="utf-8"))
-    assert list(active) == ["EVT_SOURCE"]
-    trade = active["EVT_SOURCE"]
-    assert trade["event_type"] == "CRT_BULLISH"
-    assert trade["entry_order_id"] == "ENTRY_SOURCE"
-    assert trade["remaining_qty"] == 0.65
-    assert trade["tp_filled_qty"] == {"tp1": 0.35}
-    assert trade["sl_order"]["order_id"] == "SL_LIVE"
-    assert len(actions) == 1
-    assert actions[0]["record_type"] == "TRADE_IDENTITY_RECOVERED"
-    assert actions[0]["position_present"] is position_present
-
-
-def test_reconciliation_original_journal_match_and_close_guard(tmp_path, monkeypatch):
-    import json
-    import run_once as ro
-
-    journal = tmp_path / "trades.jsonl"
-    source = {
-        "record_type": "TRADE_OPEN", "trade_id": "TR_SOURCE", "event_id": "EVT_SOURCE",
-        "symbol": "MON", "direction": "SHORT", "ts": 1_700_000_000_000,
-        "signal": {"event_type": "MA_COMPRESSION_BREAKOUT", "timeframe": "1h", "score": 75.0},
-        "execution": {"actual_entry_price": 100.0, "actual_qty": 2.0, "status": "opened_protected"},
-        "result": {"position": {"symbol": "MONAD-USDT"}},
-        "setup": {"risk_pct": 7.0},
-    }
-    journal.write_text(json.dumps(source) + "\n", encoding="utf-8")
-    monkeypatch.setattr(ro, "TRADES", journal)
-    match = ro._find_original_open_trade_record_for_position("MONAD-USDT", "SHORT", 100.0, 2.0)
-    assert match and match["event_id"] == "EVT_SOURCE"
-    partial_match = ro._find_original_open_trade_record_for_position(
-        "MONAD-USDT", "SHORT", 100.0, 1.5, tracked_initial_qty=2.0
-    )
-    assert partial_match and partial_match["event_id"] == "EVT_SOURCE"
-
-    with journal.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"record_type": "TRADE_CLOSE", "event_id": "EVT_SOURCE"}) + "\n")
-    assert ro._find_original_open_trade_record_for_position("MONAD-USDT", "SHORT", 100.0, 2.0) is None
-
-
-def test_reconciliation_recovers_existing_trade_without_duplicate_open_record(tmp_path, monkeypatch):
-    import json
-    import run_once as ro
-    import event_engine.tracker as tracker
-
-    active_path = tmp_path / "active_trades.json"
-    journal_path = tmp_path / "trades.jsonl"
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
-    monkeypatch.setattr(ro, "TRADES", journal_path)
-    # Prevent this reconciliation unit test from reaching the real BingX
-    # contract refresh for the synthetic TEST symbol.
-    symbol_normalizer = lambda value: (str(value).upper() if "-USDT" in str(value).upper() else str(value).upper() + "-USDT")
-    monkeypatch.setattr(ro, "to_bx_symbol", symbol_normalizer)
-    monkeypatch.setattr(tracker, "to_bx_symbol", symbol_normalizer)
-
-    source = {
-        "record_type": "TRADE_OPEN", "trade_id": "TR_ORIGINAL", "event_id": "EVT_ORIGINAL",
-        "symbol": "TEST", "direction": "LONG", "ts": 1_700_000_000_000,
-        "signal": {"event_type": "CRT_BULLISH", "timeframe": "1h", "score": 81.0},
-        "execution": {"requested_price": 99.9, "signal_price": 99.9, "pre_order_reference_price": 100.0,
-                      "actual_entry_price": 100.0, "actual_qty": 1.0, "order_id": "ENTRY_ORIGINAL",
-                      "status": "opened_protected", "slippage_pct": 0.1, "adverse_slippage_pct": 0.1},
-        "result": {"fill_ts_ms": 1_700_000_000_123},
-        "setup": {"event_type": "CRT_BULLISH", "event_timeframe": "1h", "risk_pct": 5.0,
-                  "target_rr": 2.0, "planned_weighted_rr": 1.3625, "effective_weighted_rr": 1.3625,
-                  "signal_price": 99.9, "entry_reference": 100.0, "invalidation_price": 95.0,
-                  "target_price": 110.0, "tp_mode": "multi_tp",
-                  "tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.3},
-                                {"leg": "tp2", "pnl_pct": 4.0, "close_fraction": 0.35},
-                                {"leg": "tp3", "pnl_pct": 6.0, "close_fraction": 0.35}],
-                  "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 0.3},
-                                          {"leg": "tp2", "pnl_pct": 4.0, "close_fraction": 0.35},
-                                          {"leg": "tp3", "pnl_pct": 6.0, "close_fraction": 0.35}],
-                  "entry_context": {"fr_oiw": 0.01}},
-    }
-    adopted = {
-        "record_type": "TRADE_OPEN", "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH",
-        "symbol": "TEST", "direction": "LONG", "reconciliation": True, "status": "reconciled_adopted",
-        "signal": {"event_type": "RECONCILED_POSITION"},
-        "execution": {"actual_entry_price": 100.0, "actual_qty": 1.0, "status": "reconciled_adopted"},
-    }
-    journal_path.write_text(json.dumps(source) + "\n" + json.dumps(adopted) + "\n", encoding="utf-8")
-    active_path.write_text(json.dumps({
-        "RECON_TEST_LONG_HASH": {
-            "trade_id": "TR_RECON", "event_id": "RECON_TEST_LONG_HASH", "symbol": "TEST",
-            "direction": "LONG", "event_type": "RECONCILED_POSITION", "entry_price": 100.0,
-            "actual_entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0,
-            "entry_ts": 1_700_000_100_000, "score": 50.0, "timeframe": "1h",
-            "setup": {"event_type": "RECONCILED_POSITION"}, "hit_legs": [], "be_activated": False,
-            "tp_orders": [], "sl_order": {}, "tp_filled_qty": {}, "tp_leg_realized_weighted_sum": {},
-            "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
-            "effective_tp_levels": source["setup"]["effective_tp_levels"],
-            "planned_risk_pct": 5.0, "planned_weighted_rr": 2.0, "effective_weighted_rr": 2.0,
-        }
-    }), encoding="utf-8")
-
-    position = {"symbol": "TEST-USDT", "positionSide": "LONG", "positionAmt": "1.0", "avgPrice": "100.0"}
-    sl = {"orderId": "SL_LIVE", "clientOrderId": "EVTSLTEST", "type": "STOP_MARKET", "stopPrice": "95.0", "origQty": "1.0"}
-    tps = [
-        {"orderId": "TP1_LIVE", "clientOrderId": "EVTTP1TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "102.0", "origQty": "0.3"},
-        {"orderId": "TP2_LIVE", "clientOrderId": "EVTTP2TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "104.0", "origQty": "0.35"},
-        {"orderId": "TP3_LIVE", "clientOrderId": "EVTTP3TEST", "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.35"},
-    ]
-    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [position])
-    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *args, **kwargs: {"status": "ok", "tp_orders": tps, "sl_orders": [sl]})
-    journaled = []
-    registered = []
-    recorded_actions = []
-    monkeypatch.setattr(ro, "record_trade", lambda row: journaled.append(row))
-    monkeypatch.setattr(ro, "record_action", lambda row: recorded_actions.append(row))
-    monkeypatch.setattr(ro, "register_active_trade", lambda **kwargs: registered.append(kwargs))
-
-    ro.reconcile_all_open_positions()
-
-    active = json.loads(active_path.read_text(encoding="utf-8"))
-    assert list(active) == ["EVT_ORIGINAL"]
-    restored = active["EVT_ORIGINAL"]
-    assert restored["event_type"] == "CRT_BULLISH"
-    assert restored["score"] == 81.0
-    assert restored["trade_id"] == "TR_ORIGINAL"
-    assert restored["entry_order_id"] == "ENTRY_ORIGINAL"
-    assert restored["sl_order"]["order_id"] == "SL_LIVE"
-    assert {x["order_id"] for x in restored["tp_orders"]} == {"TP1_LIVE", "TP2_LIVE", "TP3_LIVE"}
-    assert journaled == []
-    assert registered == []
-    assert len(recorded_actions) == 1
-    assert recorded_actions[0]["record_type"] == "TRADE_IDENTITY_RECOVERED"
-    assert recorded_actions[0]["previous_event_id"] == "RECON_TEST_LONG_HASH"

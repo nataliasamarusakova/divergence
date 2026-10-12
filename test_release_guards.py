@@ -11,6 +11,15 @@ def test_clean_release_executes_divergence_events():
     assert 'DIVERGENCE_SHADOW_ONLY: "false"' in _workflow()
 
 
+def test_crt_bearish_is_hard_disabled_without_enforcing_other_shadow_filters():
+    workflow = _workflow()
+    assert 'DISABLED_EVENT_TYPES: "CRT_BEARISH"' in workflow
+    assert 'ENTRY_QUALITY_MODE: "shadow"' in workflow
+    import run_once
+    assert run_once._event_type_is_disabled("CRT_BEARISH")
+    assert not run_once._event_type_is_disabled("CRT_BULLISH")
+
+
 def test_clean_release_has_pre_order_drift_retry_budget():
     assert 'MAX_PRE_ORDER_DRIFT_REJECTIONS: "3"' in _workflow()
     assert 'MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS: "3"' in _workflow()

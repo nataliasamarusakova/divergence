@@ -79,7 +79,7 @@ def test_trend_filter_requires_warm_4h_history():
     df4 = _frame(300, 2.0, H4)
     out = _result(df1, df4, "LONG")
     assert out["trend_reject_reason"] == "TREND_4H_UNKNOWN"
-    assert out["trend_decision"] == "UNKNOWN"
+    assert out["trend_decision"] == "REJECT"
 
 
 def test_trend_filter_requires_warm_1h_history_after_4h_alignment():
@@ -87,7 +87,7 @@ def test_trend_filter_requires_warm_1h_history_after_4h_alignment():
     df4 = _frame(450, 2.0, H4)
     out = _result(df1, df4, "LONG")
     assert out["trend_reject_reason"] == "TREND_1H_UNKNOWN"
-    assert out["trend_decision"] == "UNKNOWN"
+    assert out["trend_decision"] == "REJECT"
 
 
 def test_trend_filter_is_causal_and_ignores_future_bars():
@@ -144,37 +144,13 @@ def test_trend_filter_persistence_can_be_required_without_changing_direction_log
     assert out["trend_reject_reason"] in {"TREND_PERSISTENCE_TRANSITION", "TREND_1H_TRANSITION"}
 
 
-def test_trend_filter_keeps_unknown_separate_from_reject_and_enforce_fails_closed():
+def test_trend_filter_enforce_rejects_unknown_snapshot_but_shadow_does_not():
     import run_once
-    df1 = _frame(300, 1.0, H1)
-    df4 = _frame(300, 2.0, H4)
-    out = _result(df1, df4, "LONG")
-    assert out["trend_decision"] == "UNKNOWN"
-    assert out["trend_reject_reason"] == "TREND_4H_UNKNOWN"
-
-    # Unknown remains observable as UNKNOWN; if the user separately chooses
-    # ENFORCE, any non-ALIGNED candidate is blocked without relabeling it REJECT.
-    assert run_once._trend_filter_enforce_reject(out, "shadow") is False
-    assert run_once._trend_filter_enforce_reject(out, "enforce") is True
-    assert run_once._trend_filter_enforce_reject({"trend_decision": "REJECT"}, "enforce") is True
+    snapshot = {"trend_decision": "REJECT", "trend_reject_reason": "TREND_4H_UNKNOWN"}
+    assert run_once._trend_filter_enforce_reject(snapshot, "shadow") is False
+    assert run_once._trend_filter_enforce_reject(snapshot, "enforce") is True
     assert run_once._trend_filter_enforce_reject({"trend_decision": "ALIGNED"}, "enforce") is False
     assert run_once._trend_filter_enforce_reject(None, "enforce") is True
-
-
-def test_trend_filter_does_not_use_btc_bars_when_decision_timestamp_is_invalid():
-    from event_engine.trend_filter import evaluate_trend_filter
-    df1 = _frame(450, 1.0, H1)
-    df4 = _frame(450, 2.0, H4)
-    btc = _frame(10, -1.0, H1)
-    out = evaluate_trend_filter(
-        symbol="ETHUSDT", direction="LONG", event_type="BREAKOUT",
-        df_1h=df1, df_4h=df4, btc_1h_df=btc, decision_ts_ms=0,
-        min_bars_1h=400, min_bars_4h=400,
-    )
-    assert out["trend_decision"] == "UNKNOWN"
-    assert out["trend_reject_reason"] == "TREND_DECISION_TS_INVALID"
-    assert out["btc_regime"] == "UNKNOWN"
-    assert out["btc_bar_close_ts"] is None
 
 
 

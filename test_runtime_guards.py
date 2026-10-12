@@ -3,12 +3,6 @@ import json
 import pandas as pd
 from pathlib import Path
 
-@pytest.fixture(autouse=True)
-def _disable_account_order_guard_for_unit_tests(monkeypatch):
-    import run_once as ro
-    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", False)
-
-
 
 def test_binance_transport_uses_only_explicit_proxy_when_vpn_enabled(monkeypatch):
     import event_engine.binance as binance
@@ -190,6 +184,33 @@ REAL_JOURNAL_EVENT_ROWS = r'''
 '''
 
 
+
+
+def test_load_cached_events_drops_terminal_ids_from_persisted_cache(tmp_path, monkeypatch):
+    import run_once
+
+    now_ms = 1_800_000_000_000
+    event = lambda event_id: {
+        "event_id": event_id,
+        "symbol": "TEST",
+        "timeframe": "1h",
+        "direction": "SHORT",
+        "event_type": "CRT_BEARISH" if event_id == "EVT_TERMINAL" else "CRT_BULLISH",
+        "timestamps": {"detected_at_ts": now_ms - 60_000},
+    }
+    cache_path = tmp_path / "recent_event_cache.json"
+    events_path = tmp_path / "events.jsonl"
+    actions_path = tmp_path / "actions.jsonl"
+    events_path.write_text("", encoding="utf-8")
+    actions_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(run_once, "EVENT_CACHE", cache_path)
+    monkeypatch.setattr(run_once, "EVENTS", events_path)
+    monkeypatch.setattr(run_once, "ACTIONS", actions_path)
+    run_once._save_json_atomic(cache_path, {"updated_ts": now_ms, "events": [event("EVT_TERMINAL"), event("EVT_KEEP")]})
+
+    loaded = run_once._load_cached_events(now_ms=now_ms, terminal_ids={"EVT_TERMINAL"})
+
+    assert {row["event_id"] for row in loaded} == {"EVT_KEEP"}
 
 def test_breaker_liquidity_sweep_requires_rejection_close():
     import event_engine.signals as sig
@@ -659,7 +680,6 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
 
     monkeypatch.setattr(run_once, "EXECUTION_ENABLED", True)
     monkeypatch.setattr(run_once, "_validate_execution_config", lambda: (True, ""))
-    monkeypatch.setattr(run_once, "restore_reconciled_trade_identities_before_tracker", lambda: trace.append("identity_recovery"))
     monkeypatch.setattr(run_once, "update_active_trades", lambda: trace.append("tracker"))
     monkeypatch.setattr(run_once, "reconcile_all_open_positions", lambda: trace.append("reconcile"))
     monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: [])
@@ -685,7 +705,7 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
 
     run_once.main()
 
-    assert trace == ["identity_recovery", "tracker", "reconcile"]
+    assert trace == ["tracker", "reconcile"]
 
 
 def _set_execution_config(monkeypatch, *, mode, base, allow_live="false"):
@@ -1976,8 +1996,7 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     }
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
-    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 8.75, 14.0])
-    assert [x["leg"] for x in levels] == ["tp1", "tp2", "tp3"]
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 14.0])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -2070,13 +2089,12 @@ def test_execute_new_position_skips_sr_path_when_disabled(monkeypatch):
     })
     monkeypatch.setattr(ro, "install_protection", lambda **kwargs: {
         "status": "PROTECTED",
-        "tp_mode": "three_tp",
+        "tp_mode": "two_tp",
         "effective_tp_levels": [
             {"pnl_pct": 4.55, "qty": 2.5},
-            {"pnl_pct": 8.75, "qty": 4.0},
-            {"pnl_pct": 14.0, "qty": 3.5},
+            {"pnl_pct": 14.0, "qty": 7.5},
         ],
-        "effective_weighted_rr": 1.3625,
+        "effective_weighted_rr": 1.6625,
     })
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
 
@@ -2182,17 +2200,3 @@ def test_execution_skip_log_reports_non_stale_reason(caplog):
     assert "[EXECUTION] LONG ATH skipped: SR_SYMBOL_UNAVAILABLE" in caplog.text
     assert "No active Binance Spot USDT source" in caplog.text
     assert "EVT_TEST_SR" in caplog.text
-
-
-def test_btc_regime_is_diagnostic_only_in_candidate_admission():
-    import inspect
-    import run_once as ro
-
-    source = inspect.getsource(ro.main)
-    start = source.index('if btc_regime_df is not None and not _is_btc_symbol(symbol):')
-    end = source.index('funding_ok, funding_reason = check_funding_filter(', start)
-    btc_branch = source[start:end]
-    assert 'check_btc_regime' in btc_branch
-    assert 'BTC_CONTEXT_FLAGGED' in btc_branch
-    assert 'continue' not in btc_branch
-    assert 'diagnostic only' in btc_branch

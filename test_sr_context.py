@@ -2,12 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-@pytest.fixture(autouse=True)
-def _disable_account_order_guard_for_unit_tests(monkeypatch):
-    import run_once as ro
-    monkeypatch.setattr(ro, "BINGX_ORDER_CAPACITY_GUARD_ENABLED", False)
-
-
 
 
 def _snapshot(*zones):
@@ -234,7 +228,7 @@ def test_long_wide_resistance_zone_uses_pivot_kind_for_overlap():
     assert out["room_status"] == "ENTRY_IN_OPPOSING_ZONE"
 
 
-def test_shadow_sr_does_not_mutate_tp3(monkeypatch):
+def test_shadow_sr_does_not_mutate_two_tp_ladder(monkeypatch):
     import run_once as ro
 
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", True)
@@ -271,7 +265,8 @@ def test_shadow_sr_does_not_mutate_tp3(monkeypatch):
         "EVT_SR_SHADOW",
     )
     assert out["status"] == "opened_protected"
-    assert captured["tp_levels"][2]["pnl_pct"] == pytest.approx(4.0)
+    assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
 
 
 def test_enforced_sr_data_failure_blocks_candidate_without_sending_order(monkeypatch):
@@ -360,10 +355,11 @@ def test_post_fill_sr_recheck_allows_zone_after_tp1(monkeypatch):
         "EVT_SR_POST_FILL_ALLOWED",
     )
     assert out["status"] == "opened_protected"
+    assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
     assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][2]["pnl_pct"] == pytest.approx(4.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
 
-def test_post_fill_sr_does_not_mutate_tp3_when_zone_is_after_tp1(monkeypatch):
+def test_post_fill_sr_does_not_mutate_tp2_when_zone_is_after_tp1(monkeypatch):
     import run_once as ro
 
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", True)
@@ -399,9 +395,9 @@ def test_post_fill_sr_does_not_mutate_tp3_when_zone_is_after_tp1(monkeypatch):
         "EVT_SR_POST_FILL_NO_MUTATION",
     )
     assert out["status"] == "opened_protected"
+    assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
     assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(2.5)
-    assert captured["tp_levels"][2]["pnl_pct"] == pytest.approx(4.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
 
 
 
@@ -624,29 +620,3 @@ def test_quantity_prefixed_spot_price_scale_matches_futures_unit():
     futures_price = 0.00589
     ratio = futures_price / spot_price
     assert ratio == pytest.approx(1000.0, rel=1e-6)
-
-
-def test_sr_room_rejects_non_finite_rr_targets():
-    import event_engine.sr_context as sr
-    with pytest.raises(ValueError, match="finite positive RR targets"):
-        sr.evaluate_sr_room(
-            _snapshot((104.5, "H")),
-            entry_price=100.0,
-            direction="LONG",
-            risk_pct=2.0,
-            target_rrs=(0.65, float("nan"), 2.0),
-        )
-
-
-def test_sr_room_supports_two_target_profile_without_inventing_tp3():
-    import event_engine.sr_context as sr
-    out = sr.evaluate_sr_room(
-        _snapshot((104.5, "H")),
-        entry_price=100.0,
-        direction="LONG",
-        risk_pct=2.0,
-        target_rrs=(0.65, 1.60),
-    )
-    assert out["reject"] is False
-    assert out["effective_tp3_price"] is None
-    assert "room_margin_to_tp3_r" not in out

@@ -1,184 +1,249 @@
+"""Focused regression tests for forensic trade recovery, candidate logging and protection audit."""
 import json
 from pathlib import Path
 
 import pytest
 
 
-def test_bingx_fill_history_normalizes_execution_rows_and_paginates(monkeypatch):
+def test_fill_history_supports_bingx_tradeprice_volume_aliases(monkeypatch):
     import event_engine.bingx as bingx
 
-    seen = {}
+    captured = {}
 
-    def fake_request(method, path, params=None, *, signed=True, timeout_sec=None, retryable=True):
-        seen.update(method=method, path=path, params=dict(params or {}), signed=signed, retryable=retryable)
+    def fake_request(method, path, params=None, **kwargs):
+        captured.update(method=method, path=path, params=dict(params or {}), kwargs=kwargs)
         return {
             "code": 0,
             "data": {
                 "fill_orders": [{
                     "tradeId": "fill-1", "orderId": "order-7", "symbol": "BTC-USDT",
                     "side": "SELL", "positionSide": "LONG", "tradePrice": "105.5",
-                    "volume": "2", "tradeTime": 1700000000123, "realizedPnl": "11", "commission": "-0.04",
+                    "volume": "2", "tradeTime": 1_700_000_000,
+                    "realizedPnl": "11", "fee": "-0.04",
                 }],
                 "total": 1,
             },
         }
 
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
     monkeypatch.setattr(bingx, "_request", fake_request)
-    result = bingx.get_fill_history("BTC", 1699999999000, 1700000001000, order_id="order-7", page_index=2, page_size=25)
+    result = bingx.get_fill_history(
+        "BTC", 1_699_999_999_000, 1_700_000_001_000,
+        order_id="order-7", page_index=2, page_size=25,
+    )
 
     assert result["status"] == "ok"
     assert result["returned"] == 1
-    assert result["fills"][0]["trade_id"] == "fill-1"
-    assert result["fills"][0]["order_id"] == "order-7"
-    assert result["fills"][0]["qty"] == 2.0
-    assert result["fills"][0]["price"] == 105.5
-    assert result["fills"][0]["realized_pnl"] == 11.0
-    assert result["fills"][0]["fee"] == -0.04
-    assert seen["path"] == bingx.FILL_HISTORY_PATH
-    assert seen["params"]["orderId"] == "order-7"
-    assert seen["params"]["pageIndex"] == 2
-    assert seen["retryable"] is False
+    fill = result["fills"][0]
+    assert fill["trade_id"] == "fill-1"
+    assert fill["order_id"] == "order-7"
+    assert fill["price"] == pytest.approx(105.5)
+    assert fill["qty"] == pytest.approx(2.0)
+    assert fill["time"] == 1_700_000_000_000  # seconds normalized to ms
+    assert fill["realized_pnl"] == pytest.approx(11.0)
+    assert fill["fee"] == pytest.approx(-0.04)
+    assert captured["path"] == bingx.FILL_HISTORY_PATH
+    assert captured["params"]["orderId"] == "order-7"
+    assert captured["params"]["pageIndex"] == 2
+    assert captured["kwargs"]["retryable"] is False
 
 
-def test_bingx_fill_history_fails_closed_on_unknown_response_shape(monkeypatch):
+def test_fill_history_fails_closed_for_unknown_api_shape(monkeypatch):
     import event_engine.bingx as bingx
 
-    monkeypatch.setattr(bingx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"mystery": []}})
-    result = bingx.get_fill_history("BTC", 1699999999000, 1700000001000)
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *args, **kwargs: {"code": 0, "data": {"unknownRows": []}})
+    result = bingx.get_fill_history("BTC", 1_699_999_999_000, 1_700_000_001_000)
 
     assert result["status"] == "error"
-    assert "unexpected data shape" in result["error"]
     assert result["fills"] == []
+    assert "unexpected_data_shape" in result["error"]
 
 
-def _trade_journal_fixture(path: Path, *, complete=True, include_malformed=False):
-    event_id = "EVT_FILL_RECOVERY"
-    opened_ts = 1_699_999_900_000
-    closed_ts = 1_700_000_000_000
+def _close_fixture(*, incomplete=False, malformed_row=False):
+    event_id = "EVT_FORENSIC_TEST"
+    open_ts = 1_700_000_000_000
+    close_ts = open_ts + 60_000
     opened = {
-        "record_type": "TRADE_OPEN", "event_id": event_id, "symbol": "BTC",
-        "direction": "LONG", "ts": opened_ts,
-        "execution": {"actual_entry_price": 100.0, "actual_qty": 2.0, "order_id": "ENTRY-1", "fill_ts_ms": opened_ts},
-        "protection": {"tp_orders": [{"order_id": "TP-1"}], "sl_result": {"order_id": "SL-1"}},
+        "record_type": "TRADE_OPEN", "event_id": event_id,
+        "symbol": "BTC", "direction": "LONG", "ts": open_ts,
+        "execution": {
+            "actual_entry_price": 100.0, "actual_qty": 3.0,
+            "order_id": "ENTRY-1", "fill_ts_ms": open_ts,
+        },
+        "result": {
+            "fill_ts_ms": open_ts,
+            "protection": {"tp_orders": [], "sl_result": {}},
+        },
     }
     closed = {
-        "record_type": "TRADE_CLOSE", "event_id": event_id, "symbol": "BTC",
-        "direction": "LONG", "closed_ts": closed_ts, "entry_price": 100.0,
-        "exit_price": None, "exit_reason": "DATA_ERROR", "realized_pnl_pct": None,
-        "total_closed_qty": 2.0, "initial_qty": 2.0, "entry_order_id": "ENTRY-1",
-        "tp_order_ids": ["TP-1"], "sl_order_id": "SL-1", "planned_risk_pct": 0.5,
+        "record_type": "TRADE_CLOSE", "event_id": event_id,
+        "symbol": "BTC", "direction": "LONG", "closed_ts": close_ts,
+        "entry_price": 100.0, "exit_price": None, "exit_reason": "DATA_ERROR",
+        "realized_pnl_pct": None, "total_closed_qty": 3.0, "initial_qty": 3.0,
+        "entry_order_id": "ENTRY-1", "planned_risk_pct": 0.5,
     }
     fills = [
-        {"trade_id": "entry-fill", "order_id": "ENTRY-1", "symbol": "BTC-USDT", "side": "BUY", "position_side": "LONG", "price": 100.0, "qty": 2.0, "time": opened_ts + 1000, "realized_pnl": 0.0, "fee": -0.01},
-        {"trade_id": "tp-fill", "order_id": "TP-1", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 102.0, "qty": 1.0, "time": closed_ts - 30_000, "realized_pnl": 2.0, "fee": -0.01},
+        {"trade_id": "entry-fill", "order_id": "ENTRY-1", "symbol": "BTC-USDT", "side": "BUY", "position_side": "LONG", "price": 100.0, "qty": 3.0, "time": open_ts + 1000, "realized_pnl": 0.0, "fee": -0.03},
+        {"trade_id": "close-fill-1", "order_id": "EARLY-CLOSE", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 102.0, "qty": 1.0, "time": close_ts - 10_000, "realized_pnl": 2.0, "fee": -0.01},
+        {"trade_id": "close-fill-2", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 103.0, "qty": 1.0, "time": close_ts - 2_000, "realized_pnl": 3.0, "fee": -0.01},
     ]
-    if complete:
-        fills.append({"trade_id": "sl-fill", "order_id": "SL-1", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 104.0, "qty": 1.0, "time": closed_ts - 1000, "realized_pnl": 4.0, "fee": -0.01})
-    with path.open("w", encoding="utf-8") as stream:
-        stream.write(json.dumps(opened) + "\n")
-        stream.write(json.dumps(closed) + "\n")
-        if include_malformed:
-            stream.write('{"malformed": not-json}\n')
-    return event_id, fills
+    if not incomplete:
+        # Same final market order, two fills with different timestamps. The final
+        # order average must use both fills, not only the latest timestamp row.
+        fills.append({"trade_id": "close-fill-3", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 104.0, "qty": 1.0, "time": close_ts - 1000, "realized_pnl": 4.0, "fee": -0.01})
+    return opened, closed, fills
 
 
-def test_data_error_trade_recovery_uses_weighted_exchange_fills_and_preserves_bad_rows(tmp_path, monkeypatch):
+def test_data_error_reconstruction_uses_full_final_order_average_and_preserves_cost_uncertainty():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, fills = _close_fixture()
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+
+    assert error is None
+    assert rebuilt is not None
+    assert rebuilt["total_close_fill_qty"] == pytest.approx(3.0)
+    assert rebuilt["blended_exit_price"] == pytest.approx(103.0)
+    assert rebuilt["exit_price"] == pytest.approx(103.5)  # average for both FINAL-MARKET fills
+    assert rebuilt["exit_reason"] == "POSITION_CLOSED_BY_FILL_HISTORY"
+    assert rebuilt["realized_pnl_pct"] == pytest.approx(3.0)
+    assert rebuilt["realized_pnl_usdt"] == pytest.approx(9.0)
+    assert rebuilt["fees_usdt"] == pytest.approx(-0.06)
+
+
+def test_incomplete_data_error_fills_remain_unresolved_with_retry_metadata(tmp_path, monkeypatch):
     import event_engine.tracker as tracker
 
     journal = tmp_path / "trades.jsonl"
-    event_id, fills = _trade_journal_fixture(journal, complete=True, include_malformed=True)
-    original_malformed = '{"malformed": not-json}\n'
+    opened, closed, fills = _close_fixture(incomplete=True)
+    journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
     monkeypatch.setattr(tracker, "TRADES_PATH", journal)
     monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
 
-    recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_010_000)
-
-    assert recovered == 1
-    rows = journal.read_text(encoding="utf-8").splitlines()
-    close = next(json.loads(line) for line in rows if '"record_type": "TRADE_CLOSE"' in line)
-    assert close["event_id"] == event_id
-    assert close["exit_reason"] == "STOP_LOSS"
-    assert close["exit_price_source"] == "BINGX_FILL_HISTORY_WEIGHTED_AVERAGE"
-    assert close["exit_price"] == pytest.approx(103.0)
-    assert close["exit_execution_qty"] == pytest.approx(2.0)
-    assert close["realized_pnl_pct"] == pytest.approx(3.0)
-    assert close["realized_pnl_usdt"] == pytest.approx(6.0)
-    assert close["fees_usdt"] == pytest.approx(-0.03)
-    assert close["net_pnl_usdt"] is None
-    assert close["fill_history_recovery"]["status"] == "RECOVERED"
-    assert rows[-1] == original_malformed.rstrip("\n")
-
-
-def test_data_error_trade_with_incomplete_fills_stays_unresolved_and_uses_backoff(tmp_path, monkeypatch):
-    import event_engine.tracker as tracker
-
-    journal = tmp_path / "trades.jsonl"
-    _event_id, fills = _trade_journal_fixture(journal, complete=False)
-    monkeypatch.setattr(tracker, "TRADES_PATH", journal)
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
-
-    assert tracker._recover_data_error_trade_closes(now_ms=1_700_000_010_000) == 0
-    close = next(json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if '"record_type": "TRADE_CLOSE"' in line)
+    recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
+    assert recovered == 0
+    result = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    close = next(row for row in result if row.get("record_type") == "TRADE_CLOSE")
     assert close["exit_reason"] == "DATA_ERROR"
     assert close["realized_pnl_pct"] is None
     assert close["fill_history_recovery"]["status"] == "PENDING"
     assert close["fill_history_recovery"]["last_error"].startswith("incomplete_close_fills")
-    assert close["fill_history_recovery"]["next_retry_ts"] > 1_700_000_010_000
+    assert close["fill_history_recovery"]["next_retry_ts"] > 1_700_000_200_000
 
 
-def test_exact_stop_loss_audit_rejects_duplicate_or_mismatched_quantity_orders():
-    import event_engine.bingx as bingx
+def test_recovery_preserves_unparseable_forensic_rows(tmp_path, monkeypatch):
+    import event_engine.tracker as tracker
 
-    good = {"orderId": "sl-1", "type": "STOP_MARKET", "stopPrice": 95.0, "origQty": 2.0}
-    verified, audit = bingx._audit_exact_single_sl(
-        {"status": "ok", "sl_orders": [good]}, direction="LONG", avg_price=100,
-        expected_price=95, expected_qty=2,
+    journal = tmp_path / "trades.jsonl"
+    opened, closed, fills = _close_fixture(incomplete=True)
+    damaged = '{"malformed": not-json}\n'
+    journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n" + damaged, encoding="utf-8")
+    monkeypatch.setattr(tracker, "TRADES_PATH", journal)
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+
+    tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
+    assert journal.read_text(encoding="utf-8").splitlines()[-1] == damaged.rstrip("\n")
+
+
+def test_exact_sl_audit_rejects_duplicates_wrong_qty_and_unknown_query():
+    from event_engine.bingx import _audit_exact_single_sl
+
+    good = {"orderId": "SL-1", "type": "STOP_MARKET", "stopPrice": 95.0, "origQty": 2.0}
+    passed, audit = _audit_exact_single_sl(
+        {"status": "ok", "sl_orders": [good]}, direction="LONG", avg_price=100.0,
+        expected_price=95.0, expected_qty=2.0,
     )
-    assert verified is True
+    assert passed is True
     assert audit["audit_reason"] == "OK"
 
-    verified, audit = bingx._audit_exact_single_sl(
-        {"status": "ok", "sl_orders": [good, {**good, "orderId": "sl-duplicate"}]},
-        direction="LONG", avg_price=100, expected_price=95, expected_qty=2,
+    passed, audit = _audit_exact_single_sl(
+        {"status": "ok", "sl_orders": [good, {**good, "orderId": "SL-2"}]},
+        direction="LONG", avg_price=100.0, expected_price=95.0, expected_qty=2.0,
     )
-    assert verified is False
+    assert passed is False
     assert audit["audit_reason"] == "SL_MULTIPLE_ORDERS"
 
-    verified, audit = bingx._audit_exact_single_sl(
-        {"status": "ok", "sl_orders": [{**good, "origQty": 1.5}]}, direction="LONG",
-        avg_price=100, expected_price=95, expected_qty=2,
+    passed, audit = _audit_exact_single_sl(
+        {"status": "ok", "sl_orders": [{**good, "origQty": 1.5}]},
+        direction="LONG", avg_price=100.0, expected_price=95.0, expected_qty=2.0,
     )
-    assert verified is False
-    assert audit["audit_reason"] == "SL_QTY_OR_PRICE_MISMATCH"
+    assert passed is False
+    assert audit["audit_reason"] == "SL_QTY_MISMATCH"
 
-    verified, audit = bingx._audit_exact_single_sl(
-        {"status": "error", "error": "timeout", "sl_orders": []}, direction="LONG",
-        avg_price=100, expected_price=95, expected_qty=2,
+    passed, audit = _audit_exact_single_sl(
+        {"status": "error", "error": "timeout", "sl_orders": []},
+        direction="LONG", avg_price=100.0, expected_price=95.0, expected_qty=2.0,
     )
-    assert verified is False
+    assert passed is False
     assert audit["audit_reason"] == "OPEN_ORDERS_UNVERIFIABLE"
 
 
-def test_candidate_ledger_writes_features_rejection_reasons_and_cycle_ids(tmp_path, monkeypatch):
+def test_candidate_decision_journal_is_json_safe_and_cycle_specific(tmp_path, monkeypatch):
     import run_once as ro
 
-    path = tmp_path / "actions.jsonl"
-    monkeypatch.setattr(ro, "ACTIONS", path)
-    candidate_id = ro._candidate_identifier("EVT-123", "BTC", "REGULAR_BULLISH_RSI", "LONG", 1000, 120_000)
-    assert candidate_id == ro._candidate_identifier("EVT-123", "BTC", "REGULAR_BULLISH_RSI", "LONG", 1000, 120_000)
-    assert candidate_id != ro._candidate_identifier("EVT-123", "BTC", "REGULAR_BULLISH_RSI", "LONG", 1000, 120_001)
-
+    journal = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(ro, "ACTIONS", journal)
+    cid = ro._candidate_identifier("EVT-1", "BTC", "REGULAR_BULLISH_RSI", "LONG", 1234, 5678)
+    assert cid != ro._candidate_identifier("EVT-1", "BTC", "REGULAR_BULLISH_RSI", "LONG", 1234, 5679)
     ro._record_candidate_decision(
-        candidate_id=candidate_id, event_id="EVT-123", symbol="BTC", direction="LONG",
+        candidate_id=cid, event_id="EVT-1", symbol="BTC", direction="LONG",
         event_type="REGULAR_BULLISH_RSI", timeframe="1h", stage="FUNDING_FILTER",
-        decision="REJECTED", reason="FUNDING_ABOVE_LIMIT", evaluation_ts=123456,
-        features={"funding": 0.005, "not_finite": float("nan")}, raw_market_features={"volume24": 123.0},
+        decision="REJECTED", reason="FUNDING_ABOVE_LIMIT", evaluation_ts=5678,
+        features={"funding": 0.005, "non_finite": float("nan")},
+        raw_market_features={"volume24": 123.0},
     )
-    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    row = json.loads(journal.read_text(encoding="utf-8").splitlines()[0])
     assert row["record_type"] == "CANDIDATE_FILTER_DECISION"
-    assert row["candidate_id"] == candidate_id
+    assert row["candidate_id"] == cid
     assert row["stage"] == "FUNDING_FILTER"
     assert row["decision"] == "REJECTED"
     assert row["reason"] == "FUNDING_ABOVE_LIMIT"
-    assert row["features"]["not_finite"] is None
-    assert row["raw_market_features"]["volume24"] == 123.0
+    assert row["features"]["non_finite"] is None
+    assert row["raw_market_features"]["volume24"] == pytest.approx(123.0)
+
+
+def test_reconciliation_logs_unknown_protection_query_and_does_not_guess(tmp_path, monkeypatch):
+    import run_once as ro
+
+    actions = []
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [{
+        "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2", "avgPrice": "100",
+    }])
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
+    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *args, **kwargs: {
+        "status": "error", "error": "simulated timeout", "sl_orders": [], "tp_orders": [],
+    })
+    monkeypatch.setattr(ro, "record_action", lambda row: actions.append(row))
+
+    ro.reconcile_all_open_positions()
+
+    assert len(actions) == 1
+    assert actions[0]["record_type"] == "PROTECTION_STATE_UNKNOWN"
+    assert actions[0]["reason"] == "OPEN_ORDERS_QUERY_FAILED"
+    assert actions[0]["position_qty"] == pytest.approx(2.0)
+    assert actions[0]["repair_attempted"] is False
+
+
+def test_reconciliation_defers_repair_when_second_open_orders_query_is_unknown(monkeypatch):
+    import run_once as ro
+
+    actions = []
+    responses = iter([
+        {"status": "ok", "sl_orders": [], "tp_orders": []},
+        {"status": "error", "error": "simulated recheck timeout", "sl_orders": [], "tp_orders": []},
+    ])
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [{
+        "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2", "avgPrice": "100",
+    }])
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
+    monkeypatch.setattr(ro, "get_open_protection_directional", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(ro, "record_action", lambda row: actions.append(row))
+    monkeypatch.setattr(ro, "ensure_directional_protection", lambda **kwargs: pytest.fail("must not repair on unknown recheck"))
+
+    ro.reconcile_all_open_positions()
+
+    assert any(row.get("record_type") == "PROTECTION_RECONCILIATION_MISMATCH" for row in actions)
+    recheck = next(row for row in actions if row.get("record_type") == "PROTECTION_RECHECK_UNKNOWN")
+    assert recheck["reason"] == "PRE_REPAIR_OPEN_ORDERS_QUERY_FAILED"
+    assert recheck["repair_attempted"] is False
