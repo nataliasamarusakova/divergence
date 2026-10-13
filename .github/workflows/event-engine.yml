@@ -306,6 +306,25 @@ jobs:
             exit 1
           fi
 
+      - name: Rotate oversized action journal without losing history
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from event_engine.journal import DEFAULT_ACTION_JOURNAL_ROTATE_BYTES, rotate_jsonl_gzip
+
+          journal = Path("data/actions.jsonl")
+          archive = rotate_jsonl_gzip(
+              journal,
+              threshold_bytes=DEFAULT_ACTION_JOURNAL_ROTATE_BYTES,
+          )
+          if archive is None:
+              print("[ACTION_JOURNAL] rotation not needed")
+          else:
+              print(f"[ACTION_JOURNAL] verified and rotated to {archive}")
+          PY
+
       - name: Run engine
         env:
           BINANCE_VPN_ENABLED: "true"
@@ -450,6 +469,7 @@ jobs:
 
           git add -f data/timeframe_scan_state.json
           git add data/*.jsonl data/*.json 2>/dev/null || true
+          git add -f data/archive/*.jsonl.gz 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "[COMMIT_STATE] No runtime state changes"
