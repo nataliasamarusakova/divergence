@@ -6,6 +6,7 @@ import math
 import logging
 import os
 import time
+from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -432,7 +433,8 @@ def _save_json_atomic(path: Path, obj: Any) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    payload = json.dumps(obj, ensure_ascii=False, indent=2)
+    safe_obj = _journal_safe(obj)
+    payload = json.dumps(safe_obj, ensure_ascii=False, indent=2, allow_nan=False)
     try:
         with tmp.open("w", encoding="utf-8") as fh:
             fh.write(payload)
@@ -497,9 +499,10 @@ def _load_recent_successful_entries(path: Path, now_ms: int, cooldown_min: float
                 execution = obj.get("execution") if isinstance(obj.get("execution"), dict) else {}
                 status = str(execution.get("status") or result.get("status") or "").lower()
                 position = result.get("position") if isinstance(result.get("position"), dict) else {}
-                qty = _safe_float(position.get("positionAmt"), 0.0)
+                qty = abs(_safe_float(position.get("positionAmt"), 0.0))
                 if status not in {
                     "opened_protected", "opened_protection_check_required", "opened_protection_failed",
+                    "reconciled_adopted",
                 } or qty <= 0:
                     continue
                 symbol = str(obj.get("symbol") or "").strip().upper()
@@ -581,6 +584,17 @@ def _journal_safe(value: Any, *, _depth: int = 0) -> Any:
         return {str(key): _journal_safe(item, _depth=_depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_journal_safe(item, _depth=_depth + 1) for item in value]
+    # CoinalyzeRow and other market telemetry models are dataclasses. Convert
+    # them before the string fallback so every field (including nested `raw`)
+    # remains queryable in JSONL. Do not use str(value)[:500] for structured data.
+    if is_dataclass(value) and not isinstance(value, type):
+        try:
+            return {
+                field.name: _journal_safe(getattr(value, field.name), _depth=_depth + 1)
+                for field in dataclass_fields(value)
+            }
+        except Exception:
+            pass
     if hasattr(value, "_asdict"):
         try:
             return _journal_safe(value._asdict(), _depth=_depth + 1)
@@ -994,9 +1008,11 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
             if not symbol or oi is None:
                 continue
             oi = float(oi)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if oi <= 0:
+        # JSON has no standard NaN/Infinity values. Reject non-finite snapshots
+        # before persistence so readers never ingest implementation-specific JSON.
+        if not math.isfinite(oi) or oi <= 0:
             continue
         rec = history.setdefault(symbol, {})
         if not isinstance(rec, dict):
@@ -2088,7 +2104,7 @@ def load_successful_trade_ids(path: Path) -> set[str]:
         if not isinstance(result, dict):
             continue
         status = str(result.get("status", "")).lower()
-        if status in {"opened_protected", "opened_protection_check_required", "opened", "opened_protection_failed", "already_executed"}:
+        if status in {"opened_protected", "opened_protection_check_required", "opened", "opened_protection_failed", "already_executed", "reconciled_adopted"}:
             event_id = obj.get("event_id")
             if event_id:
                 ids.add(str(event_id))
@@ -2096,9 +2112,17 @@ def load_successful_trade_ids(path: Path) -> set[str]:
 
 
 def append_jsonl(path: Path, obj: dict, *, durable: bool = False) -> None:
+    """Append one standards-compliant JSON row to a JSONL journal.
+
+    Actions, events and trades share this writer. Sanitize at this common
+    persistence boundary so NaN/Infinity and dataclasses cannot leak into a
+    journal just because a caller bypassed ``record_action``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    safe_obj = _journal_safe(obj)
+    serialized = json.dumps(safe_obj, ensure_ascii=False, allow_nan=False) + "\n"
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(serialized)
         f.flush()
         if durable:
             os.fsync(f.fileno())
@@ -2121,34 +2145,170 @@ def record_trade(obj: dict) -> None:
     append_jsonl(TRADES, obj)
 
 
-def _record_reconciled_trade_open(symbol: str, direction: str, avg_price: float, qty: float,
-                                  *, event_id: str, tp_orders: list[dict], sl_result: dict,
-                                  setup: dict | None = None) -> None:
-    """Journal an exchange position adopted by reconciliation."""
+def _build_reconciled_setup(
+    *,
+    avg_price: float,
+    direction: str,
+    risk_pct: float,
+    tp_levels: list[dict],
+    risk_pct_source: str,
+    invalidation_price: float | None = None,
+) -> dict[str, Any]:
+    """Create explicit, internally consistent setup metrics from live protection.
+
+    For recovered positions these are inferred from the currently observed
+    stop/TP orders, not the missing original signal. The source fields keep that
+    distinction visible in later analytics.
+    """
+    entry = _safe_float(avg_price, 0.0)
+    risk = _safe_float(risk_pct, 0.0)
+    side = str(direction or "").upper()
+    if entry <= 0 or risk <= 0 or side not in {"LONG", "SHORT"}:
+        raise ValueError("cannot infer reconciled setup without valid entry, direction and risk")
+
+    inferred: list[dict[str, Any]] = []
+    for level in tp_levels if isinstance(tp_levels, list) else []:
+        if not isinstance(level, dict):
+            continue
+        pnl_pct = _safe_float(level.get("pnl_pct"), float("nan"))
+        if not math.isfinite(pnl_pct):
+            tp_price = _safe_float(level.get("price"), 0.0)
+            if tp_price <= 0:
+                continue
+            pnl_pct = ((tp_price - entry) / entry * 100.0) if side == "LONG" else ((entry - tp_price) / entry * 100.0)
+        if pnl_pct <= 0:
+            continue
+        fraction = _safe_float(level.get("close_fraction"), 0.0)
+        if fraction <= 0:
+            level_qty = _safe_float(level.get("qty"), 0.0)
+            fraction = level_qty if level_qty > 0 else 0.0
+        if fraction <= 0:
+            continue
+        inferred.append({
+            "leg": str(level.get("leg") or f"tp{len(inferred) + 1}"),
+            "pnl_pct": pnl_pct,
+            "close_fraction": fraction,
+        })
+
+    if not inferred:
+        raise ValueError("cannot infer reconciled setup without a valid live take-profit order")
+
+    total_fraction = sum(item["close_fraction"] for item in inferred)
+    if not math.isfinite(total_fraction) or total_fraction <= 0:
+        raise ValueError("cannot infer reconciled TP weights")
+    for item in inferred:
+        item["close_fraction"] /= total_fraction
+
+    per_level_rr = [item["pnl_pct"] / risk for item in inferred]
+    target_rr = max(per_level_rr)
+    weighted_rr = sum(rr * item["close_fraction"] for rr, item in zip(per_level_rr, inferred))
+    farthest = max(inferred, key=lambda item: item["pnl_pct"])
+    target_price = entry * (1.0 + farthest["pnl_pct"] / 100.0) if side == "LONG" else entry * (1.0 - farthest["pnl_pct"] / 100.0)
+
+    return {
+        "event_type": "RECONCILED_POSITION",
+        "risk_pct": risk,
+        "risk_pct_source": str(risk_pct_source),
+        "target_rr": target_rr,
+        "planned_weighted_rr": weighted_rr,
+        "effective_weighted_rr": weighted_rr,
+        "tp_mode": "single_tp" if len(inferred) == 1 else ("two_tp" if len(inferred) == 2 else "multi_tp"),
+        "effective_tp_levels": inferred,
+        "tp_levels": inferred,
+        "entry_reference": entry,
+        "invalidation_price": invalidation_price if invalidation_price and invalidation_price > 0 else None,
+        "target_price": target_price,
+        "reconciliation_metrics_source": "LIVE_EXCHANGE_PROTECTION",
+    }
+
+
+def _record_reconciled_trade_open(
+    symbol: str,
+    direction: str,
+    avg_price: float,
+    qty: float,
+    *,
+    event_id: str,
+    tp_orders: list[dict],
+    sl_result: dict,
+    setup: dict | None = None,
+) -> None:
+    """Journal an exchange position adopted by reconciliation in the TRADE_OPEN schema."""
     trade_id = "TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper()
+    observed_ts = int(time.time() * 1000)
+    setup_payload = setup if isinstance(setup, dict) else {
+        "event_type": "RECONCILED_POSITION",
+        "risk_pct": None,
+        "risk_pct_source": "UNKNOWN",
+        "target_rr": None,
+        "planned_weighted_rr": None,
+        "effective_weighted_rr": None,
+        "tp_levels": [],
+        "effective_tp_levels": [],
+        "reconciliation_metrics_source": "UNKNOWN",
+    }
     record_trade({
         "record_type": "TRADE_OPEN",
         "trade_id": trade_id,
         "event_id": event_id,
         "symbol": symbol,
         "direction": direction,
-        "signal": {"event_type": "RECONCILED_POSITION", "timeframe": "1h", "signal_price": avg_price,
-                   "score": None, "detected_at_ts": None, "event_fact": {"reconciliation": True}},
-        "execution": {"requested_price": avg_price, "signal_price": avg_price,
-                       "actual_entry_price": avg_price, "actual_qty": qty, "order_id": None,
-                       "status": "reconciled_adopted", "slippage_pct": None, "adverse_slippage_pct": None},
+        "signal": {
+            "event_type": "RECONCILED_POSITION",
+            "timeframe": "1h",
+            "signal_price": avg_price,
+            "score": None,
+            "detected_at_ts": None,
+            "event_fact": {"reconciliation": True},
+        },
+        "execution": {
+            "requested_price": avg_price,
+            "signal_price": avg_price,
+            "actual_entry_price": avg_price,
+            "actual_qty": abs(qty),
+            "order_id": None,
+            "status": "reconciled_adopted",
+            "slippage_pct": None,
+            "adverse_slippage_pct": None,
+            "fill_ts_ms": None,
+        },
+        "result": {
+            "status": "reconciled_adopted",
+            "position": {
+                "symbol": symbol,
+                "positionSide": direction,
+                "positionAmt": abs(qty),
+                "avgPrice": avg_price,
+            },
+            "protection": {"tp_orders": tp_orders, "sl_result": sl_result},
+            "reconciliation": True,
+        },
         "protection": {"tp_orders": tp_orders, "sl_result": sl_result},
-        "setup": setup or {"event_type": "RECONCILED_POSITION", "risk_pct": None},
-        "reconciliation": True, "status": "reconciled_adopted",
-        "ts": int(pd.Timestamp.utcnow().timestamp() * 1000),
+        "setup": setup_payload,
+        "planned_metrics": {
+            "target_rr": setup_payload.get("target_rr"),
+            "planned_weighted_rr": setup_payload.get("planned_weighted_rr"),
+            "effective_weighted_rr": setup_payload.get("effective_weighted_rr"),
+            "tp_mode": setup_payload.get("tp_mode"),
+            "effective_tp_levels": setup_payload.get("effective_tp_levels", []),
+            "realized_rr": None,
+        },
+        "reconciliation": True,
+        "entry_time_source": "RECONCILIATION_OBSERVED",
+        "status": "reconciled_adopted",
+        "ts": observed_ts,
     })
 
 
 def record_action(obj: dict) -> None:
+    # Sanitize every action at the persistence boundary (not only candidate
+    # decisions) so dataclasses and non-finite floats cannot create truncated or
+    # non-standard JSON rows. The sanitized object is also what reaches disk.
+    obj = _journal_safe(obj)
     # Rotate before writing, not only at workflow startup. This protects manual
     # runs and a single unusually verbose workflow cycle from exceeding GitHub's
     # per-file size limit. Existing records are retained in verified gzip history.
-    serialized = json.dumps(obj, ensure_ascii=False) + "\n"
+    serialized = json.dumps(obj, ensure_ascii=False, allow_nan=False) + "\n"
     incoming_bytes = len(serialized.encode("utf-8"))
     if incoming_bytes > ACTION_JOURNAL_ROTATE_BYTES:
         raise ValueError("single action record exceeds the configured journal rotation limit")
@@ -2603,7 +2763,7 @@ def _tp_orders_to_tracker(
             qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
         except (TypeError, ValueError):
             continue
-        if price <= 0 or qty <= 0:
+        if not math.isfinite(price) or not math.isfinite(qty) or price <= 0 or qty <= 0:
             continue
 
         if not leg and avg_price and avg_price > 0 and direction in {"LONG", "SHORT"} and expected:
@@ -2656,11 +2816,15 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
     if not sl_orders:
         return {}
     sl = sl_orders[0]
+    stop_price = _safe_float(sl.get("stopPrice", 0) or sl.get("price", 0), 0.0)
+    qty = _safe_float(sl.get("origQty", 0) or sl.get("quantity", 0), 0.0)
+    if stop_price <= 0 or qty <= 0:
+        return {}
     return {
         "status": "already_exists",
         "order_id": str(sl.get("orderId", "")),
-        "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
-        "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or 0),
+        "stop_price": stop_price,
+        "qty": qty,
     }
 
 
@@ -2792,7 +2956,17 @@ def reconcile_all_open_positions() -> None:
         except (ValueError, TypeError):
             continue
 
-        if amt == 0 or avg_price <= 0:
+        if not math.isfinite(amt) or not math.isfinite(avg_price) or amt == 0 or avg_price <= 0:
+            # Invalid exchange payloads must not flow into protection repair,
+            # active-trade state, or journals as NaN/Infinity quantities/prices.
+            record_action({
+                "record_type": "RECONCILIATION_POSITION_INVALID",
+                "symbol": bx_symbol,
+                "position_qty_raw": p.get("positionAmt"),
+                "entry_price_raw": p.get("avgPrice") or p.get("entryPrice"),
+                "reason": "NON_FINITE_OR_NON_POSITIVE_POSITION_FIELDS",
+                "ts": int(time.time() * 1000),
+            })
             continue
 
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
@@ -2843,7 +3017,7 @@ def reconcile_all_open_positions() -> None:
                 sl_price = float(sl_orders[0].get("stopPrice", 0) or sl_orders[0].get("price", 0) or 0)
                 sl_amt = float(sl_orders[0].get("origQty", 0) or sl_orders[0].get("quantity", 0) or 0)
 
-                if sl_price > 0 and sl_amt > 0:
+                if math.isfinite(sl_price) and math.isfinite(sl_amt) and sl_price > 0 and sl_amt > 0:
                     qty_matches = abs(sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
                         price_matches = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
@@ -2932,43 +3106,18 @@ def reconcile_all_open_positions() -> None:
                 if not tracked and not matched_trade:
                     try:
                         sl_price = _safe_float(sl_orders[0].get("stopPrice") or sl_orders[0].get("price"), 0.0)
-                        inferred_risk = abs(avg_price - sl_price) / avg_price * 100.0 if sl_price > 0 else 2.0
-                        inferred_risk = max(0.05, min(inferred_risk, 25.0))
-                        inferred_levels = []
-                        for tp in tracker_tp:
-                            tp_price = _safe_float(tp.get("price"), 0.0)
-                            if tp_price <= 0:
-                                continue
-                            pnl_pct = ((tp_price - avg_price) / avg_price * 100.0) if direction == "LONG" else ((avg_price - tp_price) / avg_price * 100.0)
-                            if pnl_pct <= 0:
-                                continue
-                            inferred_levels.append({
-                                "leg": str(tp.get("leg", "tp1")),
-                                "pnl_pct": pnl_pct,
-                                "close_fraction": _safe_float(tp.get("qty"), 0.0) / max(qty, 1e-12),
-                            })
-                        if not inferred_levels:
-                            inferred_levels = [{"leg": "tp2", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
-                        total_fraction = sum(max(_safe_float(x.get("close_fraction"), 0.0), 0.0) for x in inferred_levels)
-                        if total_fraction <= 0:
-                            inferred_levels = [{"leg": "tp2", "pnl_pct": inferred_risk * NORMAL_TP_RR[-1], "close_fraction": 1.0}]
-                        else:
-                            for level in inferred_levels:
-                                level["close_fraction"] = max(_safe_float(level.get("close_fraction"), 0.0), 0.0) / total_fraction
-                        max_rr = max(abs(_safe_float(tp.get("pnl_pct"), 0.0)) / inferred_risk for tp in inferred_levels)
-                        inferred_setup = {
-                            "risk_pct": inferred_risk,
-                            "target_rr": max_rr,
-                            "planned_weighted_rr": max_rr,
-                            "effective_weighted_rr": max_rr,
-                            "tp_mode": "single_tp" if len(inferred_levels) == 1 else ("two_tp" if len(inferred_levels) == 2 else "multi_tp"),
-                            "effective_tp_levels": inferred_levels,
-                            "tp_levels": inferred_levels,
-                            "entry_reference": avg_price,
-                            "invalidation_price": sl_price,
-                            "target_price": avg_price,
-                            "event_type": "RECONCILED_POSITION",
-                        }
+                        # At this point the current SL has already passed the
+                        # loss-side protection validation, so its distance is a
+                        # valid risk basis for this inferred profile.
+                        inferred_risk = abs(avg_price - sl_price) / avg_price * 100.0
+                        inferred_setup = _build_reconciled_setup(
+                            avg_price=avg_price,
+                            direction=direction,
+                            risk_pct=inferred_risk,
+                            tp_levels=tracker_tp,
+                            risk_pct_source="LIVE_STOP_DISTANCE",
+                            invalidation_price=sl_price,
+                        )
                         reconciliation_event_id = _reconciliation_event_id(
                             bx_symbol, direction, avg_price, qty, p, active_trades
                         )
@@ -3252,6 +3401,19 @@ def reconcile_all_open_positions() -> None:
                 reconciliation_event_id = _reconciliation_event_id(
                     bx_symbol, direction, avg_price, qty, p, active_trades
                 )
+                live_levels = res.get("effective_tp_levels") if isinstance(res.get("effective_tp_levels"), list) else []
+                if not live_levels:
+                    live_levels = _tp_orders_to_tracker(
+                        repaired_tp, direction=direction, avg_price=avg_price,
+                    )
+                reconciled_setup = _build_reconciled_setup(
+                    avg_price=avg_price,
+                    direction=direction,
+                    risk_pct=sl_pct,
+                    tp_levels=live_levels,
+                    risk_pct_source="FIXED_STOP_POLICY_FALLBACK",
+                    invalidation_price=expected_sl_price,
+                )
                 register_active_trade(
                     event_id=reconciliation_event_id,
                     symbol=bx_symbol.replace("-USDT", ""),
@@ -3262,11 +3424,16 @@ def reconcile_all_open_positions() -> None:
                     tp_orders=repaired_tp,
                     sl_result=repaired_sl,
                     event_type="RECONCILED_POSITION",
+                    timeframe="1h",
+                    score=50.0,
+                    setup=reconciled_setup,
+                    requested_entry_price=avg_price,
                 )
                 _record_reconciled_trade_open(
                     bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
                     event_id=reconciliation_event_id,
                     tp_orders=repaired_tp, sl_result=repaired_sl,
+                    setup=reconciled_setup,
                 )
 
             first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)

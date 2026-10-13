@@ -66,7 +66,7 @@ def _load_successful_trade_ids(path: Path) -> set[str]:
         try:
             obj = json.loads(line)
             status = str(obj.get("result", {}).get("status", "")).lower()
-            if status in {"opened_protected", "opened_protection_check_required", "opened", "already_executed"}:
+            if status in {"opened_protected", "opened_protection_check_required", "opened", "already_executed", "reconciled_adopted"}:
                 value = obj.get("event_id")
                 if value:
                     ids.add(str(value))
