@@ -30,6 +30,7 @@ from event_engine.bingx import (
 )
 from event_engine.telegram import send_detailed
 from event_engine.formatting import format_price, format_rr
+from event_engine.json_safe import json_safe
 
 log = logging.getLogger("event_engine.tracker")
 
@@ -74,7 +75,7 @@ def _load_notifications() -> dict[str, dict]:
 def _save_notifications(data: dict[str, dict]) -> None:
     NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = NOTIFICATIONS_PATH.with_name(NOTIFICATIONS_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(json_safe(data), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     os.replace(tmp, NOTIFICATIONS_PATH)
 
 
@@ -231,7 +232,7 @@ def _load_active_trades() -> dict[str, dict]:
 def _save_active_trades(trades: dict[str, dict]) -> None:
     ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
-    payload = json.dumps(trades, ensure_ascii=False, indent=2)
+    payload = json.dumps(json_safe(trades), ensure_ascii=False, indent=2, allow_nan=False)
     tmp_path.write_text(payload, encoding="utf-8")
     os.replace(tmp_path, ACTIVE_TRADES_PATH)
 
@@ -258,7 +259,7 @@ def _close_record_exists(event_id: str) -> bool:
 def _append_trade_record(record: dict) -> None:
     TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
     with TRADES_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(json.dumps(json_safe(record), ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def _fill_id(value: Any) -> str:
@@ -564,7 +565,7 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
             })
             risk_pct = _safe_float(updated.get("planned_risk_pct"), 0.0)
             updated["realized_rr"] = result["realized_pnl_pct"] / risk_pct if risk_pct > 0 else None
-            replacements[index] = json.dumps(updated, ensure_ascii=False) + "\n"
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
             recovered += 1
             log.warning("[TRACKER_RECOVERY] Recovered DATA_ERROR close %s from %d BingX fill rows (qty=%.12g, final_exit=%.12g).", event_id, result["fill_count"], result["total_close_fill_qty"], result["exit_price"])
         else:
@@ -574,7 +575,7 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
                 "last_attempt_ts": now_ms, "next_retry_ts": now_ms + delay_ms,
                 "last_error": str(reconstruct_error or "insufficient_or_ambiguous_fills"),
             }
-            replacements[index] = json.dumps(updated, ensure_ascii=False) + "\n"
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
             log.info("[TRACKER_RECOVERY] DATA_ERROR close %s remains unresolved: %s", event_id, reconstruct_error)
 
     if replacements:

@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from event_engine.json_safe import json_safe
+
 
 def _load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
@@ -36,7 +38,7 @@ def _load_state(path: Path) -> dict[str, dict]:
 def _save_state(path: Path, state: dict[str, dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(json_safe(state), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -217,7 +219,7 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
             qty = abs(float(position.get("positionAmt", 0) or 0))
         except (TypeError, ValueError):
             qty = 0.0
-        if status in {"opened", "opened_protected", "opened_protection_check_required", "opened_protection_failed"} and qty > 0:
+        if status in {"opened", "opened_protected", "opened_protection_check_required", "opened_protection_failed", "reconciled_adopted"} and qty > 0:
             confirmed_open.append(t)
     unique_confirmed_ids = {str(t.get("trade_id") or t.get("event_id")) for t in confirmed_open if t.get("trade_id") or t.get("event_id")}
     return {
@@ -265,7 +267,7 @@ def append_shadow_health(events_path: Path, health_path: Path, trades_path: Path
     snapshot = generate_shadow_health_snapshot(events_path, trades_path, divergence_shadow_path, cycle_stats)
     health_path.parent.mkdir(parents=True, exist_ok=True)
     with health_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+        f.write(json.dumps(json_safe(snapshot), ensure_ascii=False, allow_nan=False) + "\n")
     ev = snapshot["events"]
     tr = snapshot["trades"]
     ds = snapshot["divergence_shadow"]
