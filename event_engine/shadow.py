@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -243,8 +244,9 @@ def generate_shadow_health_snapshot(events_path: Path, trades_path: Path | None 
             "total": len(shadow),
             "active": sum(1 for t in shadow.values() if t.get("status") == "ACTIVE"),
             "closed": sum(1 for t in shadow.values() if t.get("status") == "CLOSED"),
-            "wins": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and float(t.get("realized_pnl_pct", 0.0) or 0.0) > 0),
-            "losses": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and float(t.get("realized_pnl_pct", 0.0) or 0.0) <= 0),
+            "wins": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and isinstance(t.get("realized_pnl_pct"), (int, float)) and float(t["realized_pnl_pct"]) > 0),
+            "losses": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and isinstance(t.get("realized_pnl_pct"), (int, float)) and float(t["realized_pnl_pct"]) <= 0),
+            "unknown_outcomes": sum(1 for t in shadow.values() if t.get("status") == "CLOSED" and (not isinstance(t.get("realized_pnl_pct"), (int, float)) or not math.isfinite(float(t["realized_pnl_pct"])) )),
         },
         # CVD needs taker-flow fields that BingX v3 klines do not return, so
         # cvd_only is structurally 0 and must not hold all_criteria_met hostage.

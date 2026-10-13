@@ -543,10 +543,12 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
                 "exit_order_ids_recovered": result["exit_order_ids"],
                 "exit_trade_ids_recovered": result["exit_trade_ids"],
                 "realized_pnl_pct": result["realized_pnl_pct"],
+                "realized_pnl_pct_source": "BINGX_FILL_HISTORY_PRICE_WEIGHTED",
                 "realized_pnl_usdt": result["realized_pnl_usdt"],
                 "realized_pnl_usdt_source": result["realized_pnl_usdt_source"],
                 "fees_usdt": result["fees_usdt"],
-                "net_pnl_usdt": None,  # funding is unknown; never assume it is zero.
+                "funding_usdt": None,  # Unknown funding must remain null, not an assumed zero.
+                "net_pnl_usdt": None,
                 "pnl_costs_status": "FEES_RECONCILED_FUNDING_UNKNOWN" if result["fees_usdt"] is not None else "FEES_OR_ENTRY_FILLS_UNKNOWN_FUNDING_UNKNOWN",
                 "exit_reason": result["exit_reason"],
                 "exit_reason_confidence": "confirmed",
@@ -1265,6 +1267,39 @@ def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, s
     return None, None
 
 
+def _stop_price_for_order(trade: dict, order_id: str | None) -> float | None:
+    """Return the trigger price belonging to the SL order that actually filled."""
+    if not order_id:
+        return None
+    target_id = str(order_id)
+    current = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+    if str(current.get("order_id") or "") == target_id:
+        price = _safe_float(current.get("stop_price"), 0.0)
+        if price > 0 and math.isfinite(price):
+            return price
+    history = trade.get("sl_order_history", [])
+    if isinstance(history, list):
+        for item in reversed(history):
+            if not isinstance(item, dict) or str(item.get("order_id") or "") != target_id:
+                continue
+            price = _safe_float(item.get("stop_price"), 0.0)
+            if price > 0 and math.isfinite(price):
+                return price
+    return None
+
+
+def _calc_stop_slippage_pct(direction: str, fill_price: float | None, stop_price: float | None) -> float | None:
+    """Measure only adverse execution slippage versus the trigger of the filled stop order."""
+    side = str(direction or "").strip().upper()
+    fill = _safe_float(fill_price, 0.0)
+    stop = _safe_float(stop_price, 0.0)
+    if side not in {"LONG", "SHORT"} or not math.isfinite(fill) or not math.isfinite(stop) or fill <= 0 or stop <= 0:
+        return None
+    if side == "LONG":
+        return max(0.0, (stop - fill) / stop * 100.0)
+    return max(0.0, (fill - stop) / stop * 100.0)
+
+
 def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     """Cancel and verify all remaining protection for a position that has closed.
 
@@ -1677,12 +1712,25 @@ def update_active_trades() -> None:
             planned_risk_usdt = (initial_notional_usdt * planned_risk_pct / 100.0) if planned_risk_pct else None
             stored_sl_price = _safe_float((trade.get("sl_order") or {}).get("stop_price"), 0.0) if isinstance(trade.get("sl_order"), dict) else 0.0
             actual_initial_sl_price = _safe_float(trade.get("planned_invalidation_price"), 0.0)
-            stop_slippage_pct = None
-            if sl_exit_price is not None and actual_initial_sl_price > 0:
-                if direction == "LONG":
-                    stop_slippage_pct = max(0.0, (actual_initial_sl_price - sl_exit_price) / actual_initial_sl_price * 100.0)
-                else:
-                    stop_slippage_pct = max(0.0, (sl_exit_price - actual_initial_sl_price) / actual_initial_sl_price * 100.0)
+            # Compare execution with the trigger price of the order that actually
+            # filled. The original invalidation is wrong after BE moves the stop.
+            filled_sl_stop_price = _stop_price_for_order(trade, filled_sl_id)
+            if sl_exit_price is None:
+                slippage_reference_price = None
+                slippage_reference_source = "NOT_APPLICABLE_NO_SL_FILL"
+            elif filled_sl_stop_price is not None:
+                slippage_reference_price = filled_sl_stop_price
+                slippage_reference_source = "FILLED_SL_ORDER_TRIGGER"
+            elif stored_sl_price > 0:
+                slippage_reference_price = stored_sl_price
+                slippage_reference_source = "CURRENT_SL_ORDER_TRIGGER_FALLBACK"
+            elif actual_initial_sl_price > 0:
+                slippage_reference_price = actual_initial_sl_price
+                slippage_reference_source = "PLANNED_INVALIDATION_FALLBACK"
+            else:
+                slippage_reference_price = None
+                slippage_reference_source = "UNKNOWN"
+            stop_slippage_pct = _calc_stop_slippage_pct(direction, sl_exit_price, slippage_reference_price)
             loss_pct = max(0.0, -final_pnl) if final_pnl is not None else None
             tail_loss_multiple = (loss_pct / planned_risk_pct) if loss_pct is not None and planned_risk_pct and planned_risk_pct > 0 else None
             execution_anomaly = bool(
@@ -1729,16 +1777,33 @@ def update_active_trades() -> None:
                         "exit_price": exit_price,
                         "exit_price_source": exit_price_source,
                         "estimated_exit_price": estimated_exit_price,
+                        # This is algebraically implied by the tracker PnL, not an
+                        # independently verified exchange-fill VWAP. Keep the
+                        # provenance explicit so auditors do not mistake it for a fill price.
+                        "pnl_implied_blended_exit_price": (
+                            entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else
+                            entry_price * (1.0 - final_pnl / 100.0)
+                        ) if final_pnl is not None and entry_price > 0 else None,
+                        "blended_exit_price_source": "DERIVED_FROM_TRACKER_PNL_NOT_FILL_VWAP" if final_pnl is not None else "UNKNOWN",
                         "realized_pnl_pct": final_pnl,
+                        "realized_pnl_pct_source": "TRACKER_WEIGHTED_LEG_PNL_GROSS_OF_COSTS" if final_pnl is not None else "UNKNOWN",
                         "realized_rr": realized_rr,
                         "effective_weighted_rr": planned_rr,
                         "planned_risk_pct": planned_risk_pct,
                         "planned_risk_usdt": planned_risk_usdt,
                         "initial_notional_usdt": initial_notional_usdt,
                         "realized_pnl_usdt": realized_pnl_usdt,
+                        "realized_pnl_usdt_source": "TRACKER_DERIVED_FROM_WEIGHTED_PNL_EXCLUDING_COSTS" if realized_pnl_usdt is not None else "UNKNOWN",
+                        "fees_usdt": None,
+                        "funding_usdt": None,
+                        "net_pnl_usdt": None,
+                        "pnl_costs_status": "FEES_AND_FUNDING_NOT_ATTRIBUTED",
                         "actual_loss_pct": loss_pct,
                         "tail_loss_multiple": tail_loss_multiple,
                         "stop_slippage_pct": stop_slippage_pct,
+                        "filled_sl_order_id": filled_sl_id,
+                        "stop_slippage_reference_price": slippage_reference_price,
+                        "stop_slippage_reference_source": slippage_reference_source,
                         "execution_anomaly": execution_anomaly,
                         "tp_mode": trade.get("tp_mode", "two_tp"),
                         "effective_tp_levels": trade.get("effective_tp_levels", []),
