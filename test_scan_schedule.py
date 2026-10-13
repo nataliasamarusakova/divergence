@@ -114,8 +114,10 @@ def test_cached_events_are_recovered_from_durable_event_journal(tmp_path, monkey
     }
     events_path.write_text(__import__("json").dumps(event) + "\n", encoding="utf-8")
     cache_path.write_text('{"updated_ts": 0, "events": []}', encoding="utf-8")
+    actions_path = tmp_path / "actions.jsonl"
     monkeypatch.setattr(run_once, "EVENTS", events_path)
     monkeypatch.setattr(run_once, "EVENT_CACHE", cache_path)
+    monkeypatch.setattr(run_once, "ACTIONS", actions_path)
 
     recovered = run_once._load_cached_events(now_ms, set())
 
@@ -137,10 +139,35 @@ def test_cached_event_recovery_excludes_terminal_events(tmp_path, monkeypatch):
     }
     events_path.write_text(__import__("json").dumps(event) + "\n", encoding="utf-8")
     cache_path.write_text('{"updated_ts": 0, "events": []}', encoding="utf-8")
+    actions_path = tmp_path / "actions.jsonl"
     monkeypatch.setattr(run_once, "EVENTS", events_path)
     monkeypatch.setattr(run_once, "EVENT_CACHE", cache_path)
+    monkeypatch.setattr(run_once, "ACTIONS", actions_path)
 
     assert run_once._load_cached_events(now_ms, {"EVT_TERMINAL"}) == []
+    # Recovery diagnostics may be journaled, but only to the isolated temp path.
+    assert actions_path.exists()
+    assert '"stage": "EVENT_CACHE_RECONCILIATION"' in actions_path.read_text(encoding="utf-8")
+
+
+def test_action_archive_is_read_for_telegram_dedup_and_cache_reconciliation(tmp_path, monkeypatch):
+    import gzip
+    import json
+    import run_once
+
+    data_dir = tmp_path / "data"
+    archive_dir = data_dir / "archive"
+    archive_dir.mkdir(parents=True)
+    archived = archive_dir / "actions-20261013T000000Z.jsonl.gz"
+    with gzip.open(archived, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps({"telegram_sent": True, "event_id": "OLD_EVENT"}) + "\n")
+        fh.write(json.dumps({"record_type": "CANDIDATE_FILTER_DECISION", "stage": "EVENT_CACHE_RECONCILIATION", "candidate_id": "OLD_CAND"}) + "\n")
+    active = data_dir / "actions.jsonl"
+    active.write_text(json.dumps({"telegram_sent": True, "event_id": "NEW_EVENT"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(run_once, "ACTIONS", active)
+
+    assert run_once.load_successful_telegram_ids(active) == {"OLD_EVENT", "NEW_EVENT"}
+    assert {r.get("candidate_id") for r in run_once._iter_action_records() if r.get("stage") == "EVENT_CACHE_RECONCILIATION"} == {"OLD_CAND"}
 
 
 def test_emit_event_returns_false_when_durable_journal_write_fails(monkeypatch):
@@ -328,6 +355,18 @@ def test_trigger_freshness_can_be_disabled_only_when_trigger_is_not_required():
     )
     assert status is None
     assert age is None
+
+
+def test_trigger_freshness_rejects_timestamp_materially_in_the_future():
+    import run_once
+    status, age = run_once._trigger_freshness_status(
+        {"trigger_bar_close_ts": 2_000_000},
+        now_ms=1_000_000,
+        max_delay_min=8.0,
+        required=True,
+    )
+    assert status == "TRIGGER_TIMESTAMP_IN_FUTURE"
+    assert abs(age - (-1_000_000.0 / 60_000.0)) < 1e-9
 
 
 def test_same_direction_candidate_prefers_newer_event_even_with_lower_score():

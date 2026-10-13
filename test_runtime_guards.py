@@ -1918,6 +1918,28 @@ def test_query_order_uses_trigger_execution_quantity_fallback(monkeypatch):
 
 
 
+def test_entry_quality_gate_keeps_missing_oi_unknown_not_zero(monkeypatch):
+    import run_once as ro
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ro, "ENTRY_QUALITY_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "ENTRY_WEAK_ENGINE_BLOCK_ENABLED", False)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_ENABLED", True)
+    monkeypatch.setattr(ro, "SHORT_OI_VETO_PCT", -5.0)
+    monkeypatch.setattr(ro, "COMPOUND_CVD_LIQ_VETO_ENABLED", False)
+    monkeypatch.setattr(ro, "SYMBOL_LOSS_COOLDOWN_MIN", 0.0)
+
+    for unknown in (None, "", "not-a-number", float("nan")):
+        row = SimpleNamespace(oi_chg24_pct=unknown, cvd24=60.0, liq_long24=0.0)
+        allowed, reasons, terminal = ro._entry_quality_gate(
+            ev={"symbol": "TEST", "event_type": "DONCHIAN_RETEST_BREAKOUT"},
+            row=row, direction="SHORT", now_ms=1_000_000, recent_loss_ts={},
+        )
+        assert allowed is True
+        assert reasons == []
+        assert terminal is False
+
+
 def test_entry_quality_gate_does_not_veto_missing_optional_market_fields(monkeypatch):
     import run_once as ro
     from types import SimpleNamespace
@@ -1991,12 +2013,12 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     setup = {
         "entry_reference": 100.0,
         "invalidation_price": 93.0,
-        "target_price": 117.5,
+        "target_price": 110.5,
         "risk_pct": 7.0,
     }
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
-    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 14.0])
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 10.5])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -2200,3 +2222,23 @@ def test_execution_skip_log_reports_non_stale_reason(caplog):
     assert "[EXECUTION] LONG ATH skipped: SR_SYMBOL_UNAVAILABLE" in caplog.text
     assert "No active Binance Spot USDT source" in caplog.text
     assert "EVT_TEST_SR" in caplog.text
+
+
+def test_shadow_health_counts_unknown_outcomes_separately(tmp_path):
+    from event_engine.shadow import generate_shadow_health_snapshot
+    import json
+    events = tmp_path / "events.jsonl"
+    trades = tmp_path / "trades.jsonl"
+    shadow = tmp_path / "shadow.json"
+    events.write_text("", encoding="utf-8")
+    trades.write_text("", encoding="utf-8")
+    shadow.write_text(json.dumps({
+        "w": {"status": "CLOSED", "realized_pnl_pct": 1.0},
+        "l": {"status": "CLOSED", "realized_pnl_pct": -1.0},
+        "u": {"status": "CLOSED", "realized_pnl_pct": None},
+        "a": {"status": "ACTIVE"},
+    }), encoding="utf-8")
+    result = generate_shadow_health_snapshot(events, trades, shadow)
+    assert result["divergence_shadow"]["wins"] == 1
+    assert result["divergence_shadow"]["losses"] == 1
+    assert result["divergence_shadow"]["unknown_outcomes"] == 1

@@ -326,7 +326,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.2875)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 2
@@ -336,7 +336,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.2875)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 2
@@ -581,7 +581,7 @@ def test_tp_order_identity_requires_expected_price():
     assert _tp_leg_from_order(order, "tp3", 106.0, 2, "abc") is False
 
 
-def test_timeframe_bucket_boundaries_and_cache_helpers(tmp_path):
+def test_timeframe_bucket_boundaries_and_cache_helpers(tmp_path, monkeypatch):
     import run_once as ro
     # 11:02 UTC-ish for hourly buckets: 10:00-11:00 is complete with 2m grace.
     now_ms = 11 * 3_600_000 + 2 * 60_000
@@ -593,11 +593,10 @@ def test_timeframe_bucket_boundaries_and_cache_helpers(tmp_path):
         "event_id": "EVT_CACHE",
         "timestamps": {"detected_at_ts": now_ms - 60 * 60_000},
     }
-    original_cache = ro.EVENT_CACHE
-    ro.EVENT_CACHE = tmp_path / "events.json"
+    monkeypatch.setattr(ro, "EVENT_CACHE", tmp_path / "events.json")
+    monkeypatch.setattr(ro, "ACTIONS", tmp_path / "actions.jsonl")
     ro._save_json_atomic(ro.EVENT_CACHE, {"events": [event]})
     assert ro._load_cached_events()[0]["event_id"] == "EVT_CACHE"
-    ro.EVENT_CACHE = original_cache
 
 
 def test_per_symbol_timeframe_scheduler_does_not_skip_new_candidate(tmp_path):
@@ -1840,22 +1839,22 @@ def test_tighter_tp_levels_are_consistent_for_normal_and_squeeze():
 
     # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
-    assert div_setup["target_rr"] == 2.00
-    assert div_setup["planned_weighted_rr"] == pytest.approx(1.6625)
+    assert div_setup["target_rr"] == 1.50
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.2875)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
     assert [x["leg"] for x in tp_div] == ["tp1", "tp2"]
     assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.65)
-    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 2.00)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.50)
     assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.75])
 
     # Squeeze setup
     sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
-    assert sq_setup["target_rr"] == 2.0
-    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.70)
+    assert sq_setup["target_rr"] == 1.5
+    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.35)
     sl_pct_sq, tp_sq = build_tp_levels(sq_setup, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
     assert [x["leg"] for x in tp_sq] == ["tp1", "tp2"]
     assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.00)
-    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 2.00)
+    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.50)
     assert tp_sq[0]["close_fraction"] == 0.30
     assert tp_sq[1]["close_fraction"] == 0.70
 

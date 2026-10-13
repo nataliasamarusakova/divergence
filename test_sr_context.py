@@ -266,7 +266,7 @@ def test_shadow_sr_does_not_mutate_two_tp_ladder(monkeypatch):
     )
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
 
 
 def test_enforced_sr_data_failure_blocks_candidate_without_sending_order(monkeypatch):
@@ -357,7 +357,7 @@ def test_post_fill_sr_recheck_allows_zone_after_tp1(monkeypatch):
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
     assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
 
 def test_post_fill_sr_does_not_mutate_tp2_when_zone_is_after_tp1(monkeypatch):
     import run_once as ro
@@ -397,7 +397,7 @@ def test_post_fill_sr_does_not_mutate_tp2_when_zone_is_after_tp1(monkeypatch):
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
     assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(4.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
 
 
 

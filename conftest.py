@@ -10,7 +10,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolate_production_entry_gates(monkeypatch):
+def isolate_production_entry_gates(monkeypatch, tmp_path):
     import run_once as ro
 
     # Keep ordinary unit/integration tests deterministic even when CI exports
@@ -18,4 +18,8 @@ def isolate_production_entry_gates(monkeypatch):
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
     monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", False)
+    # Tests that exercise candidate rejection/execution helpers must never append
+    # to the checked-in runtime journal. Individual tests may override this path
+    # with their own fixture when asserting journal contents.
+    monkeypatch.setattr(ro, "ACTIONS", tmp_path / "actions.jsonl")
     yield

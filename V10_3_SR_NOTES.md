@@ -93,9 +93,10 @@ entry reference. ATR remains available only as diagnostic telemetry; it no longe
 determines the new-entry stop and does not clip/reject the 7% policy. Orphan-position
 reconciliation also falls back to the same 7% stop when no historical trade profile exists.
 
-The 7% stop means the current normal target ladder is 5.25% / 8.75% / 14.00%
-(0.75R / 1.25R / 2.00R) and squeeze targets are 7% / 10.50% / 14.00%
-(1R / 1.5R / 2R). The partial-exit fractions are unchanged.
+With the current two-target policy and a 7% stop, normal TP1/TP2 are +4.55% / +10.50%
+(0.65R / 1.50R), while squeeze TP1/TP2 are +7.00% / +10.50%
+(1.00R / 1.50R). Partial-exit fractions remain 25%/75% for normal entries and
+30%/70% for squeeze entries. Historical trades keep their persisted target profile.
 
 ## Cross-exchange drift retry guard
 
@@ -119,12 +120,11 @@ A BingX contract that disappears or becomes unavailable after the candidate pref
 
 ## v10.3.8 TP and Telegram policy
 
-New entries use the TP ladder defined centrally in `run_once.py`: normal 0.65R/1.25R/2.00R
-and squeeze 1.00R/1.50R/2.00R, with the configured partial-exit fractions preserved. Protection
-adapts after the confirmed fill: use 3 TP legs when the actual quantity is executable, otherwise
-fall back to TP1/TP2, and finally to a single terminal TP3 when only one leg is supported.
-Restart/reconciliation fallback uses the same current ladder only when no persisted TP profile exists;
-persisted historical TP profiles are preserved.
+New entries use the two-target ladder defined centrally in `run_once.py`: normal 0.65R/1.50R
+and squeeze 1.00R/1.50R, with the configured partial-exit fractions preserved. Protection
+adapts after the confirmed fill: use TP1+TP2 when both sizes are executable, and fall back to a
+single terminal TP2 when only one leg is supported. Restart/reconciliation fallback uses the same
+current ladder only when no persisted TP profile exists; persisted historical TP profiles are preserved.
 BE remains an execution/risk-management mechanism, but the successful `BE_ACTIVATED` transition is no longer
 queued for Telegram. Local `[TRACKER_BE_ACTIVATED]` logging and `BE_FAILED` Telegram alerts remain intact.
 
@@ -158,3 +158,18 @@ The runtime-state commit step now validates the scheduler state schema before st
 force-stages the state file, pushes with retry/rebase handling, then fetches `origin/main`
 and verifies that the pushed scheduler-state hash and symbol count match the local state.
 This keeps per-symbol 1H/4H watermarks persistent without changing detector or S/R logic.
+
+## v10.3.3 TP2 distance and action-journal rotation
+
+The TP2 target for new positions is now 1.50R in both normal and squeeze modes. TP1 stays at
+0.65R for normal entries and 1.00R for squeeze entries. Close fractions are unchanged. Existing
+positions keep their persisted exchange-protection profile; this change does not automatically
+cancel or recreate orders for already-open positions.
+
+`data/actions.jsonl` is the active journal. At 80 MiB, or before a pending append would cross that
+threshold, the complete journal is compressed to `data/archive/actions-<UTC>.jsonl.gz`. The source
+and archive are compared by SHA-256 before the active file is atomically reset. The workflow uses
+the same rotation implementation before the scan, and `record_action` uses it during any run.
+The action reader traverses all verified archives plus the active journal so Telegram deduplication
+and event-cache recovery keep their history. A crash between archive installation and active-file
+reset is detected as an exact duplicate, not double-counted.

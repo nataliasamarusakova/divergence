@@ -13,6 +13,13 @@ import pandas as pd
 import requests
 
 from event_engine.coinalyze import CoinalyzeIncompleteDataError, fetch_data
+from event_engine.journal import (
+    DEFAULT_ACTION_JOURNAL_ROTATE_BYTES,
+    _active_is_latest_archive,
+    iter_gzip_jsonl_dicts,
+    iter_jsonl_dicts,
+    rotate_jsonl_gzip,
+)
 from event_engine.binance import (
     BinanceRateLimitError,
     BinanceSymbolUnavailableError,
@@ -169,6 +176,7 @@ DATA.mkdir(exist_ok=True)
 EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
+ACTION_JOURNAL_ROTATE_BYTES = DEFAULT_ACTION_JOURNAL_ROTATE_BYTES
 HEALTH = DATA / "health.jsonl"
 TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
 EVENT_CACHE = DATA / "recent_event_cache.json"
@@ -271,13 +279,13 @@ SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSE
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
 # New positions use exactly two TP targets: an early partial and the final target.
-# Keep the final target at 2R; the former middle milestone is removed.
-NORMAL_TP_RR = (0.65, 2.00)
+# New entries use a 1.50R final target; historical persisted TP profiles are preserved.
+NORMAL_TP_RR = (0.65, 1.50)
 NORMAL_TP_FRACTIONS = (0.25, 0.75)
-NORMAL_PLANNED_WEIGHTED_RR = 1.6625
-SQUEEZE_TP_RR = (1.00, 2.00)
+NORMAL_PLANNED_WEIGHTED_RR = 1.2875
+SQUEEZE_TP_RR = (1.00, 1.50)
 SQUEEZE_TP_FRACTIONS = (0.30, 0.70)
-SQUEEZE_PLANNED_WEIGHTED_RR = 1.7000
+SQUEEZE_PLANNED_WEIGHTED_RR = 1.3500
 
 # Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
 # Current source is Binance SPOT 1H. Futures can be added later without changing
@@ -647,6 +655,7 @@ def _entry_context(row: Any, ev: dict, btc_regime: dict[str, Any]) -> dict[str, 
         "pfr_oiw": _num("pfr_oiw"),
         "oi": _num("oi"),
         "oi_chg24_pct": _num("oi_chg24_pct"),
+        "oi_chg24_status": "KNOWN" if _num("oi_chg24_pct") is not None else "UNKNOWN",
         "oi_chg4h_pct": _num("oi_chg4h_pct"),
         "volume24": _num("volume24"),
         "cvd24": _num("cvd24"),
@@ -752,6 +761,36 @@ def _divergence_post_confirmation_age(ev: dict, now_ms: int) -> tuple[bool, floa
     return valid, formation_age, post_confirmation_age, confirmation_lag
 
 
+def _ensure_action_journal_safe() -> Path | None:
+    """Rotate an oversized action journal before any exchange-side work."""
+    return rotate_jsonl_gzip(
+        ACTIONS,
+        threshold_bytes=ACTION_JOURNAL_ROTATE_BYTES,
+    )
+
+
+def _iter_action_records() -> Any:
+    """Yield valid action rows from compressed history and the active JSONL.
+
+    Archive history plus the active journal is the logical actions stream. The
+    only suppressed overlap is an exact archive/active duplicate caused by a
+    process stopping after installing a verified archive but before clearing the
+    active file.
+    """
+    archive_dir = ACTIONS.parent / "archive"
+    archive_paths = sorted(archive_dir.glob("actions-*.jsonl.gz")) if archive_dir.exists() else []
+    for archive_path in archive_paths:
+        for obj in iter_gzip_jsonl_dicts(archive_path):
+            yield obj
+
+    if ACTIONS.exists():
+        if archive_paths and _active_is_latest_archive(ACTIONS, archive_dir):
+            log.warning("[ACTION_JOURNAL] Active journal exactly matches latest archive; skipping duplicate copy")
+            return
+        for obj in iter_jsonl_dicts(ACTIONS):
+            yield obj
+
+
 def _load_cached_events(now_ms: int | None = None, terminal_ids: set[str] | None = None) -> list[dict]:
     """Load live event cache and reconcile it from the durable event journal.
 
@@ -774,20 +813,9 @@ def _load_cached_events(now_ms: int | None = None, terminal_ids: set[str] | None
 
     recovered: list[dict] = []
     already_journaled: set[str] = set()
-    if ACTIONS.exists():
-        try:
-            with ACTIONS.open("r", encoding="utf-8") as action_file:
-                for action_line in action_file:
-                    try:
-                        action = json.loads(action_line)
-                    except Exception:
-                        continue
-                    if not isinstance(action, dict):
-                        continue
-                    if action.get("record_type") == "CANDIDATE_FILTER_DECISION" and action.get("stage") == "EVENT_CACHE_RECONCILIATION":
-                        already_journaled.add(str(action.get("candidate_id") or ""))
-        except OSError as exc:
-            log.warning("[CANDIDATE_JOURNAL] Could not inspect prior cache-reconciliation decisions: %s", exc)
+    for action in _iter_action_records():
+        if action.get("record_type") == "CANDIDATE_FILTER_DECISION" and action.get("stage") == "EVENT_CACHE_RECONCILIATION":
+            already_journaled.add(str(action.get("candidate_id") or ""))
     if EVENTS.exists():
         try:
             with EVENTS.open("r", encoding="utf-8") as fh:
@@ -1771,9 +1799,15 @@ def load_successful_telegram_ids(path: Path) -> set[str]:
     used load_ids(ACTIONS), which incorrectly treated telegram_sent=false rows
     as already delivered forever.
     """
+    ids: set[str] = set()
+    if path == ACTIONS:
+        rows = _iter_action_records()
+        for obj in rows:
+            if bool(obj.get("telegram_sent")) and obj.get("event_id"):
+                ids.add(str(obj["event_id"]))
+        return ids
     if not path.exists():
         return set()
-    ids: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -1781,12 +1815,8 @@ def load_successful_telegram_ids(path: Path) -> set[str]:
             obj = json.loads(line)
         except Exception:
             continue
-        if not isinstance(obj, dict):
-            continue
-        if bool(obj.get("telegram_sent")):
-            event_id = obj.get("event_id")
-            if event_id:
-                ids.add(str(event_id))
+        if isinstance(obj, dict) and bool(obj.get("telegram_sent")) and obj.get("event_id"):
+            ids.add(str(obj["event_id"]))
     return ids
 
 
@@ -1964,10 +1994,17 @@ def _entry_quality_gate(
     event_type = str(ev.get("event_type", "")).upper()
     symbol = str(ev.get("symbol", "")).strip().upper()
     d = str(direction).upper()
+    # Missing/invalid OI is unknown, not a measured 0% change. Do not let an
+    # absent value accidentally trigger or bypass a numerical OI threshold.
+    oi24: float | None = None
     try:
-        oi24 = float(getattr(row, "oi_chg24_pct", 0.0) or 0.0)
+        raw_oi24 = getattr(row, "oi_chg24_pct", None)
+        if raw_oi24 not in (None, ""):
+            parsed_oi24 = float(raw_oi24)
+            if math.isfinite(parsed_oi24):
+                oi24 = parsed_oi24
     except (TypeError, ValueError):
-        oi24 = 0.0
+        pass
     cvd24 = None
     try:
         raw_cvd24 = getattr(row, "cvd24", None)
@@ -1989,7 +2026,7 @@ def _entry_quality_gate(
     temporary_reasons: list[str] = []
     if ENTRY_WEAK_ENGINE_BLOCK_ENABLED and event_type in ENTRY_BLOCKED_EVENT_TYPES:
         reasons.append(f"WEAK_EVENT_TYPE:{event_type}")
-    if SHORT_OI_VETO_ENABLED and d == "SHORT" and oi24 < SHORT_OI_VETO_PCT:
+    if SHORT_OI_VETO_ENABLED and d == "SHORT" and oi24 is not None and oi24 < SHORT_OI_VETO_PCT:
         reasons.append(f"SHORT_OI:{oi24:.2f}%<{SHORT_OI_VETO_PCT:.2f}%")
     if (
         COMPOUND_CVD_LIQ_VETO_ENABLED
@@ -2108,6 +2145,28 @@ def _record_reconciled_trade_open(symbol: str, direction: str, avg_price: float,
 
 
 def record_action(obj: dict) -> None:
+    # Rotate before writing, not only at workflow startup. This protects manual
+    # runs and a single unusually verbose workflow cycle from exceeding GitHub's
+    # per-file size limit. Existing records are retained in verified gzip history.
+    serialized = json.dumps(obj, ensure_ascii=False) + "\n"
+    incoming_bytes = len(serialized.encode("utf-8"))
+    if incoming_bytes > ACTION_JOURNAL_ROTATE_BYTES:
+        raise ValueError("single action record exceeds the configured journal rotation limit")
+    rotate_jsonl_gzip(
+        ACTIONS,
+        threshold_bytes=ACTION_JOURNAL_ROTATE_BYTES,
+        incoming_bytes=incoming_bytes,
+    )
+    # If a process was killed mid-write, isolate the truncated last record from
+    # the next JSONL row so later records remain independently readable.
+    if ACTIONS.exists() and ACTIONS.stat().st_size:
+        with ACTIONS.open("rb") as current:
+            current.seek(-1, os.SEEK_END)
+            has_newline = current.read(1) == b"\n"
+        if not has_newline:
+            with ACTIONS.open("ab") as current:
+                current.write(b"\n")
+                current.flush()
     append_jsonl(ACTIONS, obj)
 
 
@@ -2460,7 +2519,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
     is_squeeze = _is_squeeze_event(ev_type)
 
     if is_squeeze:
-        # Squeeze: TP1 at 1.00R, final TP2 at 2.00R.
+        # Squeeze: TP1 at 1.00R, final TP2 at 1.50R.
         tp_levels = [
             {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
             for i, (rr, fraction) in enumerate(zip(SQUEEZE_TP_RR, SQUEEZE_TP_FRACTIONS), start=1)
@@ -2468,7 +2527,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR
         target_rr = SQUEEZE_TP_RR[-1]
     else:
-        # Normal: TP1 at 0.65R, final TP2 at 2.00R.
+        # Normal: TP1 at 0.65R, final TP2 at 1.50R.
         tp_levels = [
             {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
             for i, (rr, fraction) in enumerate(zip(NORMAL_TP_RR, NORMAL_TP_FRACTIONS), start=1)
@@ -3794,7 +3853,9 @@ def _trigger_age_min(trigger_meta: dict[str, Any] | None, now_ms: int | None = N
     if trigger_bar_ts <= 0:
         return None
     current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-    return max(0.0, (current_ms - trigger_bar_ts) / 60_000.0)
+    # Preserve negative ages: a future close timestamp is invalid data, not a
+    # fresh trigger. The status helper rejects it explicitly below.
+    return (current_ms - trigger_bar_ts) / 60_000.0
 
 
 def _trigger_freshness_status(
@@ -3809,6 +3870,11 @@ def _trigger_freshness_status(
     age = _trigger_age_min(trigger_meta, now_ms)
     if age is None:
         return "TRIGGER_TIMESTAMP_UNKNOWN", None
+    if age < -1.0:
+        return "TRIGGER_TIMESTAMP_IN_FUTURE", age
+    # Small negative values (<= 1 minute) can result from exchange/runner clock
+    # skew. Clamp only after explicitly rejecting implausible future timestamps.
+    age = max(0.0, age)
     limit = MAX_TRIGGER_TO_ORDER_DELAY_MIN if max_delay_min is None else float(max_delay_min)
     if age > max(0.0, limit):
         return "TRIGGER_STALE", age
@@ -3821,6 +3887,16 @@ def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> 
 
 
 def main() -> None:
+    try:
+        journal_archive = _ensure_action_journal_safe()
+        if journal_archive is not None:
+            log.info("[ACTION_JOURNAL] Startup rotation completed: %s", journal_archive)
+    except Exception as exc:
+        # Refuse to touch exchange state if journal rotation failed; otherwise
+        # a large log could become unpushable and the diagnostic history unsafe.
+        log.critical("[ACTION_JOURNAL] Startup rotation failed; aborting cycle before exchange work: %s", exc, exc_info=True)
+        return
+
     log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
 
     config_ok, config_reason = _validate_execution_config()
@@ -4718,7 +4794,9 @@ def main() -> None:
                 reject_candidate("SYMBOL_QUARANTINE", "SYMBOL_QUARANTINE_ACTIVE", quarantine_until_ts=symbol_quarantines.get(symbol.upper()))
                 continue
 
-            oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", 0.0), 0.0)
+            oi_chg24 = _safe_float(getattr(r, "oi_chg24_pct", None), None)
+            if oi_chg24 is not None and not math.isfinite(oi_chg24):
+                oi_chg24 = None
 
             entry_allowed, entry_quality_reasons, entry_quality_terminal = _entry_quality_gate(
                 ev=ev, row=r, direction=direction, now_ms=now_ms, recent_loss_ts=recent_symbol_losses
@@ -4875,7 +4953,8 @@ def main() -> None:
             setup["entry_risk"] = {
                 "signal_to_trigger_drift_pct": trigger_diag.get("signal_to_trigger_drift_pct"),
                 "oi_chg24_pct": oi_chg24,
-                "hot_oi_warning": oi_chg24 >= MAX_HOT_OI_CHG24_PCT,
+                "hot_oi_warning": oi_chg24 is not None and oi_chg24 >= MAX_HOT_OI_CHG24_PCT,
+                "oi_chg24_status": "KNOWN" if oi_chg24 is not None else "UNKNOWN",
                 "short_defensive_mode": direction == "SHORT",
                 "symbol_quarantine_until_ts": symbol_quarantines.get(symbol.upper()),
             }
@@ -5095,14 +5174,30 @@ def main() -> None:
                                 "error": freshness_error}
             # A stale/unverifiable trigger is a cycle-local skip, not a terminal event.
             # The parent setup may be retried only with a freshly validated trigger.
-            record_action({"event_id": event_id, "symbol": symbol, "direction": direction,
-                           "score": score, "event_type": ev.get("event_type"),
-                           "execution_status": trigger_freshness_status,
-                           "trigger_age_min": trigger_age_min,
-                           "trigger_bar_close_ts": trigger_bar_ts,
-                           "trigger_bar_close_utc": _format_execution_ts(trigger_bar_ts),
-                           "trigger_freshness_limit_min": MAX_TRIGGER_TO_ORDER_DELAY_MIN,
-                           "ts": int(pd.Timestamp.utcnow().timestamp() * 1000)})
+            freshness_candidate_id = str(
+                opp.get("candidate_id") or setup.get("candidate_id")
+                or _candidate_identifier(
+                    event_id, symbol, event_type_name, direction,
+                    (ev.get("timestamps") or {}).get("detected_at_ts"), execution_now_ms,
+                )
+            )
+            _record_candidate_decision(
+                candidate_id=freshness_candidate_id,
+                event_id=event_id,
+                symbol=symbol,
+                direction=direction,
+                event_type=event_type_name,
+                timeframe=str(ev.get("timeframe", "1h")),
+                stage="PRE_ORDER_TRIGGER_FRESHNESS",
+                decision="REJECTED",
+                reason=trigger_freshness_status,
+                evaluation_ts=execution_now_ms,
+                trigger_age_min=trigger_age_min,
+                trigger_bar_close_ts=trigger_bar_ts,
+                trigger_bar_close_utc=_format_execution_ts(trigger_bar_ts),
+                trigger_freshness_limit_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+                trigger_observed_at_ts=trigger_observed_ts or None,
+            )
         elif EXECUTION_ENABLED:
             active_total = sum(1 for p in current_open_positions.values() if p)
             active_longs = sum(1 for (sym, d), p in current_open_positions.items() if p and d == "LONG")

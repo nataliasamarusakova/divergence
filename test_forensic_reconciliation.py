@@ -112,6 +112,27 @@ def test_data_error_reconstruction_uses_full_final_order_average_and_preserves_c
     assert rebuilt["fees_usdt"] == pytest.approx(-0.06)
 
 
+def test_successful_recovery_persists_pnl_provenance_and_cost_uncertainty(tmp_path, monkeypatch):
+    import event_engine.tracker as tracker
+
+    journal = tmp_path / "trades.jsonl"
+    opened, closed, fills = _close_fixture(incomplete=False)
+    journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tracker, "TRADES_PATH", journal)
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+
+    recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
+    assert recovered == 1
+    rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    close = next(row for row in rows if row.get("record_type") == "TRADE_CLOSE")
+    assert close["realized_pnl_pct_source"] == "BINGX_FILL_HISTORY_PRICE_WEIGHTED"
+    assert close["realized_pnl_usdt_source"] == "BINGX_FILL_REALIZED_PNL"
+    assert close["fees_usdt"] == pytest.approx(-0.06)
+    assert close["funding_usdt"] is None
+    assert close["net_pnl_usdt"] is None
+    assert close["pnl_costs_status"] == "FEES_RECONCILED_FUNDING_UNKNOWN"
+
+
 def test_incomplete_data_error_fills_remain_unresolved_with_retry_metadata(tmp_path, monkeypatch):
     import event_engine.tracker as tracker
 
@@ -247,3 +268,35 @@ def test_reconciliation_defers_repair_when_second_open_orders_query_is_unknown(m
     recheck = next(row for row in actions if row.get("record_type") == "PROTECTION_RECHECK_UNKNOWN")
     assert recheck["reason"] == "PRE_REPAIR_OPEN_ORDERS_QUERY_FAILED"
     assert recheck["repair_attempted"] is False
+
+
+def test_stop_slippage_uses_filled_order_trigger_after_break_even_move():
+    from event_engine.tracker import _calc_stop_slippage_pct, _stop_price_for_order
+
+    trade = {
+        "planned_invalidation_price": 107.0,
+        "sl_order": {"order_id": "BE-STOP", "stop_price": 100.2},
+        "sl_order_history": [{"order_id": "INITIAL-STOP", "stop_price": 107.0}],
+    }
+
+    # The final BE order, not the original 7%-away stop, is the right reference.
+    stop_price = _stop_price_for_order(trade, "BE-STOP")
+    assert stop_price == pytest.approx(100.2)
+    assert _calc_stop_slippage_pct("SHORT", 100.5, stop_price) == pytest.approx((100.5 - 100.2) / 100.2 * 100.0)
+
+    # When an older stop is the order actually found filled, use its historical price.
+    old_stop_price = _stop_price_for_order(trade, "INITIAL-STOP")
+    assert old_stop_price == pytest.approx(107.0)
+    assert _calc_stop_slippage_pct("SHORT", 107.5, old_stop_price) == pytest.approx((107.5 - 107.0) / 107.0 * 100.0)
+
+
+def test_stop_slippage_handles_direction_and_invalid_prices():
+    from event_engine.tracker import _calc_stop_slippage_pct
+
+    assert _calc_stop_slippage_pct("LONG", 94.0, 95.0) == pytest.approx((95.0 - 94.0) / 95.0 * 100.0)
+    assert _calc_stop_slippage_pct("SHORT", 106.0, 105.0) == pytest.approx((106.0 - 105.0) / 105.0 * 100.0)
+    # Better-than-trigger fills are not adverse slippage.
+    assert _calc_stop_slippage_pct("LONG", 96.0, 95.0) == 0.0
+    assert _calc_stop_slippage_pct("SHORT", 104.0, 105.0) == 0.0
+    assert _calc_stop_slippage_pct("LONG", None, 95.0) is None
+    assert _calc_stop_slippage_pct("SIDEWAYS", 95.0, 95.0) is None
