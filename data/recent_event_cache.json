@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791916423081,
+  "updated_ts": 1791916757399,
   "events": [
     {
       "event_id": "EVT_F1764C6DCC112FB5",
@@ -2068,6 +2068,59 @@
         "atr": 0.006785423412304928,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_0C710C28330972D5",
+      "symbol": "LAB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791507599999,
+        "pivot_2_ts": 1791914399999,
+        "detected_at_ts": 1791914399999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.0495,
+        "zone_high": 0.0504,
+        "zone_low": 0.0495,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1791763199999,
+        "liquidity_sweep_level": 0.05435,
+        "mss_ts": 1791849599999,
+        "mss_pivot_ts": 1791730799999,
+        "mss_level": 0.05163,
+        "broken_ts": 1791849599999,
+        "bos_ts": 1791529199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_1A0646204783F111",
+      "symbol": "LAB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791907199999,
+        "pivot_2_ts": 1791914399999,
+        "detected_at_ts": 1791914399999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.04932,
+        "range_high": 0.04932,
+        "range_low": 0.0479,
+        "manipulation_depth_atr": 0.2453246119713483,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
