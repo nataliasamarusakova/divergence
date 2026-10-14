@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791969704242,
+  "updated_ts": 1791970023911,
   "events": [
     {
       "event_id": "EVT_CEF80FE736AA5CD3",
@@ -3649,6 +3649,57 @@
         "mss_level": 0.06454,
         "broken_ts": 1791849599999,
         "bos_ts": 1791655199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_BA0A017D65C9BD41",
+      "symbol": "CAKE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1791964799999,
+        "pivot_2_ts": 1791964799999,
+        "detected_at_ts": 1791964799999
+      },
+      "event_fact": {
+        "detection_close_price": 2.3355,
+        "compression_ratio": 0.6074837616445401,
+        "ma_spread_atr": 0.2781294251591417,
+        "compression_threshold": 0.4578384521854675,
+        "breakout_atr": 2.0693317146561396,
+        "volume_ratio": 22.2650557436423,
+        "requires_retest": true,
+        "trigger_level": 2.2897,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_10A185A9CB65389D",
+      "symbol": "CAKE",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1791964799999,
+        "pivot_2_ts": 1791964799999,
+        "detected_at_ts": 1791964799999
+      },
+      "event_fact": {
+        "ema_fast": 2.301990574817936,
+        "ema_slow": 2.299279017864897,
+        "ema200": 2.3190687477007574,
+        "body_atr": 2.0844363257120224,
+        "volume_ratio": 22.2650557436423,
+        "trigger_level": 2.301990574817936,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
