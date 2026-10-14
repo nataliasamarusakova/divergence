@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791995596526,
+  "updated_ts": 1791995946204,
   "events": [
     {
       "event_id": "EVT_91FACD4DF62B4942",
@@ -6035,6 +6035,52 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_A5A6A477ABB1236B",
+      "symbol": "MON",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1791986399999,
+        "pivot_2_ts": 1791993599999,
+        "detected_at_ts": 1791993599999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.02374,
+        "range_high": 0.02425,
+        "range_low": 0.02374,
+        "manipulation_depth_atr": 0.5425210034166841,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_393993A253D51506",
+      "symbol": "MON",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MACD_4H_BEARISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1791993599999,
+        "pivot_2_ts": 1791993599999,
+        "detected_at_ts": 1791993599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.02394,
+        "macd": -0.0004159105616415269,
+        "macd_signal": -0.00038815555750912366,
+        "macd_hist": -2.7755004132403263e-05,
+        "ema200": 0.02656317648925813,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
