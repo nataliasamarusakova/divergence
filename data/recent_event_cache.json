@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1791985494352,
+  "updated_ts": 1791985824274,
   "events": [
     {
       "event_id": "EVT_8FE29506944B0082",
@@ -3663,36 +3663,6 @@
       }
     },
     {
-      "event_id": "EVT_8CC2E86E4EA403F6",
-      "symbol": "龙虾",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1791853199999,
-        "pivot_2_ts": 1791982799999,
-        "detected_at_ts": 1791982799999
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.038,
-        "zone_high": 0.04055,
-        "zone_low": 0.038,
-        "breaker_from": "BULLISH_OB",
-        "liquidity_sweep_ts": 1791907199999,
-        "liquidity_sweep_level": 0.04859,
-        "mss_ts": 1791975599999,
-        "mss_pivot_ts": 1791885599999,
-        "mss_level": 0.04248,
-        "broken_ts": 1791975599999,
-        "bos_ts": 1791856799999,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_3DFEB5D5126F6A53",
       "symbol": "CT",
       "timeframe": "1h",
@@ -7137,6 +7107,87 @@
         "outside_volume_share": 0.25433526011560825,
         "outside_volume_share_method": "candle_range_proxy",
         "body_fraction": 0.3526011560693634,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_ACC68F7506D95A3F",
+      "symbol": "LAB",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1791939599999,
+        "pivot_2_ts": 1791975599999,
+        "detected_at_ts": 1791982799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04575,
+        "p1_price": 0.04624,
+        "p2_price": 0.04463,
+        "p1_indicator": -0.24821053888007652,
+        "p2_indicator": -0.11076011658009881,
+        "bars_between": 10,
+        "price_delta_atr": 1.4537617174121906,
+        "price_delta_pct": 3.4818339100346027,
+        "volume_ratio_20": 1.409793521208592,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.05182600497631828,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_21B1193F18BC71BD",
+      "symbol": "LAB",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "REGULAR_BULLISH_CMF",
+      "timestamps": {
+        "pivot_1_ts": 1791953999999,
+        "pivot_2_ts": 1791975599999,
+        "detected_at_ts": 1791982799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04575,
+        "p1_price": 0.04641,
+        "p2_price": 0.04463,
+        "p1_indicator": -0.2486276777952895,
+        "p2_indicator": -0.11076011658009881,
+        "bars_between": 6,
+        "price_delta_atr": 1.6072645074494993,
+        "price_delta_pct": 3.8353803059685347,
+        "volume_ratio_20": 1.409793521208592,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.05182600497631828,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_67C8BC0E35EEC6CB",
+      "symbol": "LAB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1791975599999,
+        "pivot_2_ts": 1791982799999,
+        "detected_at_ts": 1791982799999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.04591,
+        "range_high": 0.04591,
+        "range_low": 0.04463,
+        "manipulation_depth_atr": 0.5041795765706341,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
