@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792102006315,
+  "updated_ts": 1792102583953,
   "events": [
     {
       "event_id": "EVT_1D63F177425558C4",
@@ -171,7 +171,7 @@
         "zone_low": 0.20643,
         "bos_level": 0.19704,
         "ob_ts": 1792094399999,
-        "displacement_atr": 0.9387934943437106,
+        "displacement_atr": 0.9387934943437111,
         "volume_ratio": 2.696739821419228,
         "body_fraction": 0.6656465187452156,
         "market_data_source": "binance",
@@ -1493,6 +1493,56 @@
         "range_high": 0.002077,
         "range_low": 0.002046,
         "manipulation_depth_atr": 0.11587325251725468,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_74BCD20924F4EF27",
+      "symbol": "CT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1792101599999,
+        "pivot_2_ts": 1792101599999,
+        "detected_at_ts": 1792101599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.38645,
+        "bb_width": 0.03855591389141244,
+        "kc_width": 0.03712951921226537,
+        "squeeze_duration_bars": 4,
+        "compression_ratio": 1.0384167290449555,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.3756967596061327,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_AA847CAD8F55606E",
+      "symbol": "CT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792101599999,
+        "pivot_2_ts": 1792101599999,
+        "detected_at_ts": 1792101599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.38645,
+        "compression_ratio": 0.03444881466108757,
+        "ma_spread_atr": 0.018195430296659747,
+        "compression_threshold": 0.5281874129971968,
+        "breakout_atr": 1.2167335211038337,
+        "volume_ratio": 0.7037384566343569,
+        "requires_retest": true,
+        "trigger_level": 0.37352,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
