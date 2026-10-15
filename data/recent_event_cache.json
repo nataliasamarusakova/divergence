@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792034789338,
+  "updated_ts": 1792035178777,
   "events": [
     {
       "event_id": "EVT_99E78B3F5EB07262",
@@ -8821,6 +8821,35 @@
         "compressed_recent": false,
         "bb_width": 0.09954168011016051,
         "trigger_level": 0.11259,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E9269E34371C8C70",
+      "symbol": "RIVER",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792033199999,
+        "pivot_2_ts": 1792033199999,
+        "detected_at_ts": 1792033199999
+      },
+      "event_fact": {
+        "detection_close_price": 1.008,
+        "donchian_high": 1.164,
+        "donchian_low": 1.077,
+        "breakout_atr": 2.214839208585108,
+        "volume_ratio": 10.951460957020458,
+        "adx": 23.82552042088601,
+        "ema200": 1.1567110739938982,
+        "compressed_recent": true,
+        "bb_width": 0.1208863417432536,
+        "trigger_level": 1.077,
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
