@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792031371840,
+  "updated_ts": 1792031703890,
   "events": [
     {
       "event_id": "EVT_7562E4B665E0EECD",
@@ -1866,6 +1866,60 @@
         "compressed_recent": false,
         "bb_width": 0.09249571358049641,
         "trigger_level": 0.11475,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_71A215A41F80BDBE",
+      "symbol": "GRAM",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1792025999999,
+        "pivot_2_ts": 1792025999999,
+        "detected_at_ts": 1792025999999
+      },
+      "event_fact": {
+        "ema_fast": 1.3617417188982315,
+        "ema_slow": 1.376371919054187,
+        "ema200": 1.4257919803485295,
+        "body_atr": 0.466233313104743,
+        "volume_ratio": 2.0675742702875612,
+        "trigger_level": 1.3617417188982315,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_D0219BC7AC751AF2",
+      "symbol": "GRAM",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792029599999,
+        "pivot_2_ts": 1792029599999,
+        "detected_at_ts": 1792029599999
+      },
+      "event_fact": {
+        "detection_close_price": 1.342,
+        "donchian_high": 1.382,
+        "donchian_low": 1.344,
+        "breakout_atr": 0.1849220170865504,
+        "volume_ratio": 1.8404265408718008,
+        "adx": 21.431588979598626,
+        "ema200": 1.4249582293002854,
+        "compressed_recent": true,
+        "bb_width": 0.024339037615494257,
+        "trigger_level": 1.344,
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
