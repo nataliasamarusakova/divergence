@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792084416540,
+  "updated_ts": 1792084697057,
   "events": [
     {
       "event_id": "EVT_CF8A5A9BE835FF0D",
@@ -5885,6 +5885,88 @@
         "trigger_level": 0.03103,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_FF1F749A8147CA5C",
+      "symbol": "NXPC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792083599999,
+        "pivot_2_ts": 1792083599999,
+        "detected_at_ts": 1792083599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.2652,
+        "compression_ratio": 0.7386602471700006,
+        "ma_spread_atr": 0.7680275217281579,
+        "compression_threshold": 1.0397574861658943,
+        "breakout_atr": 6.782951844579006,
+        "volume_ratio": 251.73382857271977,
+        "requires_retest": true,
+        "trigger_level": 0.1975,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_DFF8B1FF7AEF079C",
+      "symbol": "NXPC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792083599999,
+        "pivot_2_ts": 1792083599999,
+        "detected_at_ts": 1792083599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.2652,
+        "donchian_high": 0.2007,
+        "donchian_low": 0.1864,
+        "breakout_atr": 6.443304771360029,
+        "volume_ratio": 251.73382857271977,
+        "adx": 45.48761956675067,
+        "ema200": 0.21135766184348195,
+        "compressed_recent": false,
+        "bb_width": 0.3316891542751449,
+        "trigger_level": 0.2007,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_161BE260B5A71A87",
+      "symbol": "NXPC",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1792058399999,
+        "pivot_2_ts": 1792083599999,
+        "detected_at_ts": 1792083599999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.1901,
+        "zone_high": 0.1901,
+        "zone_low": 0.1872,
+        "bos_level": 0.1912,
+        "ob_ts": 1792069199999,
+        "displacement_atr": 6.772962224778449,
+        "volume_ratio": 251.73382857271977,
+        "body_fraction": 0.6569767441860466,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
