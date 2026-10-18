@@ -46,17 +46,17 @@ EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
 EARLY_LOSS_CUT_4H_PNL = float(os.environ.get("EARLY_LOSS_CUT_4H_PNL", "-2.50"))
 
 # For the normal two-TP profile, move the remaining stop to break-even after TP1.
-# A single-TP micro-position is terminal (TP2 in the current profile; TP3 is
-# accepted for legacy tracked positions). The value remains configurable for research.
+# A single-TP micro-position uses the nearest TP1 target for the full position;
+# TP2/TP3 remain accepted for legacy tracked positions.
 BE_AFTER_LEG = os.environ.get("BE_AFTER_LEG", "tp1").strip().lower()
 if BE_AFTER_LEG not in {"tp1", "tp2"}:
     BE_AFTER_LEG = "tp1"
 
 
 def _be_milestone_reached(hit_legs: set[str], is_single_tp: bool) -> bool:
-    """A single-TP micro-position can only ever arm BE at its terminal leg."""
+    """A single-TP position is terminal at its sole configured TP leg."""
     if is_single_tp:
-        return bool({"tp2", "tp3"} & hit_legs)
+        return bool({"tp1", "tp2", "tp3"} & hit_legs)
     return BE_AFTER_LEG in hit_legs
 
 
@@ -1497,8 +1497,8 @@ def update_active_trades() -> None:
                         trade["early_loss_cut_last_error"] = cut.get("error") or cut
 
             # Retry a failed TP -> BE transition after the first realised partial.
-            # A single-TP profile activates only at its terminal TP2 milestone
-            # (or legacy TP3 for positions tracked under the old profile).
+            # A single-TP profile activates only when its sole TP order fills;
+            # current fallback is TP1, while TP2/TP3 remain legacy-compatible.
             hit_legs = {str(x).lower() for x in trade.get("hit_legs", []) if x}
             is_single_tp = trade.get("tp_mode") == "single_tp"
             should_move_to_be = _be_milestone_reached(hit_legs, is_single_tp)
