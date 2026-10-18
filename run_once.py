@@ -42,6 +42,7 @@ from event_engine.bingx import (
     wait_for_position_fill_directional,
     get_positions,
     get_open_protection_directional,
+    get_open_orders_snapshot,
     ensure_directional_protection,
     has_open_position,
     emergency_close_position,
@@ -189,6 +190,13 @@ class EventJournalPersistenceError(RuntimeError):
     """Raised when a newly detected event cannot be durably journaled."""
 _KLINE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
 _BINANCE_RATE_LIMIT_CACHE: dict[str, Any] = {"path": "", "cooldown_until_ms": 0, "loaded_ts": 0.0}
+# Process-local candle cache. It is explicitly enabled/cleared for one main() cycle,
+# keyed by source, normalized symbol, timeframe, requested limit, and candle period.
+_KLINE_REQUEST_CACHE: dict[tuple[str, str, str, int, int], list[dict[str, Any]]] = {}
+_KLINE_CACHE_ACTIVE = False
+_KLINE_CACHE_HITS = 0
+_KLINE_CACHE_MISSES = 0
+_KLINE_CACHE_MAX_ENTRIES = 512
 MARKET_DATA_SOURCE = os.environ.get("MARKET_DATA_SOURCE", "binance").strip().lower()
 # Binance is the signal/market-data venue; BingX remains the execution venue.
 # Coinalyze remains an independent context/derivatives source.
@@ -1214,27 +1222,97 @@ def _raise_if_binance_rate_limited(symbol: str, timeframe: str) -> None:
         )
 
 
-def _fetch_market_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
-    """Fetch signal-side candles from the configured market-data source.
+def _kline_request_cache_key(
+    source: str, symbol: str, timeframe: str, limit: int,
+) -> tuple[str, str, str, int, int] | None:
+    """Build a cache key that expires logically at each new candle boundary.
 
-    Production default is Binance. BingX remains available only when explicitly
-    selected via MARKET_DATA_SOURCE=bingx, which keeps execution and market-data
-    concerns separate without removing the existing BingX client.
+    Including the current candle bucket prevents a request made just before a bar
+    closes from being reused after that bar becomes available. Unknown timeframes
+    deliberately bypass this cache rather than guessing an interval.
     """
+    interval_ms = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+        "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+        "4h": 14_400_000, "6h": 21_600_000, "12h": 43_200_000,
+        "1d": 86_400_000,
+    }.get(str(timeframe or "").strip().lower())
+    if interval_ms is None:
+        return None
+    normalized_symbol = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    return (
+        str(source).lower(), normalized_symbol, str(timeframe).strip().lower(),
+        int(limit), int(time.time() * 1000) // interval_ms,
+    )
+
+
+def _begin_kline_request_cache_cycle() -> None:
+    global _KLINE_CACHE_ACTIVE, _KLINE_CACHE_HITS, _KLINE_CACHE_MISSES
+    _KLINE_REQUEST_CACHE.clear()
+    _KLINE_CACHE_HITS = 0
+    _KLINE_CACHE_MISSES = 0
+    _KLINE_CACHE_ACTIVE = True
+
+
+def _finish_kline_request_cache_cycle() -> None:
+    global _KLINE_CACHE_ACTIVE
+    if _KLINE_CACHE_ACTIVE:
+        log.info(
+            "[KLINE_CACHE] Cycle summary hits=%d misses=%d entries=%d",
+            _KLINE_CACHE_HITS, _KLINE_CACHE_MISSES, len(_KLINE_REQUEST_CACHE),
+        )
+    _KLINE_CACHE_ACTIVE = False
+    _KLINE_REQUEST_CACHE.clear()
+
+
+def _fetch_market_klines_scan(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch signal-side candles, reusing only identical in-cycle requests.
+
+    The cache is not persisted across runs, does not cache errors, distinguishes
+    request limits, and rotates logically at each candle boundary. Existing
+    exchange rate-limit circuit breakers remain active before cache lookup.
+    """
+    global _KLINE_CACHE_HITS, _KLINE_CACHE_MISSES
     source = MARKET_DATA_SOURCE
-    if source == "bingx":
-        return _fetch_klines_scan(symbol, timeframe, limit)
-    if source != "binance":
+    if source not in {"binance", "bingx"}:
         raise RuntimeError(f"Unsupported MARKET_DATA_SOURCE={source!r}; expected 'binance' or 'bingx'")
 
-    _raise_if_binance_rate_limited(symbol, timeframe)
-    try:
-        result = fetch_binance_klines(symbol, timeframe, limit)
-        log.info("[BINANCE_KLINE] END %s/%s rows=%d.", symbol, timeframe, len(result or []))
-        return result
-    except BinanceRateLimitError as exc:
-        _set_binance_rate_limit_cooldown(exc)
-        raise
+    cache_key = _kline_request_cache_key(source, symbol, timeframe, limit) if _KLINE_CACHE_ACTIVE else None
+    if _KLINE_CACHE_ACTIVE:
+        if source == "bingx":
+            _raise_if_kline_rate_limited(symbol, timeframe)
+        else:
+            _raise_if_binance_rate_limited(symbol, timeframe)
+        if cache_key is not None and cache_key in _KLINE_REQUEST_CACHE:
+            _KLINE_CACHE_HITS += 1
+            cached = _KLINE_REQUEST_CACHE[cache_key]
+            log.debug(
+                "[KLINE_CACHE] HIT source=%s symbol=%s timeframe=%s limit=%d rows=%d",
+                source, symbol, timeframe, int(limit), len(cached),
+            )
+            # Copy row dictionaries so a caller cannot mutate the cached snapshot.
+            return [dict(row) if isinstance(row, dict) else row for row in cached]
+        if cache_key is not None:
+            _KLINE_CACHE_MISSES += 1
+
+    if source == "bingx":
+        result = _fetch_klines_scan(symbol, timeframe, limit)
+    else:
+        _raise_if_binance_rate_limited(symbol, timeframe)
+        try:
+            result = fetch_binance_klines(symbol, timeframe, limit)
+            log.info("[BINANCE_KLINE] END %s/%s rows=%d.", symbol, timeframe, len(result or []))
+        except BinanceRateLimitError as exc:
+            _set_binance_rate_limit_cooldown(exc)
+            raise
+
+    if _KLINE_CACHE_ACTIVE and cache_key is not None and isinstance(result, list):
+        _KLINE_REQUEST_CACHE[cache_key] = list(result)
+        while len(_KLINE_REQUEST_CACHE) > _KLINE_CACHE_MAX_ENTRIES:
+            _KLINE_REQUEST_CACHE.pop(next(iter(_KLINE_REQUEST_CACHE)))
+        # Keep cached row dictionaries isolated from mutations by the first caller too.
+        return [dict(row) if isinstance(row, dict) else row for row in result]
+    return result
 
 
 def _is_btc_symbol(symbol: str) -> bool:
@@ -2765,13 +2843,6 @@ def _tp_orders_to_tracker(
             continue
         if not math.isfinite(price) or not math.isfinite(qty) or price <= 0 or qty <= 0:
             continue
-        order_id = str(order.get("orderId") or order.get("order_id") or "").strip()
-        if not order_id:
-            # The tracker polls order status by exchange order ID. Counting an
-            # unidentifiable live order as a TP leg would make reconciliation
-            # report complete protection while lifecycle tracking silently skips it.
-            log.warning("[RECONCILIATION] Ignoring TP order without exchange orderId for %s", order.get("symbol", "unknown"))
-            continue
 
         if not leg and avg_price and avg_price > 0 and direction in {"LONG", "SHORT"} and expected:
             best = None
@@ -2794,7 +2865,7 @@ def _tp_orders_to_tracker(
         row = {
             "leg": leg,
             "status": "already_exists",
-            "order_id": order_id,
+            "order_id": str(order.get("orderId", "")),
             "price": price,
             "qty": qty,
         }
@@ -2825,12 +2896,11 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
     sl = sl_orders[0]
     stop_price = _safe_float(sl.get("stopPrice", 0) or sl.get("price", 0), 0.0)
     qty = _safe_float(sl.get("origQty", 0) or sl.get("quantity", 0), 0.0)
-    order_id = str(sl.get("orderId") or sl.get("order_id") or "").strip()
-    if not order_id or stop_price <= 0 or qty <= 0:
+    if stop_price <= 0 or qty <= 0:
         return {}
     return {
         "status": "already_exists",
-        "order_id": order_id,
+        "order_id": str(sl.get("orderId", "")),
         "stop_price": stop_price,
         "qty": qty,
     }
@@ -2910,6 +2980,38 @@ def _reconciliation_event_id(
     return candidate
 
 
+def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction: str) -> dict | None:
+    """Filter an account-wide snapshot with the same symbol/side/type rules as BingX's directional reader."""
+    if not isinstance(snapshot, dict) or str(snapshot.get("status", "")).lower() != "ok":
+        return None
+    orders = snapshot.get("orders")
+    if not isinstance(orders, list) or not all(isinstance(order, dict) for order in orders):
+        return None
+
+    def symbol_key(value: Any) -> str:
+        return str(value or "").strip().upper().replace("/", "").replace("-", "")
+
+    target_symbol = symbol_key(symbol)
+    target_direction = str(direction or "").upper()
+    sl_orders: list[dict] = []
+    tp_orders: list[dict] = []
+    for order in orders:
+        if symbol_key(order.get("symbol")) != target_symbol:
+            continue
+        if str(order.get("positionSide", "")).upper() not in {target_direction, "BOTH"}:
+            continue
+        order_type = str(order.get("type", "")).upper()
+        if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+            tp_orders.append(order)
+        elif order_type in {"STOP", "STOP_MARKET"}:
+            sl_orders.append(order)
+    return {
+        "status": "ok", "symbol": symbol, "positionSide": target_direction,
+        "sl_orders": sl_orders, "tp_orders": tp_orders,
+        "source": "account_open_orders_snapshot",
+    }
+
+
 def reconcile_all_open_positions() -> None:
     # Reconciliation must never monopolize the 5-minute event loop. The normal
     # BingX session intentionally retries GETs, but that can turn one network
@@ -2941,6 +3043,37 @@ def reconcile_all_open_positions() -> None:
     log.info("[RECONCILIATION] Open-position response received: %d records.", len(positions))
     active_trades = _load_active_trades()
     log.info("[RECONCILIATION] Active trade state loaded: %d records.", len(active_trades))
+
+    # Do not make an orders request when every exchange position record is invalid.
+    has_valid_position = False
+    for candidate in positions:
+        if not str(candidate.get("symbol", "")).strip():
+            continue
+        try:
+            candidate_amt = float(candidate.get("positionAmt", 0) or 0)
+            candidate_price = float(candidate.get("avgPrice", 0) or candidate.get("entryPrice", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate_amt) and math.isfinite(candidate_price) and candidate_amt != 0 and candidate_price > 0:
+            has_valid_position = True
+            break
+
+    protection_snapshot = None
+    snapshot_started = time.monotonic()
+    if has_valid_position:
+        try:
+            snapshot_result = get_open_orders_snapshot(timeout_sec=recon_timeout, retryable=False)
+            if isinstance(snapshot_result, dict) and str(snapshot_result.get("status", "")).lower() == "ok" and isinstance(snapshot_result.get("orders"), list):
+                protection_snapshot = snapshot_result
+                log.info(
+                    "[RECONCILIATION] Account-wide open-orders snapshot received: %d orders in %.2fs.",
+                    len(snapshot_result["orders"]), time.monotonic() - snapshot_started,
+                )
+            else:
+                snapshot_error = snapshot_result.get("error", "invalid snapshot response") if isinstance(snapshot_result, dict) else "invalid snapshot response"
+                log.warning("[RECONCILIATION] Account-wide order snapshot unavailable; falling back to symbol queries: %s", snapshot_error)
+        except Exception as exc:
+            log.warning("[RECONCILIATION] Account-wide order snapshot failed; falling back to symbol queries: %s", exc)
 
     for position_index, p in enumerate(positions, start=1):
         elapsed = time.monotonic() - started
@@ -2980,12 +3113,28 @@ def reconcile_all_open_positions() -> None:
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
 
-        log.info("[RECONCILIATION] Position %d/%d: %s %s | checking protection...", position_index, len(positions), bx_symbol, direction)
-        prot = get_open_protection_directional(
-            bx_symbol,
-            direction,
-            timeout_sec=recon_timeout,
-            retryable=False,
+        protection_started = time.monotonic()
+        if protection_snapshot is not None:
+            protection_source = "account_snapshot"
+            prot = _protection_from_open_orders_snapshot(protection_snapshot, bx_symbol, direction)
+            if prot is None:
+                # Unexpected local schema is not evidence of missing protection.
+                protection_source = "symbol_fallback_after_snapshot_validation"
+                prot = get_open_protection_directional(
+                    bx_symbol, direction, timeout_sec=recon_timeout, retryable=False,
+                )
+        else:
+            protection_source = "symbol_query_fallback"
+            prot = get_open_protection_directional(
+                bx_symbol, direction, timeout_sec=recon_timeout, retryable=False,
+            )
+        if not isinstance(prot, dict):
+            prot = {"status": "error", "error": "invalid protection query result", "sl_orders": [], "tp_orders": []}
+        log.info(
+            "[RECONCILIATION] Position %d/%d: %s %s | protection_source=%s elapsed=%.3fs status=%s SL=%d TP=%d",
+            position_index, len(positions), bx_symbol, direction, protection_source,
+            time.monotonic() - protection_started, str(prot.get("status", "unknown")),
+            len(prot.get("sl_orders", []) or []), len(prot.get("tp_orders", []) or []),
         )
         if prot.get("status") != "ok":
             log.warning("[RECONCILIATION] Cannot inspect protection for %s: %s", bx_symbol, prot.get("error"))
@@ -3026,7 +3175,6 @@ def reconcile_all_open_positions() -> None:
                 sl_amt = float(sl_orders[0].get("origQty", 0) or sl_orders[0].get("quantity", 0) or 0)
 
                 if math.isfinite(sl_price) and math.isfinite(sl_amt) and sl_price > 0 and sl_amt > 0:
-                    sl_order_id = str(sl_orders[0].get("orderId") or sl_orders[0].get("order_id") or "").strip()
                     qty_matches = abs(sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
                         price_matches = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
@@ -3034,7 +3182,7 @@ def reconcile_all_open_positions() -> None:
                         price_matches = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
                     else:
                         price_matches = False
-                    sl_valid = bool(sl_order_id and price_matches and qty_matches and len(sl_orders) == 1)
+                    sl_valid = bool(price_matches and qty_matches and len(sl_orders) == 1)
             except (TypeError, ValueError):
                 sl_valid = False
 
@@ -3051,9 +3199,7 @@ def reconcile_all_open_positions() -> None:
             else:
                 observed_sl_qty = sl_qtys[0] if sl_qtys else 0.0
                 observed_sl_price = sl_prices[0] if sl_prices else 0.0
-                if not str(sl_orders[0].get("orderId") or sl_orders[0].get("order_id") or "").strip():
-                    mismatch_reason = "SL_ORDER_ID_MISSING"
-                elif abs(observed_sl_qty - qty) > max(qty * 1e-6, 1e-12):
+                if abs(observed_sl_qty - qty) > max(qty * 1e-6, 1e-12):
                     mismatch_reason = "SL_QTY_MISMATCH"
                 elif direction == "LONG" and not ((observed_sl_price <= avg_price * 1.003) if be_activated else (observed_sl_price < avg_price)):
                     mismatch_reason = "SL_PRICE_NOT_PROTECTIVE"
@@ -3197,7 +3343,6 @@ def reconcile_all_open_positions() -> None:
                 try:
                     r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
                     r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
-                    r_sl_order_id = str(recheck_sl[0].get("orderId") or recheck_sl[0].get("order_id") or "").strip()
                     r_qty_matches = abs(r_sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
                         r_price_matches = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
@@ -3205,7 +3350,7 @@ def reconcile_all_open_positions() -> None:
                         r_price_matches = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
                     else:
                         r_price_matches = False
-                    recheck_sl_valid = bool(r_sl_order_id and r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
+                    recheck_sl_valid = bool(r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
                 except (TypeError, ValueError):
                     recheck_sl_valid = False
             if recheck_sl_valid and remaining_expected_legs.issubset(recheck_known_legs):
@@ -4066,6 +4211,9 @@ def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> 
 
 
 def main() -> None:
+    global _KLINE_CACHE_ACTIVE
+    _KLINE_REQUEST_CACHE.clear()
+    _KLINE_CACHE_ACTIVE = False
     try:
         journal_archive = _ensure_action_journal_safe()
         if journal_archive is not None:
@@ -4082,6 +4230,8 @@ def main() -> None:
     if not config_ok:
         log.critical("[ENGINE] EXECUTION PREFLIGHT FAILED: %s", config_reason)
         return
+
+    _begin_kline_request_cache_cycle()
 
     if EXECUTION_ENABLED:
         try:
@@ -5727,6 +5877,7 @@ def main() -> None:
     summary_str = " ".join(f"{k}={v}" for k, v in stats.items())
     log.info("[SUMMARY] [FORENSIC_SUMMARY] %s", summary_str)
     log.info("[SUMMARY] [ENGINE_SUMMARY] opened_trades_this_cycle=%d execution_attempts_this_cycle=%d %s", opened_trades_this_cycle, execution_attempts_this_cycle, summary_str)
+    _finish_kline_request_cache_cycle()
     log.info("========== [ENGINE] CYCLE END: opened_trades_this_cycle=%d execution_attempts_this_cycle=%d ==========", opened_trades_this_cycle, execution_attempts_this_cycle)
 
 

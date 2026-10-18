@@ -22,4 +22,10 @@ def isolate_production_entry_gates(monkeypatch, tmp_path):
     # to the checked-in runtime journal. Individual tests may override this path
     # with their own fixture when asserting journal contents.
     monkeypatch.setattr(ro, "ACTIONS", tmp_path / "actions.jsonl")
+    # Default to the established per-symbol reconciliation path in tests. Tests
+    # for the account-wide snapshot opt in explicitly with their own response,
+    # so ordinary unit tests can never make an exchange/network request.
+    monkeypatch.setattr(ro, "get_open_orders_snapshot", lambda **kwargs: {
+        "status": "error", "error": "account-wide snapshot disabled by test fixture", "orders": [],
+    })
     yield

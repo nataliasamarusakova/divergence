@@ -45,7 +45,7 @@ def test_scheduler_state_uses_v9_style_persistent_data_without_pre_run_cleanup()
     assert 'data/timeframe_scan_state.json' in workflow
     assert 'recent_event_cache.json' not in workflow  # runtime path is owned by run_once.py
     assert 'git add -f data/timeframe_scan_state.json' in workflow
-    assert 'git fetch --prune origin main' in workflow
+    assert 'git fetch --prune --no-tags origin main' in workflow
     assert 'merged scheduler state' in workflow
     assert 'Synchronize persistent scheduler state before tests' not in workflow
     assert 'Backup persisted runtime state before tests' not in workflow
