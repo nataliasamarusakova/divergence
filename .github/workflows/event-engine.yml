@@ -186,7 +186,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # The engine needs the current tree, not the full repository history.
+          # Commit-state logic below deepens history only if rebase needs it.
+          fetch-depth: 1
+          fetch-tags: false
           ref: main
           persist-credentials: true
 
@@ -370,7 +373,7 @@ jobs:
           # Before committing, merge the scheduler state with the current remote copy.
           # This prevents a queued repository_dispatch run that started from an older
           # checkout from overwriting newer per-symbol watermarks.
-          git fetch --prune origin main
+          git fetch --prune --no-tags origin main
 
           python - <<'PY'
           import json
@@ -473,7 +476,7 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "[COMMIT_STATE] No runtime state changes"
-            git fetch --prune origin main
+            git fetch --prune --no-tags origin main
             if ! git cat-file -e origin/main:data/timeframe_scan_state.json 2>/dev/null; then
               echo "[COMMIT_STATE] ERROR: local state unchanged but origin/main has no scheduler state" >&2
               exit 1
@@ -494,7 +497,30 @@ jobs:
 
           max_attempts=5
           for attempt in $(seq 1 "$max_attempts"); do
-            git fetch --prune origin main
+            git fetch --prune --no-tags origin main
+
+            # A shallow checkout may not initially contain a merge-base when a
+            # queued run has advanced main. Deepen incrementally; never force-push,
+            # reset, or rebase unrelated histories. If ancestry cannot be proven,
+            # stop and preserve the local runtime snapshot as a workflow artifact.
+            if ! git merge-base HEAD origin/main >/dev/null 2>&1; then
+              found_merge_base=false
+              for deepen in 32 64 128 256 512 1024 2048 4096; do
+                echo "[COMMIT_STATE] No merge-base yet; deepening origin/main by ${deepen} commits"
+                if ! git fetch --no-tags --deepen="$deepen" origin main; then
+                  echo "[COMMIT_STATE] ERROR: failed to deepen origin/main history; refusing to push state" >&2
+                  exit 1
+                fi
+                if git merge-base HEAD origin/main >/dev/null 2>&1; then
+                  found_merge_base=true
+                  break
+                fi
+              done
+              if [ "$found_merge_base" != true ]; then
+                echo "[COMMIT_STATE] ERROR: no common Git ancestor found after bounded deepening; refusing to push state" >&2
+                exit 1
+              fi
+            fi
 
             # A later/parallel queued run can move main forward. Rebase the already
             # merged runtime snapshot before each push attempt.
@@ -509,7 +535,7 @@ jobs:
             fi
 
             if git push origin HEAD:main; then
-              git fetch --prune origin main
+              git fetch --prune --no-tags origin main
               remote_sha="$(git show origin/main:data/timeframe_scan_state.json | sha256sum | awk '{print $1}')"
               local_sha="$(sha256sum data/timeframe_scan_state.json | awk '{print $1}')"
               echo "[PERSISTENCE] local_sha256=$local_sha"
@@ -544,3 +570,16 @@ jobs:
 
           echo "[COMMIT_STATE] ERROR: failed to push persistent runtime state after $max_attempts attempts" >&2
           exit 1
+
+      - name: Preserve runtime state if persistence failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: divergence-runtime-state-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            data/timeframe_scan_state.json
+            data/*.jsonl
+            data/*.json
+            data/archive/*.jsonl.gz
+          if-no-files-found: ignore
+          retention-days: 14
