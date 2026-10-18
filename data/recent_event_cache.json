@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792322817801,
+  "updated_ts": 1792323180848,
   "events": [
     {
       "event_id": "EVT_0D6F01040380F206",
@@ -590,34 +590,6 @@
         "requires_retest": true,
         "trigger_level": 48.76,
         "engine": "MA_COMPRESSION",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_967072E0C8FB4BC8",
-      "symbol": "DASH",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1792317599999,
-        "pivot_2_ts": 1792317599999,
-        "detected_at_ts": 1792317599999
-      },
-      "event_fact": {
-        "detection_close_price": 49.35,
-        "donchian_high": 49.27,
-        "donchian_low": 47.2,
-        "breakout_atr": 0.14334952942440898,
-        "bb_width": 0.030947079183399808,
-        "bb_width_threshold": 0.03984288162585785,
-        "volume_ratio": 1.7010542383004155,
-        "adx": 23.195060378638708,
-        "requires_retest": true,
-        "trigger_level": 49.27,
-        "engine": "BREAKOUT_MOMENTUM",
         "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
@@ -1351,6 +1323,34 @@
         "atr": 0.0028115886791384337,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_304AB323024F2DA7",
+      "symbol": "龙虾",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1792303199999,
+        "pivot_2_ts": 1792321199999,
+        "detected_at_ts": 1792321199999
+      },
+      "event_fact": {
+        "swept_level": 0.0258,
+        "sweep_depth_atr": 0.30352081001901693,
+        "reclaim_displacement_atr": 1.0899156359773705,
+        "rejection_wick_fraction": 0.863247863247863,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1792317599999,
+        "lookback_bars": 20,
+        "volume_ratio": 2.8201619649750262,
+        "trigger_level": 0.0258,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
