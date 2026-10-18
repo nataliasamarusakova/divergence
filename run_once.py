@@ -2765,6 +2765,13 @@ def _tp_orders_to_tracker(
             continue
         if not math.isfinite(price) or not math.isfinite(qty) or price <= 0 or qty <= 0:
             continue
+        order_id = str(order.get("orderId") or order.get("order_id") or "").strip()
+        if not order_id:
+            # The tracker polls order status by exchange order ID. Counting an
+            # unidentifiable live order as a TP leg would make reconciliation
+            # report complete protection while lifecycle tracking silently skips it.
+            log.warning("[RECONCILIATION] Ignoring TP order without exchange orderId for %s", order.get("symbol", "unknown"))
+            continue
 
         if not leg and avg_price and avg_price > 0 and direction in {"LONG", "SHORT"} and expected:
             best = None
@@ -2787,7 +2794,7 @@ def _tp_orders_to_tracker(
         row = {
             "leg": leg,
             "status": "already_exists",
-            "order_id": str(order.get("orderId", "")),
+            "order_id": order_id,
             "price": price,
             "qty": qty,
         }
@@ -2818,11 +2825,12 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
     sl = sl_orders[0]
     stop_price = _safe_float(sl.get("stopPrice", 0) or sl.get("price", 0), 0.0)
     qty = _safe_float(sl.get("origQty", 0) or sl.get("quantity", 0), 0.0)
-    if stop_price <= 0 or qty <= 0:
+    order_id = str(sl.get("orderId") or sl.get("order_id") or "").strip()
+    if not order_id or stop_price <= 0 or qty <= 0:
         return {}
     return {
         "status": "already_exists",
-        "order_id": str(sl.get("orderId", "")),
+        "order_id": order_id,
         "stop_price": stop_price,
         "qty": qty,
     }
@@ -3018,6 +3026,7 @@ def reconcile_all_open_positions() -> None:
                 sl_amt = float(sl_orders[0].get("origQty", 0) or sl_orders[0].get("quantity", 0) or 0)
 
                 if math.isfinite(sl_price) and math.isfinite(sl_amt) and sl_price > 0 and sl_amt > 0:
+                    sl_order_id = str(sl_orders[0].get("orderId") or sl_orders[0].get("order_id") or "").strip()
                     qty_matches = abs(sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
                         price_matches = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
@@ -3025,7 +3034,7 @@ def reconcile_all_open_positions() -> None:
                         price_matches = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
                     else:
                         price_matches = False
-                    sl_valid = bool(price_matches and qty_matches and len(sl_orders) == 1)
+                    sl_valid = bool(sl_order_id and price_matches and qty_matches and len(sl_orders) == 1)
             except (TypeError, ValueError):
                 sl_valid = False
 
@@ -3042,7 +3051,9 @@ def reconcile_all_open_positions() -> None:
             else:
                 observed_sl_qty = sl_qtys[0] if sl_qtys else 0.0
                 observed_sl_price = sl_prices[0] if sl_prices else 0.0
-                if abs(observed_sl_qty - qty) > max(qty * 1e-6, 1e-12):
+                if not str(sl_orders[0].get("orderId") or sl_orders[0].get("order_id") or "").strip():
+                    mismatch_reason = "SL_ORDER_ID_MISSING"
+                elif abs(observed_sl_qty - qty) > max(qty * 1e-6, 1e-12):
                     mismatch_reason = "SL_QTY_MISMATCH"
                 elif direction == "LONG" and not ((observed_sl_price <= avg_price * 1.003) if be_activated else (observed_sl_price < avg_price)):
                     mismatch_reason = "SL_PRICE_NOT_PROTECTIVE"
@@ -3186,6 +3197,7 @@ def reconcile_all_open_positions() -> None:
                 try:
                     r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
                     r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
+                    r_sl_order_id = str(recheck_sl[0].get("orderId") or recheck_sl[0].get("order_id") or "").strip()
                     r_qty_matches = abs(r_sl_amt - qty) <= max(qty * 1e-6, 1e-12)
                     if direction == "LONG":
                         r_price_matches = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
@@ -3193,7 +3205,7 @@ def reconcile_all_open_positions() -> None:
                         r_price_matches = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
                     else:
                         r_price_matches = False
-                    recheck_sl_valid = bool(r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
+                    recheck_sl_valid = bool(r_sl_order_id and r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
                 except (TypeError, ValueError):
                     recheck_sl_valid = False
             if recheck_sl_valid and remaining_expected_legs.issubset(recheck_known_legs):

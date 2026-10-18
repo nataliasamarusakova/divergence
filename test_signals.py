@@ -225,7 +225,19 @@ def test_select_supported_tp_levels_adapts_to_position_size():
     assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == ["tp1", "tp2"]
     assert [x["pnl_pct"] for x in bx._select_supported_tp_levels(levels, 3.0, 0, 1.0)] == [5.0, 14.0]
     assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 2.0, 0, 1.0)] == ["tp1", "tp2"]
-    assert [x["leg"] for x in bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)] == ["tp2"]
+    single = bx._select_supported_tp_levels(levels, 1.0, 0, 1.0)
+    assert [x["leg"] for x in single] == ["tp1"]
+    assert [x["pnl_pct"] for x in single] == [5.0]
+    assert [x["close_fraction"] for x in single] == [1.0]
+
+    # A singleton legacy TP2 has no TP1 distance attached. Preserve the target
+    # and leg identity during reconciliation instead of relabeling the far TP as TP1.
+    legacy_single = bx._select_supported_tp_levels(
+        [{"leg": "tp2", "pnl_pct": 10.5, "close_fraction": 1.0}], 1.0, 0, 1.0
+    )
+    assert [x["leg"] for x in legacy_single] == ["tp2"]
+    assert [x["pnl_pct"] for x in legacy_single] == [10.5]
+    assert [x["close_fraction"] for x in legacy_single] == [1.0]
 
 
 def test_select_supported_tp_levels_uses_allocator_feasibility():
@@ -1399,6 +1411,18 @@ def test_sl_validation_requires_expected_price_and_qty():
     assert not bx._validate_sl_order_for_position(order, "LONG", 100.0, expected_price=95.0, expected_qty=2.0)
 
 
+
+def test_exact_single_sl_audit_rejects_order_without_exchange_id():
+    from event_engine import bingx as bx
+
+    valid, audit = bx._audit_exact_single_sl(
+        {"status": "ok", "sl_orders": [{"type": "STOP_MARKET", "stopPrice": "93", "origQty": "1"}]},
+        direction="LONG", avg_price=100.0, expected_price=93.0, expected_qty=1.0,
+    )
+    assert valid is False
+    assert audit["audit_reason"] == "SL_ORDER_ID_MISSING"
+
+
 def test_sl_validation_accepts_break_even_only_when_explicitly_expected():
     from event_engine import bingx as bx
     long_be = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1"}
@@ -1918,11 +1942,11 @@ def test_be_tp1_policy_is_still_selectable(monkeypatch, tmp_path):
     assert trade["be_activated"] is True
 
 
-def test_be_single_tp_position_arms_only_at_terminal_leg(monkeypatch, tmp_path):
-    """A micro-position collapses to terminal TP2; legacy TP3 remains accepted."""
-    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp2", tp_mode="single_tp")
-    assert be_calls == []
-    assert trade["be_activated"] is False
+def test_be_single_tp_position_arms_only_at_its_sole_tp(monkeypatch, tmp_path):
+    """The new single-TP fallback is TP1; legacy TP2/TP3 remain accepted."""
+    be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp1"], "tp1", tp_mode="single_tp")
+    assert len(be_calls) == 1
+    assert trade["be_activated"] is True
 
     be_calls, trade = _run_be_case(monkeypatch, tmp_path, ["tp3"], "tp2", tp_mode="single_tp")
     assert len(be_calls) == 1
@@ -2339,6 +2363,163 @@ def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch
     assert all("clientOrderId" not in p for p in conditional)
 
 
+
+def test_micro_position_uses_full_size_nearest_tp_end_to_end(monkeypatch):
+    """If a two-leg allocation is impossible, the only order is TP1 for 100%."""
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 0, "pricePrecision": 2, "tradeMinQuantity": 1.0,
+    })
+    state = {"sl_orders": [], "tp_orders": []}
+    posted = []
+
+    def get_protection(*args, **kwargs):
+        return {"status": "ok", "sl_orders": list(state["sl_orders"]), "tp_orders": list(state["tp_orders"])}
+
+    def post_order(symbol, direction, params, client_order_id, **kwargs):
+        order_id = f"O{len(posted) + 1}"
+        posted.append(dict(params))
+        order = {
+            "orderId": order_id,
+            "type": params["type"],
+            "stopPrice": params.get("stopPrice", "0"),
+            "origQty": params["quantity"],
+        }
+        if params["type"] == "STOP_MARKET":
+            state["sl_orders"].append(order)
+        elif params["type"] == "TAKE_PROFIT_MARKET":
+            state["tp_orders"].append(order)
+        return {"code": 0, "data": {"order": {"orderId": order_id}}}
+
+    monkeypatch.setattr(bx, "get_open_protection_directional", get_protection)
+    monkeypatch.setattr(bx, "_post_protection_order_verified", post_order)
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 7.0,
+        [
+            {"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 0.25},
+            {"leg": "tp2", "pnl_pct": 10.5, "close_fraction": 0.75},
+        ],
+        trade_id="TR_MICRO_TP1",
+    )
+
+    assert out["status"] == "PROTECTED"
+    assert out["tp_mode"] == "single_tp"
+    assert out["effective_tp_levels"] == [{
+        "leg": "tp1", "pnl_pct": 4.55, "close_fraction": 1.0, "qty": 1.0,
+    }]
+    assert len(out["tp_orders"]) == 1
+    assert out["tp_orders"][0]["leg"] == "tp1"
+    tp_posts = [x for x in posted if x["type"] == "TAKE_PROFIT_MARKET"]
+    assert len(tp_posts) == 1
+    assert tp_posts[0]["stopPrice"] == "104.55"
+    assert tp_posts[0]["quantity"] == "1"
+
+
+def test_mismatched_existing_tp_cancel_failure_is_protection_failed(monkeypatch):
+    """A stale TP hidden from the cleanup sweep must still fail protection."""
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 0, "pricePrecision": 2, "tradeMinQuantity": 1.0,
+    })
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "93.00", "origQty": "1"}
+    stale_tp = {"orderId": "TP_OLD", "type": "TAKE_PROFIT_MARKET", "stopPrice": "104.55", "origQty": "2"}
+    monkeypatch.setattr(bx, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [sl], "tp_orders": [stale_tp],
+    })
+    monkeypatch.setattr(bx, "_cancel_protection_order_verified", lambda *a, **k: (False, "cancel timeout; order still visible"))
+    posted = []
+    monkeypatch.setattr(bx, "_post_protection_order_verified", lambda *a, **k: posted.append(a) or {"code": 0, "data": {"order": {"orderId": "UNEXPECTED"}}})
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 7.0,
+        [
+            {"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 0.25},
+            {"leg": "tp2", "pnl_pct": 10.5, "close_fraction": 0.75},
+        ],
+        trade_id="TR_STALE_TP_CANCEL",
+    )
+
+    assert out["status"] == "PROTECTION_FAILED"
+    assert "could not be cancelled" in out["error"]
+    assert out["stale_tp_cancellations"] == [{
+        "order_id": "TP_OLD", "status": "error", "error": "cancel timeout; order still visible",
+    }]
+    assert out["tp_orders"][0]["status"] == "error"
+    assert posted == []
+
+
+
+
+def test_reconciled_single_tp2_preserves_existing_target_and_order(monkeypatch):
+    """A saved singleton TP2 has no TP1 metadata; repair must not relabel/recreate it."""
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 0, "pricePrecision": 2, "tradeMinQuantity": 1.0,
+    })
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "93.00", "origQty": "1"}
+    tp2 = {"orderId": "TP2", "type": "TAKE_PROFIT_MARKET", "stopPrice": "110.50", "origQty": "1"}
+    monkeypatch.setattr(bx, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [sl], "tp_orders": [tp2],
+    })
+    posted = []
+    cancelled = []
+    monkeypatch.setattr(bx, "_post_protection_order_verified", lambda *a, **k: posted.append(a) or {"code": 0, "data": {"order": {"orderId": "NEW"}}})
+    monkeypatch.setattr(bx, "_cancel_protection_order_verified", lambda *a, **k: cancelled.append(a) or (True, "cancelled"))
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 7.0,
+        [{"leg": "tp2", "pnl_pct": 10.5, "close_fraction": 1.0}],
+        trade_id="TR_LEGACY_SINGLE_TP2",
+    )
+
+    assert out["status"] == "PROTECTED"
+    assert out["tp_mode"] == "single_tp"
+    assert out["effective_tp_levels"][0]["leg"] == "tp2"
+    assert out["effective_tp_levels"][0]["pnl_pct"] == pytest.approx(10.5)
+    assert out["tp_orders"][0]["order_id"] == "TP2"
+    assert posted == []
+    assert cancelled == []
+
+
+def test_tp_order_without_exchange_id_is_not_declared_protected(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 0, "pricePrecision": 2, "tradeMinQuantity": 1.0,
+    })
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "93.00", "origQty": "1"}
+    untrackable_tp = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "104.55", "origQty": "1"}
+    monkeypatch.setattr(bx, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [sl], "tp_orders": [untrackable_tp],
+    })
+    posted = []
+    monkeypatch.setattr(bx, "_post_protection_order_verified", lambda *a, **k: posted.append(a) or {"code": 0, "data": {"order": {"orderId": "NEW"}}})
+
+    out = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 7.0,
+        [{"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 1.0}],
+        trade_id="TR_NO_TP_ID",
+    )
+
+    assert out["status"] == "PROTECTION_FAILED"
+    assert "missing orderId" in out["error"]
+    assert out["stale_tp_cancellations"] == [{
+        "order_id": None,
+        "status": "error",
+        "error": "open TP order is missing orderId; cannot cancel or verify cleanup",
+    }]
+    assert posted == []
+
+
 def test_ensure_protection_cancels_stale_tp_profile_legs(monkeypatch):
     from event_engine import bingx as bx
 
@@ -2375,6 +2556,26 @@ def test_ensure_protection_cancels_stale_tp_profile_legs(monkeypatch):
     assert cancel_calls == ["TP2"]
     assert out["stale_tp_cancellations"] == [{"order_id": "TP2", "status": "cancelled", "error": None}]
     assert [x["leg"] for x in out["tp_orders"]] == ["tp1"]
+
+
+
+def test_tp_reconciliation_does_not_track_order_without_exchange_id(caplog):
+    import run_once as ro
+
+    orders = [{"type": "TAKE_PROFIT_MARKET", "stopPrice": "104.55", "origQty": "1"}]
+    expected = [{"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 1.0, "qty": 1.0}]
+    with caplog.at_level("WARNING"):
+        out = ro._tp_orders_to_tracker(orders, direction="LONG", avg_price=100.0, effective_levels=expected)
+    assert out == []
+    assert "without exchange orderId" in caplog.text
+
+
+
+def test_sl_reconciliation_does_not_track_order_without_exchange_id():
+    import run_once as ro
+    assert ro._sl_order_to_tracker([{
+        "type": "STOP_MARKET", "stopPrice": "93.0", "origQty": "1.0",
+    }]) == {}
 
 
 def test_reconciliation_uses_tp_price_when_current_conditional_orders_have_no_client_id(monkeypatch):
@@ -3273,6 +3474,70 @@ def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypat
     assert saved["exit_price"] == pytest.approx(94.0)
     assert saved["exit_price_source"] == "SL_FILL"
     assert saved["realized_pnl_pct"] == pytest.approx(-4.25)
+
+
+
+def test_tracker_single_tp1_fill_closes_full_position_and_cleans_sl(monkeypatch, tmp_path):
+    """The micro-position TP1 is terminal: no residual and no unnecessary BE order."""
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "trade_id": "TR_SINGLE_TP1", "event_id": "EVT_SINGLE_TP1", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1_000,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1", "qty": 1.0}],
+        "sl_order": {"order_id": "SL1", "stop_price": 93.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "be_activated": False, "be_required": False, "closed": False,
+        "effective_tp_levels": [{"leg": "tp1", "pnl_pct": 4.55, "close_fraction": 1.0, "qty": 1.0}],
+        "tp_mode": "single_tp", "planned_risk_pct": 7.0, "effective_weighted_rr": 0.65,
+    }
+    active_path.write_text(json.dumps({"EVT_SINGLE_TP1": trade}), encoding="utf-8")
+    open_protection = {"sl_orders": [{"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "93.0", "origQty": "1.0"}], "tp_orders": []}
+    be_calls = []
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_recover_data_error_trade_closes", lambda: None)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found", "positionAmt": "0"})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_order", lambda _symbol, order_id: (
+        {"status": "ok", "order_status": "FILLED", "executed_qty": 1.0, "avg_price": 104.55}
+        if order_id == "TP1" else {"status": "error", "error": "order not found"}
+    ))
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{
+        "open": 100.0, "high": 104.6, "low": 99.0, "close": 104.55, "close_time": 2_000,
+    }])
+    monkeypatch.setattr(tr, "_move_sl_to_break_even", lambda *a, **k: be_calls.append(True) or {"status": "created", "order_id": "BE_SL"})
+
+    def get_protection(*a, **k):
+        return {"status": "ok", "sl_orders": list(open_protection["sl_orders"]), "tp_orders": list(open_protection["tp_orders"])}
+
+    def cancel_protection(_symbol, _direction, order, **kwargs):
+        order_id = str(order.get("orderId", ""))
+        open_protection["sl_orders"] = [x for x in open_protection["sl_orders"] if str(x.get("orderId", "")) != order_id]
+        open_protection["tp_orders"] = [x for x in open_protection["tp_orders"] if str(x.get("orderId", "")) != order_id]
+        return True, "cancelled_and_verified"
+
+    monkeypatch.setattr(tr, "get_open_protection_directional", get_protection)
+    monkeypatch.setattr(tr, "_cancel_protection_order_verified", cancel_protection)
+
+    tr.update_active_trades()
+
+    closed = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    assert closed["exit_reason"] == "TAKE_PROFIT_FULL"
+    assert closed["exit_price_source"] == "TP_WEIGHTED_AVERAGE"
+    assert closed["realized_pnl_pct"] == pytest.approx(4.55)
+    assert closed["tp_closed_qty"] == pytest.approx(1.0)
+    assert closed["total_closed_qty"] == pytest.approx(1.0)
+    assert be_calls == []
+    assert open_protection["sl_orders"] == []
+    assert open_protection["tp_orders"] == []
+    assert "EVT_SINGLE_TP1" not in active
 
 
 def test_tracker_partial_tp_plus_break_even_fill_is_realized(monkeypatch, tmp_path):
