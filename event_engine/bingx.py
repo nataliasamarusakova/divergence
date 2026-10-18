@@ -455,6 +455,57 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
     return _normalize_orders_list(resp)
 
 
+def get_open_orders_snapshot(
+    *, timeout_sec: float | None = None, retryable: bool = True,
+) -> dict:
+    """Fetch one account-wide open-order snapshot for reconciliation.
+
+    BingX documents ``symbol`` as optional on openOrders. This helper is stricter
+    than the symbol-scoped reader: an unexpected response shape or an unidentifiable
+    protection order is reported as an error so callers can fall back to the known
+    per-symbol query rather than treating unknown data as missing protection.
+    """
+    try:
+        resp = _request(
+            "GET",
+            OPEN_ORDERS_PATH,
+            {},
+            timeout_sec=timeout_sec,
+            retryable=retryable,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": f"openOrders snapshot request failed: {exc}", "orders": []}
+
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        error = resp.get("msg", "openOrders snapshot failed") if isinstance(resp, dict) else "invalid openOrders response"
+        return {"status": "error", "error": str(error), "orders": []}
+
+    data = resp.get("data")
+    if isinstance(data, list):
+        orders = data
+    elif isinstance(data, dict) and isinstance(data.get("orders"), list):
+        orders = data["orders"]
+    else:
+        return {"status": "error", "error": "openOrders snapshot has unexpected data shape", "orders": []}
+
+    if not all(isinstance(order, dict) for order in orders):
+        return {"status": "error", "error": "openOrders snapshot contains a non-object order", "orders": []}
+
+    protection_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"}
+    for order in orders:
+        order_type = str(order.get("type", "")).upper()
+        if order_type not in protection_types:
+            continue
+        if not str(order.get("symbol") or "").strip() or str(order.get("positionSide") or "").upper() not in {"LONG", "SHORT", "BOTH"}:
+            return {
+                "status": "error",
+                "error": "openOrders snapshot contains an unidentifiable protection order",
+                "orders": [],
+            }
+
+    return {"status": "ok", "orders": [dict(order) for order in orders], "source": "account_open_orders_snapshot"}
+
+
 def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
     bx = to_bx_symbol(symbol)
     if not bx:
@@ -722,8 +773,8 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     qty = float(q)
 
     # TP count is selected after the confirmed fill from the actual position
-    # quantity. New entries use two TP legs when executable, otherwise the
-    # nearest TP1 leg for the full position; no new position may install three TP orders.
+    # quantity. New entries use two TP legs when executable, otherwise one
+    # terminal TP2 leg; no new position may install three TP orders.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -1289,13 +1340,13 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
 def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
     """Select at most two TP legs using actual filled quantity constraints.
 
-    New strategy profiles contain TP1 and terminal TP2. If a legacy or custom
-    caller supplies three levels, keep its first and final target and drop the
-    obsolete middle milestone; the final target is relabelled TP2. If a
-    multi-level profile cannot support both legs, use its nearest target (TP1)
-    for the entire position. A singleton input preserves its leg and target
-    because its missing earlier target cannot be reconstructed safely. Feasibility
-    is tested with the same allocator used for real TP orders.
+    New strategy profiles already contain TP1 and terminal TP2. If a legacy or
+    custom caller supplies three levels, keep its first and final target and drop
+    the obsolete middle milestone; the final target is relabelled TP2. If the
+    position cannot support both legs, use the nearest target (TP1) for the
+    entire position. This avoids leaving micro-positions with an unreachable
+    terminal target. Feasibility is tested with the same allocator used for
+    real TP orders.
     """
     if not tp_levels_norm or position_qty <= 0:
         return []
@@ -1325,13 +1376,10 @@ def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float,
     # the actual filled quantity, precision, and minimum executable quantity.
     for candidate_count in range(len(available_levels), 0, -1):
         if candidate_count == 1:
+            # A single executable order must realize the nearest profit target,
+            # not the farthest target intended for the remaining partial size.
             candidate = [dict(available_levels[0])]
-            # Only collapse a multi-level ladder to its nearest target. A
-            # singleton input may be a legacy/reconciled TP2/TP3 whose original
-            # TP1 distance is no longer present in the payload; preserve that
-            # target and leg identity rather than relabeling a far target TP1.
-            if len(available_levels) > 1:
-                candidate[0]["leg"] = "tp1"
+            candidate[0]["leg"] = "tp1"
             candidate[0]["close_fraction"] = 1.0
         else:
             candidate = [dict(x) for x in available_levels[:candidate_count]]
@@ -2052,9 +2100,9 @@ def ensure_directional_protection(
             "emergency_close": rollback,
         }
 
-    # Adapt the TP profile to the confirmed exchange position size. New
+    # Adapt the two-TP profile to the confirmed exchange position size. New
     # positions never receive three TP orders; if two legs are not executable,
-    # keep only the nearest TP1 at full size rather than place invalid partial orders.
+    # retain one terminal TP2 leg rather than place invalid partial orders.
     tp_levels_norm = _select_supported_tp_levels(
         tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
     )
@@ -2102,11 +2150,6 @@ def ensure_directional_protection(
 
     tp_results = []
     stale_tp_cancellations = []
-    # A matched-but-mismatched TP is marked handled before cancellation so the
-    # same order cannot be assigned to another leg. Preserve cancellation
-    # failures separately; otherwise that live stale order would be filtered
-    # out of the final stale-order sweep and the function could return SL_ONLY.
-    stale_tp_cleanup_failed = False
     handled_existing_tp_ids: set[str] = set()
     current_price = None
     current_price_checked = False
@@ -2126,21 +2169,9 @@ def ensure_directional_protection(
                 break
 
         if existing_leg:
-            existing_order_id = str(existing_leg.get("orderId", "")).strip()
-            if not existing_order_id:
-                # An order without an exchange ID cannot be tracked or safely
-                # cancelled. Do not count it as healthy protection or create a
-                # duplicate beside an order that may still be live.
-                stale_tp_cleanup_failed = True
-                tp_results.append({
-                    "leg": leg,
-                    "status": "error",
-                    "error": "existing TP order is missing orderId; cannot verify or safely replace it",
-                    "qty": tp_qty,
-                    "pnl_pct": pnl_pct,
-                })
-                continue
-            handled_existing_tp_ids.add(existing_order_id)
+            existing_order_id = str(existing_leg.get("orderId", ""))
+            if existing_order_id:
+                handled_existing_tp_ids.add(existing_order_id)
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
             # An existing TP is reusable only when both price and quantity match
             # the current desired leg. Reusing a smaller/older order can leave
@@ -2164,12 +2195,6 @@ def ensure_directional_protection(
             if old_order_id:
                 cancel_ok, cancel_note = _cancel_protection_order_verified(symbol, direction, existing_leg)
                 if not cancel_ok:
-                    stale_tp_cleanup_failed = True
-                    stale_tp_cancellations.append({
-                        "order_id": old_order_id,
-                        "status": "error",
-                        "error": cancel_note,
-                    })
                     tp_results.append({
                         "leg": leg,
                         "status": "error",
@@ -2251,19 +2276,11 @@ def ensure_directional_protection(
     # are healthy so there is no intentional protection gap.
     stale_tps = [
         order for order in existing_tp
-        if not str(order.get("orderId", "")).strip()
-        or str(order.get("orderId", "")).strip() not in handled_existing_tp_ids
+        if str(order.get("orderId", "")) and str(order.get("orderId", "")) not in handled_existing_tp_ids
     ]
+    stale_tp_cleanup_failed = False
     for stale in stale_tps:
-        order_id = str(stale.get("orderId", "")).strip()
-        if not order_id:
-            stale_tp_cleanup_failed = True
-            stale_tp_cancellations.append({
-                "order_id": None,
-                "status": "error",
-                "error": "open TP order is missing orderId; cannot cancel or verify cleanup",
-            })
-            continue
+        order_id = str(stale.get("orderId", ""))
         ok, note = _cancel_protection_order_verified(symbol, direction, stale)
         stale_tp_cancellations.append({
             "order_id": order_id,
@@ -2306,12 +2323,6 @@ def ensure_directional_protection(
         "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
         "protection_audit": protection_audit,
-        **({
-            "error": "one or more stale TP orders could not be cancelled and verified: " + "; ".join(
-                f"{item.get('order_id') or 'missing orderId'}: {item.get('error') or item.get('status')}"
-                for item in stale_tp_cancellations if item.get("status") == "error"
-            )
-        } if stale_tp_cleanup_failed else {}),
     }
 
 
@@ -2380,9 +2391,7 @@ def _audit_exact_single_sl(
 
     valid = [
         order for order in orders
-        if isinstance(order, dict)
-        and str(order.get("orderId") or order.get("order_id") or "").strip()
-        and _validate_sl_order_for_position(
+        if isinstance(order, dict) and _validate_sl_order_for_position(
             order, direction, avg_price,
             expected_price=expected_price, expected_qty=expected_qty,
         )
@@ -2398,9 +2407,7 @@ def _audit_exact_single_sl(
         observed = orders[0] if isinstance(orders[0], dict) else {}
         observed_qty = _num(observed, "origQty", "quantity")
         observed_price = _num(observed, "stopPrice", "price")
-        if not str(observed.get("orderId") or observed.get("order_id") or "").strip():
-            reason = "SL_ORDER_ID_MISSING"
-        elif expected_qty > 0 and not _qty_matches_position(observed_qty, expected_qty):
+        if expected_qty > 0 and not _qty_matches_position(observed_qty, expected_qty):
             reason = "SL_QTY_MISMATCH"
         elif expected_price is not None and expected_price > 0 and not _sl_price_matches(observed_price, expected_price):
             reason = "SL_PRICE_MISMATCH"

@@ -290,6 +290,12 @@ def _fetch_trade_fill_history(record: dict, opened_record: dict | None, now_ms: 
     if end_ts - start_ts > 90 * 24 * 60 * 60 * 1000:
         return [], "trade_history_window_exceeds_90_days"
 
+    event_id = str(record.get("event_id") or "<unknown>")
+    log.info(
+        "[TRACKER_RECOVERY] Fill-history scan START event=%s symbol=%s window=%s..%s span_hours=%.2f timeout=5.0s",
+        event_id, symbol, start_ts, end_ts, (end_ts - start_ts) / 3_600_000.0,
+    )
+
     # The documented endpoint paginates with pageIndex/pageSize (max 1000).
     # Small windows prevent a large response or undocumented range limit from
     # silently truncating fills for long-lived trades.
@@ -305,19 +311,43 @@ def _fetch_trade_fill_history(record: dict, opened_record: dict | None, now_ms: 
             wait = 0.22 - (time.monotonic() - last_request_monotonic)
             if last_request_monotonic > 0 and wait > 0:
                 time.sleep(wait)
+            request_started = time.monotonic()
+            log.info(
+                "[TRACKER_RECOVERY] Fill-history request START event=%s symbol=%s chunk=%s..%s page=%d page_size=1000 timeout=5.0s",
+                event_id, symbol, cursor, chunk_end, page_index,
+            )
             try:
                 response = get_fill_history(
                     symbol, cursor, chunk_end, page_index=page_index,
                     page_size=1000, timeout_sec=5.0,
                 )
             except Exception as exc:
+                request_elapsed = time.monotonic() - request_started
+                log.warning(
+                    "[TRACKER_RECOVERY] Fill-history request ERROR event=%s symbol=%s page=%d elapsed=%.2fs error=%s",
+                    event_id, symbol, page_index, request_elapsed, exc,
+                )
                 return [], f"fill_history_exception:{exc}"
+            request_elapsed = time.monotonic() - request_started
             last_request_monotonic = time.monotonic()
             if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
-                return [], str(response.get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
+                response_error = str(response.get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
+                log.warning(
+                    "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=ERROR error=%s",
+                    event_id, symbol, page_index, request_elapsed, response_error,
+                )
+                return [], response_error
             rows = response.get("fills")
             if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                log.warning(
+                    "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=INVALID_PAYLOAD",
+                    event_id, symbol, page_index, request_elapsed,
+                )
                 return [], "fill_history_invalid_fills_payload"
+            log.info(
+                "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=OK rows=%d",
+                event_id, symbol, page_index, request_elapsed, len(rows),
+            )
             for row in rows:
                 # De-duplicate repeated IDs across page/time-boundary responses.
                 identity = _fill_id(row.get("trade_id"))
@@ -496,6 +526,7 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
         log.warning("[TRACKER_RECOVERY] Trade journal read failed: %s", exc)
         return 0
 
+    cycle_started = time.monotonic()
     parsed: list[dict | None] = []
     open_by_event: dict[str, dict] = {}
     for raw_line in raw_lines:
@@ -529,8 +560,17 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
         attempts_this_cycle += 1
         event_id = str(record.get("event_id") or "")
         opened = open_by_event.get(event_id)
+        record_started = time.monotonic()
+        log.info(
+            "[TRACKER_RECOVERY] DATA_ERROR attempt START event=%s attempt_in_cycle=%d/%d",
+            event_id, attempts_this_cycle, max(0, int(max_records)),
+        )
         fills, query_error = _fetch_trade_fill_history(record, opened, now_ms)
         result, reconstruct_error = (None, query_error) if query_error else _rebuild_data_error_close(record, opened, fills)
+        log.info(
+            "[TRACKER_RECOVERY] DATA_ERROR attempt END event=%s elapsed=%.2fs fills=%d query_error=%s reconstructed=%s",
+            event_id, time.monotonic() - record_started, len(fills), query_error or "none", bool(result),
+        )
         attempts = int(_safe_float(recovery.get("attempts"), 0.0)) + 1
         updated = dict(record)
         if result:
@@ -594,6 +634,10 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
             except OSError:
                 pass
             return 0
+    log.info(
+        "[TRACKER_RECOVERY] Cycle END elapsed=%.2fs attempted=%d recovered=%d rewritten_rows=%d",
+        time.monotonic() - cycle_started, attempts_this_cycle, recovered, len(replacements),
+    )
     return recovered
 
 
