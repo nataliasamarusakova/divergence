@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792499879902,
+  "updated_ts": 1792500200774,
   "events": [
     {
       "event_id": "EVT_03F3C17E91DEB5B0",
@@ -643,7 +643,7 @@
         "zone_low": 0.3519,
         "bos_level": 0.3515,
         "ob_ts": 1792479599999,
-        "displacement_atr": 1.2749130400630955,
+        "displacement_atr": 1.2749130400630957,
         "volume_ratio": 1.3375692661560135,
         "body_fraction": 0.9113924050632934,
         "market_data_source": "binance",
@@ -2807,6 +2807,53 @@
         "displacement_atr": 1.1308096305315578,
         "volume_ratio": 3.4801207160262844,
         "body_fraction": 0.7672413793103465,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_5AA5C0E24B045DAA",
+      "symbol": "STX",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1792497599999,
+        "pivot_2_ts": 1792497599999,
+        "detected_at_ts": 1792497599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.3451,
+        "bb_width": 0.018367569245802295,
+        "kc_width": 0.017440711739858172,
+        "squeeze_duration_bars": 3,
+        "compression_ratio": 1.0531433303737214,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.3470346441300709,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E2A4D081E4C95848",
+      "symbol": "STX",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MACD_4H_BEARISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1792497599999,
+        "pivot_2_ts": 1792497599999,
+        "detected_at_ts": 1792497599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.3451,
+        "macd": -0.010837704346499832,
+        "macd_signal": -0.01070097491703707,
+        "macd_hist": -0.0001367294294627626,
+        "ema200": 0.354533103065495,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
