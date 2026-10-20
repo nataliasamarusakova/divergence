@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792459391900,
+  "updated_ts": 1792459685660,
   "events": [
     {
       "event_id": "EVT_D01A78D5983E882D",
@@ -2579,6 +2579,32 @@
         "volume_ratio": 0.9448984887334733,
         "requires_retest": true,
         "trigger_level": 0.0417,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_46DAD1A95B4CD560",
+      "symbol": "APR",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792457999999,
+        "pivot_2_ts": 1792457999999,
+        "detected_at_ts": 1792457999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.02844,
+        "compression_ratio": 0.16408274343980192,
+        "ma_spread_atr": 0.18578617968257913,
+        "compression_threshold": 1.1322712906171006,
+        "breakout_atr": 0.4800551692112464,
+        "volume_ratio": 0.39467523466699767,
+        "requires_retest": true,
+        "trigger_level": 0.02909,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
         "market_data_source": "binance",
