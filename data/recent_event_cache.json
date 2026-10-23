@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792733605202,
+  "updated_ts": 1792733899483,
   "events": [
     {
       "event_id": "EVT_5826B61F8C0A4B0A",
@@ -2096,6 +2096,87 @@
         "trigger_level": 0.2003,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_A43B10F4E61B2582",
+      "symbol": "ZEREBRO",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1792731599999,
+        "pivot_2_ts": 1792731599999,
+        "detected_at_ts": 1792731599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.031763,
+        "bb_width": 0.003151166894978026,
+        "kc_width": 0.0026325694592175264,
+        "squeeze_duration_bars": 25,
+        "compression_ratio": 1.1969928785524395,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.03026528472960876,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_93EA4DF293C7631C",
+      "symbol": "ZEREBRO",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1792691999999,
+        "pivot_2_ts": 1792731599999,
+        "detected_at_ts": 1792731599999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.028785,
+        "zone_high": 0.028785,
+        "zone_low": 0.02837,
+        "bos_level": 0.02914,
+        "ob_ts": 1792709999999,
+        "displacement_atr": 1.8120912196566639,
+        "volume_ratio": 2.8635861833138634,
+        "body_fraction": 0.8505617977528077,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_3477A4FCB86BFDF0",
+      "symbol": "ZEREBRO",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1791417599999,
+        "pivot_2_ts": 1792727999999,
+        "detected_at_ts": 1792727999999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.029697,
+        "zone_high": 0.029697,
+        "zone_low": 0.029182,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1791763199999,
+        "liquidity_sweep_level": 0.02828,
+        "mss_ts": 1791777599999,
+        "mss_pivot_ts": 1791619199999,
+        "mss_level": 0.029574,
+        "broken_ts": 1791777599999,
+        "bos_ts": 1791475199999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
