@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792750235194,
+  "updated_ts": 1792750485667,
   "events": [
     {
       "event_id": "EVT_D7BD355BF9310805",
@@ -2864,6 +2864,32 @@
         "volume_ratio": 0.9276349833258473,
         "requires_retest": true,
         "trigger_level": 0.3116,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_82A93F86D422E463",
+      "symbol": "1000BONK",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792745999999,
+        "pivot_2_ts": 1792745999999,
+        "detected_at_ts": 1792745999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.003177,
+        "compression_ratio": 0.8955518655224568,
+        "ma_spread_atr": 1.0446465880807532,
+        "compression_threshold": 1.16648362679845,
+        "breakout_atr": 0.9681989966865779,
+        "volume_ratio": 2.08019201969597,
+        "requires_retest": true,
+        "trigger_level": 0.003157,
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
         "market_data_source": "binance",
