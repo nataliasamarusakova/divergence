@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792796007077,
+  "updated_ts": 1792796271268,
   "events": [
     {
       "event_id": "EVT_42584F506884CB0C",
@@ -1410,6 +1410,30 @@
         "mss_level": 0.4076,
         "broken_ts": 1792681199999,
         "bos_ts": 1792511999999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_5E211768420DAA83",
+      "symbol": "JUP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1792792799999,
+        "pivot_2_ts": 1792792799999,
+        "detected_at_ts": 1792792799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.3021,
+        "bb_width": 0.013575212705515649,
+        "kc_width": 0.011517894594815004,
+        "squeeze_duration_bars": 20,
+        "compression_ratio": 1.1786192861694347,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.3047510527025925,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
