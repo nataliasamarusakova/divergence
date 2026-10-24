@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792885379809,
+  "updated_ts": 1792885664296,
   "events": [
     {
       "event_id": "EVT_FE1263A8A3D4A29B",
@@ -1646,6 +1646,32 @@
         "range_high": 0.012291,
         "range_low": 0.012175,
         "manipulation_depth_atr": 0.4484191290305193,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_27AD1C8E5375C17C",
+      "symbol": "BIRB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792879199999,
+        "pivot_2_ts": 1792879199999,
+        "detected_at_ts": 1792879199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.0854,
+        "compression_ratio": 0.9696567692036208,
+        "ma_spread_atr": 0.7582726543840518,
+        "compression_threshold": 0.7820010940642649,
+        "breakout_atr": 0.3652649732034363,
+        "volume_ratio": 0.24963432047867304,
+        "requires_retest": true,
+        "trigger_level": 0.09091,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
