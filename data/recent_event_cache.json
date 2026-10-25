@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1792935214461,
+  "updated_ts": 1792935488849,
   "events": [
     {
       "event_id": "EVT_6E20775E262B2422",
@@ -1414,6 +1414,32 @@
         "outside_volume_share": 0.21311475409835787,
         "outside_volume_share_method": "candle_range_proxy",
         "body_fraction": 0.2786885245901585,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_8DFA4CF98FC530C7",
+      "symbol": "CT",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1792929599999,
+        "pivot_2_ts": 1792929599999,
+        "detected_at_ts": 1792929599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.15942,
+        "compression_ratio": 0.359198827571172,
+        "ma_spread_atr": 0.8915427420297505,
+        "compression_threshold": 2.4820313252639985,
+        "breakout_atr": 0.41548090634756746,
+        "volume_ratio": 0.8422880899853714,
+        "requires_retest": true,
+        "trigger_level": 0.1623,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
