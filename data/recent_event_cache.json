@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793024316706,
+  "updated_ts": 1793024638114,
   "events": [
     {
       "event_id": "EVT_85D740A43711090F",
@@ -3172,6 +3172,32 @@
         "trigger_level": 1.214,
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_ABA495CB9CD99BB5",
+      "symbol": "BR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1793019599999,
+        "pivot_2_ts": 1793019599999,
+        "detected_at_ts": 1793019599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.4867,
+        "compression_ratio": 0.2959735637504955,
+        "ma_spread_atr": 0.21833278333372366,
+        "compression_threshold": 0.7376766376262486,
+        "breakout_atr": 0.5985542800046266,
+        "volume_ratio": 0.9366430498536611,
+        "requires_retest": true,
+        "trigger_level": 0.4789,
+        "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
