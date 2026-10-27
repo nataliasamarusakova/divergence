@@ -1032,7 +1032,28 @@ def _move_sl_to_break_even(
     trade_token = str(trade_id) if trade_id else uuid.uuid4().hex.upper()[:16]
     be_client_id = "EVTBE" + hashlib.sha256(str(trade_token).upper().encode()).hexdigest().upper()[:24]
 
-    verified = get_open_protection_directional(symbol, direction)
+    # Never change SL protection when the open-orders snapshot is not authoritative.
+    # Otherwise an API timeout/malformed response can skip old-SL cancellation and
+    # still fall through to posting a second break-even SL.
+    try:
+        verified = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        verified = {"status": "error", "error": str(exc)}
+    if not isinstance(verified, dict) or verified.get("status") != "ok":
+        detail = str(verified.get("error", verified.get("status", "unknown"))) if isinstance(verified, dict) else "malformed openOrders response"
+        error = f"openOrders state unknown before BE; refusing SL change: {detail}"
+        log.error("[TRACKER] %s %s: %s", direction, symbol, error)
+        _notify_be_failure(symbol, direction, error, event_id=trade_id)
+        return {
+            "status": "error",
+            "error": error,
+            "order_id": "",
+            "stop_price": entry_price,
+            "old_sl_id": str(old_sl_id or ""),
+            "protection_state_unknown": True,
+            "sl_mutation_attempted": False,
+        }
+
     if verified.get("status") == "ok":
         for order in verified.get("sl_orders", []):
             cid = str(order.get("clientOrderId", "")).upper()

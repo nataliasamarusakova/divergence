@@ -2630,6 +2630,10 @@ def ensure_directional_protection(
 
     tp_results = []
     stale_tp_cancellations = []
+    # Covers failures both when replacing a wrong-quantity TP for a desired leg
+    # and when removing an unclaimed stale TP after creating desired protection.
+    # A failed cancellation means an unexpected live TP may remain on the exchange.
+    stale_tp_cleanup_failed = False
     handled_existing_tp_ids: set[str] = set()
     current_price = None
     current_price_checked = False
@@ -2675,6 +2679,13 @@ def ensure_directional_protection(
             if old_order_id:
                 cancel_ok, cancel_note = _cancel_protection_order_verified(symbol, direction, existing_leg)
                 if not cancel_ok:
+                    stale_tp_cleanup_failed = True
+                    stale_tp_cancellations.append({
+                        "order_id": old_order_id,
+                        "leg": leg,
+                        "status": "error",
+                        "error": cancel_note,
+                    })
                     tp_results.append({
                         "leg": leg,
                         "status": "error",
@@ -2758,7 +2769,6 @@ def ensure_directional_protection(
         order for order in existing_tp
         if str(order.get("orderId", "")) and str(order.get("orderId", "")) not in handled_existing_tp_ids
     ]
-    stale_tp_cleanup_failed = False
     for stale in stale_tps:
         order_id = str(stale.get("orderId", ""))
         ok, note = _cancel_protection_order_verified(symbol, direction, stale)
