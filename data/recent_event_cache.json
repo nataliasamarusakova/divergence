@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793106387383,
+  "updated_ts": 1793106695203,
   "events": [
     {
       "event_id": "EVT_45CA84F64D8297A8",
@@ -1709,6 +1709,59 @@
         "vwap": 0.26331580105756563,
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "VP_9257B0E0E161AF8A",
+      "symbol": "PARTI",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLUME_PROFILE_ACCUMULATION",
+      "timestamps": {
+        "detected_at_ts": 1793105999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.03688,
+        "hvn_center": 0.038226666666666666,
+        "hvn_bin": 21,
+        "hvn_volume": 200256470.0,
+        "baseline_hvn_volume_projected": 14351186.75,
+        "recent_hvn_volume": 142851723.0,
+        "hvn_growth_ratio": 9.954000703112584,
+        "distance_from_hvn_bins": 4.039999999999989,
+        "price_left_hvn": true,
+        "atr": 0.0008266986844317326,
+        "volume_profile_method": "ohlcv_typical_price_proxy",
+        "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_732C135D2394DE3F",
+      "symbol": "PARTI",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793091599999,
+        "pivot_2_ts": 1793105999999,
+        "detected_at_ts": 1793105999999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.03807,
+        "zone_high": 0.03846,
+        "zone_low": 0.03807,
+        "bos_level": 0.03787,
+        "ob_ts": 1793095199999,
+        "displacement_atr": 1.3548074500123581,
+        "volume_ratio": 2.186671495873136,
+        "body_fraction": 0.6436781609195384,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
