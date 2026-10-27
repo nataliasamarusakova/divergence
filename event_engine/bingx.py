@@ -813,10 +813,22 @@ def get_fill_history(
             "fee_asset": normalized_fee_asset,
             "raw_fill": row,
         })
+    # If the endpoint supplies a total record count, it is authoritative. A full
+    # final page (returned == page_size == total) is complete, not truncated. When
+    # total is absent/unparseable, retain the conservative full-page fallback.
+    total_count = None
+    if total not in (None, ""):
+        try:
+            parsed_total = float(total)
+            if math.isfinite(parsed_total) and parsed_total >= 0:
+                total_count = parsed_total
+        except (TypeError, ValueError, OverflowError):
+            total_count = None
+    has_more = (page_index * page_size < total_count) if total_count is not None else (len(fills) >= page_size)
     return {
         "status": "ok", "fills": fills, "page_index": page_index,
         "page_size": page_size, "returned": len(fills), "total": total,
-        "has_more": len(fills) >= page_size,
+        "has_more": has_more,
     }
 
 

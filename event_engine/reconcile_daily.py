@@ -426,7 +426,7 @@ def main() -> int:
         }
         _append_health(HEALTH_PATH, emergency_report)
         try:
-            send_detailed(f"<b>Divergence daily reconciliation failed</b>\\n<code>{type(exc).__name__}: {str(exc)[:700]}</code>")
+            send_detailed(f"<b>Divergence daily reconciliation failed</b>\n<code>{type(exc).__name__}: {str(exc)[:700]}</code>")
         except Exception:
             pass
         print(json.dumps(emergency_report, ensure_ascii=False, indent=2), file=sys.stderr)

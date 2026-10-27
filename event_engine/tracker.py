@@ -2659,6 +2659,10 @@ def update_active_trades() -> None:
                 trade["close_cleanup_last_error"] = cleanup_note
                 trade["closed"] = False
                 log.error("[TRACKER] Trade %s closed but protection cleanup is pending: %s", event_id, cleanup_note)
+                # Keep the retryable lifecycle in active_trades.json. Without this
+                # assignment, the atomic save below would delete the trade and no
+                # subsequent cycle could retry removal of stale exchange protection.
+                updated_trades[event_id] = trade
 
         except Exception as exc:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
