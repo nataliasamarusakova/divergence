@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.10"
+APP_VERSION = "V10.4.12"
 
 import pandas as pd
 import requests
@@ -1938,6 +1938,19 @@ def _register_cross_exchange_drift_failure(event_id: str, failure_counts: dict[s
     current_fail_count = failure_counts.get(event_id, 0) + 1
     failure_counts[event_id] = current_fail_count
     return current_fail_count, current_fail_count >= MAX_CROSS_EXCHANGE_DRIFT_REJECTIONS
+
+
+def _rollback_terminal_reason(status: Any) -> str | None:
+    """Return a terminal reason for a verified rollback that left no live position.
+
+    ``opened_rolled_back`` is returned only after the rollback path verifies that
+    the position is absent or confirms the residual close. Retrying the same event
+    would otherwise reopen a position that can immediately hit the same protection
+    failure on every scheduler cycle.
+    """
+    if str(status or "").strip().lower() == "opened_rolled_back":
+        return "EXECUTION_ROLLED_BACK"
+    return None
 
 
 def load_successful_telegram_ids(path: Path) -> set[str]:
@@ -6020,9 +6033,15 @@ def main() -> None:
                     recent_entry_ts[str(symbol).upper()] = now_ms
     
                 err_str = str(execution_result.get("error", "")).lower()
-                terminal_reason = None
                 status_now = str(execution_result.get("status", ""))
-                if status_now == "PRE_ORDER_DRIFT_EXCEEDED":
+                terminal_reason = _rollback_terminal_reason(status_now)
+                if terminal_reason:
+                    log.warning(
+                        "[EXECUTION] %s (%s) opened position was verified rolled back; "
+                        "terminalizing event %s to prevent repeating the same open/rollback cycle.",
+                        symbol, direction, event_id,
+                    )
+                elif status_now == "PRE_ORDER_DRIFT_EXCEEDED":
                     current_fail_count = pre_order_drift_fail_counts.get(event_id, 0) + 1
                     pre_order_drift_fail_counts[event_id] = current_fail_count
                     if current_fail_count >= MAX_PRE_ORDER_DRIFT_REJECTIONS:

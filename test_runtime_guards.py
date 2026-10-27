@@ -159,6 +159,18 @@ def test_cross_exchange_drift_retry_budget_exhausts_on_third_rejection(monkeypat
     assert run_once._register_cross_exchange_drift_failure("EVT_B", counts) == (1, False)
 
 
+def test_verified_rollback_is_terminalized_in_main():
+    import inspect
+    import run_once
+
+    assert run_once._rollback_terminal_reason("opened_rolled_back") == "EXECUTION_ROLLED_BACK"
+    assert run_once._rollback_terminal_reason("OPENED_ROLLED_BACK") == "EXECUTION_ROLLED_BACK"
+    assert run_once._rollback_terminal_reason("opened_protected") is None
+    source = inspect.getsource(run_once.main)
+    assert "terminal_reason = _rollback_terminal_reason(status_now)" in source
+    assert 'record_trade({' in source and '"record_type": "EVENT_TERMINAL"' in source
+
+
 def test_terminal_event_ids_are_loaded(tmp_path):
     import run_once
 
@@ -907,6 +919,63 @@ def test_btc_filter_rejects_non_finite_values_as_insufficient_data():
             ok, reason = check_btc_regime(pd.DataFrame({"close": values}), "LONG")
             assert ok is True
             assert reason == "INSUFFICIENT_DATA"
+
+
+
+def test_has_open_position_trusts_explicit_bingx_position_side(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_positions", lambda: [{
+        "symbol": "TEST-USDT", "positionSide": "SHORT", "positionAmt": "0.20",
+    }])
+
+    # Hedge-mode positionAmt may be positive for SHORT; explicit side wins.
+    assert bx.has_open_position("TEST", "SHORT") is True
+    assert bx.has_open_position("TEST", "LONG") is False
+
+
+def test_open_market_retry_does_not_reuse_canceled_status_from_previous_attempt(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    post_calls = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_args, **_kwargs: True)
+
+    def fake_request(_method, _path, params):
+        post_calls.append(dict(params))
+        if len(post_calls) == 1:
+            return {"code": -1, "msg": "read timed out"}
+        # Deliberately omit status: the accepted retry must not inherit the
+        # CANCELED status obtained while reconciling attempt one.
+        return {"code": 0, "data": {"order": {
+            "orderId": "OID-RETRY", "clientOrderId": params["clientOrderId"],
+        }}}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(
+        bx, "get_order_by_client_order_id",
+        lambda _symbol, client_id: {
+            "status": "ok", "order_id": "OID-CANCELED", "order_status": "CANCELED",
+            "executed_qty": 0.0, "client_order_id": client_id,
+        },
+    )
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD_CANCELED_RETRY_STATUS")
+
+    assert out["status"] == "opened"
+    assert out["order_id"] == "OID-RETRY"
+    assert out["open_attempt"] == 2
+    assert out["order_status"] == "UNKNOWN"
 
 
 def test_open_market_transport_error_queries_client_order_id_before_accepting_fill(monkeypatch):

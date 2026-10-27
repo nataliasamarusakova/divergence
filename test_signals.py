@@ -4041,3 +4041,13 @@ def test_closed_trade_with_failed_protection_cleanup_remains_retryable(tmp_path,
     assert saved["EVT_CLEANUP_RETRY"]["close_cleanup_pending"] is True
     assert saved["EVT_CLEANUP_RETRY"]["close_cleanup_last_error"] == "cancel timeout"
     assert any(json.loads(line).get("record_type") == "TRADE_CLOSE" for line in trades_path.read_text(encoding="utf-8").splitlines())
+
+
+def test_liquidation_squeeze_docstring_matches_required_soft_factors():
+    import inspect
+    from event_engine.signals import detect_liquidation_squeeze
+
+    doc = inspect.getdoc(detect_liquidation_squeeze) or ""
+    assert "directional crowding" in doc
+    assert "not sufficient on" in doc
+    assert "extreme OI-weighted funding or crowded L/S accounts" in doc
