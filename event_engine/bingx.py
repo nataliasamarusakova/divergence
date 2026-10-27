@@ -1760,6 +1760,14 @@ def get_open_protection_directional(
             }
         row_symbol = str(order.get("symbol") or "").strip()
         has_order_identity = any(str(order.get(key) or "").strip() for key in ("orderId", "orderID", "clientOrderId"))
+        protective_type = order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"}
+        if protective_type and not row_symbol:
+            # An order ID proves that an order exists, not which contract it
+            # protects. Do not attribute a symbol-less conditional to this symbol.
+            return {
+                "status": "error", "error": "protective openOrders row is missing symbol; protection ownership is unknown",
+                "symbol": bx_symbol, "positionSide": direction, "tp_orders": [], "sl_orders": [],
+            }
         if not row_symbol and not has_order_identity:
             return {
                 "status": "error", "error": "openOrders row is not identifiable by symbol or order id",
@@ -1767,6 +1775,12 @@ def get_open_protection_directional(
             }
         if row_symbol:
             normalized_symbol = row_symbol.upper().replace("_", "-").replace("/", "-")
+            # Contract aliases (e.g. LIT -> LIGHTER on BingX derivatives) must
+            # be resolved to the exchange's canonical symbol before comparison.
+            try:
+                normalized_symbol = str(to_bx_symbol(normalized_symbol) or normalized_symbol).upper()
+            except Exception:
+                pass
             if normalized_symbol != bx_symbol:
                 continue
         position_side = str(order.get("positionSide", "")).upper()
@@ -2099,14 +2113,30 @@ def get_live_price(symbol: str) -> float | None:
 
         data = resp.get("data")
         if isinstance(data, list):
-            row = next((item for item in data if isinstance(item, dict) and str(item.get("symbol", "")).upper() == bx_symbol), None)
-            row = row or (data[0] if data and isinstance(data[0], dict) else None)
+            # A symbol-filtered endpoint may still return a list. Never fall back
+            # to its first row: that row may belong to another contract.
+            matching_rows = [
+                item for item in data
+                if isinstance(item, dict)
+                and str(item.get("symbol", "")).strip().upper().replace("_", "-").replace("/", "-") == bx_symbol
+            ]
+            row = matching_rows[0] if len(matching_rows) == 1 else None
+            if len(matching_rows) > 1:
+                log.warning("[BINGX] Live-price response contains duplicate rows for %s", bx_symbol)
+                return None
         elif isinstance(data, dict):
             row = data
         else:
             row = None
         if not isinstance(row, dict):
-            log.warning("[BINGX] Live-price response has no data row for %s", bx_symbol)
+            log.warning("[BINGX] Live-price response has no unambiguous row for %s", bx_symbol)
+            return None
+        row_symbol = str(row.get("symbol") or "").strip().upper().replace("_", "-").replace("/", "-")
+        if row_symbol != bx_symbol:
+            log.error(
+                "[BINGX] Refusing live price for %s: response symbol is %r",
+                bx_symbol, row.get("symbol"),
+            )
             return None
         try:
             price = float(row.get("price"))
@@ -2420,6 +2450,86 @@ def _cancel_protection_order_verified(symbol: str, direction: str, order: dict, 
         if attempt + 1 < max_attempts:
             time.sleep(0.25 * (attempt + 1))
     return False, last or "cancel failed"
+
+
+def cleanup_directional_protection_after_close(
+    symbol: str, direction: str, *, confirm_reads: int = 2, retry_delay: float = 0.15
+) -> dict:
+    """Remove and verify every conditional order only after closure is confirmed.
+
+    Rollback entries are not normal tracked trades, so the tracker cannot clean
+    their SL/TP later unless this explicit cleanup succeeds or is queued by the
+    caller. Two fresh NOT_FOUND reads prevent cancelling protection for a position
+    that is still open or whose state is merely unavailable.
+    """
+    direction = str(direction or "").upper()
+    if direction not in {"LONG", "SHORT"} or not to_bx_symbol(symbol):
+        return {"status": "error", "error": "invalid_symbol_or_direction"}
+
+    confirmed_absent = 0
+    last_position: dict = {}
+    for read_index in range(max(2, int(confirm_reads))):
+        try:
+            last_position = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "pending", "error": f"position_confirmation_exception:{exc}", "cancelled_order_ids": []}
+        pos_status = str((last_position or {}).get("status", "")).lower()
+        if pos_status == "found" and abs(float((last_position or {}).get("positionAmt", 0) or 0)) > 1e-12:
+            return {"status": "position_still_open", "error": "refusing to cancel protection while position is open", "position": last_position, "cancelled_order_ids": []}
+        if pos_status != "not_found":
+            return {"status": "pending", "error": f"position_state_not_confirmed:{pos_status or 'unknown'}", "cancelled_order_ids": []}
+        confirmed_absent += 1
+        if read_index + 1 < max(2, int(confirm_reads)):
+            time.sleep(max(0.0, retry_delay))
+    if confirmed_absent < 2:
+        return {"status": "pending", "error": "position_absence_not_confirmed_twice", "cancelled_order_ids": []}
+
+    try:
+        snapshot = get_open_protection_directional(symbol, direction, retryable=False)
+    except Exception as exc:
+        return {"status": "pending", "error": f"open_protection_read_exception:{exc}", "cancelled_order_ids": []}
+    if not isinstance(snapshot, dict) or snapshot.get("status") != "ok":
+        return {"status": "pending", "error": str((snapshot or {}).get("error", "open_protection_state_unknown")) if isinstance(snapshot, dict) else "malformed_open_protection_snapshot", "cancelled_order_ids": []}
+
+    orders = list(snapshot.get("sl_orders", [])) + list(snapshot.get("tp_orders", []))
+    cancelled: list[str] = []
+    failures: list[str] = []
+    seen: set[str] = set()
+    for order in orders:
+        if not isinstance(order, dict):
+            failures.append("non_object_protection_order")
+            continue
+        order_id = str(order.get("orderId") or order.get("orderID") or "").strip()
+        if not order_id:
+            failures.append("protection_order_missing_order_id")
+            continue
+        if order_id in seen:
+            continue
+        seen.add(order_id)
+        try:
+            ok, note = _cancel_protection_order_verified(symbol, direction, order, max_attempts=3)
+        except Exception as exc:
+            ok, note = False, str(exc)
+        if ok:
+            cancelled.append(order_id)
+        else:
+            failures.append(f"{order_id}:{note}")
+
+    try:
+        final_snapshot = get_open_protection_directional(symbol, direction, retryable=False)
+    except Exception as exc:
+        return {"status": "pending", "error": f"final_protection_verification_exception:{exc}", "cancelled_order_ids": cancelled}
+    if not isinstance(final_snapshot, dict) or final_snapshot.get("status") != "ok":
+        return {"status": "pending", "error": str((final_snapshot or {}).get("error", "final_protection_state_unknown")) if isinstance(final_snapshot, dict) else "malformed_final_protection_snapshot", "cancelled_order_ids": cancelled}
+    remaining = list(final_snapshot.get("sl_orders", [])) + list(final_snapshot.get("tp_orders", []))
+    if remaining:
+        failures.append("protection_orders_remain_after_cleanup")
+    return {
+        "status": "cleaned" if not failures else "pending",
+        "error": None if not failures else "; ".join(failures),
+        "cancelled_order_ids": cancelled,
+        "remaining_order_ids": [str(o.get("orderId") or o.get("orderID") or "") for o in remaining if isinstance(o, dict)],
+    }
 
 
 def ensure_directional_protection(

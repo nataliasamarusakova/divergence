@@ -238,6 +238,44 @@ def _save_active_trades(trades: dict[str, dict]) -> None:
     os.replace(tmp_path, ACTIVE_TRADES_PATH)
 
 
+def queue_protection_cleanup_pending(
+    symbol: str, direction: str, reason: str, *, source_event_id: str | None = None
+) -> str:
+    """Persist rollback protection cleanup when the immediate exchange cleanup is inconclusive.
+
+    A rollback-created order has no normal active-trade lifecycle, so without a
+    durable cleanup-only record the next tracker cycle would never retry it. The
+    pre-entry gate also uses this record to avoid reusing the symbol-side while
+    an orphan conditional order may still exist.
+    """
+    direction = str(direction or "").upper()
+    canonical_symbol = to_bx_symbol(symbol) or str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if direction not in {"LONG", "SHORT"} or not canonical_symbol:
+        raise ValueError("valid symbol and LONG/SHORT direction are required for cleanup queue")
+    cleanup_id = "ROLLBACK_CLEANUP_" + hashlib.sha256(f"{canonical_symbol}|{direction}".encode("utf-8")).hexdigest()[:20].upper()
+    trades = _load_active_trades()
+    prior = trades.get(cleanup_id, {}) if isinstance(trades.get(cleanup_id), dict) else {}
+    prior.update({
+        "event_id": cleanup_id,
+        "symbol": canonical_symbol,
+        "direction": direction,
+        "closed": False,
+        "remaining_qty": 0.0,
+        "initial_qty": 0.0,
+        "entry_price": 0.0,
+        "close_cleanup_pending": True,
+        "close_cleanup_last_error": str(reason)[:1000],
+        "protection_cleanup_only": True,
+        "protection_cleanup_source_event_id": str(source_event_id or ""),
+        "close_notification_pending": False,
+        "close_journal_pending": False,
+    })
+    trades[cleanup_id] = prior
+    _save_active_trades(trades)
+    log.critical("[TRACKER] Persisted rollback protection cleanup pending for %s %s (id=%s): %s", canonical_symbol, direction, cleanup_id, reason)
+    return cleanup_id
+
+
 def _close_record_exists(event_id: str) -> bool:
     if not TRADES_PATH.exists():
         return False
@@ -987,7 +1025,7 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, event_id: str |
 
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
-    old_sl_price: float | None = None,
+    old_sl_price: float | None = None, *, prior_order_may_exist: bool = False, prior_order_id: str | None = None,
 ) -> dict:
     """Move the stop-loss to break-even without ever holding two SL orders.
 
@@ -1001,8 +1039,10 @@ def _move_sl_to_break_even(
               If it fails -> DO NOT create the new SL (position stays protected
               by the old stop; no double-SL window is possible).
       Step 3: create the new STOP_MARKET at entry price.
-      Step 4: verify the new SL on the exchange; on failure restore the old
-              stop price (best effort) and raise an error status.
+      Step 4: verify the new SL on the exchange. Restore the old stop only when
+              the new POST is known to have been rejected; after an ambiguous
+              POST/verification result, do not recreate a second SL and require
+              reconciliation/retry before another mutation.
     """
     direction = str(direction).upper()
     bx = to_bx_symbol(symbol)
@@ -1078,7 +1118,29 @@ def _move_sl_to_break_even(
                     "order_id": existing_id,
                     "client_order_id": cid or be_client_id,
                     "stop_price": entry_price,
+                    "new_order_may_exist": not cleanup_ok,
+                    "protection_state_unknown": not cleanup_ok,
                 }
+
+    # A prior successful/ambiguous BE POST must not be repeated merely because
+    # a subsequent openOrders snapshot does not yet display it. The matching
+    # branch above can adopt an identifiable BE order; otherwise leave all live
+    # orders untouched and let a later reconciliation/operator resolve identity.
+    if prior_order_may_exist:
+        error = (
+            "prior BE stop may already exist but is not identifiable in the current "
+            "openOrders snapshot; refusing another SL mutation"
+        )
+        log.critical(
+            "[TRACKER] %s %s: %s (prior_order_id=%s)",
+            direction, symbol, error, prior_order_id or "unknown",
+        )
+        _notify_be_failure(symbol, direction, error, event_id=trade_id)
+        return {
+            "status": "error", "error": error, "order_id": str(prior_order_id or ""),
+            "stop_price": entry_price, "new_order_may_exist": True,
+            "protection_state_unknown": True, "sl_mutation_attempted": False,
+        }
 
     # Step 2: remove EVERY currently visible non-BE SL before creating the new BE SL.
     # Relying only on local old_sl_id is unsafe after a restart/reconciliation because
@@ -1146,19 +1208,25 @@ def _move_sl_to_break_even(
         except Exception:
             return False
 
-    def _fail(error: str) -> dict:
-        restored = _restore_old_sl()
+    def _fail(error: str, *, restore_old: bool = True, new_order_may_exist: bool = False, new_order_id: str = "") -> dict:
+        # Restoring the old SL is safe only when we know the new POST was rejected
+        # before creating an order. If a successful POST may already have created
+        # the BE SL, a failed follow-up query must not recreate a second STOP.
+        restored = _restore_old_sl() if restore_old else False
+        restore_state = "succeeded" if restored else ("not_attempted_due_to_unknown_new_order" if not restore_old else "FAILED")
         log.error(
-            "[TRACKER] BE move failed for %s %s: %s; old SL restore %s.",
-            direction, symbol, error, "succeeded" if restored else "FAILED",
+            "[TRACKER] BE move failed for %s %s: %s; old SL restore %s; new_order_may_exist=%s new_order_id=%s.",
+            direction, symbol, error, restore_state, new_order_may_exist, new_order_id or "unknown",
         )
-        _notify_be_failure(symbol, direction, f"{error}; restore={'ok' if restored else 'failed'}", event_id=trade_id)
+        _notify_be_failure(symbol, direction, f"{error}; restore={restore_state}; new_order_may_exist={new_order_may_exist}", event_id=trade_id)
         return {
             "status": "error",
             "error": error,
-            "order_id": "",
+            "order_id": new_order_id,
             "stop_price": entry_price,
             "old_sl_restored": bool(restored),
+            "new_order_may_exist": bool(new_order_may_exist),
+            "protection_state_unknown": bool(new_order_may_exist or not restore_old),
         }
 
     sl_side = "SELL" if direction == "LONG" else "BUY"
@@ -1176,19 +1244,37 @@ def _move_sl_to_break_even(
             symbol, direction, params, None, max_attempts=3, retry_delay=0.25
         )
     except Exception as exc:
-        return _fail(f"BE stop request exception: {exc}")
+        # Transport exceptions are ambiguous: the exchange may have accepted the
+        # POST. Do not blindly restore the prior stop and risk two live SLs.
+        return _fail(f"BE stop request exception: {exc}", restore_old=False, new_order_may_exist=True)
 
-    if not isinstance(resp, dict) or resp.get("code") != 0:
-        return _fail(f"BE stop failed: {resp}")
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        code = str(resp.get("code", "")) if isinstance(resp, dict) else ""
+        explicit_rejection = bool(code and code not in {"-1", "0"} and not resp.get("protection_state_unknown")) if isinstance(resp, dict) else False
+        return _fail(
+            f"BE stop failed: {resp}",
+            restore_old=explicit_rejection,
+            new_order_may_exist=not explicit_rejection,
+        )
 
     order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
     new_order_id = str(order.get("orderId", ""))
     if not new_order_id:
-        return _fail("BE stop response has no orderId")
+        # code=0 without an ID may still mean the conditional order was accepted.
+        return _fail("BE stop response has no orderId", restore_old=False, new_order_may_exist=True)
 
-    verified_after = get_open_protection_directional(symbol, direction)
-    if verified_after.get("status") != "ok":
-        return _fail("BE stop verification failed")
+    try:
+        verified_after = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return _fail(
+            f"BE stop verification exception: {exc}", restore_old=False,
+            new_order_may_exist=True, new_order_id=new_order_id,
+        )
+    if not isinstance(verified_after, dict) or verified_after.get("status") != "ok":
+        return _fail(
+            "BE stop verification failed", restore_old=False,
+            new_order_may_exist=True, new_order_id=new_order_id,
+        )
 
     found = any(
         str(o.get("orderId", "")) == new_order_id
@@ -1197,7 +1283,12 @@ def _move_sl_to_break_even(
         for o in verified_after.get("sl_orders", [])
     )
     if not found:
-        return _fail("BE stop not visible on exchange with exact price/quantity")
+        # An order accepted by POST may be invisible due to API lag or may have
+        # already triggered. Restoring the old SL here can create a duplicate.
+        return _fail(
+            "BE stop not visible on exchange with exact price/quantity",
+            restore_old=False, new_order_may_exist=True, new_order_id=new_order_id,
+        )
 
     return {
         "status": "created",
@@ -1532,15 +1623,22 @@ def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     direction = str(trade.get("direction", "")).upper()
     if not symbol or direction not in {"LONG", "SHORT"}:
         return False, "invalid trade identity for protection cleanup"
-    try:
-        live = get_position_directional(symbol, direction)
-    except Exception as exc:
-        return False, f"position state read failed: {exc}"
-    live_status = str(live.get("status", "")).lower()
-    if live_status == "found" and abs(_safe_float(live.get("positionAmt"), 0.0)) > 0:
-        return False, "refusing cleanup because a new live position exists for the same symbol/direction"
-    if live_status != "not_found":
-        return False, f"refusing cleanup because position state is not proven closed: {live_status or 'unknown'}"
+    # Cleanup-only rollback records may survive a restart after the immediate
+    # close/cleanup sequence was ambiguous. Require two distinct NOT_FOUND reads
+    # here too; a single transient empty response must not authorize cancellation
+    # of protection belonging to a still-live position.
+    for read_index in range(2):
+        try:
+            live = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return False, f"position state read failed: {exc}"
+        live_status = str(live.get("status", "")).lower()
+        if live_status == "found" and abs(_safe_float(live.get("positionAmt"), 0.0)) > 0:
+            return False, "refusing cleanup because a live position exists for the same symbol/direction"
+        if live_status != "not_found":
+            return False, f"refusing cleanup because position state is not proven closed: {live_status or 'unknown'}"
+        if read_index == 0:
+            time.sleep(0.15)
     try:
         prot = get_open_protection_directional(symbol, direction)
     except Exception as exc:
@@ -2073,12 +2171,14 @@ def update_active_trades() -> None:
             if cleanup_ok:
                 trade["close_cleanup_pending"] = False
                 trade["closed"] = True
-                log.info("[TRACKER] Closed trade %s protection cleanup verified.", event_id)
-            else:
-                trade["closed"] = False
-                trade["close_cleanup_pending"] = True
-                trade["close_cleanup_last_error"] = cleanup_note
-                log.error("[TRACKER] Closed trade %s still has protection cleanup pending: %s", event_id, cleanup_note)
+                trade.pop("close_cleanup_last_error", None)
+                log.info("[TRACKER] Closed trade %s protection cleanup verified; removing from active state.", event_id)
+                # Active state must not retain a closed row for an extra cycle.
+                continue
+            trade["closed"] = False
+            trade["close_cleanup_pending"] = True
+            trade["close_cleanup_last_error"] = cleanup_note
+            log.error("[TRACKER] Closed trade %s still has protection cleanup pending: %s", event_id, cleanup_note)
             updated_trades[event_id] = trade
             continue
 
@@ -2271,16 +2371,34 @@ def update_active_trades() -> None:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
-                retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
+                retry = _move_sl_to_break_even(
+                    symbol, direction, entry_price, rem_qty, old_sl_id,
+                    str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price,
+                    prior_order_may_exist=bool(trade.get("be_order_may_exist")),
+                    prior_order_id=str(trade.get("be_possible_order_id") or "") or None,
+                )
                 if retry.get("status") == "created":
+                    if old_sl_id:
+                        history = trade.setdefault("sl_order_history", [])
+                        if all(str(x.get("order_id", "")) != str(old_sl_id) for x in history if isinstance(x, dict)):
+                            history.append({"order_id": str(old_sl_id), "stop_price": old_sl_price, "replaced_ts": now_ms})
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
                     trade["be_required"] = False
                     trade["be_last_error"] = None
                     trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
+                    trade.pop("be_order_may_exist", None)
+                    trade.pop("be_possible_order_id", None)
+                    trade.pop("be_possible_qty", None)
+                    trade.pop("be_possible_stop_price", None)
                 else:
                     trade["be_required"] = True
                     trade["be_last_error"] = retry.get("error")
+                    if retry.get("new_order_may_exist"):
+                        trade["be_order_may_exist"] = True
+                        trade["be_possible_order_id"] = str(retry.get("order_id") or trade.get("be_possible_order_id") or "")
+                        trade["be_possible_qty"] = rem_qty
+                        trade["be_possible_stop_price"] = entry_price
 
             # Проверка исполнения Тейк-Профитов
             for tp in trade.get("tp_orders", []):
@@ -2380,6 +2498,8 @@ def update_active_trades() -> None:
                             old_sl_id=old_sl_id,
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
+                            prior_order_may_exist=bool(trade.get("be_order_may_exist")),
+                            prior_order_id=str(trade.get("be_possible_order_id") or "") or None,
                         )
                         if new_sl.get("status") == "created":
                             if old_sl_id:
@@ -2389,6 +2509,12 @@ def update_active_trades() -> None:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
+                            trade["be_required"] = False
+                            trade["be_last_error"] = None
+                            trade.pop("be_order_may_exist", None)
+                            trade.pop("be_possible_order_id", None)
+                            trade.pop("be_possible_qty", None)
+                            trade.pop("be_possible_stop_price", None)
                             log.info(
                                 "[TRACKER_BE_ACTIVATED] %s (%s) %s milestone reached. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, leg.upper(), entry_price
@@ -2396,6 +2522,11 @@ def update_active_trades() -> None:
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")
+                            if new_sl.get("new_order_may_exist"):
+                                trade["be_order_may_exist"] = True
+                                trade["be_possible_order_id"] = str(new_sl.get("order_id") or trade.get("be_possible_order_id") or "")
+                                trade["be_possible_qty"] = rem_qty
+                                trade["be_possible_stop_price"] = entry_price
                             log.error(
                                 "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")

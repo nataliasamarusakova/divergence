@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import hashlib
 import sys
 import time
 from collections import Counter, defaultdict
@@ -31,6 +32,8 @@ DATA_DIR = Path(os.environ.get("DIVERGENCE_DATA_DIR", ROOT / "data"))
 ACTIVE_TRADES_PATH = DATA_DIR / "active_trades.json"
 TRADES_PATH = DATA_DIR / "trades.jsonl"
 HEALTH_PATH = DATA_DIR / "health.jsonl"
+ALERT_STATE_PATH = DATA_DIR / "reconciliation_alert_state.json"
+ALERT_REPEAT_SUPPRESSION_SEC = max(0.0, min(24 * 3600.0, float(os.environ.get("RECONCILIATION_ALERT_REPEAT_SUPPRESSION_SEC", "3600"))))
 MAX_INCOME_SYMBOLS = max(0, min(3, int(os.environ.get("RECONCILIATION_MAX_SYMBOLS", "2"))))
 INCOME_TIMEOUT_SEC = max(1.0, min(3.0, float(os.environ.get("RECONCILIATION_INCOME_TIMEOUT_SEC", "2"))))
 INCOME_REQUEST_BUDGET = max(1, min(4, int(os.environ.get("RECONCILIATION_INCOME_REQUEST_BUDGET", "4"))))
@@ -45,10 +48,78 @@ def _timestamp_ms(value: Any) -> int:
 
 
 def _symbol(value: Any) -> str:
+    """Normalize common USDT contract spellings without network lookups.
+
+    BingX can return BASE-USDT while journals/providers may use BASEUSDT.
+    Splitting a compact quote suffix avoids producing invalid keys like
+    BTCUSDT-USDT, which would otherwise create false reconciliation alarms.
+    """
     text = str(value or "").strip().upper().replace("_", "-").replace("/", "-")
-    if text and "-" not in text:
+    if not text:
+        return ""
+    if "-" not in text and text.endswith("USDT") and len(text) > len("USDT"):
+        text = f"{text[:-len('USDT')]}-USDT"
+    elif "-" not in text:
         text += "-USDT"
     return text
+
+
+# Reconciliation must remain bounded and read-only: symbol normalization must not
+# trigger an unbounded contract-catalog request for every row. Keep the known
+# Coinalyze/BingX alias here and honor any operator-provided mapping as well.
+_KNOWN_POSITION_SYMBOL_ALIASES = {
+    "LIT-USDT": "LIGHTER-USDT",
+    "LITUSDT": "LIGHTER-USDT",
+    "LIT": "LIGHTER-USDT",
+}
+
+
+def _canonical_position_symbol(value: Any) -> str:
+    """Normalize known data-provider aliases without performing network I/O.
+
+    Coinalyze uses LIT while BingX's perpetual contract may be exposed as
+    LIGHTER-USDT. A reconciliation process must not issue repeated contract-list
+    requests while comparing rows; on unknown aliases it preserves the raw key so
+    unresolved identity remains visible instead of guessing based on equal sizes.
+    """
+    raw = _symbol(value)
+    if not raw:
+        return raw
+
+    configured = getattr(bingx, "SYMBOL_MAP", {})
+    if isinstance(configured, dict):
+        for alias, target in configured.items():
+            alias_norm, target_norm = _symbol(alias), _symbol(target)
+            if raw == alias_norm or raw.replace("-", "") == alias_norm.replace("-", ""):
+                return target_norm or raw
+            if raw == target_norm:
+                return target_norm
+
+    known = _KNOWN_POSITION_SYMBOL_ALIASES.get(raw) or _KNOWN_POSITION_SYMBOL_ALIASES.get(raw.replace("-", ""))
+    if known:
+        return known
+
+    # Use an already-populated in-process contract catalog only. Never call
+    # to_bx_symbol/get_contract here because they may issue a network request.
+    cache = getattr(bingx, "CACHE", {})
+    catalog = cache.get("data", {}) if isinstance(cache, dict) else {}
+    by_name = cache.get("by_display_name", {}) if isinstance(cache, dict) else {}
+    if isinstance(catalog, dict) and raw in catalog:
+        return raw
+    if isinstance(by_name, dict):
+        for candidate in (raw, raw.replace("-", ""), raw.replace("-USDT", "USDT")):
+            contract = by_name.get(candidate)
+            if isinstance(contract, dict) and contract.get("symbol"):
+                return _symbol(contract.get("symbol"))
+    if isinstance(catalog, dict):
+        raw_compact = raw.replace("-", "").replace("/", "")
+        for contract in catalog.values():
+            if not isinstance(contract, dict):
+                continue
+            display = _symbol(contract.get("displayName")).replace("-", "").replace("/", "")
+            if display == raw_compact and contract.get("symbol"):
+                return _symbol(contract.get("symbol"))
+    return raw
 
 
 def _direction(value: Any, qty: float | None = None) -> str:
@@ -110,7 +181,7 @@ def _active_local_positions(active: dict) -> tuple[dict[tuple[str, str], float],
             continue
         if not math.isfinite(qty) or qty <= 1e-12:
             continue
-        symbol = _symbol(trade.get("symbol"))
+        symbol = _canonical_position_symbol(trade.get("symbol"))
         direction = _direction(trade.get("direction"))
         if not symbol or direction not in {"LONG", "SHORT"}:
             errors.append(f"active_trade_missing_identity:{event_id}")
@@ -136,7 +207,7 @@ def _exchange_positions(rows: list[dict]) -> tuple[dict[tuple[str, str], float],
             continue
         if abs(qty_signed) <= 1e-12:
             continue
-        symbol = _symbol(row.get("symbol"))
+        symbol = _canonical_position_symbol(row.get("symbol"))
         direction = _direction(row.get("positionSide"), qty_signed)
         if not symbol or direction not in {"LONG", "SHORT"}:
             errors.append(f"exchange_position_missing_identity:{index}")
@@ -157,14 +228,68 @@ def _append_health(path: Path, report: dict) -> str | None:
         return f"health_jsonl_write_error:{exc}"
 
 
+def _alert_signature(discrepancies: list[dict]) -> str:
+    """Fingerprint the exact discrepancy state, including quantities and identity."""
+    normalized = json.dumps(discrepancies, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _repeat_alert_suppressed(discrepancies: list[dict], path: Path, now_ms: int) -> tuple[bool, str]:
+    if not discrepancies:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, "no_discrepancies"
+    if ALERT_REPEAT_SUPPRESSION_SEC <= 0:
+        return False, "suppression_disabled"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        saved = {}
+    signature = _alert_signature(discrepancies)
+    if saved.get("signature") == signature:
+        last_sent = int(saved.get("last_sent_ts_ms", 0) or 0)
+        age_sec = (now_ms - last_sent) / 1000.0 if last_sent > 0 else float("inf")
+        if 0 <= age_sec < ALERT_REPEAT_SUPPRESSION_SEC:
+            return True, f"unchanged_discrepancy_suppressed_for_{int(ALERT_REPEAT_SUPPRESSION_SEC)}s"
+    return False, "new_or_changed_discrepancy"
+
+
+def _mark_alert_sent(discrepancies: list[dict], path: Path, now_ms: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({
+            "signature": _alert_signature(discrepancies),
+            "last_sent_ts_ms": int(now_ms),
+        }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        # Notification dedup is optional telemetry; it must not interrupt reconciliation.
+        print(f"[DAILY_RECONCILIATION] Could not persist alert suppression state: {exc}", file=sys.stderr)
+
+
+def _discrepancy_message_detail(item: dict) -> str:
+    if item.get("code") == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH":
+        return (
+            f"{item.get('symbol', '?')} {item.get('direction', '?')}: "
+            f"local_qty={item.get('local_qty')} exchange_qty={item.get('exchange_qty')} "
+            f"delta={item.get('delta_qty')} tolerance={item.get('tolerance_qty')}"
+        )
+    return str(item.get("detail") or item.get("code") or "unknown")
+
+
 def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = None, notify: bool = True) -> dict:
     """Run one bounded, read-only reconciliation and return a JSON-safe report."""
     global ACTIVE_TRADES_PATH, TRADES_PATH, HEALTH_PATH
     if data_dir is not None:
         data_dir = Path(data_dir)
         active_path, trades_path, health_path = data_dir / "active_trades.json", data_dir / "trades.jsonl", data_dir / "health.jsonl"
+        alert_state_path = data_dir / "reconciliation_alert_state.json"
     else:
         active_path, trades_path, health_path = ACTIVE_TRADES_PATH, TRADES_PATH, HEALTH_PATH
+        alert_state_path = ALERT_STATE_PATH
     now_ms = int(now_ms or time.time() * 1000)
     utc_now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     day_start = int(utc_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -401,16 +526,34 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     if write_error:
         report["status"] = "CRITICAL"
         report["discrepancies"].append({"level": "CRITICAL", "code": "HEALTH_LOG_WRITE_FAILED", "detail": write_error})
-    if notify and report["discrepancies"]:
-        lines = [f"<b>Divergence daily reconciliation: {report['status']}</b>", f"UTC day: <code>{report['utc_day']}</code>"]
-        for item in report["discrepancies"][:12]:
-            detail = item.get("detail") or item.get("code")
-            lines.append(f"• <b>{item.get('level')}</b> {item.get('code')}: <code>{str(detail)[:350]}</code>")
-        lines.append("Read-only check; it does not place/cancel orders or block a later run.")
-        try:
-            send_detailed("\n".join(lines))
-        except Exception as exc:
-            print(f"[DAILY_RECONCILIATION] Telegram alert failed: {exc}", file=sys.stderr)
+    if notify:
+        suppress, suppression_reason = _repeat_alert_suppressed(report["discrepancies"], alert_state_path, now_ms)
+        if report["discrepancies"] and suppress:
+            report["notification"] = {"status": "SUPPRESSED_REPEAT", "reason": suppression_reason}
+        elif report["discrepancies"]:
+            lines = [f"<b>Divergence daily reconciliation: {report['status']}</b>", f"UTC day: <code>{report['utc_day']}</code>"]
+            for item in report["discrepancies"][:12]:
+                detail = _discrepancy_message_detail(item)
+                lines.append(f"• <b>{item.get('level')}</b> {item.get('code')}: <code>{str(detail)[:350]}</code>")
+            lines.append("Read-only check; it does not place/cancel orders or block a later run.")
+            try:
+                delivery = send_detailed("\n".join(lines))
+                delivered = bool(delivery) and all(
+                    isinstance(result, dict) and result.get("sent") is True
+                    for result in delivery.values()
+                )
+                if delivered:
+                    _mark_alert_sent(report["discrepancies"], alert_state_path, now_ms)
+                    report["notification"] = {"status": "SENT", "reason": suppression_reason}
+                else:
+                    # A failed/missing Telegram delivery must not start the repeat
+                    # suppression window; the unchanged critical alert needs retry.
+                    report["notification"] = {"status": "FAILED", "error": "telegram_delivery_not_confirmed", "delivery": delivery}
+            except Exception as exc:
+                report["notification"] = {"status": "FAILED", "error": str(exc)}
+                print(f"[DAILY_RECONCILIATION] Telegram alert failed: {exc}", file=sys.stderr)
+        else:
+            report["notification"] = {"status": "NOT_NEEDED", "reason": "no_discrepancies"}
     print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
     return report
 
