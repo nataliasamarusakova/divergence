@@ -106,6 +106,21 @@ SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Parse a finite numeric value without allowing malformed API fields to raise.
+
+    ``open_market`` uses this while resolving an acknowledgement whose order ID is
+    missing. Keeping the helper local to the exchange client prevents a malformed
+    executed-quantity field from raising NameError before the live-position safety
+    path can run.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
 def _sign(params: dict[str, Any]) -> str:
     qs = urlencode(params)
     return hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
@@ -1225,8 +1240,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                 queried = get_order_by_client_order_id(symbol, str(linked_client_order_id))
             except Exception as exc:
                 queried = {"status": "error", "error": str(exc)}
-            queried_id = str(queried.get("order_id") or "").strip() if isinstance(queried, dict) else ""
-            queried_status = str(queried.get("order_status") or "").upper() if isinstance(queried, dict) else ""
+            if not isinstance(queried, dict):
+                queried = {"status": "error", "error": "order lookup returned a non-object response"}
+            queried_id = str(queried.get("order_id") or "").strip()
+            queried_status = str(queried.get("order_status") or "").upper()
             if queried.get("status") == "ok" and queried_id and (
                 _safe_float(queried.get("executed_qty"), 0.0) > 0
                 or queried_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}

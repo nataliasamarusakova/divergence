@@ -277,12 +277,20 @@ def queue_protection_cleanup_pending(
     return cleanup_id
 
 
-def _close_record_exists(event_id: str) -> bool:
+def _load_close_record(event_id: str) -> dict | None:
+    """Return the latest persisted close record for a pending notification.
+
+    A close notification can fail to enter notifications.json after the close
+    journal has already been written. Keeping enough context to rebuild that
+    notification avoids re-running the exchange lifecycle for a position already
+    confirmed closed.
+    """
     if not TRADES_PATH.exists():
-        return False
+        return None
+    found: dict | None = None
     try:
-        with TRADES_PATH.open("r", encoding="utf-8") as f:
-            for line in f:
+        with TRADES_PATH.open("r", encoding="utf-8") as stream:
+            for line in stream:
                 if not line.strip():
                     continue
                 try:
@@ -290,10 +298,53 @@ def _close_record_exists(event_id: str) -> bool:
                 except Exception:
                     continue
                 if obj.get("record_type") == "TRADE_CLOSE" and str(obj.get("event_id")) == str(event_id):
-                    return True
+                    found = obj
     except OSError as exc:
-        log.warning("[TRACKER] Could not inspect close journal: %s", exc)
-    return False
+        log.warning("[TRACKER] Could not inspect close journal for notification recovery: %s", exc)
+    return found
+
+
+def _close_record_exists(event_id: str) -> bool:
+    return _load_close_record(event_id) is not None
+
+
+def _rebuild_close_notification_text(event_id: str, trade: dict) -> str | None:
+    """Rebuild an interrupted close message from persisted journal/state only."""
+    close_record = _load_close_record(event_id) or {}
+    symbol = str(close_record.get("symbol") or trade.get("symbol") or "").strip()
+    direction = str(close_record.get("direction") or trade.get("direction") or "").upper()
+    entry_price = _safe_float(close_record.get("entry_price", trade.get("entry_price")), 0.0)
+    if not symbol or direction not in {"LONG", "SHORT"} or entry_price <= 0:
+        return None
+
+    pnl_raw = close_record.get("realized_pnl_pct", trade.get("realized_pnl_pct"))
+    pnl_pct = _safe_float(pnl_raw, None) if pnl_raw is not None else None
+    rr_raw = close_record.get("realized_rr", trade.get("realized_rr"))
+    realized_rr = _safe_float(rr_raw, None) if rr_raw is not None else None
+    planned_raw = close_record.get("effective_weighted_rr", trade.get("planned_weighted_rr"))
+    planned_rr = _safe_float(planned_raw, None) if planned_raw is not None else None
+    duration = _safe_float(close_record.get("duration_min", trade.get("duration_min")), 0.0)
+    peak = _safe_float(close_record.get("peak_pnl_pct", trade.get("peak_pnl_pct")), 0.0)
+    drawdown = _safe_float(close_record.get("max_drawdown_pct", trade.get("max_drawdown_pct")), 0.0)
+    exit_price_raw = close_record.get("exit_price", trade.get("exit_price"))
+    exit_price = _safe_float(exit_price_raw, 0.0) if exit_price_raw is not None else None
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    return format_trade_closed_message(
+        name=str(trade.get("name") or close_record.get("name") or symbol),
+        symbol=symbol,
+        direction=direction,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        pnl_pct=pnl_pct,
+        realized_rr=realized_rr,
+        planned_rr=planned_rr,
+        duration_min=duration,
+        peak_pnl=peak,
+        max_drawdown=drawdown,
+        exit_reason=str(close_record.get("exit_reason") or trade.get("exit_reason") or "POSITION_CLOSED"),
+        event_type=str(close_record.get("event_type") or trade.get("event_type") or "DIVERGENCE"),
+        timeframe=str(trade.get("timeframe") or setup.get("event_timeframe") or "1h"),
+    )
 
 
 def _append_trade_record(record: dict) -> None:
@@ -2221,6 +2272,75 @@ def update_active_trades() -> None:
     updated_trades: dict[str, dict] = {}
 
     for event_id, trade in trades.items():
+        if trade.get("close_notification_pending"):
+            # The close journal is already durable; do not re-run position/fill/
+            # candle queries just because queue persistence for Telegram failed.
+            nid = _notification_id(str(event_id), "TRADE_CLOSE")
+            notifications = _load_notifications()
+            queued = notifications.get(nid)
+            notification_is_durable = (
+                isinstance(queued, dict)
+                and str(queued.get("event_id", "")) == str(event_id)
+                and str(queued.get("kind", "")).upper() == "TRADE_CLOSE"
+            )
+            if not notification_is_durable:
+                text = str(trade.get("close_notification_text") or "").strip()
+                if not text:
+                    rebuilt = _rebuild_close_notification_text(str(event_id), trade)
+                    text = rebuilt or ""
+                if text:
+                    trade["close_notification_text"] = text
+                    try:
+                        _queue_notification(
+                            nid,
+                            event_id=str(event_id),
+                            kind="TRADE_CLOSE",
+                            symbol=str(trade.get("symbol", "")),
+                            direction=str(trade.get("direction", "")),
+                            text=text,
+                        )
+                    except Exception as exc:
+                        log.warning("[TELEGRAM] Could not restore close notification queue for %s: %s", event_id, exc)
+                    notifications = _load_notifications()
+                    queued = notifications.get(nid)
+                    notification_is_durable = (
+                        isinstance(queued, dict)
+                        and str(queued.get("event_id", "")) == str(event_id)
+                        and str(queued.get("kind", "")).upper() == "TRADE_CLOSE"
+                    )
+
+            # Protection cleanup is independent of Telegram delivery. If it has
+            # not already been verified, retry it here while avoiding normal trade
+            # lifecycle API calls (position polls, MFE candles and order lookups).
+            if not trade.get("close_cleanup_verified"):
+                cleanup_ok, cleanup_note = _cleanup_closed_trade_protection(trade)
+                if cleanup_ok:
+                    trade["close_cleanup_pending"] = False
+                    trade["close_cleanup_verified"] = True
+                    trade.pop("close_cleanup_last_error", None)
+                else:
+                    trade["close_cleanup_pending"] = True
+                    trade["close_cleanup_last_error"] = cleanup_note
+                    trade["close_cleanup_verified"] = False
+                    log.error("[TRACKER] Pending close cleanup for %s: %s", event_id, cleanup_note)
+
+            if notification_is_durable:
+                trade["close_notification_pending"] = False
+                trade.pop("close_notification_text", None)
+            else:
+                trade["close_notification_pending"] = True
+                trade["closed"] = False
+                updated_trades[event_id] = trade
+                continue
+
+            if trade.get("close_cleanup_verified") and not trade.get("close_cleanup_pending"):
+                trade["closed"] = True
+                continue
+
+            trade["closed"] = False
+            updated_trades[event_id] = trade
+            continue
+
         if trade.get("close_cleanup_pending"):
             cleanup_ok, cleanup_note = _cleanup_closed_trade_protection(trade)
             if cleanup_ok:
@@ -2795,59 +2915,62 @@ def update_active_trades() -> None:
             log.info("[TRACKER_TRADE_CLOSED] %s (%s/%s) | PnL: %s | Realized R:R: %s | Planned R:R: %s | Exit: %s (%s) | Duration: %.1f min", close_emoji, trade.get("name", symbol), symbol, pnl_text, format_rr(realized_rr, decimals=2), format_rr(planned_rr, decimals=2), exit_text, exit_reason, duration_min)
 
             notification_persisted = True
+            nid = _notification_id(str(event_id), "TRADE_CLOSE")
+            close_notification_text = format_trade_closed_message(
+                name=trade.get("name", symbol),
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl_pct=final_pnl,
+                realized_rr=realized_rr,
+                planned_rr=planned_rr,
+                duration_min=duration_min,
+                peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
+                max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
+                exit_reason=exit_reason,
+                event_type=trade.get("event_type", "DIVERGENCE"),
+                timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
+            )
+            # Keep the exact message in the retryable state until its queue record
+            # is durable. This covers failures before notifications.json is written.
+            trade["close_notification_text"] = close_notification_text
             try:
-                nid = _notification_id(str(event_id), "TRADE_CLOSE")
                 _queue_notification(
                     nid,
                     event_id=str(event_id),
                     kind="TRADE_CLOSE",
                     symbol=symbol,
                     direction=direction,
-                    text=format_trade_closed_message(
-                        name=trade.get("name", symbol),
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        pnl_pct=final_pnl,
-                        realized_rr=realized_rr,
-                        planned_rr=planned_rr,
-                        duration_min=duration_min,
-                        peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
-                        max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
-                        exit_reason=exit_reason,
-                        event_type=trade.get("event_type", "DIVERGENCE"),
-                        timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
-                    ),
+                    text=close_notification_text,
                 )
             except Exception as exc:
                 notification_persisted = False
                 log.error("[TELEGRAM] Close notification queue error %s: %s", event_id, exc)
 
-            if not notification_persisted:
-                trade["closed"] = False
-                trade["close_notification_pending"] = True
-                updated_trades[event_id] = trade
-                continue
-
-            trade["close_notification_pending"] = False
+            trade["close_notification_pending"] = not notification_persisted
             trade["close_journal_pending"] = False
+            if notification_persisted:
+                trade.pop("close_notification_text", None)
+
+            # A Telegram persistence failure must never bypass cleanup of stale
+            # SL/TP orders for a position already confirmed closed.
             cleanup_ok, cleanup_note = _cleanup_closed_trade_protection(trade)
             if cleanup_ok:
                 trade["close_cleanup_pending"] = False
-                trade["closed"] = True
+                trade["close_cleanup_verified"] = True
+                trade["closed"] = bool(notification_persisted)
                 trade.pop("close_cleanup_last_error", None)
             else:
-                # The position is already closed, but stale protection must not be
-                # allowed to survive into a future position on the same instrument.
-                # Keep the lifecycle state retryable until openOrders confirms cleanup.
+                # Keep cleanup retryable. Notification and protection cleanup are
+                # separate durable concerns; neither is allowed to erase the other.
                 trade["close_cleanup_pending"] = True
+                trade["close_cleanup_verified"] = False
                 trade["close_cleanup_last_error"] = cleanup_note
                 trade["closed"] = False
                 log.error("[TRACKER] Trade %s closed but protection cleanup is pending: %s", event_id, cleanup_note)
-                # Keep the retryable lifecycle in active_trades.json. Without this
-                # assignment, the atomic save below would delete the trade and no
-                # subsequent cycle could retry removal of stale exchange protection.
+
+            if not notification_persisted or not cleanup_ok:
                 updated_trades[event_id] = trade
 
         except Exception as exc:
