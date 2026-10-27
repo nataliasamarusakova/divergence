@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.6"
+APP_VERSION = "V10.4.7"
 
 import pandas as pd
 import requests
@@ -1609,6 +1609,20 @@ def _trend_history_causal_count(df: pd.DataFrame | None, decision_ts: int) -> in
     return int(mask.sum())
 
 
+def _trend_decision_timestamp(trigger_diag: Any, detected_at: Any, now_ms: int) -> int:
+    """Use the closed trigger time, or the event timestamp when 15m trigger is disabled.
+
+    A zero timestamp causes the causal trend filter to reject every candidate and
+    repeatedly fetch history with no eligible bars, so a valid event time is required.
+    """
+    diag = trigger_diag if isinstance(trigger_diag, dict) else {}
+    trigger_ts = int(_safe_float(diag.get("trigger_bar_close_ts"), 0.0))
+    if trigger_ts > 0:
+        return trigger_ts
+    detected_ts = int(_safe_float(detected_at, 0.0))
+    return detected_ts if detected_ts > 0 else int(now_ms)
+
+
 def _ensure_trend_history(
     *,
     symbol: str,
@@ -2984,9 +2998,31 @@ def _tp_orders_to_tracker(
             pending.sort(key=lambda item: abs(item[1] - avg_price))
         else:
             pending.sort(key=lambda item: item[1])
-        fallback_legs = ["tp2"] if len(pending) == 1 else ["tp1", "tp2"]
-        for (row, _), leg in zip(pending, fallback_legs):
+        used_legs = {str(row.get("leg", "")).lower() for row in out if row.get("leg")}
+        available_legs = [leg for leg in ("tp1", "tp2", "tp3") if leg not in used_legs]
+        # Preserve the historic single orphan-TP convention only when no other
+        # leg is already identified. Otherwise use an unused leg to avoid a
+        # duplicate tp2 key in the tracker fill ledger.
+        if len(pending) == 1 and not used_legs:
+            fallback_legs = ["tp2"]
+        else:
+            fallback_legs = available_legs
+        for index, (row, _) in enumerate(pending):
+            if index < len(fallback_legs):
+                leg = fallback_legs[index]
+            else:
+                # Legacy/foreign profiles can have more than three live TPs. Do not
+                # silently drop any exchange order; extra identities remain unique
+                # and trackable without pretending they are configured tp1/tp2/tp3.
+                order_id = str(row.get("order_id") or "")
+                leg = f"tp_extra_{order_id}" if order_id else f"tp_extra_{index + 1}"
+                suffix = 2
+                base_leg = leg
+                while leg in used_legs:
+                    leg = f"{base_leg}_{suffix}"
+                    suffix += 1
             row["leg"] = leg
+            used_legs.add(leg)
             out.append(row)
 
     return out
@@ -5078,14 +5114,14 @@ def main() -> None:
                 stats["trigger_passed"] += 1
                 tf_stats["trigger_passed"] += 1
 
-            # Trend Filter v1 is evaluated only after a valid closed-15M trigger.
-            # The causal decision timestamp is the trigger candle close, not the later
-            # wall-clock observation time. The latter is retained separately for
-            # execution-age telemetry/staleness checks. Every HTF frame is clipped to
-            # bars with close_time <= this trigger timestamp, so later 1H/4H bars can
-            # never influence the shadow/enforce decision.
+            # Trend Filter v1 uses the closed-15M trigger timestamp when available.
+            # If REQUIRE_15M_TRIGGER is disabled, there is no trigger timestamp; use
+            # the event detection time (or cycle time only as a last resort) instead
+            # of passing zero, which would reject every trend evaluation and force
+            # pointless empty causal-history refetches. HTF frames remain clipped to
+            # the selected decision timestamp to prevent future-data leakage.
             if TREND_FILTER_ENABLED and TREND_FILTER_MODE != "off":
-                decision_ts = int(_safe_float((trigger_diag or {}).get("trigger_bar_close_ts"), 0.0))
+                decision_ts = _trend_decision_timestamp(trigger_diag, detected_at, now_ms)
                 try:
                     if symbol not in trend_1h_cache:
                         k1_trend = scan_klines_cache.get((symbol, "1h"))

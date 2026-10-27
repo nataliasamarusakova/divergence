@@ -63,6 +63,9 @@ def test_scheduler_state_push_is_verified_on_remote():
     assert 'remote_sha256=' in workflow
     assert 'remote scheduler state verified symbols=' in workflow
     assert 'State pushed and verified successfully' in workflow
+    assert 'REBASE_HEAD' in workflow
+    assert 'Resolving scheduler-state conflict with max-watermark merge' in workflow
+    assert 'GIT_EDITOR=true git rebase --continue' in workflow
 
 
 def test_release_telemetry_uses_attempts_and_opened_trades_separately():
@@ -121,8 +124,19 @@ def test_kline_rate_limit_circuit_breaker_settings():
 
 def test_release_wires_trend_decision_to_closed_trigger_timestamp():
     source = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'decision_ts = int(_safe_float((trigger_diag or {}).get("trigger_bar_close_ts"), 0.0))' in source
+    assert "decision_ts = _trend_decision_timestamp(trigger_diag, detected_at, now_ms)" in source
+    assert "def _trend_decision_timestamp(" in source
     assert 'decision_ts = int(trigger_observed_at_ts or time.time() * 1000)' not in source
+
+
+def test_trend_decision_timestamp_falls_back_when_15m_trigger_is_not_required():
+    import run_once
+
+    detected_at = 1_760_000_000_000
+    cycle_now = detected_at + 60_000
+    assert run_once._trend_decision_timestamp({"ok": True, "reason": "not_required"}, detected_at, cycle_now) == detected_at
+    assert run_once._trend_decision_timestamp({"trigger_bar_close_ts": detected_at - 900_000}, detected_at, cycle_now) == detected_at - 900_000
+    assert run_once._trend_decision_timestamp({"reason": "not_required"}, 0, cycle_now) == cycle_now
 
 
 def test_release_uses_fixed_seven_percent_stop():
@@ -257,6 +271,9 @@ def test_release_has_manual_vpn_test_workflow():
     assert 'Cross-exchange live price drift >1%' in text
     assert 'latest returned candle' not in text
     assert '"$BASE/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=10"' in text
+    assert 'mkdir -p vpn-audit/responses vpn-audit/pretty' in text
+    assert "label|url|http_status|curl_exit|body_sha|body_bytes\\n' > vpn-audit/manifest.tsv" in text
+    assert text.index('mkdir -p vpn-audit/responses vpn-audit/pretty') < text.index('tee vpn-audit/dns-routing.txt')
 
 
 def test_pytest_isolates_production_sr_environment(monkeypatch):
@@ -398,9 +415,9 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.6"' in runtime
+    assert 'APP_VERSION = "V10.4.7"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_6.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_7.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes

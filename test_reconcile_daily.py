@@ -151,3 +151,18 @@ def test_unknown_net_attribution_is_not_misclassified_as_failed_close(tmp_path, 
     report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
     assert not any(item["code"] == "DATA_ERROR_CLOSES_IN_UTC_DAY" for item in report["discrepancies"])
     assert report["status"] != "CRITICAL"
+
+
+def test_main_failure_alert_contains_real_newline(tmp_path, monkeypatch):
+    from event_engine import reconcile_daily as recon
+
+    alerts = []
+    monkeypatch.setattr(recon, "HEALTH_PATH", tmp_path / "health.jsonl")
+    monkeypatch.setattr(recon, "run_reconciliation", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(recon, "_append_health", lambda path, report: None)
+    monkeypatch.setattr(recon, "send_detailed", lambda message: alerts.append(message))
+
+    assert recon.main() == 0
+    assert len(alerts) == 1
+    assert "</b>\\n<code>" not in alerts[0]
+    assert "</b>\n<code>" in alerts[0]

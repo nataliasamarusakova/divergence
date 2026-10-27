@@ -397,3 +397,25 @@ def test_stop_slippage_handles_direction_and_invalid_prices():
     assert _calc_stop_slippage_pct("SHORT", 104.0, 105.0) == 0.0
     assert _calc_stop_slippage_pct("LONG", None, 95.0) is None
     assert _calc_stop_slippage_pct("SIDEWAYS", 95.0, 95.0) is None
+
+
+def test_fill_history_uses_total_to_distinguish_full_final_page(monkeypatch):
+    import event_engine.bingx as bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
+    rows = [
+        {"tradeId": f"F-{i}", "orderId": "O-1", "symbol": "BTC-USDT", "side": "SELL",
+         "positionSide": "LONG", "price": "100", "qty": "0.01", "time": 1_700_000_000_000,
+         "realizedPnl": "0", "fee": "0", "feeAsset": "USDT"}
+        for i in range(1000)
+    ]
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"fill_orders": rows, "total": 1000}})
+    result = bingx.get_fill_history("BTC", 1_699_999_999_000, 1_700_000_001_000, page_index=1, page_size=1000)
+    assert result["status"] == "ok"
+    assert result["returned"] == 1000
+    assert result["total"] == 1000
+    assert result["has_more"] is False
+
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"fill_orders": rows, "total": 1001}})
+    result = bingx.get_fill_history("BTC", 1_699_999_999_000, 1_700_000_001_000, page_index=1, page_size=1000)
+    assert result["has_more"] is True

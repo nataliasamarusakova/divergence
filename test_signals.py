@@ -4002,3 +4002,39 @@ def test_tracker_live_pnl_extrema_updates_mae_and_drawdown():
     assert trade["peak_pnl_pct"] == pytest.approx(2.0)
     assert trade["mae_pct"] == pytest.approx(-1.5)
     assert trade["max_drawdown_pct"] == pytest.approx(-3.5)
+
+
+def test_closed_trade_with_failed_protection_cleanup_remains_retryable(tmp_path, monkeypatch):
+    import time
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    now_ms = int(time.time() * 1000)
+    trade = {
+        "event_id": "EVT_CLEANUP_RETRY", "trade_id": "TR_CLEANUP_RETRY",
+        "symbol": "TEST", "direction": "LONG", "entry_price": 100.0,
+        "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": now_ms - 60 * 60_000,
+        "tp_orders": [], "sl_order": {}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
+        "realized_pnl_weighted_sum": 0.0, "closed": False, "manual_exit_reason": None,
+    }
+    active_path.write_text(json.dumps({"EVT_CLEANUP_RETRY": trade}), encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found", "positionAmt": 0})
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tr, "_cleanup_closed_trade_protection", lambda *a, **k: (False, "cancel timeout"))
+    monkeypatch.setattr(tr, "EARLY_LOSS_CUT_ENABLED", False)
+
+    tr.update_active_trades()
+
+    saved = json.loads(active_path.read_text(encoding="utf-8"))
+    assert "EVT_CLEANUP_RETRY" in saved
+    assert saved["EVT_CLEANUP_RETRY"]["closed"] is False
+    assert saved["EVT_CLEANUP_RETRY"]["close_cleanup_pending"] is True
+    assert saved["EVT_CLEANUP_RETRY"]["close_cleanup_last_error"] == "cancel timeout"
+    assert any(json.loads(line).get("record_type") == "TRADE_CLOSE" for line in trades_path.read_text(encoding="utf-8").splitlines())

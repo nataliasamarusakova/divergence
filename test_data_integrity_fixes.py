@@ -298,3 +298,34 @@ def test_tracker_and_shadow_state_writers_normalize_nonfinite_numbers(tmp_path, 
     assert json.loads((tmp_path / "shadow.json").read_text(encoding="utf-8")) == {
         "event": {"score": None}
     }
+
+
+def test_tracker_conversion_preserves_three_or_more_unlabelled_live_tp_orders():
+    import run_once as ro
+
+    orders = [
+        {"orderId": "TP-105", "stopPrice": 105.0, "origQty": 1.0},
+        {"orderId": "TP-110", "stopPrice": 110.0, "origQty": 1.0},
+        {"orderId": "TP-115", "stopPrice": 115.0, "origQty": 1.0},
+        {"orderId": "TP-120", "stopPrice": 120.0, "origQty": 1.0},
+    ]
+    tp = ro._tp_orders_to_tracker(orders, direction="LONG", avg_price=100.0)
+    assert len(tp) == 4
+    assert {row["order_id"] for row in tp} == {"TP-105", "TP-110", "TP-115", "TP-120"}
+    assert len({row["leg"] for row in tp}) == 4
+    assert {row["leg"] for row in tp[:3]} == {"tp1", "tp2", "tp3"}
+    assert any(row["leg"].startswith("tp_extra_") for row in tp)
+
+
+def test_tracker_conversion_uses_unused_leg_when_one_pending_tp_has_known_tp2():
+    import run_once as ro
+
+    tp = ro._tp_orders_to_tracker([
+        {"orderId": "TP-KNOWN-2", "clientOrderId": "EVT_TP2_ABC", "stopPrice": 110.0, "origQty": 1.0},
+        {"orderId": "TP-UNKNOWN", "stopPrice": 105.0, "origQty": 1.0},
+    ], direction="LONG", avg_price=100.0)
+    assert len(tp) == 2
+    assert {row["order_id"] for row in tp} == {"TP-KNOWN-2", "TP-UNKNOWN"}
+    assert len({row["leg"] for row in tp}) == 2
+    assert next(row for row in tp if row["order_id"] == "TP-KNOWN-2")["leg"] == "tp2"
+    assert next(row for row in tp if row["order_id"] == "TP-UNKNOWN")["leg"] == "tp1"
