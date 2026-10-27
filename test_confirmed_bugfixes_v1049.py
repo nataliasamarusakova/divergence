@@ -301,3 +301,84 @@ def test_coinalyze_page_cap_marks_truncation_as_incomplete(monkeypatch):
 
     with pytest.raises(coinalyze.CoinalyzeIncompleteDataError, match="pagination incomplete"):
         coinalyze.fetch_data()
+
+
+def test_successful_market_ack_without_order_id_resolves_direct_order_id_without_name_error(monkeypatch):
+    """The direct-ID recovery branch must not call an undefined float helper."""
+    import event_engine.bingx as bx
+
+    _prepare_market_order_without_id(monkeypatch, bx)
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda *_a, **_k: {
+        "status": "ok", "order_id": "OID-RECOVERED", "order_status": "FILLED", "executed_qty": "2.5"
+    })
+
+    result = bx.open_market("TEST", "LONG", 100.0, "TRADE-X")
+
+    assert result["status"] == "opened"
+    assert result["order_id"] == "OID-RECOVERED"
+    assert result["order_status"] == "FILLED"
+
+
+def test_close_notification_pending_skips_exchange_lifecycle_calls_and_recovers_queue(monkeypatch, tmp_path):
+    """A closed trade waiting for queue persistence must not be processed as live."""
+    import json
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    notifications_path = tmp_path / "notifications.json"
+    trades_path = tmp_path / "trades.jsonl"
+    trade = {
+        "event_id": "EVT_CLOSE_NOTIFY_PENDING",
+        "trade_id": "TR_CLOSE_NOTIFY_PENDING",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "initial_qty": 1.0,
+        "remaining_qty": 0.0,
+        "entry_ts": 1_700_000_000_000,
+        "exit_price": 99.0,
+        "exit_reason": "STOP_LOSS",
+        "duration_min": 12.0,
+        "planned_weighted_rr": 1.5,
+        "closed": False,
+        "close_notification_pending": True,
+        "close_notification_text": "persisted close message",
+        "close_cleanup_pending": False,
+        "close_cleanup_verified": True,
+    }
+    active_path.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+    trades_path.write_text(json.dumps({
+        "record_type": "TRADE_CLOSE", "event_id": trade["event_id"], "symbol": "TEST-USDT",
+        "direction": "LONG", "entry_price": 100.0, "exit_price": 99.0,
+        "realized_pnl_pct": -1.0, "realized_rr": -1.0, "effective_weighted_rr": 1.5,
+        "duration_min": 12.0, "exit_reason": "STOP_LOSS", "event_type": "TEST", "max_drawdown_pct": 1.0,
+    }) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "NOTIFICATIONS_PATH", notifications_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda *_a, **_k: pytest.fail("must not poll position for pending close notification"))
+    monkeypatch.setattr(tr, "get_order", lambda *_a, **_k: pytest.fail("must not query orders for pending close notification"))
+    monkeypatch.setattr(tr, "fetch_klines", lambda *_a, **_k: pytest.fail("must not fetch candles for pending close notification"))
+    monkeypatch.setattr(tr, "_cleanup_closed_trade_protection", lambda *_a, **_k: pytest.fail("cleanup was already verified"))
+
+    def fail_queue(*_args, **_kwargs):
+        raise OSError("temporary notification storage failure")
+    monkeypatch.setattr(tr, "_queue_notification", fail_queue)
+    tr.update_active_trades()
+    saved = json.loads(active_path.read_text(encoding="utf-8"))
+    assert saved[trade["event_id"]]["close_notification_pending"] is True
+    assert saved[trade["event_id"]]["closed"] is False
+
+    def persist_queue(notification_id, **kwargs):
+        notifications_path.write_text(json.dumps({notification_id: {
+            "notification_id": notification_id, "event_id": kwargs["event_id"],
+            "kind": kwargs["kind"], "text": kwargs["text"], "resolved": False, "chats": {"A": {"sent": False}}
+        }}), encoding="utf-8")
+        return False  # Durable queue entry, delivery may still be retried later.
+    monkeypatch.setattr(tr, "_queue_notification", persist_queue)
+    tr.update_active_trades()
+    assert json.loads(active_path.read_text(encoding="utf-8")) == {}
+    persisted = json.loads(notifications_path.read_text(encoding="utf-8"))
+    assert next(iter(persisted.values()))["event_id"] == trade["event_id"]
