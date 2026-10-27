@@ -44,7 +44,7 @@ jobs:
       REQUIRE_CVD_CONFIRMATION: "false"
       ENTRY_QUALITY_GATE_ENABLED: "true"
       ENTRY_QUALITY_MODE: "shadow"
-      DISABLED_EVENT_TYPES: "CRT_BEARISH"
+      DISABLED_EVENT_TYPES: "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"
       MIN_SETUP_SCORE: "60"
       MIN_SHORT_SETUP_SCORE: "75"
       # Trend Filter v1 starts in shadow: it records causal 4H/1H/BTC state but does not block trades yet.
@@ -82,13 +82,11 @@ jobs:
       AJAY_SR_MAX_DATA_AGE_MIN: "130"
       MAX_SR_DATA_REJECTIONS: "3"
       ENTRY_WEAK_ENGINE_BLOCK_ENABLED: "true"
-      ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,CRT_BULLISH,CRT_BEARISH,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH"
-      SHORT_OI_VETO_ENABLED: "true"
-      SHORT_OI_VETO_PCT: "-5.00"
+      ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION"
       COMPOUND_CVD_LIQ_VETO_ENABLED: "true"
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
-      SYMBOL_LOSS_COOLDOWN_MIN: "360"
+      SYMBOL_LOSS_COOLDOWN_MIN: "0"
       # New positions use TP1 + terminal TP2; if the filled size cannot support both, use one terminal TP2.
       REJECT_SINGLE_TP: "false"
       REQUIRE_MULTI_TP: "false"
@@ -126,7 +124,10 @@ jobs:
       REQUIRE_4H_CONTEXT_FOR_1H: "true"
       ENABLE_MACD_4H_ENGINE: "true"
       ENABLE_MA_COMPRESSION_ENGINE: "true"
-      ENABLE_BREAKOUT_MOMENTUM_ENGINE: "true"
+      # MA compression detector stays enabled for telemetry, but its event type is
+      # deliberately in ENTRY_BLOCKED_EVENT_TYPES during this research window (shadow only).
+      # Breakout momentum is disabled at detector level as well as by event policy.
+      ENABLE_BREAKOUT_MOMENTUM_ENGINE: "false"
       ENABLE_DONCHIAN_RETEST_ENGINE: "true"
       ENABLE_LIQUIDITY_SWEEP_ENGINE: "true"
       ENABLE_EMA_PULLBACK_ENGINE: "true"
@@ -140,16 +141,20 @@ jobs:
       EXTREME_SHORT_FUNDING: "-0.50"
       EXTREME_LONG_FUNDING: "0.50"
       FUNDING_REQUIRED: "false"
+      LONG_LS_GATE_ENABLED: "true"
+      LONG_LS_MAX: "1.36"
+      LONG_OI_CHG4H_MAX: "3.0"
+      LONG_FR_BAND_MIN: "0.0009"
+      LONG_FR_BAND_MAX: "0.00665"
+      LONG_BTC_VETO_ENABLED: "true"
       BE_AFTER_LEG: "tp1"
-      EARLY_LOSS_CUT_ENABLED: "false"
+      EARLY_LOSS_CUT_ENABLED: "true"
       EARLY_LOSS_CUT_2H_MIN: "120"
       EARLY_LOSS_CUT_2H_PNL: "-1.50"
       EARLY_LOSS_CUT_4H_MIN: "240"
       EARLY_LOSS_CUT_4H_PNL: "-2.50"
-      MAX_ACTIVE_TRADES: "12"
-      MAX_ACTIVE_LONGS: "6"
-      MAX_ACTIVE_SHORTS: "6"
-      # VST research mode: deliberately no simultaneous-position cap.
+      # VST research mode: code invariant disables simultaneous-position, directional,
+      # and per-cycle entry caps. Do not set MAX_ACTIVE_* in this workflow.
       PORTFOLIO_CAP_ENABLED: "false"
       MAX_EVENT_AGE_MIN: "60"
       SQUEEZE_RELEASE_LOOKBACK_BARS: "4"
@@ -168,16 +173,17 @@ jobs:
       LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
       LIQ_SQUEEZE_FUNDING_EXTREME: "0.03"
       LIQ_SQUEEZE_PRICE_SPIKE_ATR: "1.0"
-      SYMBOL_ENTRY_COOLDOWN_MIN: "15"
-      SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN: "45"
+      SYMBOL_ENTRY_COOLDOWN_MIN: "0"
+      SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN: "0"
       MAX_SHORT_SQUEEZE_ADVERSE_FUNDING: "-0.10"
       MAX_LONG_SQUEEZE_ADVERSE_FUNDING: "0.10"
       MAX_ENTRY_DRIFT_PCT: "2.00"
       MAX_SQUEEZE_ENTRY_DRIFT_PCT: "2.00"
       MAX_HOT_OI_CHG24_PCT: "50"
       HOT_OI_SCORE_PENALTY: "15"
-      SYMBOL_MAX_CONSECUTIVE_LOSSES: "3"
-      SYMBOL_QUARANTINE_MIN: "360"
+      # Research-unlimited tests re-entry behavior without per-symbol cooldown/quarantine.
+      SYMBOL_MAX_CONSECUTIVE_LOSSES: "0"
+      SYMBOL_QUARANTINE_MIN: "0"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
       VPN_EXPECTED_COUNTRY: NL
@@ -355,6 +361,15 @@ jobs:
             cat "$VPN_DIR/wireproxy.log" || true
             rm -rf "$VPN_DIR"
           fi
+
+      - name: Read-only BingX position and daily ledger reconciliation
+        if: always() && !cancelled()
+        env:
+          RECONCILIATION_MAX_SYMBOLS: "2"
+          RECONCILIATION_INCOME_TIMEOUT_SEC: "2"
+          RECONCILIATION_INCOME_REQUEST_BUDGET: "4"
+        run: |
+          python scripts/reconcile_daily.py
 
       - name: Commit state
         if: always()
