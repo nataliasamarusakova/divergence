@@ -60,6 +60,9 @@ POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/po
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 FILL_HISTORY_PATH = "/openApi/swap/v2/trade/fillHistory"
+INCOME_HISTORY_PATH = "/openApi/swap/v2/user/income"
+POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
+POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
 CACHE = {
     "ts": 0.0,
@@ -427,18 +430,56 @@ def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> boo
     return False
 
 
-def _normalize_orders_list(resp: dict) -> list[dict]:
+def _extract_response_rows(
+    resp: dict,
+    *,
+    collection_keys: tuple[str, ...],
+    single_row_markers: tuple[str, ...],
+    context: str,
+) -> list[dict]:
+    """Extract a documented collection shape without treating schema drift as empty.
+
+    An empty list is accepted only when the response explicitly represents a
+    collection. An unexpected ``data`` object, scalar, or malformed row raises
+    so callers cannot mistake an unreadable API response for no positions/orders.
+    """
+    if not isinstance(resp, dict):
+        raise ValueError(f"{context}: response is not an object")
     data = resp.get("data")
     if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("orders", "positions", "order", "position"):
-            val = data.get(key)
-            if isinstance(val, list):
-                return val
-            if isinstance(val, dict):
-                return [val]
-    return []
+        rows = data
+    elif isinstance(data, dict):
+        rows = None
+        for key in collection_keys:
+            if key not in data:
+                continue
+            value = data.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+            if isinstance(value, dict):
+                rows = [value]
+                break
+            raise ValueError(f"{context}: data.{key} is not a list/object")
+        if rows is None and any(key in data for key in single_row_markers):
+            rows = [data]
+        if rows is None:
+            raise ValueError(f"{context}: unrecognized data shape")
+    else:
+        raise ValueError(f"{context}: missing or invalid data collection")
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"{context}: collection contains non-object row")
+    return rows
+
+
+def _normalize_orders_list(resp: dict) -> list[dict]:
+    """Compatibility wrapper; strict callers should handle malformed shapes."""
+    return _extract_response_rows(
+        resp,
+        collection_keys=("orders", "order", "list", "rows"),
+        single_row_markers=("orderId", "orderID", "clientOrderId", "type", "stopPrice"),
+        context="openOrders",
+    )
 
 
 def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
@@ -450,9 +491,31 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") not in (0, "0"):
-        raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
-    return _normalize_orders_list(resp)
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        code = resp.get("code") if isinstance(resp, dict) else "invalid_response"
+        msg = resp.get("msg") if isinstance(resp, dict) else repr(resp)
+        raise RuntimeError(f"[BINGX] get_positions failed: code={code} msg={msg}")
+    try:
+        rows = _extract_response_rows(
+            resp,
+            collection_keys=("positions", "position", "list", "rows"),
+            single_row_markers=("positionAmt", "positionSide", "avgPrice", "entryPrice"),
+            context="get_positions",
+        )
+        for index, row in enumerate(rows):
+            if not str(row.get("symbol") or "").strip():
+                raise ValueError(f"get_positions: row {index} has no symbol")
+            try:
+                qty = float(row.get("positionAmt"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"get_positions: row {index} has invalid positionAmt") from exc
+            if not math.isfinite(qty):
+                raise ValueError(f"get_positions: row {index} has non-finite positionAmt")
+            if abs(qty) > 0 and str(row.get("positionSide") or "").upper() not in {"LONG", "SHORT", "BOTH"}:
+                raise ValueError(f"get_positions: active row {index} has no valid positionSide")
+        return rows
+    except ValueError as exc:
+        raise RuntimeError(f"[BINGX] get_positions response is ambiguous: {exc}") from exc
 
 
 def get_open_orders_snapshot(
@@ -493,10 +556,17 @@ def get_open_orders_snapshot(
 
     protection_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"}
     for order in orders:
-        order_type = str(order.get("type", "")).upper()
+        order_type = str(order.get("type") or "").strip().upper()
+        order_symbol = str(order.get("symbol") or "").strip()
+        if not order_type or not order_symbol:
+            return {
+                "status": "error",
+                "error": "openOrders snapshot has an unidentifiable protection/order row: missing type or symbol; protection state is unknown",
+                "orders": [],
+            }
         if order_type not in protection_types:
             continue
-        if not str(order.get("symbol") or "").strip() or str(order.get("positionSide") or "").upper() not in {"LONG", "SHORT", "BOTH"}:
+        if str(order.get("positionSide") or "").upper() not in {"LONG", "SHORT", "BOTH"}:
             return {
                 "status": "error",
                 "error": "openOrders snapshot contains an unidentifiable protection order",
@@ -580,6 +650,49 @@ def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
     return _query_order(symbol, client_order_id=client_order_id)
 
 
+def _extract_known_rows(payload: Any, row_keys: tuple[str, ...], *, depth: int = 0) -> tuple[list[dict] | None, Any]:
+    """Extract rows from known API wrappers only; never guess an arbitrary list key."""
+    if isinstance(payload, list):
+        if all(isinstance(row, dict) for row in payload):
+            return payload, None
+        return None, "non_object_row"
+    if not isinstance(payload, dict) or depth > 4:
+        return None, "unexpected_shape"
+    for key in row_keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if isinstance(value, list):
+            if all(isinstance(row, dict) for row in value):
+                return value, payload.get("total")
+            return None, "non_object_row"
+        if isinstance(value, dict) and key in {"result", "data", "resultData", "response"}:
+            rows, total = _extract_known_rows(value, row_keys, depth=depth + 1)
+            if rows is not None:
+                return rows, total
+    return None, "unexpected_shape"
+
+
+def _shape_fingerprint(payload: Any) -> tuple[str, str]:
+    """Return a stable, non-sensitive fingerprint and a brief shape description."""
+    def shape(value: Any, depth: int = 0) -> Any:
+        if isinstance(value, list):
+            sample = shape(value[0], depth + 1) if value and depth < 3 else None
+            return {"type": "list", "length": len(value), "sample": sample}
+        if isinstance(value, dict):
+            if depth >= 3:
+                return {"type": "dict", "keys": sorted(map(str, value.keys()))[:30]}
+            return {"type": "dict", "fields": {str(k): shape(v, depth + 1) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))[:30]}}
+        return {"type": type(value).__name__}
+    rendered = json.dumps(shape(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    fingerprint = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+    if isinstance(payload, dict):
+        description = ",".join(f"{key}:{type(value).__name__}" for key, value in sorted(payload.items(), key=lambda kv: str(kv[0]))[:20])
+    else:
+        description = type(payload).__name__
+    return fingerprint, description
+
+
 def get_fill_history(
     symbol: str,
     start_ts: int,
@@ -591,17 +704,14 @@ def get_fill_history(
     currency: str | None = None,
     timeout_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Query actual swap fill history and normalize documented/observed field aliases.
+    """Query actual swap fills and normalize common BingX field aliases.
 
-    Endpoint: GET /openApi/swap/v2/trade/fillHistory. Unknown response shapes fail
-    closed; callers must never confuse an API/format error with zero fills.
+    Unknown payload shapes fail closed, with a shape fingerprint logged for
+    diagnosis. A market/trigger price is never promoted to an execution price.
     """
     raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
     bx = to_bx_symbol(raw_symbol) if raw_symbol else None
     if not bx:
-        # Older/delisted contracts may no longer be in the live contracts catalog,
-        # while their account history can still be queried. Use only a conservative
-        # syntactic USDT swap fallback; no fabricated current-market metadata is used.
         if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
             bx = raw_symbol
         elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
@@ -622,8 +732,11 @@ def get_fill_history(
     }
     if order_id not in (None, ""):
         params["orderId"] = str(order_id)
-    if str(currency or "").upper() in {"USDT", "USDC"}:
-        params["currency"] = str(currency).upper()
+    requested_currency = str(currency or "").strip().upper()
+    if requested_currency in {"USDT", "USDC"}:
+        params["currency"] = requested_currency
+    else:
+        requested_currency = ""
     try:
         resp = _request("GET", FILL_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
     except Exception as exc:
@@ -631,23 +744,19 @@ def get_fill_history(
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         error = resp.get("msg", resp) if isinstance(resp, dict) else resp
         return {"status": "error", "error": str(error), "code": resp.get("code") if isinstance(resp, dict) else None, "fills": []}
+
     data = resp.get("data")
-    if isinstance(data, list):
-        rows = data
-        total = None
-    elif isinstance(data, dict):
-        rows = None
-        for key in ("fill_orders", "fillOrders", "fills", "list", "orders"):
-            if key in data:
-                rows = data.get(key)
-                break
-        total = data.get("total")
-        if not isinstance(rows, list):
-            return {"status": "error", "error": "fill_history_unexpected_data_shape", "fills": []}
-    else:
-        return {"status": "error", "error": "fill_history_missing_data", "fills": []}
-    if not all(isinstance(row, dict) for row in rows):
-        return {"status": "error", "error": "fill_history_non_object_row", "fills": []}
+    row_keys = (
+        "fill_orders", "fillOrders", "fills", "list", "orders", "rows", "records",
+        "tradeFills", "trade_fills", "fillList", "fill_list", "result", "data",
+        "resultData", "response",
+    )
+    rows, total = _extract_known_rows(data, row_keys)
+    if rows is None:
+        fingerprint, description = _shape_fingerprint(data)
+        reason = "fill_history_non_object_row" if total == "non_object_row" else "fill_history_unexpected_data_shape"
+        log.warning("[BINGX] %s fingerprint=%s shape=%s", reason, fingerprint, description)
+        return {"status": "error", "error": reason, "shape_fingerprint": fingerprint, "fills": []}
 
     def first_number(row: dict, names: tuple[str, ...]) -> float | None:
         for key in names:
@@ -662,24 +771,46 @@ def get_fill_history(
                 return number
         return None
 
+    def first_text(row: dict, names: tuple[str, ...]) -> str:
+        for key in names:
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
     fills: list[dict[str, Any]] = []
     for row in rows:
-        fill_ts = first_number(row, ("time", "tradeTime", "fillTime", "closeTime", "tradeTimestamp", "ts", "createTime"))
+        fill_ts = first_number(row, (
+            "time", "tradeTime", "trade_time", "fillTime", "closeTime", "tradeTimestamp",
+            "timestamp", "transactTime", "ts", "createTime",
+        ))
         if fill_ts is not None and 0 < fill_ts < 100_000_000_000:
             fill_ts *= 1000.0
-        qty = first_number(row, ("qty", "quantity", "volume", "tradeVolume", "executedQty", "fillQty"))
-        price = first_number(row, ("price", "tradePrice", "fillPrice", "avgPrice"))
+        qty = first_number(row, (
+            "qty", "quantity", "volume", "tradeVolume", "executedQty", "fillQty", "dealVolume",
+        ))
+        price = first_number(row, ("price", "tradePrice", "fillPrice", "avgPrice", "dealPrice"))
+        reported_fee_asset = first_text(row, ("feeAsset", "commissionAsset", "feeCurrency", "currency", "asset")).upper()
+        # Official fillHistory rows may expose `fee` without a per-row asset
+        # field. Treat it as the requested settlement currency only when the
+        # caller explicitly filtered the endpoint by that currency.
+        normalized_fee_asset = reported_fee_asset or requested_currency or None
         fills.append({
-            "trade_id": str(row.get("tradeId") or row.get("fillId") or row.get("id") or ""),
-            "order_id": str(row.get("orderId") or row.get("orderID") or ""),
-            "symbol": str(row.get("symbol") or bx).upper(),
-            "side": str(row.get("side") or "").upper(),
-            "position_side": str(row.get("positionSide") or row.get("positionSideName") or "").upper(),
+            "trade_id": first_text(row, ("tradeId", "tradeID", "trade_id", "fillId", "fillID", "fill_id", "id")),
+            "order_id": first_text(row, ("orderId", "orderID", "order_id")),
+            "symbol": first_text(row, ("symbol", "contract", "instrument")) or bx,
+            "side": first_text(row, ("side", "tradeSide", "orderSide")).upper(),
+            "position_side": first_text(row, ("positionSide", "positionSideName", "position_side")).upper(),
             "price": price,
             "qty": abs(qty) if qty is not None else None,
             "time": int(fill_ts) if fill_ts is not None else None,
-            "realized_pnl": first_number(row, ("realizedPnl", "realizedPNL", "realizedProfit")),
-            "fee": first_number(row, ("fee", "commission", "tradingFee")),
+            "realized_pnl": first_number(row, (
+                "realizedPnl", "realizedPNL", "realizedProfit", "realized_profit", "realized_pnl",
+            )),
+            "fee": first_number(row, (
+                "fee", "commission", "tradingFee", "tradeFee", "fillFee", "commissionFee", "transactionFee",
+            )),
+            "fee_asset": normalized_fee_asset,
             "raw_fill": row,
         })
     return {
@@ -688,6 +819,140 @@ def get_fill_history(
         "has_more": len(fills) >= page_size,
     }
 
+
+def get_income_history(
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    limit: int = 1000,
+    timeout_sec: float | None = 5.0,
+    max_range_requests: int = 64,
+) -> dict[str, Any]:
+    """Read signed account cashflows (realized PnL, trading fees, funding fees).
+
+    The endpoint returns actual account ledger amounts. Full-history completeness
+    is required: a truncated response or an unknown row shape is an error, never
+    treated as a zero cost. The API retains only a bounded recent history.
+    """
+    raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    bx = to_bx_symbol(raw_symbol) if raw_symbol else None
+    if not bx:
+        if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
+            bx = raw_symbol
+        elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
+            bx = raw_symbol.replace("-", "") + "-USDT"
+        else:
+            return {"status": "error", "error": "invalid_or_unknown_income_symbol", "records": [], "complete": False}
+    try:
+        start_ts, end_ts, limit = int(start_ts), int(end_ts), int(limit)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "invalid_income_history_parameters", "records": [], "complete": False}
+    if start_ts <= 0 or end_ts <= start_ts or limit < 1:
+        return {"status": "error", "error": "invalid_income_history_range_or_limit", "records": [], "complete": False}
+    limit = min(limit, 1000)
+    seen: set[str] = set()
+    request_count = 0
+    # Bound recursive time-range splitting so a dense account history cannot
+    # turn a single recovery into thousands of signed API requests. Callers
+    # doing secondary/background reconciliation may choose a smaller budget;
+    # exhausting it is an explicit incomplete-data error, never a partial total.
+    try:
+        max_range_requests = max(1, min(64, int(max_range_requests)))
+    except (TypeError, ValueError, OverflowError):
+        return {"status": "error", "error": "invalid_income_history_request_budget", "records": [], "complete": False}
+
+    def fetch_range(lo: int, hi: int, depth: int = 0) -> tuple[list[dict] | None, str | None]:
+        nonlocal request_count
+        if request_count >= max_range_requests:
+            return None, "income_history_query_budget_exhausted"
+        request_count += 1
+        params = {"symbol": bx, "startTime": lo, "endTime": hi, "limit": limit}
+        try:
+            response = _request("GET", INCOME_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
+        except Exception as exc:
+            return None, f"request_exception:{exc}"
+        if not isinstance(response, dict) or response.get("code") not in (0, "0"):
+            err = response.get("msg", response) if isinstance(response, dict) else response
+            return None, str(err)
+        data = response.get("data")
+        rows, meta = _extract_known_rows(data, ("list", "rows", "records", "income", "incomeList", "income_list", "incomeRecords", "income_records", "result", "data", "resultData", "response"))
+        if rows is None:
+            fp, desc = _shape_fingerprint(data)
+            log.warning("[BINGX] income history unexpected shape fingerprint=%s shape=%s", fp, desc)
+            return None, "income_history_unexpected_data_shape"
+        if len(rows) < limit:
+            return rows, None
+        # `user/income` has no offset cursor. Split saturated ranges by time rather
+        # than assuming the first limit rows represent the whole ledger.
+        if depth >= 12 or hi - lo <= 1:
+            return None, "income_history_range_still_truncated_after_time_split"
+        mid = (lo + hi) // 2
+        left, left_error = fetch_range(lo, mid, depth + 1)
+        if left_error:
+            return None, left_error
+        right, right_error = fetch_range(mid + 1, hi, depth + 1)
+        if right_error:
+            return None, right_error
+        return (left or []) + (right or []), None
+
+    rows, error = fetch_range(start_ts, end_ts)
+    if error or rows is None:
+        return {"status": "error", "error": error or "income_history_unavailable", "records": [], "complete": False}
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        def first_number(names: tuple[str, ...]) -> float | None:
+            for key in names:
+                value = row.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(number):
+                    return number
+            return None
+        def first_text(names: tuple[str, ...]) -> str:
+            for key in names:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return ""
+        amount = first_number(("income", "amount", "cashFlow", "cashflow"))
+        timestamp = first_number(("time", "timestamp", "ts", "createTime", "transactTime"))
+        if timestamp is not None and 0 < timestamp < 100_000_000_000:
+            timestamp *= 1000.0
+        if amount is None or timestamp is None or timestamp <= 0:
+            return {"status": "error", "error": "income_history_record_missing_amount_or_time", "records": [], "complete": False}
+        record = {
+            "record_id": first_text(("tranId", "transactionId", "transId", "id")),
+            "trade_id": first_text(("tradeId", "tradeID", "trade_id")),
+            "order_id": first_text(("orderId", "orderID", "order_id")),
+            # Do not infer a missing row symbol from the query filter; an unidentifiable
+            # ledger row must not be silently attributed to the requested contract.
+            "symbol": first_text(("symbol", "contract", "instrument")).upper(),
+            "income_type": first_text(("incomeType", "income_type", "type")).upper(),
+            "amount": amount,
+            "asset": first_text(("asset", "currency")).upper(),
+            "time": int(timestamp),
+            "info": first_text(("info", "remark", "description")),
+            "raw_income": row,
+        }
+        identity = record["record_id"] or hashlib.sha256(
+            json.dumps({k: record[k] for k in ("symbol", "income_type", "amount", "asset", "time", "trade_id")}, sort_keys=True).encode()
+        ).hexdigest()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        records.append(record)
+    records.sort(key=lambda item: (item["time"], item["record_id"]))
+    return {
+        "status": "ok", "records": records, "complete": True,
+        "symbol": bx, "start_ts": start_ts, "end_ts": end_ts,
+        "returned": len(records), "source": "BINGX_USER_INCOME", "query_count": request_count,
+    }
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
     bx = to_bx_symbol(symbol)
@@ -951,6 +1216,16 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
+    # This engine only supports Hedge Mode. BingX explicitly rejects reduceOnly
+    # in Hedge Mode; never add it and never retry a failed close with that flag
+    # removed. A mismatched configured mode is a hard error before any POST.
+    if POSITION_MODE != "HEDGE":
+        return {"status": "error", "error": f"unsupported_position_mode_for_directional_close:{POSITION_MODE}", "escalation_required": True}
+    actual_mode = get_position_mode()
+    if actual_mode.get("status") != "ok":
+        return {"status": "error", "error": actual_mode.get("error", "position_mode_unknown"), "escalation_required": True}
+    if actual_mode.get("mode") != "HEDGE":
+        return {"status": "error", "error": f"exchange_position_mode_mismatch_for_directional_close:{actual_mode.get('mode')}", "escalation_required": True}
     bx_symbol = to_bx_symbol(symbol)
     contract = get_contract(symbol)
     if not bx_symbol or not contract:
@@ -965,19 +1240,54 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
         f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}".upper().encode()
     ).hexdigest().upper()[:24]
 
+    def _confirm_absence(first_state: dict | None = None) -> dict:
+        """Require a second explicit not_found response before declaring flat."""
+        state = first_state
+        if not isinstance(state, dict):
+            try:
+                state = get_position_directional(symbol, direction)
+            except Exception as exc:
+                return {"status": "error", "error": f"position_read_exception:{exc}"}
+        if str(state.get("status", "")).lower() != "not_found":
+            return state
+        time.sleep(0.25)
+        try:
+            confirmed = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "error", "error": f"position_absence_confirmation_exception:{exc}"}
+        if str(confirmed.get("status", "")).lower() == "not_found":
+            return {"status": "not_found", "symbol": bx_symbol, "positionSide": direction, "absence_reads": 2}
+        return confirmed
+
     for attempt in range(2):
         try:
             live = get_position_directional(symbol, direction)
         except Exception as exc:
             return {"status": "error", "error": f"position verification failed before emergency close: {exc}"}
-        if str(live.get("status", "")).lower() != "found":
-            return {"status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": attempt}
+        live_status = str(live.get("status", "")).lower()
+        if live_status == "not_found":
+            live = _confirm_absence(live)
+            live_status = str(live.get("status", "")).lower()
+            if live_status == "not_found":
+                return {"status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": attempt, "verification": "two_not_found_reads"}
+        if live_status != "found":
+            return {
+                "status": "unknown", "error": f"position state is not safe to close: {live.get('error', live_status or 'unknown')}",
+                "symbol": bx_symbol, "direction": direction, "attempts": attempt, "escalation_required": True,
+            }
 
-        live_qty = abs(float(live.get("positionAmt", 0) or 0))
-        close_qty = live_qty if live_qty > 0 else requested_qty
-        close_qty = _round_qty(close_qty, precision)
+        try:
+            live_qty = abs(float(live.get("positionAmt", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            live_qty = 0.0
+        if not math.isfinite(live_qty) or live_qty <= 0:
+            return {
+                "status": "unknown", "error": "live position quantity is not confirmed; refusing emergency close POST",
+                "symbol": bx_symbol, "direction": direction, "attempts": attempt, "escalation_required": True,
+            }
+        close_qty = _round_qty(live_qty, precision)
         if close_qty <= 0:
-            return {"status": "error", "error": "emergency close quantity is zero", "symbol": bx_symbol}
+            return {"status": "unknown", "error": "emergency close quantity rounds to zero", "symbol": bx_symbol, "escalation_required": True}
 
         side = "SELL" if direction == "LONG" else "BUY"
         params = {
@@ -1020,15 +1330,32 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
                             "symbol": bx_symbol, "direction": direction,
                             "client_order_id": client_order_id, "escalation_required": True,
                         }
-                    residual_qty = abs(float(after_recovery.get("positionAmt", 0) or 0)) if str(after_recovery.get("status", "")).lower() == "found" else 0.0
-                    if residual_qty <= 0:
+                    after_status = str(after_recovery.get("status", "")).lower()
+                    if after_status == "not_found":
+                        after_recovery = _confirm_absence(after_recovery)
+                        after_status = str(after_recovery.get("status", "")).lower()
+                        if after_status == "not_found":
+                            return {
+                                "status": "closed", "symbol": bx_symbol, "direction": direction,
+                                "client_order_id": client_order_id,
+                                "order_id": queried.get("order_id"),
+                                "execution_price": queried.get("avg_price") or None,
+                                "idempotency": "order_queried_after_transport_error",
+                                "verification": "two_not_found_reads",
+                            }
+                    if after_status != "found":
                         return {
-                            "status": "closed",
-                            "symbol": bx_symbol,
-                            "direction": direction,
-                            "client_order_id": client_order_id,
-                            "execution_price": queried.get("avg_price") or None,
-                            "idempotency": "order_queried_after_transport_error",
+                            "status": "unknown",
+                            "error": f"close order outcome found but live position state is unknown: {after_recovery.get('error', after_status or 'unknown')}",
+                            "symbol": bx_symbol, "direction": direction,
+                            "client_order_id": client_order_id, "escalation_required": True,
+                        }
+                    residual_qty = abs(float(after_recovery.get("positionAmt", 0) or 0))
+                    if not math.isfinite(residual_qty) or residual_qty <= 0:
+                        return {
+                            "status": "unknown", "error": "position read reported found with invalid residual quantity",
+                            "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id,
+                            "escalation_required": True,
                         }
                     if order_status == "FILLED":
                         return {
@@ -1085,10 +1412,12 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
 
         time.sleep(0.25)
         execution_price = None
+        actual_order_id = None
         if isinstance(response, dict):
             data = response.get("data") or {}
             order = data.get("order") if isinstance(data, dict) else {}
             if isinstance(order, dict):
+                actual_order_id = order.get("orderId") or order.get("orderID") or data.get("orderId")
                 for key in ("avgPrice", "avg_price", "executedAvgPrice"):
                     try:
                         candidate = float(order.get(key))
@@ -1101,13 +1430,33 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             after = get_position_directional(symbol, direction)
         except Exception as exc:
             return {"status": "unknown", "error": f"emergency close submitted but verification failed: {exc}", "symbol": bx_symbol, "client_order_id": client_order_id}
-        if str(after.get("status", "")).lower() != "found" or abs(float(after.get("positionAmt", 0) or 0)) <= 0:
+        after_status = str(after.get("status", "")).lower()
+        if after_status == "not_found":
+            after = _confirm_absence(after)
+            after_status = str(after.get("status", "")).lower()
+            if after_status == "not_found":
+                return {
+                    "status": "closed", "symbol": bx_symbol, "direction": direction,
+                    "client_order_id": client_order_id, "order_id": str(actual_order_id) if actual_order_id not in (None, "") else None,
+                    "execution_price": execution_price,
+                    "verification": "two_not_found_reads",
+                }
+        if after_status != "found":
             return {
-                "status": "closed",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "execution_price": execution_price,
+                "status": "unknown",
+                "error": f"emergency close submitted but position state is unknown: {after.get('error', after_status or 'unknown')}",
+                "symbol": bx_symbol, "direction": direction,
+                "client_order_id": client_order_id, "escalation_required": True,
+            }
+        try:
+            after_qty = abs(float(after.get("positionAmt", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            after_qty = 0.0
+        if not math.isfinite(after_qty) or after_qty <= 0:
+            return {
+                "status": "unknown", "error": "position state found but residual quantity is invalid after close",
+                "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id,
+                "escalation_required": True,
             }
 
         # An HTTP-successful MARKET close can still race the position endpoint: the
@@ -1131,7 +1480,7 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
 
         verified_status = str(verified_order.get("order_status", "")).upper()
         verified_executed_qty = float(verified_order.get("executed_qty", 0) or 0)
-        residual_qty = abs(float(after.get("positionAmt", 0) or 0))
+        residual_qty = after_qty
 
         if verified_status == "FILLED" and residual_qty > 0:
             return {
@@ -1189,7 +1538,11 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             "escalation_required": True,
         }
 
-    if str(final_state.get("status", "")).lower() == "found":
+    final_status = str(final_state.get("status", "")).lower()
+    if final_status == "not_found":
+        final_state = _confirm_absence(final_state)
+        final_status = str(final_state.get("status", "")).lower()
+    if final_status == "found":
         try:
             remaining_qty = abs(float(final_state.get("positionAmt", 0) or 0))
         except (TypeError, ValueError):
@@ -1205,54 +1558,138 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             "remaining_qty": remaining_qty, "escalation_required": True,
         }
 
+    if final_status == "not_found":
+        return {
+            "status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": 2,
+            "verification": "final_two_not_found_reads",
+        }
     return {
-        "status": "closed",
+        "status": "unknown",
+        "error": f"emergency close final position state is unknown: {final_state.get('error', final_status or 'unknown')}",
         "symbol": bx_symbol, "direction": direction, "attempts": 2,
-        "verification": "final_readback",
+        "escalation_required": True,
     }
 
 
+def get_position_mode() -> dict[str, Any]:
+    """Return the exchange-reported position mode; unknown is not treated as Hedge."""
+    try:
+        response = _request("GET", POSITION_MODE_PATH, {}, signed=True, retryable=False)
+    except Exception as exc:
+        return {"status": "error", "error": f"position_mode_request_exception:{exc}"}
+    if not isinstance(response, dict) or response.get("code") not in (0, "0"):
+        error = response.get("msg", response) if isinstance(response, dict) else response
+        return {"status": "error", "error": f"position_mode_query_failed:{error}"}
+    data = response.get("data")
+    if not isinstance(data, dict) or "dualSidePosition" not in data:
+        return {"status": "error", "error": "position_mode_response_missing_dualSidePosition"}
+    value = data.get("dualSidePosition")
+    if isinstance(value, bool):
+        hedge = value
+    elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        hedge = value.strip().lower() == "true"
+    else:
+        return {"status": "error", "error": "position_mode_response_invalid_dualSidePosition"}
+    return {"status": "ok", "mode": "HEDGE" if hedge else "ONE_WAY", "dualSidePosition": hedge}
+
+
 def get_position_directional(symbol: str, direction: str) -> dict:
+    """Read one directional position without confusing unknown data with flat state.
+
+    Only a valid, recognized response with no matching nonzero position can
+    produce ``not_found``. API errors, schema drift, malformed quantities, and
+    an active position without a usable side remain ``error`` / ``found``.
+    """
     bx_symbol = to_bx_symbol(symbol)
     direction = str(direction).upper()
-    if not bx_symbol:
-        return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
+    if not bx_symbol or direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": "invalid_position_query", "symbol": bx_symbol}
 
-    resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
+    try:
+        resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
+    except Exception as exc:
+        return {"status": "error", "error": f"position_request_exception:{exc}", "symbol": bx_symbol}
+    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+        error = resp.get("msg", resp) if isinstance(resp, dict) else resp
+        return {"status": "error", "error": f"get_position failed: {error}", "symbol": bx_symbol}
 
-    for p in _normalize_orders_list(resp):
-        position_side = str(p.get("positionSide", "")).upper()
-        if position_side not in (direction, "BOTH"):
+    data = resp.get("data")
+    if isinstance(data, list):
+        positions = data
+    elif isinstance(data, dict):
+        positions = None
+        for key in ("positions", "position", "list", "rows"):
+            value = data.get(key)
+            if isinstance(value, list):
+                positions = value
+                break
+            if isinstance(value, dict):
+                positions = [value]
+                break
+        if positions is None and any(k in data for k in ("positionAmt", "positionSide", "avgPrice", "entryPrice")):
+            positions = [data]
+        if positions is None:
+            return {"status": "error", "error": "position_response_unrecognized_data_shape", "symbol": bx_symbol}
+    else:
+        return {"status": "error", "error": "position_response_missing_or_invalid_data", "symbol": bx_symbol}
+
+    if not all(isinstance(row, dict) for row in positions):
+        return {"status": "error", "error": "position_response_contains_non_object_row", "symbol": bx_symbol}
+
+    for position in positions:
+        row_symbol = str(position.get("symbol") or bx_symbol).upper().replace("_", "-").replace("/", "-")
+        if row_symbol != bx_symbol:
             continue
 
+        raw_side = str(position.get("positionSide", "")).upper().strip()
+        raw_qty = position.get("positionAmt")
         try:
-            qty = abs(float(p.get("positionAmt", 0) or 0))
-            avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
-        except (TypeError, ValueError):
+            qty_signed = float(raw_qty)
+        except (TypeError, ValueError, OverflowError):
+            # If this row has directional information but its quantity cannot
+            # be read, absence cannot be proven.
+            if raw_side in {direction, "BOTH"}:
+                return {"status": "error", "error": "position_response_invalid_positionAmt", "symbol": bx_symbol}
+            if raw_side in {"LONG", "SHORT"} and raw_side != direction:
+                continue
+            return {"status": "error", "error": "position_response_missing_position_side_or_quantity", "symbol": bx_symbol}
+        if not math.isfinite(qty_signed):
+            return {"status": "error", "error": "position_response_non_finite_positionAmt", "symbol": bx_symbol}
+        if abs(qty_signed) <= 0:
             continue
 
-        if qty <= 0 or avg_price <= 0:
+        if raw_side not in {"LONG", "SHORT", "BOTH"}:
+            return {"status": "error", "error": "position_response_active_row_missing_valid_positionSide", "symbol": bx_symbol}
+        if raw_side == "BOTH":
+            if direction == "LONG" and qty_signed < 0:
+                continue
+            if direction == "SHORT" and qty_signed > 0:
+                continue
+        elif raw_side != direction:
             continue
 
-        if position_side == "BOTH":
-            try:
-                raw_amt = float(p.get("positionAmt", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if direction == "LONG" and raw_amt < 0:
-                continue
-            if direction == "SHORT" and raw_amt > 0:
-                continue
+        def _positive_price(*keys: str) -> float:
+            for key in keys:
+                try:
+                    value = float(position.get(key) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value) and value > 0:
+                    return value
+            return 0.0
 
+        avg_price = _positive_price("avgPrice", "entryPrice", "avgEntryPrice", "averagePrice")
+        # Quantity and direction prove the position exists even if a newly
+        # observed API response omits the average price. Keep it found so no
+        # lifecycle path can mistake it for a closed position.
         return {
             "status": "found",
-            "symbol": p.get("symbol", bx_symbol),
+            "symbol": row_symbol,
             "positionSide": direction,
             "avgPrice": avg_price,
-            "positionAmt": qty,
-            "entryPrice": float(p.get("entryPrice", 0) or avg_price),
+            "entryPrice": _positive_price("entryPrice") or avg_price,
+            "positionAmt": abs(qty_signed),
+            "price_status": "confirmed" if avg_price > 0 else "unknown",
         }
 
     return {"status": "not_found", "symbol": bx_symbol, "positionSide": direction}
@@ -1291,15 +1728,44 @@ def get_open_protection_directional(
     if resp.get("code") not in (0, "0"):
         return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
 
+    try:
+        orders = _normalize_orders_list(resp)
+    except ValueError as exc:
+        return {
+            "status": "error", "error": f"openOrders response is ambiguous: {exc}",
+            "symbol": bx_symbol, "positionSide": direction, "tp_orders": [], "sl_orders": [],
+        }
+
     tp_orders = []
     sl_orders = []
 
-    for order in _normalize_orders_list(resp):
+    for order in orders:
+        order_type = str(order.get("type", "")).strip().upper()
+        if not order_type:
+            return {
+                "status": "error", "error": "openOrders row is missing order type; protection state is unknown",
+                "symbol": bx_symbol, "positionSide": direction, "tp_orders": [], "sl_orders": [],
+            }
+        row_symbol = str(order.get("symbol") or "").strip()
+        has_order_identity = any(str(order.get(key) or "").strip() for key in ("orderId", "orderID", "clientOrderId"))
+        if not row_symbol and not has_order_identity:
+            return {
+                "status": "error", "error": "openOrders row is not identifiable by symbol or order id",
+                "symbol": bx_symbol, "positionSide": direction, "tp_orders": [], "sl_orders": [],
+            }
+        if row_symbol:
+            normalized_symbol = row_symbol.upper().replace("_", "-").replace("/", "-")
+            if normalized_symbol != bx_symbol:
+                continue
         position_side = str(order.get("positionSide", "")).upper()
+        if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"} and position_side not in {"LONG", "SHORT", "BOTH"}:
+            return {
+                "status": "error", "error": "protective openOrders row has missing/invalid positionSide",
+                "symbol": bx_symbol, "positionSide": direction, "tp_orders": [], "sl_orders": [],
+            }
         if position_side not in (direction, "BOTH"):
             continue
 
-        order_type = str(order.get("type", "")).upper()
         if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
             tp_orders.append(order)
         elif order_type in {"STOP", "STOP_MARKET"}:
@@ -1833,12 +2299,19 @@ def _post_protection_order_verified(
                     "msg": f"{last_resp.get('msg', 'transport error')}; conditional protection verification failed: {exc}",
                     "protection_state_unknown": True,
                 }
+            if live_status == "not_found":
+                return {
+                    "code": -1,
+                    "msg": f"{last_resp.get('msg', 'transport error')}; position absence confirmed by position endpoint",
+                    "protection_state_unknown": True,
+                    "position_gone": True,
+                }
             if live_status != "found" or live_qty <= 0:
                 return {
                     "code": -1,
-                    "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after conditional-order timeout",
+                    "msg": f"{last_resp.get('msg', 'transport error')}; position state remains unknown after conditional-order timeout: {live_pos.get('error', live_status)}",
                     "protection_state_unknown": True,
-                    "position_gone": True,
+                    "position_gone": False,
                 }
             return {
                 "code": -1,
@@ -1856,12 +2329,19 @@ def _post_protection_order_verified(
                 "msg": f"{last_resp.get('msg', 'transport error')}; live position verification failed: {exc}",
                 "protection_state_unknown": True,
             }
+        if live_status == "not_found":
+            return {
+                "code": -1,
+                "msg": f"{last_resp.get('msg', 'transport error')}; position absence confirmed by position endpoint",
+                "protection_state_unknown": True,
+                "position_gone": True,
+            }
         if live_status != "found" or live_qty <= 0:
             return {
                 "code": -1,
-                "msg": f"{last_resp.get('msg', 'transport error')}; position no longer exists after timeout",
+                "msg": f"{last_resp.get('msg', 'transport error')}; position state remains unknown after timeout: {live_pos.get('error', live_status)}",
                 "protection_state_unknown": True,
-                "position_gone": True,
+                "position_gone": False,
             }
 
         # MARKET TP/close can fill between POST and verification. Never recreate.

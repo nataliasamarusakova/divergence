@@ -14,6 +14,7 @@ from event_engine.bingx import (
     get_position_directional,
     get_order,
     get_fill_history,
+    get_income_history,
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
@@ -319,7 +320,7 @@ def _fetch_trade_fill_history(record: dict, opened_record: dict | None, now_ms: 
             try:
                 response = get_fill_history(
                     symbol, cursor, chunk_end, page_index=page_index,
-                    page_size=1000, timeout_sec=5.0,
+                    page_size=1000, currency="USDT", timeout_sec=5.0,
                 )
             except Exception as exc:
                 request_elapsed = time.monotonic() - request_started
@@ -382,6 +383,11 @@ def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: l
         return None, "missing_trade_identity_or_quantity"
 
     entry_order_id = _fill_id(record.get("entry_order_id") or execution.get("order_id"))
+    # Symbol/time/side/quantity coincidence is not a trade identity. Without a
+    # journaled entry order ID, unrelated fills on the same contract can appear
+    # to reconstruct this DATA_ERROR close. Leave the record unresolved instead.
+    if not entry_order_id:
+        return None, "missing_entry_order_id_for_reconstruction"
     sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
     sl_ids = {_fill_id(record.get("sl_order_id")), _fill_id(sl_result.get("order_id") or sl_result.get("orderId"))}
     sl_ids.discard("")
@@ -425,14 +431,40 @@ def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: l
         elif side == close_side:
             close_fills.append(fill)
 
-    known_protection_ids = sl_ids | tp_ids
-    if known_protection_ids and any(_fill_id(fill.get("order_id")) in known_protection_ids for fill in close_fills):
-        close_fills = [fill for fill in close_fills if _fill_id(fill.get("order_id")) in known_protection_ids]
+    # Only fills from directly journaled exit/protection order IDs can be
+    # attributed to this logical trade. Never fall back to every opposite-side
+    # fill on the same symbol/time window when these IDs do not match.
+    direct_exit_ids = set(sl_ids) | set(tp_ids)
+    for key in ("order_id", "orderId", "orderID", "close_order_id", "exit_order_id", "manual_exit_order_id", "filled_sl_order_id"):
+        value = _fill_id(record.get(key))
+        if value:
+            direct_exit_ids.add(value)
+    for key in ("close_order_ids", "exit_order_ids", "tp_order_ids", "filled_order_ids"):
+        value = record.get(key)
+        if isinstance(value, list):
+            direct_exit_ids.update(_fill_id(item) for item in value if _fill_id(item))
+    direct_exit_ids.discard(entry_order_id)
+    if not direct_exit_ids:
+        return None, "missing_direct_exit_order_ids_for_reconstruction"
+    close_fills = [fill for fill in close_fills if _fill_id(fill.get("order_id")) in direct_exit_ids]
     if not close_fills:
-        return None, "no_close_side_fills_found"
+        return None, "no_fills_for_journaled_exit_order_ids"
 
     filled_qty = sum(abs(_safe_float(fill.get("qty"), 0.0)) for fill in close_fills)
     tolerance = max(target_qty * 0.002, 1e-10)
+    entry_qty = sum(abs(_safe_float(fill.get("qty"), 0.0)) for fill in entry_fills)
+    if not entry_fills:
+        return None, "entry_order_has_no_confirmed_fills"
+    if abs(entry_qty - target_qty) > tolerance:
+        return None, f"entry_fill_qty_mismatch:{entry_qty:.12g}/{target_qty:.12g}"
+    # Recompute entry VWAP from fills belonging to the exact entry order rather
+    # than relying on a possibly tracker-derived journal price.
+    entry_price = sum(
+        abs(_safe_float(fill.get("qty"), 0.0)) * _safe_float(fill.get("price"), 0.0)
+        for fill in entry_fills
+    ) / entry_qty
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        return None, "invalid_entry_fill_vwap"
     if filled_qty < target_qty - tolerance:
         return None, f"incomplete_close_fills:{filled_qty:.12g}/{target_qty:.12g}"
     if filled_qty > target_qty + tolerance:
@@ -488,9 +520,11 @@ def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: l
         realized_pnl_usdt = None
         realized_pnl_usdt_source = "UNKNOWN_EXCHANGE_REALIZED_PNL_MISSING"
 
-    entry_qty = sum(abs(_safe_float(fill.get("qty"), 0.0)) for fill in entry_fills)
     all_fee_fills = entry_fills + close_fills
-    if entry_fills and abs(entry_qty - target_qty) <= tolerance and all(fill.get("fee") is not None for fill in all_fee_fills):
+    if all(
+        fill.get("fee") is not None and str(fill.get("fee_asset") or "").upper() == "USDT"
+        for fill in all_fee_fills
+    ):
         fees_usdt = sum(float(fill.get("fee")) for fill in all_fee_fills)
     else:
         fees_usdt = None
@@ -918,6 +952,24 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
     return False, last_error
 
 
+def _notify_position_state_unknown(
+    symbol: str, direction: str, detail: str, event_id: str | None = None, *, kind: str = "POSITION_STATE_UNKNOWN",
+) -> None:
+    """Queue a durable operator alert when exchange position state is ambiguous."""
+    try:
+        eid = str(event_id or f"{symbol}:{direction}:{kind}")
+        nid = _notification_id(eid, kind)
+        text = (
+            f"🚨 <b>BingX position state requires verification ({symbol} {direction})</b>\n"
+            f"Status: <code>{detail}</code>\n"
+            "Бот не считает позицию закрытой и не отправляет слепой повторный ордер. "
+            "Срочно проверьте фактическую позицию и SL/TP на бирже."
+        )
+        _queue_notification(nid, event_id=eid, kind=kind, symbol=symbol, direction=direction, text=text)
+    except Exception as exc:
+        log.error("[TELEGRAM] Could not queue position-state alert: %s", exc)
+
+
 def _notify_be_failure(symbol: str, direction: str, detail: str, event_id: str | None = None) -> None:
     """Queue a durable Telegram alert for BE failures."""
     try:
@@ -967,11 +1019,14 @@ def _move_sl_to_break_even(
 
     # Always reconcile the actual live quantity immediately before changing the SL.
     live_pos = get_position_directional(symbol, direction)
-    if str(live_pos.get("status", "")).lower() != "found":
-        return {"status": "position_gone", "error": "position not found before BE", "order_id": "", "stop_price": entry_price}
+    live_status = str(live_pos.get("status", "")).lower()
+    if live_status == "not_found":
+        return {"status": "position_gone", "error": "position absence confirmed before BE", "order_id": "", "stop_price": entry_price}
+    if live_status != "found":
+        return {"status": "error", "error": f"position state unknown before BE: {live_pos.get('error', live_status or 'unknown')}", "order_id": "", "stop_price": entry_price}
     live_qty = abs(_safe_float(live_pos.get("positionAmt"), 0.0))
     if live_qty <= 0:
-        return {"status": "position_gone", "error": "position quantity is zero before BE", "order_id": "", "stop_price": entry_price}
+        return {"status": "error", "error": "position quantity invalid before BE", "order_id": "", "stop_price": entry_price}
     qty = live_qty
 
     trade_token = str(trade_id) if trade_id else uuid.uuid4().hex.upper()[:16]
@@ -1154,11 +1209,14 @@ def _early_loss_cut_guard(symbol: str, direction: str, current_price: float, qty
         pos = get_position_directional(symbol, direction)
     except Exception as exc:
         return False, f"position_recheck_error:{exc}", qty
-    if str(pos.get("status", "")).lower() != "found":
-        return False, "position_not_found_on_recheck", 0.0
+    pos_status = str(pos.get("status", "")).lower()
+    if pos_status == "not_found":
+        return False, "position_absence_confirmed_on_recheck", 0.0
+    if pos_status != "found":
+        return False, f"position_state_unknown_on_recheck:{pos.get('error', pos_status or 'unknown')}", qty
     live_qty = abs(_safe_float(pos.get("positionAmt"), 0.0))
     if live_qty <= 0:
-        return False, "position_zero_on_recheck", 0.0
+        return False, "position_quantity_invalid_on_recheck", qty
 
     try:
         protection = get_open_protection_directional(symbol, direction)
@@ -1286,29 +1344,126 @@ def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | Non
 
 
 
+def _vwap_actual_fill_rows(
+    rows: Any,
+    order_id: str,
+    direction: str | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    expected_qty: float | None = None,
+) -> float | None:
+    """Calculate VWAP only from uniquely identifiable, actual fills for one order.
+
+    A trigger price or a malformed/partially paginated list is not execution proof.
+    Every row must carry an actual fill/trade identifier, exact order id, valid side,
+    positive price/quantity, and a timestamp inside the requested reconciliation window.
+    """
+    if not isinstance(rows, list) or not rows:
+        return None
+    weighted = 0.0
+    total_qty = 0.0
+    wanted_id = str(order_id)
+    wanted_side = str(direction or "").upper()
+    for fill in rows:
+        if not isinstance(fill, dict):
+            return None
+        row_order = str(fill.get("order_id") or fill.get("orderId") or fill.get("orderID") or "")
+        if not row_order or row_order != wanted_id:
+            return None
+        fill_id = str(
+            fill.get("trade_id") or fill.get("tradeId") or fill.get("tradeID")
+            or fill.get("fill_id") or fill.get("fillId") or fill.get("id") or ""
+        ).strip()
+        if not fill_id:
+            return None
+        pos_side = str(fill.get("position_side") or fill.get("positionSide") or "").upper()
+        if wanted_side and pos_side and pos_side not in {wanted_side, "BOTH"}:
+            return None
+        price = _safe_float(fill.get("price"), 0.0)
+        qty = abs(_safe_float(fill.get("qty", fill.get("executedQty", fill.get("vol"))), 0.0))
+        timestamp = int(_safe_float(fill.get("time", fill.get("timestamp")), 0.0))
+        if 0 < timestamp < 100_000_000_000:
+            timestamp *= 1000
+        if (price <= 0 or qty <= 0 or timestamp <= 0 or not math.isfinite(price * qty)):
+            return None
+        if start_ts is not None and timestamp < int(start_ts):
+            return None
+        if end_ts is not None and timestamp > int(end_ts):
+            return None
+        weighted += price * qty
+        total_qty += qty
+    if total_qty <= 0:
+        return None
+    if expected_qty is not None and expected_qty > 0:
+        if abs(total_qty - expected_qty) > max(1e-8, expected_qty * 0.01):
+            return None
+    vwap = weighted / total_qty
+    return vwap if math.isfinite(vwap) and vwap > 0 else None
+
+
 def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, str | None]:
-    candidates: list[tuple[str, str]] = []
+    """Recover actual stop execution price, never the trigger price.
+
+    Exchange order average price plus positive executed quantity is accepted for a
+    FILLED order. If that information is incomplete, exact fillHistory rows are
+    required even when the order status says FILLED. Trigger-only statuses are never
+    treated as fills.
+    """
+    candidates: list[str] = []
     current = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
     if current.get("order_id"):
-        candidates.append((str(current.get("order_id")), "current"))
+        candidates.append(str(current.get("order_id")))
     for item in trade.get("sl_order_history", []) or []:
         if isinstance(item, dict) and item.get("order_id"):
-            candidates.append((str(item.get("order_id")), "history"))
-    seen = set()
-    for order_id, _source in candidates:
-        if order_id in seen:
-            continue
-        seen.add(order_id)
+            candidates.append(str(item.get("order_id")))
+    direction = str(trade.get("direction") or "").upper()
+    now_ms = int(time.time() * 1000)
+    entry_ts = int(_safe_float(trade.get("entry_ts"), 0.0))
+    if entry_ts and entry_ts < 100_000_000_000:
+        entry_ts *= 1000
+    # BingX recent fill history is bounded; don't query an arbitrarily old entry.
+    start_ts = max(now_ms - 6 * 24 * 60 * 60 * 1000, entry_ts - 60_000 if entry_ts > 0 else 1)
+    end_ts = now_ms + 60_000
+    for order_id in dict.fromkeys(candidates):
         try:
             info = get_order(symbol, order_id)
         except Exception:
+            info = {}
+        if not isinstance(info, dict) or str(info.get("status", "")).lower() != "ok":
             continue
-        if str(info.get("status", "")).lower() != "ok":
+        status = str(info.get("order_status", "")).upper()
+        # Triggered/active/partially-filled orders are not final exits. Their actual
+        # fills may be useful diagnostics, but cannot explain the disappearance of
+        # the whole position as a completed SL execution.
+        if status != "FILLED":
             continue
-        if str(info.get("order_status", "")).upper() == "FILLED":
-            px = _safe_float(info.get("avg_price"), 0.0)
-            if px > 0:
+        px = _safe_float(info.get("avg_price"), 0.0)
+        executed_qty = _safe_float(info.get("executed_qty"), 0.0)
+        if px > 0 and executed_qty > 0 and math.isfinite(px * executed_qty):
+            return px, order_id
+
+        raw_order = info.get("raw_order") if isinstance(info.get("raw_order"), dict) else {}
+        embedded = next((raw_order.get(k) for k in ("fills", "fill_orders", "fillOrders", "trade_list", "tradeList") if isinstance(raw_order.get(k), list)), None)
+        if embedded is not None:
+            px = _vwap_actual_fill_rows(embedded, order_id, direction, start_ts, end_ts, executed_qty or None)
+            if px is not None:
                 return px, order_id
+
+        try:
+            response = get_fill_history(
+                symbol, start_ts, end_ts, order_id=order_id,
+                page_index=1, page_size=1000, timeout_sec=5.0,
+            )
+        except Exception:
+            continue
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+            continue
+        if response.get("has_more") is True:
+            continue
+        fills = response.get("fills")
+        px = _vwap_actual_fill_rows(fills, order_id, direction, start_ts, end_ts, executed_qty or None)
+        if px is not None:
+            return px, order_id
     return None, None
 
 
@@ -1401,6 +1556,477 @@ def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     return (not failures), ("; ".join(failures) if failures else "cleanup_verified")
 
 
+def _cashflow_symbol(symbol: Any) -> str:
+    value = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if not value:
+        return ""
+    value = value.replace("--", "-")
+    if "-" not in value:
+        if value.endswith("USDT") and len(value) > 4:
+            value = value[:-4] + "-USDT"
+        else:
+            value += "-USDT"
+    return value
+
+
+def _event_timestamp_ms(opened: dict | None) -> int:
+    if not isinstance(opened, dict):
+        return 0
+    execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
+    result = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    candidates = (
+        execution.get("fill_ts_ms"), result.get("fill_ts_ms"),
+        opened.get("entry_ts"), opened.get("ts"),
+        (opened.get("signal") or {}).get("detected_at_ts") if isinstance(opened.get("signal"), dict) else None,
+    )
+    for candidate in candidates:
+        timestamp = int(_safe_float(candidate, 0.0))
+        if timestamp > 0:
+            # Normalize Unix seconds while preserving normal millisecond epochs.
+            return timestamp * 1000 if timestamp < 100_000_000_000 else timestamp
+    return 0
+
+
+def _overlapping_same_symbol_trade(
+    event_id: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    opened_by_event: dict[str, dict],
+    close_ts_by_event: dict[str, int],
+) -> str | None:
+    wanted_symbol = _cashflow_symbol(symbol)
+    for other_event, other_open in opened_by_event.items():
+        if other_event == event_id or _cashflow_symbol(other_open.get("symbol")) != wanted_symbol:
+            continue
+        other_start = _event_timestamp_ms(other_open)
+        if other_start <= 0:
+            continue
+        other_end = int(close_ts_by_event.get(other_event, 0) or 0)
+        # An unmatched open is treated as still open; this is intentionally
+        # conservative because income rows do not carry an unambiguous side.
+        if other_end <= 0:
+            other_end = 2**63 - 1
+        if other_start <= end_ts and other_end >= start_ts:
+            return other_event
+    return None
+
+
+def _cashflow_order_ids(opened: dict, close_record: dict) -> tuple[str | None, set[str]]:
+    """Extract exchange order IDs recorded for one local position lifecycle."""
+    execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
+    open_result = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    entry_id = str(execution.get("order_id") or execution.get("orderId") or open_result.get("order_id") or open_result.get("orderId") or "").strip() or None
+    order_ids: set[str] = set()
+    if entry_id:
+        order_ids.add(entry_id)
+
+    def add_order(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in ("order_id", "orderId", "orderID", "sl_order_id", "tp_order_id"):
+                value = obj.get(key)
+                if value not in (None, ""):
+                    order_ids.add(str(value).strip())
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    add_order(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                add_order(value)
+
+    # Only inspect execution/protection structures, not arbitrary signal metadata.
+    add_order(open_result.get("protection"))
+    add_order(opened.get("protection"))
+    add_order(opened.get("sl_order"))
+    add_order(opened.get("tp_orders"))
+    for key in ("order_id", "orderId", "orderID", "close_order_id", "exit_order_id", "manual_exit_order_id", "filled_sl_order_id"):
+        value = close_record.get(key)
+        if value not in (None, ""):
+            order_ids.add(str(value).strip())
+    for key in ("close_order_ids", "exit_order_ids", "tp_order_ids", "filled_order_ids"):
+        value = close_record.get(key)
+        if isinstance(value, list):
+            order_ids.update(str(item).strip() for item in value if item not in (None, ""))
+    order_ids.discard("")
+    return entry_id, order_ids
+
+
+def _load_exchange_fill_evidence(
+    symbol: str, direction: str, query_start: int, query_end: int,
+    entry_order_id: str | None, order_ids: set[str],
+) -> tuple[list[dict] | None, str | None]:
+    """Load complete actual fills for known entry/protection/exit order IDs."""
+    if not entry_order_id:
+        return None, "abandon:journal_missing_entry_order_id"
+    exit_order_ids = order_ids - {entry_order_id}
+    if not exit_order_ids:
+        return None, "abandon:journal_missing_exit_order_ids"
+    if query_end - query_start > 7 * 24 * 60 * 60 * 1000:
+        return None, "exchange_fill_query_window_exceeds_seven_days"
+
+    fills_by_id: dict[str, dict] = {}
+    order_fill_counts: dict[str, int] = {}
+    for order_id in sorted(order_ids):
+        try:
+            response = get_fill_history(
+                symbol, query_start, query_end, order_id=order_id,
+                page_index=1, page_size=1000, currency="USDT", timeout_sec=5.0,
+            )
+        except Exception as exc:
+            return None, f"fill_history_exception_for_order:{order_id}:{exc}"
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+            error = response.get("error", "fill_history_invalid_response") if isinstance(response, dict) else "fill_history_invalid_response"
+            return None, f"fill_history_failed_for_order:{order_id}:{error}"
+        if response.get("has_more") is True:
+            return None, f"fill_history_truncated_for_order:{order_id}"
+        rows = response.get("fills")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return None, f"fill_history_invalid_rows_for_order:{order_id}"
+        for fill in rows:
+            fill_order_id = str(fill.get("order_id") or "").strip()
+            if fill_order_id != order_id:
+                return None, f"fill_history_order_id_mismatch:{order_id}:{fill_order_id or 'MISSING'}"
+            if _cashflow_symbol(fill.get("symbol")) != _cashflow_symbol(symbol):
+                return None, f"fill_history_symbol_mismatch_for_order:{order_id}"
+            fill_ts = int(_safe_float(fill.get("time"), 0.0))
+            qty = abs(_safe_float(fill.get("qty"), 0.0))
+            price = _safe_float(fill.get("price"), 0.0)
+            fee = _safe_float(fill.get("fee"), float("nan"))
+            fee_asset = str(fill.get("fee_asset") or "").upper()
+            trade_id = str(fill.get("trade_id") or "").strip()
+            if not trade_id or fill_ts <= 0 or not query_start <= fill_ts <= query_end:
+                return None, f"fill_history_missing_identity_or_time_for_order:{order_id}"
+            if qty <= 0 or price <= 0 or not math.isfinite(qty * price):
+                return None, f"fill_history_missing_actual_qty_price_for_order:{order_id}"
+            if not math.isfinite(fee) or fee_asset != "USDT":
+                return None, f"fill_history_fee_unknown_or_non_usdt_for_order:{order_id}"
+            pos_side = str(fill.get("position_side") or "").upper()
+            if pos_side and pos_side not in {str(direction).upper(), "BOTH"}:
+                return None, f"fill_history_position_side_mismatch_for_order:{order_id}"
+            realized_raw = fill.get("realized_pnl")
+            if realized_raw in (None, ""):
+                if order_id == entry_order_id:
+                    fill = dict(fill, realized_pnl=0.0)
+                else:
+                    return None, f"exit_fill_realized_pnl_unknown_for_order:{order_id}"
+            realized = _safe_float(fill.get("realized_pnl"), float("nan"))
+            if not math.isfinite(realized):
+                return None, f"fill_history_realized_pnl_non_finite_for_order:{order_id}"
+            normalized = dict(fill)
+            normalized.update(order_id=order_id, trade_id=trade_id, time=fill_ts, qty=qty, price=price, fee=fee, fee_asset=fee_asset, realized_pnl=realized)
+            previous = fills_by_id.get(trade_id)
+            if previous is not None and any(previous.get(k) != normalized.get(k) for k in ("order_id", "qty", "price", "fee", "realized_pnl")):
+                return None, f"duplicate_fill_id_conflict:{trade_id}"
+            fills_by_id[trade_id] = normalized
+            order_fill_counts[order_id] = order_fill_counts.get(order_id, 0) + 1
+
+    if order_fill_counts.get(entry_order_id, 0) <= 0:
+        return None, "entry_order_has_no_confirmed_fills"
+    if not any(order_fill_counts.get(order_id, 0) > 0 for order_id in exit_order_ids):
+        return None, "no_confirmed_exit_fills_for_known_exit_orders"
+    return list(fills_by_id.values()), None
+
+
+def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6) -> int:
+    """Reconcile cashflows only when ledger trade IDs link to exact exchange fills.
+
+    Symbol/time-window totals alone are not position attribution. The recovery
+    path requires known entry/exit order IDs, complete actual fill history, direct
+    income.tradeId ↔ fill.trade_id links, and PnL/fee checks within $0.02. If any
+    identity or coverage is missing, net PnL remains unknown.
+    """
+    if not TRADES_PATH.exists():
+        return 0
+    now_ms = int(now_ms or time.time() * 1000)
+    try:
+        raw_lines = TRADES_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as exc:
+        log.warning("[TRACKER_CASHFLOW] Cannot read trade journal: %s", exc)
+        return 0
+
+    parsed: list[dict | None] = []
+    opened_by_event: dict[str, dict] = {}
+    close_ts_by_event: dict[str, int] = {}
+    close_indices_by_event: dict[str, list[int]] = {}
+    for index, line in enumerate(raw_lines):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            parsed.append(None)
+            continue
+        parsed.append(record if isinstance(record, dict) else None)
+        if not isinstance(record, dict):
+            continue
+        event_id = str(record.get("event_id") or "")
+        if not event_id:
+            continue
+        if record.get("record_type") == "TRADE_OPEN":
+            opened_by_event.setdefault(event_id, record)
+        elif record.get("record_type") == "TRADE_CLOSE":
+            ts = int(_safe_float(record.get("closed_ts") or record.get("ts"), 0.0))
+            if ts and ts < 100_000_000_000:
+                ts *= 1000
+            close_ts_by_event[event_id] = max(close_ts_by_event.get(event_id, 0), ts)
+            close_indices_by_event.setdefault(event_id, []).append(index)
+
+    replacements: dict[int, str] = {}
+    attempts_this_cycle = 0
+    recovered = 0
+    retention_ms = 89 * 24 * 60 * 60 * 1000
+    for event_id, indices in close_indices_by_event.items():
+        if attempts_this_cycle >= max(0, int(max_records)):
+            break
+        index = indices[-1]
+        record = parsed[index]
+        if not isinstance(record, dict):
+            continue
+        current_status = str(record.get("pnl_costs_status") or "")
+        recovery = record.get("cashflow_recovery") if isinstance(record.get("cashflow_recovery"), dict) else {}
+        if current_status == "BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED" and record.get("net_pnl_usdt") is not None:
+            continue
+
+        # Invalidate V10.4.2's symbol/time-window-only totals. They are real account
+        # cashflows but cannot be asserted as net PnL for this particular position.
+        if current_status in {"BINGX_ACCOUNT_INCOME_CONFIRMED", "BINGX_SYMBOL_WINDOW_CASHFLOWS_ATTRIBUTED"}:
+            record = dict(record)
+            # Legacy symbol/window aggregates are account facts, not trade facts.
+            # Preserve the historical number under an explicitly unattributed name;
+            # never let it remain in a per-position realized/net PnL field.
+            legacy_gross = record.get("realized_pnl_usdt")
+            if legacy_gross is not None:
+                record["unattributed_symbol_window_realized_pnl_usdt"] = legacy_gross
+                record["unattributed_symbol_window_realized_pnl_source"] = "LEGACY_ACCOUNT_SYMBOL_WINDOW_AGGREGATE_NOT_PER_POSITION"
+            record["realized_pnl_usdt"] = None
+            record["realized_pnl_usdt_source"] = "UNATTRIBUTED_SYMBOL_WINDOW_AGGREGATE"
+            for key in ("fees_usdt", "funding_usdt", "net_pnl_usdt", "other_cashflows_usdt"):
+                record[key] = None
+            record["pnl_costs_status"] = "UNVERIFIED_POSITION_ATTRIBUTION"
+            record["net_pnl_attribution_status"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+            recovery = {}
+            record["cashflow_recovery"] = recovery
+            parsed[index] = record
+            # Persist the invalidation even if later validation (timestamps, order IDs,
+            # overlap checks) prevents a recovery attempt during this cycle.
+            replacements[index] = json.dumps(json_safe(record), ensure_ascii=False, allow_nan=False) + "\n"
+
+        if str(recovery.get("status") or "").startswith("ABANDONED") or recovery.get("status") == "RECOVERED":
+            continue
+        if int(_safe_float(recovery.get("next_retry_ts"), 0.0)) > now_ms:
+            continue
+        opened = opened_by_event.get(event_id)
+        open_ts = _event_timestamp_ms(opened)
+        close_ts = int(_safe_float(record.get("closed_ts") or record.get("ts"), 0.0))
+        if close_ts and close_ts < 100_000_000_000:
+            close_ts *= 1000
+        symbol = str(record.get("symbol") or (opened or {}).get("symbol") or "")
+        direction = str(record.get("direction") or (opened or {}).get("direction") or "").upper()
+        if open_ts <= 0 or close_ts <= open_ts or not symbol or direction not in {"LONG", "SHORT"}:
+            continue
+        if now_ms - close_ts > retention_ms:
+            updated = dict(record)
+            updated["cashflow_recovery"] = {
+                "status": "ABANDONED_OUTSIDE_EXCHANGE_RETENTION",
+                "attempts": int(_safe_float(recovery.get("attempts"), 0.0)),
+                "last_error": "exchange_income_history_retention_exceeded",
+            }
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+            continue
+        query_start, query_end = max(1, open_ts - 60_000), close_ts + 60_000
+        overlapping = _overlapping_same_symbol_trade(
+            event_id, symbol, query_start, query_end, opened_by_event, close_ts_by_event,
+        )
+        if overlapping:
+            updated = dict(record)
+            updated["cashflow_recovery"] = {
+                "status": "ABANDONED_AMBIGUOUS_SYMBOL_OVERLAP",
+                "attempts": int(_safe_float(recovery.get("attempts"), 0.0)),
+                "overlapping_event_id": overlapping,
+                "last_error": "same_symbol_journal_positions_overlap",
+            }
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+            continue
+
+        entry_order_id, order_ids = _cashflow_order_ids(opened or {}, record)
+        attempts_this_cycle += 1
+        fills, fill_error = _load_exchange_fill_evidence(
+            symbol, direction, query_start, query_end, entry_order_id, order_ids,
+        )
+        if fill_error:
+            updated = dict(record)
+            attempts = int(_safe_float(recovery.get("attempts"), 0.0)) + 1
+            terminal = fill_error.startswith("abandon:") or attempts >= 40 or "window_exceeds_seven_days" in fill_error
+            delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempts - 1, 4)))
+            updated["fees_usdt"] = None
+            updated["funding_usdt"] = None
+            updated["net_pnl_usdt"] = None
+            if updated.get("realized_pnl_usdt") is not None and str(updated.get("realized_pnl_usdt_source") or "").startswith("TRACKER_DERIVED"):
+                updated["estimated_gross_pnl_usdt"] = updated.get("realized_pnl_usdt")
+                updated["estimated_gross_pnl_usdt_source"] = "TRACKER_ESTIMATE_NOT_EXCHANGE_FILL_RECONCILED"
+                updated["realized_pnl_usdt"] = None
+                updated["realized_pnl_usdt_source"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+            updated["pnl_costs_status"] = "UNVERIFIED_POSITION_ATTRIBUTION"
+            updated["net_pnl_attribution_status"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+            updated["cashflow_recovery"] = {
+                "status": "ABANDONED_NO_DIRECT_ORDER_IDS" if fill_error.startswith("abandon:") else ("ABANDONED_MAX_ATTEMPTS" if terminal else "PENDING"),
+                "attempts": attempts, "last_attempt_ts": now_ms,
+                "next_retry_ts": None if terminal else now_ms + delay_ms,
+                "last_error": fill_error,
+            }
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+            log.warning("[TRACKER_CASHFLOW] Trade=%s remains unattributed: %s", event_id, fill_error)
+            continue
+
+        try:
+            response = get_income_history(symbol, query_start, query_end, limit=1000, timeout_sec=5.0)
+        except Exception as exc:
+            response = {"status": "error", "error": f"income_history_exception:{exc}", "complete": False, "records": []}
+        records = response.get("records") if isinstance(response, dict) else None
+        error = None
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok" or response.get("complete") is not True:
+            error = str(response.get("error", "income_history_incomplete")) if isinstance(response, dict) else "income_history_invalid_response"
+            records = []
+        elif not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
+            error, records = "income_history_invalid_records", []
+
+        fill_ids = {str(fill.get("trade_id")) for fill in fills}
+        order_ids = set(order_ids)
+        relevant: list[dict] = []
+        recognized_types = {
+            "REALIZED_PNL", "TRADING_FEE", "FUNDING_FEE",
+            "INSURANCE_CLEAR", "ADL", "SYSTEM_DEDUCTION", "GTD_PRICE",
+        }
+        if error is None:
+            for item in records:
+                income_type = str(item.get("income_type") or "").upper()
+                # Account transfers are not position PnL and may have no symbol.
+                if income_type == "TRANSFER":
+                    continue
+                row_symbol = _cashflow_symbol(item.get("symbol")) if item.get("symbol") else ""
+                row_time = int(_safe_float(item.get("time"), 0.0))
+                if row_symbol and row_symbol != _cashflow_symbol(symbol):
+                    continue
+                if not query_start <= row_time <= query_end:
+                    continue
+                if income_type not in recognized_types:
+                    error = f"income_history_unrecognized_or_unrelated_type:{income_type or 'MISSING'}"
+                    break
+                if not row_symbol:
+                    error = "income_history_missing_symbol_for_relevant_cashflow"
+                    break
+                if str(item.get("asset") or "").upper() != "USDT":
+                    error = "income_history_non_usdt_asset"
+                    break
+                amount = _safe_float(item.get("amount"), float("nan"))
+                if not math.isfinite(amount):
+                    error = "income_history_non_finite_amount"
+                    break
+                trade_ref = str(item.get("trade_id") or "").strip()
+                order_ref = str(item.get("order_id") or "").strip()
+                if trade_ref not in fill_ids and order_ref not in order_ids:
+                    error = f"income_history_cashflow_not_linked_to_position_fills:{item.get('record_id') or 'NO_ID'}"
+                    break
+                relevant.append(item)
+
+        exit_order_ids = order_ids - ({entry_order_id} if entry_order_id else set())
+        exit_fill_ids = {str(fill.get("trade_id")) for fill in fills if str(fill.get("order_id")) in exit_order_ids}
+        realized_rows = [item for item in relevant if str(item.get("income_type") or "").upper() == "REALIZED_PNL"]
+        fee_rows = [item for item in relevant if str(item.get("income_type") or "").upper() == "TRADING_FEE"]
+        if error is None and not realized_rows:
+            error = "income_history_missing_realized_pnl_rows"
+        if error is None and not fee_rows:
+            error = "income_history_missing_trading_fee_rows"
+        realized_income_ids = {str(item.get("trade_id") or "") for item in realized_rows}
+        fee_income_ids = {str(item.get("trade_id") or "") for item in fee_rows}
+        if error is None and not exit_fill_ids.issubset(realized_income_ids):
+            error = "income_history_realized_pnl_fill_id_coverage_incomplete"
+        if error is None and not fill_ids.issubset(fee_income_ids):
+            error = "income_history_fee_fill_id_coverage_incomplete"
+
+        updated = dict(record)
+        attempts = int(_safe_float(recovery.get("attempts"), 0.0)) + 1
+        if error is None:
+            fill_gross = sum(_safe_float(fill.get("realized_pnl"), 0.0) for fill in fills if str(fill.get("order_id")) in exit_order_ids)
+            fill_fees = sum(_safe_float(fill.get("fee"), 0.0) for fill in fills)
+            income_gross = sum(_safe_float(item.get("amount"), 0.0) for item in realized_rows)
+            income_fees = sum(_safe_float(item.get("amount"), 0.0) for item in fee_rows)
+            if abs(income_gross - fill_gross) > 0.02:
+                error = f"income_vs_fill_realized_pnl_mismatch:{income_gross:.8g}!={fill_gross:.8g}"
+            elif abs(income_fees - fill_fees) > 0.02:
+                error = f"income_vs_fill_fees_mismatch:{income_fees:.8g}!={fill_fees:.8g}"
+
+        if error is None:
+            funding_rows = [item for item in relevant if str(item.get("income_type") or "").upper() == "FUNDING_FEE"]
+            funding = sum(_safe_float(item.get("amount"), 0.0) for item in funding_rows)
+            other_rows = [item for item in relevant if str(item.get("income_type") or "").upper() in {"INSURANCE_CLEAR", "ADL", "SYSTEM_DEDUCTION", "GTD_PRICE"}]
+            other_cashflows = sum(_safe_float(item.get("amount"), 0.0) for item in other_rows)
+            net = fill_gross + fill_fees + funding + other_cashflows
+            updated.update({
+                "realized_pnl_usdt": fill_gross,
+                "realized_pnl_usdt_source": "BINGX_ORDER_LINKED_FILL_HISTORY",
+                "fees_usdt": fill_fees,
+                "fees_usdt_source": "BINGX_ORDER_LINKED_FILL_HISTORY_SIGNED_FEES",
+                "funding_usdt": funding,
+                "funding_usdt_source": "BINGX_ACCOUNT_INCOME_TRADE_ID_LINKED" if funding_rows else "BINGX_INCOME_COMPLETE_NO_LINKED_FUNDING_ROWS",
+                "other_cashflows_usdt": other_cashflows,
+                "other_cashflows_usdt_source": "BINGX_ACCOUNT_INCOME_TRADE_ID_LINKED_OTHER_FLOWS",
+                "net_pnl_usdt": net,
+                "net_pnl_usdt_source": "BINGX_ORDER_LINKED_FILLS_PLUS_TRADE_ID_LINKED_INCOME",
+                "net_pnl_attribution_status": "EXACT_EXCHANGE_ORDER_FILL_IDS_MATCHED_TO_ACCOUNT_INCOME_TRADE_IDS",
+                "cashflow_attribution_scope": "DIRECT_ORDER_FILL_ID_AND_INCOME_TRADE_ID_LINK",
+                "pnl_costs_status": "BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED",
+                "cashflow_recovery": {
+                    "status": "RECOVERED", "attempts": attempts, "recovered_ts": now_ms,
+                    "source": "BINGX_ORDER_LINKED_FILL_HISTORY_AND_USER_INCOME",
+                    "orders": sorted(order_ids), "fill_trade_ids": sorted(fill_ids),
+                    "rows": len(relevant), "income_types": sorted({str(item.get("income_type") or "").upper() for item in relevant}),
+                    "transaction_ids": sorted({str(item.get("record_id")) for item in relevant if item.get("record_id")}),
+                    "cashflow_window_ms": [query_start, query_end],
+                    "gross_crosscheck_delta_usdt": income_gross - fill_gross,
+                    "fee_crosscheck_delta_usdt": income_fees - fill_fees,
+                },
+            })
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+            recovered += 1
+            log.info("[TRACKER_CASHFLOW] Exact exchange-linked net PnL event=%s gross=%.8g fees=%.8g funding=%.8g other=%.8g net=%.8g fills=%d income_rows=%d", event_id, fill_gross, fill_fees, funding, other_cashflows, net, len(fills), len(relevant))
+        else:
+            delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempts - 1, 4)))
+            terminal = attempts >= 40 or error.startswith("abandon:") or "window_exceeds_seven_days" in error
+            updated["fees_usdt"] = None
+            updated["funding_usdt"] = None
+            updated["net_pnl_usdt"] = None
+            if updated.get("realized_pnl_usdt") is not None and str(updated.get("realized_pnl_usdt_source") or "").startswith("TRACKER_DERIVED"):
+                updated["estimated_gross_pnl_usdt"] = updated.get("realized_pnl_usdt")
+                updated["estimated_gross_pnl_usdt_source"] = "TRACKER_ESTIMATE_NOT_EXCHANGE_FILL_RECONCILED"
+                updated["realized_pnl_usdt"] = None
+                updated["realized_pnl_usdt_source"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+            updated["pnl_costs_status"] = "UNVERIFIED_POSITION_ATTRIBUTION"
+            updated["net_pnl_attribution_status"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+            updated["cashflow_recovery"] = {
+                "status": "ABANDONED_NO_DIRECT_ORDER_IDS" if error.startswith("abandon:") else ("ABANDONED_MAX_ATTEMPTS" if terminal else "PENDING"),
+                "attempts": attempts, "last_attempt_ts": now_ms,
+                "next_retry_ts": None if terminal else now_ms + delay_ms,
+                "last_error": error,
+            }
+            replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+            log.warning("[TRACKER_CASHFLOW] Trade=%s cashflow attribution pending/unknown: %s", event_id, error)
+
+    if replacements:
+        temp_path = TRADES_PATH.with_name(TRADES_PATH.name + ".cashflow.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as stream:
+                for index, raw_line in enumerate(raw_lines):
+                    stream.write(replacements.get(index, raw_line if raw_line.endswith("\n") else raw_line + "\n"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, TRADES_PATH)
+        except OSError as exc:
+            log.error("[TRACKER_CASHFLOW] Failed to persist ledger reconciliation: %s", exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return recovered
+
 def update_active_trades() -> None:
     # Reconcile historical DATA_ERROR closes even when no positions remain open.
     # Only fill-history-confirmed prices and quantities are accepted.
@@ -1408,6 +2034,10 @@ def update_active_trades() -> None:
         _recover_data_error_trade_closes()
     except Exception as exc:
         log.error("[TRACKER_RECOVERY] DATA_ERROR fill-history recovery failed safely: %s", exc)
+    try:
+        _recover_trade_cashflows(max_records=6)
+    except Exception as exc:
+        log.error("[TRACKER_CASHFLOW] Account-income recovery failed safely: %s", exc)
     _retry_pending_notifications()
     trades = _load_active_trades()
     if not trades:
@@ -1461,9 +2091,52 @@ def update_active_trades() -> None:
             pos_status = str(pos.get("status", "")).lower()
 
             if pos_status not in {"found", "not_found"}:
+                detail = str(pos.get("error") or pos_status or "unknown")
+                trade["position_state_alert_pending"] = True
+                trade["position_state_last_error"] = detail
                 trade["last_observation_ts"] = now_ms
+                _notify_position_state_unknown(symbol, direction, detail, str(event_id))
                 updated_trades[event_id] = trade
                 continue
+
+            if pos_status == "not_found":
+                # One empty snapshot is not proof that the position was closed.
+                # Require an independent follow-up read; any error or a reappearing
+                # position defers lifecycle closure until the next tracker cycle.
+                try:
+                    time.sleep(0.25)
+                    confirm = get_position_directional(symbol, direction)
+                except Exception as exc:
+                    trade["position_gone_confirmation"] = {
+                        "status": "PENDING", "observed_ts": now_ms,
+                        "reason": f"second_position_read_exception:{exc}",
+                    }
+                    trade["last_observation_ts"] = now_ms
+                    trade["position_state_alert_pending"] = True
+                    trade["position_state_last_error"] = trade["position_gone_confirmation"]["reason"]
+                    _notify_position_state_unknown(symbol, direction, trade["position_state_last_error"], str(event_id))
+                    updated_trades[event_id] = trade
+                    log.warning("[TRACKER] Deferring close for %s: second position read failed: %s", event_id, exc)
+                    continue
+                confirm_status = str(confirm.get("status", "")).lower()
+                if confirm_status != "not_found":
+                    trade["position_gone_confirmation"] = {
+                        "status": "PENDING", "observed_ts": now_ms,
+                        "reason": f"second_position_read_{confirm_status or 'unknown'}",
+                    }
+                    trade["last_observation_ts"] = now_ms
+                    trade["position_state_alert_pending"] = True
+                    trade["position_state_last_error"] = trade["position_gone_confirmation"]["reason"]
+                    if confirm_status == "found":
+                        trade["current_position_qty"] = abs(_safe_float(confirm.get("positionAmt"), 0.0))
+                        trade["last_exchange_avg_price"] = _safe_float(confirm.get("avgPrice"), 0.0) or trade.get("last_exchange_avg_price")
+                    _notify_position_state_unknown(symbol, direction, trade["position_state_last_error"], str(event_id))
+                    updated_trades[event_id] = trade
+                    log.warning("[TRACKER] Deferring close for %s: position disappearance not confirmed (%s).", event_id, confirm_status or "unknown")
+                    continue
+                trade["position_gone_confirmation"] = {"status": "CONFIRMED", "observed_ts": now_ms, "reads": 2}
+                pos = confirm
+                pos_status = "not_found"
 
             pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
             if pos_status == "found":
@@ -1525,8 +2198,13 @@ def update_active_trades() -> None:
                             cut = emergency_close_position(symbol, direction, qty=live_qty, reason_token=early_loss_reason)
                         except Exception as exc:
                             cut = {"status": "error", "error": str(exc)}
-                    if safe_to_close and str(cut.get("status", "")).lower() == "closed":
+                    if safe_to_close and str(cut.get("status", "")).lower() == "closed" and cut.get("client_order_id"):
                         trade["manual_exit_reason"] = early_loss_reason
+                        # Actual exchange orderId is required for fill reconciliation;
+                        # clientOrderId is not interchangeable with exchange fill trade IDs.
+                        if cut.get("order_id") not in (None, ""):
+                            trade["manual_exit_order_id"] = str(cut.get("order_id"))
+                        trade["position_state_alert_pending"] = False
                         manual_execution_price = _safe_float(cut.get("execution_price"), 0.0)
                         if manual_execution_price > 0:
                             trade["manual_exit_price"] = manual_execution_price
@@ -1537,8 +2215,30 @@ def update_active_trades() -> None:
                             trade["current_position_qty"] = pos_amt
                         except Exception as exc:
                             log.warning("[TRACKER_EARLY_LOSS_CUT] post-close verification failed for %s: %s", event_id, exc)
+                    elif safe_to_close and str(cut.get("status", "")).lower() == "closed":
+                        detail = "position_was_already_absent_before_early_loss_cut_order"
+                        trade["early_loss_cut_last_error"] = detail
+                        trade["position_state_alert_pending"] = True
+                        trade["position_state_last_error"] = detail
+                        _notify_position_state_unknown(
+                            symbol, direction, detail, str(event_id), kind="EARLY_LOSS_CUT_CLOSE_ATTRIBUTION_UNKNOWN",
+                        )
+                        try:
+                            pos = get_position_directional(symbol, direction)
+                            pos_status = str(pos.get("status", "")).lower()
+                            pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
+                            trade["current_position_qty"] = pos_amt
+                        except Exception as exc:
+                            log.warning("[TRACKER_EARLY_LOSS_CUT] post-close verification failed for %s: %s", event_id, exc)
                     else:
                         trade["early_loss_cut_last_error"] = cut.get("error") or cut
+                        if bool(cut.get("escalation_required")) or str(cut.get("status", "")).lower() in {"unknown", "error"}:
+                            detail = str(cut.get("error") or cut.get("status") or "unknown")
+                            trade["position_state_alert_pending"] = True
+                            trade["position_state_last_error"] = detail
+                            _notify_position_state_unknown(
+                                symbol, direction, detail, str(event_id), kind="EMERGENCY_CLOSE_UNCERTAIN",
+                            )
 
             # Retry a failed TP -> BE transition after the first realised partial.
             # A single-TP profile activates only when its sole TP order fills;
@@ -1847,6 +2547,15 @@ def update_active_trades() -> None:
                         "tail_loss_multiple": tail_loss_multiple,
                         "stop_slippage_pct": stop_slippage_pct,
                         "filled_sl_order_id": filled_sl_id,
+                        "manual_exit_order_id": trade.get("manual_exit_order_id"),
+                        "exit_order_ids": sorted({
+                            str(x) for x in (
+                                [filled_sl_id, trade.get("manual_exit_order_id")]
+                                + [item.get("order_id") for item in trade.get("tp_orders", []) if isinstance(item, dict)]
+                                + [item.get("order_id") for item in trade.get("sl_order_history", []) if isinstance(item, dict)]
+                                + [((trade.get("sl_order") or {}).get("order_id")) if isinstance(trade.get("sl_order"), dict) else None]
+                            ) if x not in (None, "")
+                        }),
                         "stop_slippage_reference_price": slippage_reference_price,
                         "stop_slippage_reference_source": slippage_reference_source,
                         "execution_anomaly": execution_anomaly,

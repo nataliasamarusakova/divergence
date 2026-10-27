@@ -376,23 +376,37 @@ def detect_ma_compression_breakout(df: pd.DataFrame, symbol: str, timeframe: str
     if len(hist) < compression_lookback or pd.isna(spread.iloc[-2]) or pd.isna(spread.iloc[-1]):
         return []
     threshold = float(hist.quantile(compression_quantile))
-    was_compressed = float(spread.iloc[-2]) <= threshold
+    # Require compression on at least three of the five bars immediately before
+    # the breakout bar. A single narrow/noisy bar is not a squeeze by itself.
+    recent = spread.iloc[-6:-1].dropna()
+    was_compressed = len(recent) >= 3 and int((recent <= threshold).sum()) >= 3
     if not was_compressed:
         return []
     close = float(d["close"].iloc[-1])
-    prev = float(d["close"].iloc[-2])
     atr = float(d["atr"].iloc[-1]) if pd.notna(d["atr"].iloc[-1]) else 0.0
-    if atr <= 0:
+    if atr <= 0 or compression_lookback < 1:
         return []
-    prior_high = float(d["high"].iloc[-2])
-    prior_low = float(d["low"].iloc[-2])
+    prior_window = d.iloc[-compression_lookback-1:-1]
+    if len(prior_window) < compression_lookback:
+        return []
+    # Structural levels come from the full pre-breakout lookback, not the
+    # immediately preceding candle's high/low (which is often inside the range).
+    prior_high = float(prior_window["high"].max())
+    prior_low = float(prior_window["low"].min())
     vol_mean = d["volume"].iloc[-21:-1].mean() if len(d) >= 21 else np.nan
     vol_ratio = float(d["volume"].iloc[-1] / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else 0.0
+    # Reject breakouts without material participation. Missing/zero baseline
+    # volume maps to vol_ratio=0 and therefore fails closed.
+    if vol_ratio < 1.5:
+        return []
     if close > prior_high and close > float(d["ema30"].iloc[-1]):
-        direction, breakout = "LONG", (close - prev) / atr
+        direction, breakout = "LONG", (close - prior_high) / atr
     elif close < prior_low and close < float(d["ema30"].iloc[-1]):
-        direction, breakout = "SHORT", (prev - close) / atr
+        direction, breakout = "SHORT", (prior_low - close) / atr
     else:
+        return []
+    # Do not chase an already-extended candle more than two ATR beyond the level.
+    if breakout > 2.0:
         return []
     ts = int(d["close_time"].iloc[-1])
     typ = "MA_COMPRESSION_BREAKOUT"
@@ -424,7 +438,9 @@ def detect_breakout_momentum(df: pd.DataFrame, symbol: str, timeframe: str = "1h
     if len(hist) < 30 or pd.isna(atr.iloc[-1]) or pd.isna(d["adx"].iloc[-1]):
         return []
     width_threshold = float(hist.quantile(0.35))
-    compressed_recent = bool((bb_width.iloc[-11:-1] <= width_threshold).any())
+    # Compression must be present on the bar immediately before the breakout;
+    # a squeeze from many bars ago must not qualify the end of a later expansion.
+    compressed_recent = bool(pd.notna(bb_width.iloc[-2]) and bb_width.iloc[-2] <= width_threshold)
     close = float(d["close"].iloc[-1]); atr_v = float(atr.iloc[-1])
     dc_high = float(d["high"].iloc[-donchian_n-1:-1].max())
     dc_low = float(d["low"].iloc[-donchian_n-1:-1].min())
@@ -438,6 +454,9 @@ def detect_breakout_momentum(df: pd.DataFrame, symbol: str, timeframe: str = "1h
     elif close < dc_low - 0.10 * atr_v and close < float(d["ema50"].iloc[-1]):
         direction, breakout_atr = "SHORT", (dc_low - close) / atr_v
     else:
+        return []
+    # Reject a breakout more than 2 ATR beyond the Donchian level.
+    if breakout_atr > 2.0:
         return []
     ts = int(d["close_time"].iloc[-1])
     typ = "BREAKOUT_MOMENTUM"
@@ -500,6 +519,10 @@ def detect_donchian_retest(df: pd.DataFrame, symbol: str, timeframe: str = "1h",
         breakout_atr = (dc_low - close) / atr_v
         level = dc_low
     else:
+        return []
+
+    # Reject a breakout more than 2 ATR beyond the Donchian level.
+    if breakout_atr > 2.0:
         return []
 
     ts = int(d["close_time"].iloc[-1])
