@@ -369,7 +369,7 @@ jobs:
           RECONCILIATION_INCOME_TIMEOUT_SEC: "2"
           RECONCILIATION_INCOME_REQUEST_BUDGET: "4"
         run: |
-          python scripts/reconcile_daily.py
+          python -m event_engine.reconcile_daily
 
       - name: Commit state
         if: always()
