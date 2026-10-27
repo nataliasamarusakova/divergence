@@ -4,6 +4,24 @@ import pytest
 
 
 
+@pytest.fixture(autouse=True)
+def _disable_network_symbol_resolution(monkeypatch):
+    """Execution-path unit tests use normalized test symbols and must stay offline."""
+    import run_once as ro
+
+    def normalize(symbol):
+        text = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+        if not text:
+            return None
+        if "-" not in text and text.endswith("USDT") and len(text) > 4:
+            return f"{text[:-4]}-USDT"
+        if "-" not in text:
+            return text + "-USDT"
+        return text
+
+    monkeypatch.setattr(ro, "to_bx_symbol", normalize)
+
+
 def _snapshot(*zones):
     accepted = []
     for center, kind in zones:

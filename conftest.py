@@ -12,6 +12,14 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_production_entry_gates(monkeypatch, tmp_path):
     import run_once as ro
+    import event_engine.tracker as tracker
+
+    # Keep runtime-state writes inside pytest's temporary directory. Rollback
+    # safety logic intentionally persists unresolved cleanup records, and tests
+    # must not leak those records into unrelated candidates or into the repo.
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tracker, "NOTIFICATIONS_PATH", tmp_path / "notifications.json")
 
     # Keep ordinary unit/integration tests deterministic even when CI exports
     # production VST settings such as AJAY_SR_ROOM_MODE=enforce.

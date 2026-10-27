@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.7"
+APP_VERSION = "V10.4.8"
 
 import pandas as pd
 import requests
@@ -47,6 +47,7 @@ from event_engine.bingx import (
     get_open_protection_directional,
     get_open_orders_snapshot,
     ensure_directional_protection,
+    cleanup_directional_protection_after_close,
     has_open_position,
     emergency_close_position,
     get_position_directional,
@@ -95,6 +96,7 @@ from event_engine.tracker import (
     update_active_trades,
     register_active_trade,
     update_active_trade_protection,
+    queue_protection_cleanup_pending,
     _load_active_trades,
 )
 
@@ -309,8 +311,7 @@ SQUEEZE_TP_FRACTIONS = (0.30, 0.70)
 SQUEEZE_PLANNED_WEIGHTED_RR = 1.3500
 
 # Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
-# Current source is Binance SPOT 1H. Futures can be added later without changing
-# the room/gate logic; see V10_3_SR_NOTES.md.
+# Current source is Binance SPOT 1H. Keep venue expansion explicit and independently tested.
 AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
 AJAY_SR_ROOM_MODE = os.environ.get("AJAY_SR_ROOM_MODE", "shadow").strip().lower()
 if AJAY_SR_ROOM_MODE not in {"off", "shadow", "enforce"}:
@@ -3752,9 +3753,112 @@ def _market_entry_outcome_unknown(execution_result: dict[str, Any]) -> bool:
     return isinstance(open_result, dict) and str(open_result.get("status", "")).lower() == "unknown"
 
 
+def _symbol_identity_for_state(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace("_", "-").replace("/", "-")
+    try:
+        canonical = to_bx_symbol(raw)
+    except Exception:
+        canonical = None
+    if canonical:
+        return str(canonical).strip().upper().replace("_", "-").replace("/", "-")
+    return raw if "-" in raw else (raw + "-USDT" if raw else "")
+
+
+def _pending_protection_cleanup_for(symbol: str, direction: str) -> str | None:
+    """Return a pending cleanup record for this canonical exchange symbol-side, if any."""
+    target_direction = str(direction or "").upper()
+    try:
+        trades = _load_active_trades()
+    except Exception:
+        # If local state cannot be inspected, don't guess that cleanup is absent.
+        return "UNKNOWN_ACTIVE_TRADE_STATE"
+    pending = [
+        (record_id, trade) for record_id, trade in trades.items()
+        if isinstance(trade, dict) and trade.get("close_cleanup_pending")
+    ]
+    if not pending:
+        return None
+    target_symbol = _symbol_identity_for_state(symbol)
+    for record_id, trade in pending:
+        trade_direction = str(trade.get("direction") or "").upper()
+        trade_symbol = _symbol_identity_for_state(trade.get("symbol"))
+        if trade_direction == target_direction and trade_symbol == target_symbol:
+            return str(record_id)
+    return None
+
+
+def _finalize_rollback_protection_cleanup(
+    symbol: str, direction: str, event_id: str, rollback: dict | None
+) -> dict:
+    """Clean rollback-created protection or persist a retryable cleanup-only state."""
+    rollback = rollback if isinstance(rollback, dict) else {}
+    rollback_status = str(rollback.get("status", "unknown") or "unknown").lower()
+    if rollback_status != "closed":
+        # A failed/ambiguous close is not permission to cancel protection. Persist
+        # the retryable identity anyway: it prevents a second entry while the
+        # engine cannot prove whether the first position still exists.
+        cleanup = {
+            "status": "pending",
+            "error": f"rollback_not_confirmed_closed:{rollback_status}",
+            "position_state": "unknown_or_still_open",
+        }
+    else:
+        try:
+            cleanup = cleanup_directional_protection_after_close(symbol, direction)
+        except Exception as exc:
+            cleanup = {"status": "pending", "error": f"cleanup_exception:{type(exc).__name__}:{exc}"}
+    if isinstance(cleanup, dict) and cleanup.get("status") == "cleaned":
+        return cleanup
+
+    reason = str((cleanup or {}).get("error", "protection_cleanup_state_unknown")) if isinstance(cleanup, dict) else "malformed_cleanup_result"
+    try:
+        pending_id = queue_protection_cleanup_pending(
+            symbol, direction, reason, source_event_id=event_id,
+        )
+    except Exception as exc:
+        pending_id = None
+        reason = f"{reason}; failed_to_persist_cleanup_queue:{type(exc).__name__}:{exc}"
+    record_action({
+        "record_type": "ROLLBACK_PROTECTION_CLEANUP_PENDING",
+        "event_id": event_id, "symbol": symbol, "direction": direction,
+        "cleanup": cleanup, "pending_cleanup_id": pending_id,
+        "error": reason, "ts": int(time.time() * 1000),
+    })
+    log.critical(
+        "[EXECUTION] Rollback outcome for %s %s does not have verified protection cleanup; pending_id=%s error=%s",
+        direction, symbol, pending_id or "NOT_PERSISTED", reason,
+    )
+    try:
+        send_tg(
+            f"⚠️ <b>Rollback protection cleanup pending</b>\n"
+            f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
+            f"Event: <code>{event_id}</code>\n"
+            f"Cleanup: <code>{reason[:600]}</code>\n"
+            f"New entries for this symbol/side are blocked until cleanup is verified."
+        )
+    except Exception as exc:
+        log.error("[TELEGRAM] Could not notify rollback cleanup failure: %s", exc)
+    if isinstance(cleanup, dict):
+        cleanup = dict(cleanup)
+    else:
+        cleanup = {"status": "pending"}
+    cleanup["pending_cleanup_id"] = pending_id
+    return cleanup
+
+
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
+
+    pending_cleanup_id = _pending_protection_cleanup_for(symbol, direction)
+    if pending_cleanup_id:
+        reason = f"protection cleanup is pending for {symbol} {direction} ({pending_cleanup_id})"
+        log.critical("[EXECUTION] %s; refusing new entry until cleanup is verified", reason)
+        return {
+            "status": "PROTECTION_CLEANUP_PENDING", "mode": EXECUTION_MODE,
+            "order_id": None, "position": {}, "error": reason,
+            "pending_cleanup_id": pending_cleanup_id,
+        }
 
     log.info("[EXECUTION] Preparing market entry: %s %s at ref price %.8g...", direction, symbol, price)
 
@@ -4052,6 +4156,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         }
         if result["rolled_back"]:
             result["position"] = {**(position or {}), "positionAmt": 0.0}
+        result["protection_cleanup"] = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
         return result
 
     try:
@@ -4108,6 +4213,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             direction, symbol, fill_drift_pct, drift_limit, rollback.get("status"),
         )
         result_position = {**position, "positionAmt": 0.0} if flattened else {**position, "positionAmt": actual_qty}
+        rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
         return {
             "status": "ENTRY_DRIFT_EXCEEDED",
             "mode": EXECUTION_MODE,
@@ -4118,6 +4224,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "error": f"signal_to_fill_distance_pct={fill_drift_pct:.6f} > limit={drift_limit:.6f}",
             "emergency_close": rollback,
             "rolled_back": flattened,
+            "protection_cleanup": rollback_cleanup,
             "fill_ts_ms": fill_ts_ms,
             "notional_usdt": actual_avg_price * actual_qty,
             "leverage": opened.get("leverage"),
@@ -4272,17 +4379,38 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     if protection.get("rolled_back"):
         final_status = "opened_rolled_back"
+        # emergency_close_position only returns closed after two NOT_FOUND reads.
+        # Do not overwrite that confirmed zero quantity with the entry's original
+        # quantity in the final return. A later explicit FOUND response is handled
+        # as a residual position and remains visible to main/reconciliation.
+        position = {**position, "positionAmt": 0.0}
+        protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
+            symbol, direction, event_id, protection.get("emergency_close")
+        )
         try:
             post_close = get_position_directional(symbol, direction)
-            if str(post_close.get("status", "")).lower() == "not_found":
-                position = {**position, "positionAmt": 0.0}
-            elif str(post_close.get("status", "")).lower() != "found":
+            post_status = str(post_close.get("status", "")).lower()
+            if post_status == "found":
+                post_qty = abs(_safe_float(post_close.get("positionAmt"), 0.0))
+                if post_qty > 0:
+                    position = {**post_close, "positionAmt": post_qty}
+                    final_status = "rollback_position_still_open"
+                    protection["rolled_back"] = False
+                    log.critical(
+                        "[EXECUTION] Rollback claimed closed but a residual %s %s position remains qty=%s",
+                        direction, symbol, post_qty,
+                    )
+            elif post_status != "not_found":
                 log.critical(
-                    "[EXECUTION] Rollback was reported closed but post-close position state is unknown for %s %s: %s",
-                    direction, symbol, post_close.get("error", post_close.get("status")),
+                    "[EXECUTION] Rollback was reported closed; later state read is unknown for %s %s: %s",
+                    direction, symbol, post_close.get("error", post_status or "unknown"),
                 )
         except Exception as exc:
             log.critical("[EXECUTION] Rollback was reported closed but post-close position verification failed for %s %s: %s", direction, symbol, exc)
+    elif protection_status not in {"PROTECTED", "SL_ONLY"} and isinstance(protection.get("emergency_close"), dict):
+        protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
+            symbol, direction, event_id, protection.get("emergency_close")
+        )
     elif protection_status == "PROTECTED":
         final_status = "opened_protected"
     elif protection_status == "SL_ONLY":
@@ -4298,7 +4426,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         "mode": EXECUTION_MODE,
         "order_id": order_id,
         "open_result": opened,
-        "position": {**position, "positionAmt": actual_qty, "avgPrice": actual_avg_price},
+        "position": {**position, "positionAmt": _safe_float(position.get("positionAmt"), actual_qty), "avgPrice": _safe_float(position.get("avgPrice", actual_avg_price), actual_avg_price)},
         "protection": protection,
         "sl_pct": sl_pct,
         "tp_levels": tp_levels,

@@ -179,11 +179,13 @@ def test_pine_sr_manual_diagnostic_workflow_is_spot_only():
     assert 'BTC-USDT' in wf
 
 
-def test_release_documents_futures_as_future_sr_source():
-    notes = Path('V10_3_SR_NOTES.md').read_text(encoding='utf-8')
-    assert 'Binance SPOT 1H' in notes
-    assert 'Futures' in notes and 'add' in notes
-    assert 'get_cached_sr_snapshot()' in notes
+def test_release_keeps_sr_room_disabled_and_uses_lazy_cached_snapshot():
+    workflow = _workflow()
+    runtime = Path('run_once.py').read_text(encoding='utf-8')
+    assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
+    assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
+    assert 'get_cached_sr_snapshot' in runtime
+    assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
 
 
 def test_release_uses_binance_for_signal_market_data_and_bingx_for_execution():
@@ -415,16 +417,17 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.7"' in runtime
+    assert 'APP_VERSION = "V10.4.8"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_7.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_8.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes
     assert 'active_trades.json' in notes
     assert 'event_engine/reconcile_daily.py' in notes
-    # Historical release notes remain tracked in the source repository.
-    assert Path('RELEASE_NOTES_V10_4_4.md').is_file()
+    # The current release note documents the current package; obsolete notes are not runtime/test dependencies.
+    assert not Path('RELEASE_NOTES_V10_4_4.md').exists()
+    assert not Path('RELEASE_NOTES_V10_4_7.md').exists()
 
 
 def test_release_runs_bounded_read_only_reconciliation_after_engine():

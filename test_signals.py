@@ -1951,7 +1951,7 @@ def _run_be_case(monkeypatch, tmp_path, hit_legs, be_after_leg, tp_mode=None):
     be_calls = []
     monkeypatch.setattr(
         tr, "_move_sl_to_break_even",
-        lambda symbol, direction, entry, qty, old_id, trade_id, old_sl_price: be_calls.append(old_id) or {"status": "created", "order_id": "NEW_BE"}
+        lambda symbol, direction, entry, qty, old_id, trade_id, old_sl_price, **kwargs: be_calls.append(old_id) or {"status": "created", "order_id": "NEW_BE"}
     )
     tr.update_active_trades()
     saved = json.loads(active_path.read_text(encoding="utf-8"))
@@ -2622,6 +2622,8 @@ def test_execute_new_position_flattens_when_protection_install_fails(monkeypatch
     monkeypatch.setattr(ro, "install_protection", lambda **k: {
         "status": "PROTECTION_FAILED", "error": "openOrders timeout", "rolled_back": False,
     })
+    monkeypatch.setattr(ro, "_finalize_rollback_protection_cleanup", lambda *a, **k: {"status": "cleaned"})
+    monkeypatch.setattr(ro, "get_position_directional", lambda *a, **k: {"status": "not_found"})
     calls = []
     monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: calls.append(k) or {"status": "closed"})
     out = ro.execute_new_position(
@@ -2631,6 +2633,7 @@ def test_execute_new_position_flattens_when_protection_install_fails(monkeypatch
     )
     assert out["status"] == "opened_rolled_back"
     assert out["protection"]["rolled_back"] is True
+    assert out["position"]["positionAmt"] == 0.0
     assert calls
 
 
