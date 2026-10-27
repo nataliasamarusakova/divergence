@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.4"
+APP_VERSION = "V10.4.6"
 
 import pandas as pd
 import requests
@@ -252,7 +252,7 @@ if ENTRY_QUALITY_MODE not in {"off", "shadow", "enforce"}:
     ENTRY_QUALITY_MODE = "shadow"
 ENTRY_WEAK_ENGINE_BLOCK_ENABLED = os.environ.get("ENTRY_WEAK_ENGINE_BLOCK_ENABLED", "false").lower() == "true"
 # Explicit hard denylist, separate from the experimental/shadow Entry Quality gate.
-# V10.4.4 preserves the research-window event policy while hardening fill reconciliation.
+# V10.4.5 preserves the research-window event policy and hardens protection failure handling.
 DISABLED_EVENT_TYPES = {
     x.strip().upper()
     for x in os.environ.get(

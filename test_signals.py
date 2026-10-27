@@ -1146,6 +1146,58 @@ def test_move_sl_to_break_even_aborts_when_old_cancel_fails(monkeypatch):
     assert not any(c[0] == "post" for c in calls), "no new SL may be created after a failed old-SL cancel"
 
 
+def test_move_sl_to_break_even_refuses_new_sl_when_open_orders_state_unknown(monkeypatch):
+    """Unknown openOrders is not permission to skip old-SL cancellation and post a new SL."""
+    import event_engine.tracker as tr
+
+    post_calls = []
+    alerts = []
+    monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "1"})
+    monkeypatch.setattr(
+        tr, "get_open_protection_directional",
+        lambda *a, **k: {"status": "error", "error": "read timeout"},
+    )
+    monkeypatch.setattr(
+        tr, "_post_protection_order_verified",
+        lambda *a, **k: post_calls.append((a, k)) or {"code": 0, "data": {"order": {"orderId": "NEW"}}},
+    )
+    monkeypatch.setattr(tr, "_notify_be_failure", lambda *a, **k: alerts.append((a, k)))
+
+    result = tr._move_sl_to_break_even("TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0)
+
+    assert result["status"] == "error"
+    assert result["protection_state_unknown"] is True
+    assert result["sl_mutation_attempted"] is False
+    assert "openOrders state unknown" in result["error"]
+    assert post_calls == [], "must not create a second SL when existing protection cannot be inspected"
+    assert len(alerts) == 1
+
+
+def test_move_sl_to_break_even_refuses_mutation_when_open_orders_query_raises(monkeypatch):
+    """Transport exceptions during openOrders verification follow the same fail-closed path."""
+    import event_engine.tracker as tr
+
+    post_calls = []
+    monkeypatch.setattr(tr, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(tr, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "1"})
+    def raise_open_orders(*args, **kwargs):
+        raise TimeoutError("openOrders timeout")
+    monkeypatch.setattr(tr, "get_open_protection_directional", raise_open_orders)
+    monkeypatch.setattr(
+        tr, "_post_protection_order_verified",
+        lambda *a, **k: post_calls.append((a, k)) or {"code": 0, "data": {"order": {"orderId": "NEW"}}},
+    )
+    monkeypatch.setattr(tr, "_notify_be_failure", lambda *a, **k: None)
+
+    result = tr._move_sl_to_break_even("TEST", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=97.0)
+    assert result["status"] == "error"
+    assert result["protection_state_unknown"] is True
+    assert post_calls == []
+
+
 def test_trigger_stale_guard_uses_current_time_not_cycle_start(monkeypatch):
     import run_once
 
@@ -1892,6 +1944,9 @@ def _run_be_case(monkeypatch, tmp_path, hit_legs, be_after_leg, tp_mode=None):
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
     monkeypatch.setattr(tr, "TRADES_PATH", tmp_path / "trades.jsonl")
     monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.0", "avgPrice": "100.0"})
+    # Tracker tests must not make live exchange HTTP calls; the test only exercises
+    # break-even milestone logic, not ticker connectivity.
+    monkeypatch.setattr(tr, "get_live_price", lambda s: 102.0)
     monkeypatch.setattr(tr, "fetch_klines", lambda s, tf, limit=60: [{"close": 102.0}])
     be_calls = []
     monkeypatch.setattr(
@@ -1945,6 +2000,7 @@ def test_tracker_does_not_activate_be_without_tp_milestone(monkeypatch, tmp_path
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
     monkeypatch.setattr(tr, "TRADES_PATH", tmp_path / "trades.jsonl")
     monkeypatch.setattr(tr, "get_position_directional", lambda s, d: {"status": "found", "positionAmt": "7.5", "avgPrice": "100.0"})
+    monkeypatch.setattr(tr, "get_live_price", lambda s: 101.0)
     monkeypatch.setattr(tr, "fetch_klines", lambda s, tf, limit=60: [{"close": 101.0}])
     be_calls = []
     monkeypatch.setattr(tr, "_move_sl_to_break_even", lambda *a, **k: be_calls.append(True) or {"status": "created", "order_id": "NEW_BE"})
@@ -2341,6 +2397,43 @@ def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch
     conditional = [p for p in captured if p.get("type") in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}]
     assert conditional
     assert all("clientOrderId" not in p for p in conditional)
+
+
+def test_ensure_protection_fails_if_wrong_quantity_tp_cannot_be_cancelled(monkeypatch):
+    """A live wrong-quantity TP must not be hidden behind SL_ONLY status."""
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda s: {
+        "quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001,
+    })
+    sl = {"orderId": "SL1", "type": "STOP_MARKET", "stopPrice": "95.00", "origQty": "1.0"}
+    wrong_qty_tp = {"orderId": "TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "101.00", "origQty": "0.5"}
+    monkeypatch.setattr(
+        bx, "get_open_protection_directional",
+        lambda *a, **k: {"status": "ok", "sl_orders": [sl], "tp_orders": [wrong_qty_tp]},
+    )
+    monkeypatch.setattr(bx, "_cancel_protection_order_verified", lambda *a, **k: (False, "cancel verification timed out"))
+    monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
+    post_calls = []
+    monkeypatch.setattr(
+        bx, "_post_protection_order_verified",
+        lambda *a, **k: post_calls.append((a, k)) or {"code": 0, "data": {"order": {"orderId": "NEWTP"}}},
+    )
+
+    result = bx.ensure_directional_protection(
+        "TEST", "LONG", 100.0, 1.0, 5.0,
+        [{"leg": "tp1", "pnl_pct": 1.0, "close_fraction": 1.0}],
+        trade_id="TRD_WRONG_TP_QTY",
+    )
+
+    assert result["status"] == "PROTECTION_FAILED"
+    assert result["tp_orders"][0]["status"] == "error"
+    assert "stale TP cancel failed" in result["tp_orders"][0]["error"]
+    assert result["stale_tp_cancellations"] == [{
+        "order_id": "TP1", "leg": "tp1", "status": "error", "error": "cancel verification timed out",
+    }]
+    assert post_calls == [], "replacement TP must not be attempted while an unverified old TP remains live"
 
 
 def test_ensure_protection_cancels_stale_tp_profile_legs(monkeypatch):

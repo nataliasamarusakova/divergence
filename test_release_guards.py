@@ -394,27 +394,33 @@ def test_long_btc_regime_gate_fails_closed_only_for_long_and_handles_btc_self():
     assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BEAR"}, enabled=True)
 
 def test_release_version_and_billing_modes_documented():
-    assert Path('VERSION').read_text(encoding='utf-8').strip() == 'V10.4.4'
-    runtime = Path('run_once.py').read_text(encoding='utf-8')
-    assert 'APP_VERSION = "V10.4.4"' in runtime
+    # APP_VERSION in the entry point is the single source of truth; a separate
+    # VERSION marker is intentionally not required by runtime or CI.
+    assert not Path("VERSION").exists()
+    runtime = Path("run_once.py").read_text(encoding="utf-8")
+    assert 'APP_VERSION = "V10.4.6"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_4.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_6.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes
     assert 'active_trades.json' in notes
-    assert 'scripts/reconcile_daily.py' in notes
+    assert 'event_engine/reconcile_daily.py' in notes
+    # Historical release notes remain tracked in the source repository.
+    assert Path('RELEASE_NOTES_V10_4_4.md').is_file()
 
 
 def test_release_runs_bounded_read_only_reconciliation_after_engine():
     workflow = _workflow()
-    script = Path("scripts/reconcile_daily.py").read_text(encoding="utf-8")
+    script = Path("event_engine/reconcile_daily.py").read_text(encoding="utf-8")
     assert "Read-only BingX position and daily ledger reconciliation" in workflow
     assert workflow.index("Run engine") < workflow.index("Read-only BingX position and daily ledger reconciliation")
     assert workflow.index("Stop Binance WireProxy") < workflow.index("Read-only BingX position and daily ledger reconciliation")
     assert workflow.index("Read-only BingX position and daily ledger reconciliation") < workflow.index("Commit state")
     assert 'RECONCILIATION_MAX_SYMBOLS: "2"' in workflow
     assert 'RECONCILIATION_INCOME_REQUEST_BUDGET: "4"' in workflow
+    assert "python -m event_engine.reconcile_daily" in workflow
+    assert "scripts/reconcile_daily.py" not in workflow
     assert "get_positions" in script and "get_open_protection_directional" in script and "get_income_history" in script
     assert "emergency_close_position(" not in script
     assert "place_order(" not in script

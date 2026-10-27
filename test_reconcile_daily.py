@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone
 
-from scripts import reconcile_daily as recon
+from event_engine import reconcile_daily as recon
 
 
 def _stub_protection(symbol, direction, **kwargs):
