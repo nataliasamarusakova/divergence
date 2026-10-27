@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.8"
+APP_VERSION = "V10.4.9"
 
 import pandas as pd
 import requests
@@ -3320,10 +3320,15 @@ def reconcile_all_open_positions() -> None:
 
                 if math.isfinite(sl_price) and math.isfinite(sl_amt) and sl_price > 0 and sl_amt > 0:
                     qty_matches = abs(sl_amt - qty) <= max(qty * 1e-6, 1e-12)
+                    # An orphan has no reliable local BE flag or original risk
+                    # profile. Preserve a correctly sized stop at/near entry (BE)
+                    # or on the protective side; never infer that it should be
+                    # replaced by the default 7% stop merely because local state is absent.
+                    allow_break_even = be_activated or matched_trade is None
                     if direction == "LONG":
-                        price_matches = (sl_price <= avg_price * 1.003) if be_activated else (sl_price < avg_price)
+                        price_matches = (sl_price <= avg_price * 1.003) if allow_break_even else (sl_price < avg_price)
                     elif direction == "SHORT":
-                        price_matches = (sl_price >= avg_price * 0.997) if be_activated else (sl_price > avg_price)
+                        price_matches = (sl_price >= avg_price * 0.997) if allow_break_even else (sl_price > avg_price)
                     else:
                         price_matches = False
                     sl_valid = bool(price_matches and qty_matches and len(sl_orders) == 1)
@@ -3411,12 +3416,19 @@ def reconcile_all_open_positions() -> None:
                         # loss-side protection validation, so its distance is a
                         # valid risk basis for this inferred profile.
                         inferred_risk = abs(avg_price - sl_price) / avg_price * 100.0
+                        risk_source = "LIVE_STOP_DISTANCE"
+                        if not math.isfinite(inferred_risk) or inferred_risk <= 1e-9:
+                            # A live BE stop has zero current distance by definition.
+                            # Use a labelled fallback for analytical setup metadata only;
+                            # the actual exchange SL remains untouched at its observed price.
+                            inferred_risk = float(FIXED_STOP_LOSS_PCT)
+                            risk_source = "BE_STOP_ANALYTICAL_FALLBACK"
                         inferred_setup = _build_reconciled_setup(
                             avg_price=avg_price,
                             direction=direction,
                             risk_pct=inferred_risk,
                             tp_levels=tracker_tp,
-                            risk_pct_source="LIVE_STOP_DISTANCE",
+                            risk_pct_source=risk_source,
                             invalidation_price=sl_price,
                         )
                         reconciliation_event_id = _reconciliation_event_id(
@@ -3488,10 +3500,11 @@ def reconcile_all_open_positions() -> None:
                     r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
                     r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
                     r_qty_matches = abs(r_sl_amt - qty) <= max(qty * 1e-6, 1e-12)
+                    allow_break_even = be_activated or matched_trade is None
                     if direction == "LONG":
-                        r_price_matches = (r_sl_price <= avg_price * 1.003) if be_activated else (r_sl_price < avg_price)
+                        r_price_matches = (r_sl_price <= avg_price * 1.003) if allow_break_even else (r_sl_price < avg_price)
                     elif direction == "SHORT":
-                        r_price_matches = (r_sl_price >= avg_price * 0.997) if be_activated else (r_sl_price > avg_price)
+                        r_price_matches = (r_sl_price >= avg_price * 0.997) if allow_break_even else (r_sl_price > avg_price)
                     else:
                         r_price_matches = False
                     recheck_sl_valid = bool(r_sl_price > 0 and r_sl_amt > 0 and r_qty_matches and r_price_matches and len(recheck_sl) == 1)
@@ -3545,6 +3558,22 @@ def reconcile_all_open_positions() -> None:
 
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
+        preserved_orphan_sl_price = None
+        if matched_trade is None and len(recheck_sl) == 1:
+            # Preserve any single, identifiable trigger already on the protective
+            # side even if its quantity is wrong. The repair can correct quantity
+            # at the same price; defaulting to -7% would unnecessarily widen risk.
+            candidate_sl_price = _safe_float(
+                recheck_sl[0].get("stopPrice") or recheck_sl[0].get("price"), 0.0
+            )
+            if (
+                math.isfinite(candidate_sl_price) and candidate_sl_price > 0
+                and ((direction == "LONG" and candidate_sl_price <= avg_price * 1.003)
+                     or (direction == "SHORT" and candidate_sl_price >= avg_price * 0.997))
+            ):
+                preserved_orphan_sl_price = candidate_sl_price
+        desired_repair_sl_price = avg_price if be_activated else preserved_orphan_sl_price
+
         res = ensure_directional_protection(
             symbol=bx_symbol,
             direction=direction,
@@ -3553,7 +3582,7 @@ def reconcile_all_open_positions() -> None:
             stop_loss_pct=sl_pct,
             tp_levels=tp_levels,
             trade_id=str(trade_event_id).replace("EVT_", ""),
-            stop_loss_price=avg_price if be_activated else None,
+            stop_loss_price=desired_repair_sl_price,
         )
 
         status = str(res.get("status", "")).upper()
@@ -3576,7 +3605,7 @@ def reconcile_all_open_positions() -> None:
         post_repair = get_open_protection_directional(
             bx_symbol, direction, timeout_sec=recon_timeout, retryable=False,
         )
-        expected_sl_price = avg_price if be_activated else (
+        expected_sl_price = desired_repair_sl_price if desired_repair_sl_price is not None else (
             avg_price * (1.0 - sl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + sl_pct / 100.0)
         )
         post_sl_valid, post_sl_audit = _audit_exact_single_sl(
@@ -3844,6 +3873,140 @@ def _finalize_rollback_protection_cleanup(
         cleanup = {"status": "pending"}
     cleanup["pending_cleanup_id"] = pending_id
     return cleanup
+
+
+def _handle_rollback_followup(
+    *,
+    symbol: str,
+    direction: str,
+    event_id: str,
+    trade_id: str,
+    last_known_position: dict,
+    protection: dict,
+    setup: dict,
+    sl_pct: float,
+    tp_levels: list,
+    last_known_qty: float,
+    last_known_avg_price: float,
+) -> tuple[str, dict, dict]:
+    """Resolve a rollback with a fresh position read before removing protection.
+
+    A MARKET close can be acknowledged as closed while a later exchange snapshot
+    shows a residual. Protection must stay in place until absence is re-confirmed;
+    residual positions are repaired/closed or returned through normal tracker paths.
+    """
+    result_protection = dict(protection) if isinstance(protection, dict) else {}
+    result_position = {**(last_known_position or {}), "positionAmt": 0.0}
+    try:
+        post_close = get_position_directional(symbol, direction)
+    except Exception as exc:
+        post_close = {"status": "error", "error": str(exc)}
+    post_status = str(post_close.get("status", "")).lower() if isinstance(post_close, dict) else "error"
+
+    if post_status == "not_found":
+        result_protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
+            symbol, direction, event_id, result_protection.get("emergency_close")
+        )
+        record_action({
+            "record_type": "ROLLBACK_POST_CLOSE_STATE", "event_id": event_id,
+            "symbol": symbol, "direction": direction, "post_close_status": "not_found",
+            "protection_cleanup": result_protection.get("rollback_protection_cleanup"),
+            "ts": int(time.time() * 1000),
+        })
+        return "opened_rolled_back", result_position, result_protection
+
+    if post_status == "found":
+        post_qty = abs(_safe_float(post_close.get("positionAmt"), 0.0))
+        post_avg = _safe_float(post_close.get("avgPrice") or post_close.get("entryPrice"), last_known_avg_price)
+        if post_qty > 0 and math.isfinite(post_qty) and post_avg > 0 and math.isfinite(post_avg):
+            result_position = {**post_close, "positionAmt": post_qty, "avgPrice": post_avg}
+            result_protection["rolled_back"] = False
+            log.critical(
+                "[EXECUTION] Rollback close was contradicted by live residual %s %s qty=%s; protection cleanup deferred",
+                direction, symbol, post_qty,
+            )
+            try:
+                recovery = install_protection(
+                    symbol=symbol, direction=direction, position=result_position,
+                    setup=setup, sl_pct=sl_pct, tp_levels=tp_levels,
+                    trade_id=f"{trade_id}:RESIDUAL",
+                )
+            except Exception as exc:
+                recovery = {"status": "PROTECTION_EXCEPTION", "error": str(exc)}
+            result_protection["rollback_position_recovery"] = recovery
+            recovery_status = str(recovery.get("status", "")).upper()
+            record_action({
+                "record_type": "ROLLBACK_RESIDUAL_POSITION_FOUND", "event_id": event_id,
+                "symbol": symbol, "direction": direction, "position_qty": post_qty,
+                "protection_recovery_status": recovery_status,
+                "protection_recovery_error": recovery.get("error"),
+                "protection_cleanup_deferred": True, "ts": int(time.time() * 1000),
+            })
+            if recovery_status in {"PROTECTED", "SL_ONLY"}:
+                result_protection = {
+                    **result_protection, **recovery,
+                    "rollback_position_recovery": recovery, "rolled_back": False,
+                }
+                return ("opened_protected" if recovery_status == "PROTECTED" else "opened_protection_check_required"), result_position, result_protection
+
+            # A protection repair that has not proven a valid SL gets one bounded
+            # emergency close for the confirmed residual. Do not cancel protection
+            # unless that close returns a verified closed state.
+            close_result = recovery.get("emergency_close") if isinstance(recovery.get("emergency_close"), dict) else None
+            if not isinstance(close_result, dict) or str(close_result.get("status", "")).lower() != "closed":
+                close_result = emergency_close_position(
+                    symbol, direction, post_qty,
+                    reason_token=f"ROLLBACKRESIDUAL:{trade_id}:{int(time.time() * 1000)}",
+                )
+            result_protection["rollback_residual_close"] = close_result
+            if str(close_result.get("status", "")).lower() == "closed":
+                result_position = {**result_position, "positionAmt": 0.0}
+                result_protection["rolled_back"] = True
+                result_protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
+                    symbol, direction, event_id, close_result
+                )
+                return "opened_rolled_back", result_position, result_protection
+
+            result_protection["rolled_back"] = False
+            result_protection["rollback_state_unknown"] = True
+            log.critical(
+                "[EXECUTION] Residual %s %s qty=%s remains unresolved after repair/close; it will be registered for tracker/reconciliation",
+                direction, symbol, post_qty,
+            )
+            try:
+                send_tg(
+                    f"🚨 <b>Rollback left a live position</b>\n"
+                    f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
+                    f"Qty: <code>{post_qty}</code>\n"
+                    "Protection repair and emergency close were not confirmed; the position is retained for reconciliation."
+                )
+            except Exception:
+                pass
+            return "opened_protection_failed", result_position, result_protection
+
+    # An API error, malformed FOUND response, or unrecognized state is not proof
+    # of closure. Leave existing exchange orders untouched and persist a nonzero
+    # last-known quantity in tracker state to block blind re-entry and retry later.
+    result_position = {
+        **(last_known_position or {}),
+        "positionAmt": abs(last_known_qty),
+        "avgPrice": last_known_avg_price,
+    }
+    result_protection["rolled_back"] = False
+    result_protection["rollback_state_unknown"] = True
+    result_protection["rollback_state_error"] = str((post_close or {}).get("error") or post_status or "unknown")
+    record_action({
+        "record_type": "ROLLBACK_POST_CLOSE_STATE_UNKNOWN", "event_id": event_id,
+        "symbol": symbol, "direction": direction, "post_close_status": post_status or "unknown",
+        "error": result_protection["rollback_state_error"],
+        "protection_cleanup_deferred": True, "last_known_qty": abs(last_known_qty),
+        "ts": int(time.time() * 1000),
+    })
+    log.critical(
+        "[EXECUTION] Rollback position state unknown for %s %s; leaving protection untouched and retaining local tracking: %s",
+        direction, symbol, result_protection["rollback_state_error"],
+    )
+    return "opened_protection_check_required", result_position, result_protection
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
@@ -4378,35 +4541,12 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         protection["rolled_back"] = str(rollback.get("status", "")).lower() == "closed"
 
     if protection.get("rolled_back"):
-        final_status = "opened_rolled_back"
-        # emergency_close_position only returns closed after two NOT_FOUND reads.
-        # Do not overwrite that confirmed zero quantity with the entry's original
-        # quantity in the final return. A later explicit FOUND response is handled
-        # as a residual position and remains visible to main/reconciliation.
-        position = {**position, "positionAmt": 0.0}
-        protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
-            symbol, direction, event_id, protection.get("emergency_close")
+        final_status, position, protection = _handle_rollback_followup(
+            symbol=symbol, direction=direction, event_id=event_id, trade_id=trade_id,
+            last_known_position=position, protection=protection, setup=setup_for_fill,
+            sl_pct=sl_pct, tp_levels=tp_levels, last_known_qty=actual_qty,
+            last_known_avg_price=actual_avg_price,
         )
-        try:
-            post_close = get_position_directional(symbol, direction)
-            post_status = str(post_close.get("status", "")).lower()
-            if post_status == "found":
-                post_qty = abs(_safe_float(post_close.get("positionAmt"), 0.0))
-                if post_qty > 0:
-                    position = {**post_close, "positionAmt": post_qty}
-                    final_status = "rollback_position_still_open"
-                    protection["rolled_back"] = False
-                    log.critical(
-                        "[EXECUTION] Rollback claimed closed but a residual %s %s position remains qty=%s",
-                        direction, symbol, post_qty,
-                    )
-            elif post_status != "not_found":
-                log.critical(
-                    "[EXECUTION] Rollback was reported closed; later state read is unknown for %s %s: %s",
-                    direction, symbol, post_close.get("error", post_status or "unknown"),
-                )
-        except Exception as exc:
-            log.critical("[EXECUTION] Rollback was reported closed but post-close position verification failed for %s %s: %s", direction, symbol, exc)
     elif protection_status not in {"PROTECTED", "SL_ONLY"} and isinstance(protection.get("emergency_close"), dict):
         protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
             symbol, direction, event_id, protection.get("emergency_close")
