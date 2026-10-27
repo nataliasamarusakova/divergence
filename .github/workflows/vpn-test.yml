@@ -113,6 +113,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p vpn-audit/responses vpn-audit/pretty
+          printf 'label|url|http_status|curl_exit|body_sha|body_bytes\n' > vpn-audit/manifest.tsv
 
           {
             echo '=== DNS ==='

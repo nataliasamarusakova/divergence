@@ -537,16 +537,83 @@ jobs:
               fi
             fi
 
-            # A later/parallel queued run can move main forward. Rebase the already
-            # merged runtime snapshot before each push attempt.
+            # A remote update can overlap the scheduler snapshot. If the scheduler
+            # JSON is the only conflicted path, rebuild its max-watermark merge from
+            # the replayed local commit and latest origin/main, then continue rebase.
+            # Other runtime-file conflicts are not guessed: abort and preserve the
+            # snapshot as an artifact rather than retrying the same deterministic conflict.
             if ! git rebase origin/main; then
-              git rebase --abort 2>/dev/null || true
-              # Recreate the merge against the newer remote state on the next attempt.
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                sleep $((attempt * 3))
-                continue
+              conflict_paths="$(git diff --name-only --diff-filter=U | sort)"
+              if [ "$conflict_paths" = "data/timeframe_scan_state.json" ]; then
+                echo "[COMMIT_STATE] Resolving scheduler-state conflict with max-watermark merge"
+                if python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          state_path = "data/timeframe_scan_state.json"
+
+          def read_ref(ref):
+              raw = subprocess.check_output(["git", "show", f"{ref}:{state_path}"], text=True)
+              value = json.loads(raw)
+              if not isinstance(value, dict) or value.get("version") != 2 or not isinstance(value.get("symbols"), dict):
+                  raise SystemExit(f"[COMMIT_STATE] invalid scheduler state at {ref}")
+              return value
+
+          local = read_ref("REBASE_HEAD")
+          remote = read_ref("origin/main")
+          merged = {"version": 2, "symbols": {}}
+          for symbol in sorted(set(local["symbols"]) | set(remote["symbols"])):
+              lrec = local["symbols"].get(symbol)
+              rrec = remote["symbols"].get(symbol)
+              lrec = lrec if isinstance(lrec, dict) else {}
+              rrec = rrec if isinstance(rrec, dict) else {}
+              out = {}
+              for tf in ("1h", "4h"):
+                  candidates = []
+                  for rec in (lrec, rrec):
+                      try:
+                          value = int(rec.get(tf))
+                      except (TypeError, ValueError):
+                          continue
+                      candidates.append(value)
+                  if candidates:
+                      out[tf] = max(candidates)
+              try:
+                  lts = int(lrec.get("updated_ts", 0) or 0)
+              except (TypeError, ValueError):
+                  lts = 0
+              try:
+                  rts = int(rrec.get("updated_ts", 0) or 0)
+              except (TypeError, ValueError):
+                  rts = 0
+              if max(lts, rts) > 0:
+                  out["updated_ts"] = max(lts, rts)
+              if out:
+                  merged["symbols"][symbol] = out
+
+          Path(state_path).write_text(json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"[COMMIT_STATE] conflict merge local={len(local['symbols'])} remote={len(remote['symbols'])} merged={len(merged['symbols'])}")
+          PY
+                then
+                  git add -f data/timeframe_scan_state.json
+                  if GIT_EDITOR=true git rebase --continue; then
+                    echo "[COMMIT_STATE] Scheduler-state conflict resolved; continuing push attempt"
+                  else
+                    git rebase --abort 2>/dev/null || true
+                    echo "[COMMIT_STATE] ERROR: could not continue after scheduler-state merge" >&2
+                    break
+                  fi
+                else
+                  git rebase --abort 2>/dev/null || true
+                  echo "[COMMIT_STATE] ERROR: scheduler-state conflict merge failed; preserving snapshot artifact" >&2
+                  break
+                fi
+              else
+                git rebase --abort 2>/dev/null || true
+                echo "[COMMIT_STATE] ERROR: unsupported rebase conflict paths: ${conflict_paths:-<unknown>}" >&2
+                break
               fi
-              break
             fi
 
             if git push origin HEAD:main; then
