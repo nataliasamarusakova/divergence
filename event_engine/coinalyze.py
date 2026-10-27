@@ -332,6 +332,16 @@ def click_next_page(page, current_page_num: int) -> bool:
         target = pag.query_selector("[aria-label='Next'], .next, a[rel='next']")
     if target is None:
         return False
+    try:
+        disabled = target.get_attribute("disabled") is not None
+        aria_disabled = str(target.get_attribute("aria-disabled") or "").strip().lower() == "true"
+        classes = str(target.get_attribute("class") or "").lower().split()
+        if disabled or aria_disabled or "disabled" in classes:
+            return False
+    except Exception:
+        # If the control's state cannot be inspected, clicking it below and
+        # requiring a visible table transition is the conservative validation.
+        pass
 
     target.click()
     page.wait_for_timeout(1500)
@@ -343,7 +353,11 @@ def click_next_page(page, current_page_num: int) -> bool:
             return True
         page.wait_for_timeout(500)
 
-    return False
+    # A next-page control existed and was clicked, but the table never changed.
+    # This is a pagination failure, not proof that the current page was the last.
+    raise RuntimeError(
+        f"Coinalyze page transition failed after clicking page {current_page_num + 1}"
+    )
 
 
 def get_page_urls(html_text: str) -> list[str]:
@@ -361,7 +375,7 @@ def get_page_urls(html_text: str) -> list[str]:
         if full not in urls:
             urls.append(full)
 
-    return urls[:MAX_PAGES]
+    return urls[:MAX_PAGES + 1]
 
 
 def parse_table(html_text: str) -> list[CoinalyzeRow]:
@@ -483,7 +497,13 @@ def fetch_data() -> list[CoinalyzeRow]:
 
             log.info("[COINALYZE] Page 1: %d rows", len(rows))
             page_urls = get_page_urls(html)
-            log.info("[COINALYZE] Pagination: %d pages", len(page_urls))
+            log.info("[COINALYZE] Pagination: %d pages (cap=%d)", min(len(page_urls), MAX_PAGES), MAX_PAGES)
+            if len(page_urls) > MAX_PAGES:
+                page_errors.append({
+                    "page": MAX_PAGES + 1, "url": page_urls[MAX_PAGES],
+                    "error": f"pagination_exceeds_MAX_PAGES:{MAX_PAGES}",
+                })
+                page_urls = page_urls[:MAX_PAGES]
 
             if len(page_urls) > 1:
                 for i, url in enumerate(page_urls[1:], start=2):
@@ -503,19 +523,46 @@ def fetch_data() -> list[CoinalyzeRow]:
 
             elif page.query_selector(".pagination") is not None:
                 page_num = 1
-                while page_num < MAX_PAGES and click_next_page(page, page_num):
-                    page.wait_for_selector("tbody tr", timeout=15_000)
-                    page.wait_for_timeout(500)
-                    html = page.content()
-                    rows = parse_table(html)
-                    added = 0
-                    for row in rows:
-                        if row.symbol not in seen:
-                            all_rows.append(row)
-                            seen.add(row.symbol)
-                            added += 1
-                    page_num += 1
-                    log.info("[COINALYZE] Click page %d: +%d new rows", page_num, added)
+                while page_num < MAX_PAGES:
+                    try:
+                        advanced = click_next_page(page, page_num)
+                        if not advanced:
+                            break  # no next-page control means pagination is complete
+                        page.wait_for_selector("tbody tr", timeout=15_000)
+                        page.wait_for_timeout(500)
+                        html = page.content()
+                        rows = parse_table(html)
+                        added = 0
+                        for row in rows:
+                            if row.symbol not in seen:
+                                all_rows.append(row)
+                                seen.add(row.symbol)
+                                added += 1
+                        page_num += 1
+                        log.info("[COINALYZE] Click page %d: +%d new rows", page_num, added)
+                    except Exception as exc:
+                        page_errors.append({
+                            "page": page_num + 1, "url": f"{COINALYZE_URL}#page={page_num + 1}",
+                            "error": str(exc)[:200],
+                        })
+                        log.exception("[COINALYZE] Click pagination failed at page %d", page_num + 1)
+                        break
+                if page_num >= MAX_PAGES:
+                    # Verify whether a page beyond the cap exists by probing the
+                    # same next-control logic. A working next page means truncation;
+                    # a failed transition is also incomplete, never a clean finish.
+                    try:
+                        has_more_pages = click_next_page(page, page_num)
+                        if has_more_pages:
+                            page_errors.append({
+                                "page": page_num + 1, "url": f"{COINALYZE_URL}#page={page_num + 1}",
+                                "error": f"pagination_reached_MAX_PAGES:{MAX_PAGES}",
+                            })
+                    except Exception as exc:
+                        page_errors.append({
+                            "page": page_num + 1, "url": f"{COINALYZE_URL}#page={page_num + 1}",
+                            "error": f"pagination_cap_probe_failed:{type(exc).__name__}:{str(exc)[:160]}",
+                        })
         finally:
             browser.close()
 

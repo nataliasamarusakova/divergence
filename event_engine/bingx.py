@@ -219,9 +219,13 @@ def contracts(*, require_fresh: bool = False) -> dict[str, dict]:
 
 
 def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
-    s = (symbol or "").strip().upper()
+    s = (symbol or "").strip().upper().replace("_", "-").replace("/", "-")
     if not s:
         return None
+    # Compact quote symbols (e.g. BTCUSDT) are common in logs and external data.
+    # Normalize them before catalog lookup so fallback cannot form BTCUSDT-USDT.
+    if "-" not in s and s.endswith("USDT") and len(s) > 4:
+        s = f"{s[:-4]}-USDT"
 
     catalog = contracts(require_fresh=require_fresh)
     mapped = SYMBOL_MAP.get(s)
@@ -693,6 +697,34 @@ def _shape_fingerprint(payload: Any) -> tuple[str, str]:
     return fingerprint, description
 
 
+def _normalize_history_symbol(symbol: str) -> str | None:
+    """Normalize base, dashed, and compact USDT symbols for history endpoints.
+
+    History APIs are contract-scoped. A compact market symbol such as BTCUSDT
+    must become BTC-USDT before contract lookup/fallback; appending another quote
+    suffix would query the invalid BTCUSDT-USDT contract.
+    """
+    raw = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if not raw:
+        return None
+    # A no-dash symbol ending in USDT is a compact quote symbol, not a base asset.
+    if not raw.endswith("-USDT") and raw.endswith("USDT") and len(raw) > 4:
+        raw = f"{raw[:-4]}-USDT"
+    try:
+        bx = to_bx_symbol(raw)
+    except Exception:
+        bx = None
+    if bx:
+        return str(bx).strip().upper().replace("_", "-").replace("/", "-")
+    # Keep the legacy fallback for already contract-shaped symbols and bare base
+    # tickers, but only after compact-quote normalization above.
+    if raw.endswith("-USDT") and raw[:-5].replace("-", "").isalnum():
+        return raw
+    if raw.replace("-", "").isalnum() and 1 <= len(raw) <= 24:
+        return raw.replace("-", "") + "-USDT"
+    return None
+
+
 def get_fill_history(
     symbol: str,
     start_ts: int,
@@ -709,15 +741,9 @@ def get_fill_history(
     Unknown payload shapes fail closed, with a shape fingerprint logged for
     diagnosis. A market/trigger price is never promoted to an execution price.
     """
-    raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
-    bx = to_bx_symbol(raw_symbol) if raw_symbol else None
+    bx = _normalize_history_symbol(symbol)
     if not bx:
-        if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
-            bx = raw_symbol
-        elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
-            bx = raw_symbol.replace("-", "") + "-USDT"
-        else:
-            return {"status": "error", "error": "invalid_or_unknown_historical_symbol", "fills": []}
+        return {"status": "error", "error": "invalid_or_unknown_historical_symbol", "fills": []}
     try:
         start_ts, end_ts = int(start_ts), int(end_ts)
         page_index, page_size = int(page_index), int(page_size)
@@ -847,15 +873,9 @@ def get_income_history(
     is required: a truncated response or an unknown row shape is an error, never
     treated as a zero cost. The API retains only a bounded recent history.
     """
-    raw_symbol = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
-    bx = to_bx_symbol(raw_symbol) if raw_symbol else None
+    bx = _normalize_history_symbol(symbol)
     if not bx:
-        if raw_symbol.endswith("-USDT") and raw_symbol[:-5].replace("-", "").isalnum():
-            bx = raw_symbol
-        elif raw_symbol.replace("-", "").isalnum() and 1 <= len(raw_symbol) <= 24:
-            bx = raw_symbol.replace("-", "") + "-USDT"
-        else:
-            return {"status": "error", "error": "invalid_or_unknown_income_symbol", "records": [], "complete": False}
+        return {"status": "error", "error": "invalid_or_unknown_income_symbol", "records": [], "complete": False}
     try:
         start_ts, end_ts, limit = int(start_ts), int(end_ts), int(limit)
     except (TypeError, ValueError):
@@ -1175,6 +1195,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                             "order_reference_price": sizing_price,
                             "order_id": None,
                             "client_order_id": client_order_id,
+                            "entry_ack_missing_order_id": True,
                             "idempotency": "position_verified_after_transport_error",
                             "response": response,
                         }
@@ -1191,9 +1212,71 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
 
         data = response.get("data") or {}
-        order = data.get("order") or {}
-        order_id = order.get("orderId") or data.get("orderId")
-
+        order = data.get("order") or {} if isinstance(data, dict) else {}
+        order_id = (order.get("orderId") or order.get("orderID") or data.get("orderId") or data.get("orderID")) if isinstance(data, dict) else None
+        linked_client_order_id = order.get("clientOrderId") or client_order_id if isinstance(order, dict) else client_order_id
+        if not order_id:
+            # A success code without an order ID is not a complete execution ack.
+            # Try resolving the deterministic client id; if the exchange still
+            # cannot provide a direct ID, return UNKNOWN so main() terminalizes the
+            # event and reconciliation adopts any live position rather than losing
+            # the audit link or blindly opening again.
+            try:
+                queried = get_order_by_client_order_id(symbol, str(linked_client_order_id))
+            except Exception as exc:
+                queried = {"status": "error", "error": str(exc)}
+            queried_id = str(queried.get("order_id") or "").strip() if isinstance(queried, dict) else ""
+            queried_status = str(queried.get("order_status") or "").upper() if isinstance(queried, dict) else ""
+            if queried.get("status") == "ok" and queried_id and (
+                _safe_float(queried.get("executed_qty"), 0.0) > 0
+                or queried_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}
+            ):
+                order_id = queried_id
+                order_status = queried_status
+            else:
+                try:
+                    live_position = get_position_directional(symbol, direction)
+                except Exception as exc:
+                    live_position = {"status": "error", "error": str(exc)}
+                if isinstance(live_position, dict) and str(live_position.get("status", "")).lower() == "found":
+                    try:
+                        live_qty = abs(float(live_position.get("positionAmt", 0) or 0))
+                        live_avg = float(live_position.get("avgPrice") or live_position.get("entryPrice") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        live_qty = live_avg = 0.0
+                    if live_qty > 0 and math.isfinite(live_qty) and live_avg > 0 and math.isfinite(live_avg):
+                        log.critical(
+                            "[BINGX] MARKET entry ack had no orderId but a live %s %s position is confirmed; continuing to protection with clientOrderId=%s and unresolved direct order id",
+                            direction, bx, linked_client_order_id,
+                        )
+                        return {
+                            "status": "opened",
+                            "symbol": bx,
+                            "qty": live_qty,
+                            "leverage": leverage,
+                            "sizing_price": sizing_price,
+                            "signal_price": float(price),
+                            "order_reference_price": sizing_price,
+                            "order_id": None,
+                            "client_order_id": str(linked_client_order_id),
+                            "order_status": queried_status or "POSITION_CONFIRMED",
+                            "entry_ack_missing_order_id": True,
+                            "entry_position_snapshot": live_position,
+                            "response": response,
+                            "order_lookup": queried,
+                        }
+                return {
+                    "status": "unknown",
+                    "error": "market entry success response missing orderId; direct order lookup and live-position confirmation did not resolve it",
+                    "symbol": bx, "qty": qty, "leverage": leverage,
+                    "sizing_price": sizing_price, "signal_price": float(price),
+                    "order_reference_price": sizing_price,
+                    "client_order_id": str(linked_client_order_id),
+                    "order_status": queried_status or "UNKNOWN",
+                    "response": response, "order_lookup": queried,
+                    "position_lookup": live_position,
+                    "entry_ack_missing_order_id": True,
+                }
         return {
             "status": "opened",
             "symbol": bx,
@@ -1202,8 +1285,9 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "sizing_price": sizing_price,
             "signal_price": float(price),
             "order_reference_price": sizing_price,
-            "order_id": order_id,
-            "client_order_id": order.get("clientOrderId") or client_order_id,
+            "order_id": str(order_id),
+            "client_order_id": str(linked_client_order_id),
+            "order_status": order_status if "order_status" in locals() else str(order.get("status", "")).upper(),
             "response": response,
             "open_attempt": open_attempt + 1,
         }

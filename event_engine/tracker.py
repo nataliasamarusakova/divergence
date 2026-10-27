@@ -13,6 +13,7 @@ from typing import Any
 from event_engine.bingx import (
     get_position_directional,
     get_order,
+    get_order_by_client_order_id,
     get_fill_history,
     get_income_history,
     get_open_protection_directional,
@@ -1735,7 +1736,12 @@ def _cashflow_order_ids(opened: dict, close_record: dict) -> tuple[str | None, s
     """Extract exchange order IDs recorded for one local position lifecycle."""
     execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
     open_result = opened.get("result") if isinstance(opened.get("result"), dict) else {}
-    entry_id = str(execution.get("order_id") or execution.get("orderId") or open_result.get("order_id") or open_result.get("orderId") or "").strip() or None
+    prior_recovery = close_record.get("cashflow_recovery") if isinstance(close_record.get("cashflow_recovery"), dict) else {}
+    entry_id = str(
+        execution.get("order_id") or execution.get("orderId")
+        or open_result.get("order_id") or open_result.get("orderId")
+        or prior_recovery.get("resolved_entry_order_id") or ""
+    ).strip() or None
     order_ids: set[str] = set()
     if entry_id:
         order_ids.add(entry_id)
@@ -1768,6 +1774,14 @@ def _cashflow_order_ids(opened: dict, close_record: dict) -> tuple[str | None, s
             order_ids.update(str(item).strip() for item in value if item not in (None, ""))
     order_ids.discard("")
     return entry_id, order_ids
+
+
+def _cashflow_entry_client_order_id(opened: dict) -> str | None:
+    """Read deterministic clientOrderId for delayed resolution of a missing ACK id."""
+    result = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    ack = result.get("open_result") if isinstance(result.get("open_result"), dict) else {}
+    value = ack.get("client_order_id") or ack.get("clientOrderId") or ack.get("clientOrderID")
+    return str(value).strip() if value not in (None, "") else None
 
 
 def _load_exchange_fill_evidence(
@@ -1966,6 +1980,42 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
             continue
 
         entry_order_id, order_ids = _cashflow_order_ids(opened or {}, record)
+        entry_client_order_id = _cashflow_entry_client_order_id(opened or {})
+        resolved_entry_order_id = entry_order_id
+        if not entry_order_id and entry_client_order_id:
+            # A code=0 market response can be missing orderId even while the
+            # position is real. Retry a read-only clientOrderId lookup during
+            # recovery; never substitute symbol/time-window fills for this link.
+            try:
+                resolved = get_order_by_client_order_id(symbol, entry_client_order_id)
+            except Exception as exc:
+                resolved = {"status": "error", "error": str(exc)}
+            candidate_id = str(resolved.get("order_id") or "").strip() if isinstance(resolved, dict) else ""
+            if isinstance(resolved, dict) and str(resolved.get("status", "")).lower() == "ok" and candidate_id:
+                entry_order_id = candidate_id
+                resolved_entry_order_id = candidate_id
+                order_ids.add(candidate_id)
+            else:
+                attempts_this_cycle += 1
+                updated = dict(record)
+                attempts = int(_safe_float(recovery.get("attempts"), 0.0)) + 1
+                delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempts - 1, 4)))
+                updated["fees_usdt"] = None
+                updated["funding_usdt"] = None
+                updated["net_pnl_usdt"] = None
+                updated["pnl_costs_status"] = "UNVERIFIED_POSITION_ATTRIBUTION"
+                updated["net_pnl_attribution_status"] = "UNKNOWN_DIRECT_FILL_LINK_REQUIRED"
+                updated["cashflow_recovery"] = {
+                    "status": "PENDING_ENTRY_ORDER_ID_RESOLUTION" if attempts < 40 else "ABANDONED_MAX_ATTEMPTS",
+                    "attempts": attempts, "last_attempt_ts": now_ms,
+                    "next_retry_ts": now_ms + delay_ms if attempts < 40 else None,
+                    "client_order_id": entry_client_order_id,
+                    "last_error": str((resolved or {}).get("error") or "clientOrderId lookup did not return a direct order id")[:500],
+                }
+                replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
+                log.warning("[TRACKER_CASHFLOW] Trade=%s entry order id not yet resolvable for clientOrderId=%s; retrying without guessing", event_id, entry_client_order_id)
+                continue
+
         attempts_this_cycle += 1
         fills, fill_error = _load_exchange_fill_evidence(
             symbol, direction, query_start, query_end, entry_order_id, order_ids,
@@ -1989,6 +2039,8 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
                 "status": "ABANDONED_NO_DIRECT_ORDER_IDS" if fill_error.startswith("abandon:") else ("ABANDONED_MAX_ATTEMPTS" if terminal else "PENDING"),
                 "attempts": attempts, "last_attempt_ts": now_ms,
                 "next_retry_ts": None if terminal else now_ms + delay_ms,
+                "resolved_entry_order_id": resolved_entry_order_id,
+                "client_order_id": entry_client_order_id,
                 "last_error": fill_error,
             }
             replacements[index] = json.dumps(json_safe(updated), ensure_ascii=False, allow_nan=False) + "\n"
@@ -2095,6 +2147,7 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
                 "pnl_costs_status": "BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED",
                 "cashflow_recovery": {
                     "status": "RECOVERED", "attempts": attempts, "recovered_ts": now_ms,
+                    "resolved_entry_order_id": resolved_entry_order_id,
                     "source": "BINGX_ORDER_LINKED_FILL_HISTORY_AND_USER_INCOME",
                     "orders": sorted(order_ids), "fill_trade_ids": sorted(fill_ids),
                     "rows": len(relevant), "income_types": sorted({str(item.get("income_type") or "").upper() for item in relevant}),
@@ -2123,6 +2176,8 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
             updated["cashflow_recovery"] = {
                 "status": "ABANDONED_NO_DIRECT_ORDER_IDS" if error.startswith("abandon:") else ("ABANDONED_MAX_ATTEMPTS" if terminal else "PENDING"),
                 "attempts": attempts, "last_attempt_ts": now_ms,
+                "resolved_entry_order_id": resolved_entry_order_id,
+                "client_order_id": entry_client_order_id,
                 "next_retry_ts": None if terminal else now_ms + delay_ms,
                 "last_error": error,
             }
