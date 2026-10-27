@@ -48,6 +48,33 @@ def test_fill_history_supports_bingx_tradeprice_volume_aliases(monkeypatch):
     assert captured["kwargs"]["retryable"] is False
 
 
+def test_official_fill_history_shape_uses_explicit_currency_filter_for_fee_asset(monkeypatch):
+    import event_engine.bingx as bingx
+
+    captured = {}
+    def fake_request(method, path, params=None, **kwargs):
+        captured.update(params=dict(params or {}))
+        return {"code": 0, "data": {"fill_orders": [{
+            "tradeId": "official-fill-1", "orderId": "official-order-1",
+            "symbol": "BTC-USDT", "side": "SELL", "price": "99.5",
+            "qty": "1", "time": 1_700_000_000_000,
+            "realizedPnl": "0.5", "fee": "-0.01",
+        }]}}
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    result = bingx.get_fill_history(
+        "BTC", 1_699_999_999_000, 1_700_000_001_000, currency="USDT",
+    )
+    assert result["status"] == "ok"
+    assert captured["params"]["currency"] == "USDT"
+    assert result["fills"][0]["fee_asset"] == "USDT"
+
+    # Without an explicit currency filter, missing fee-asset metadata stays unknown.
+    result_unfiltered = bingx.get_fill_history("BTC", 1_699_999_999_000, 1_700_000_001_000)
+    assert result_unfiltered["fills"][0]["fee_asset"] is None
+
+
 def test_fill_history_fails_closed_for_unknown_api_shape(monkeypatch):
     import event_engine.bingx as bingx
 
@@ -81,17 +108,17 @@ def _close_fixture(*, incomplete=False, malformed_row=False):
         "symbol": "BTC", "direction": "LONG", "closed_ts": close_ts,
         "entry_price": 100.0, "exit_price": None, "exit_reason": "DATA_ERROR",
         "realized_pnl_pct": None, "total_closed_qty": 3.0, "initial_qty": 3.0,
-        "entry_order_id": "ENTRY-1", "planned_risk_pct": 0.5,
+        "entry_order_id": "ENTRY-1", "exit_order_ids": ["EARLY-CLOSE", "FINAL-MARKET"], "planned_risk_pct": 0.5,
     }
     fills = [
-        {"trade_id": "entry-fill", "order_id": "ENTRY-1", "symbol": "BTC-USDT", "side": "BUY", "position_side": "LONG", "price": 100.0, "qty": 3.0, "time": open_ts + 1000, "realized_pnl": 0.0, "fee": -0.03},
-        {"trade_id": "close-fill-1", "order_id": "EARLY-CLOSE", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 102.0, "qty": 1.0, "time": close_ts - 10_000, "realized_pnl": 2.0, "fee": -0.01},
-        {"trade_id": "close-fill-2", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 103.0, "qty": 1.0, "time": close_ts - 2_000, "realized_pnl": 3.0, "fee": -0.01},
+        {"trade_id": "entry-fill", "order_id": "ENTRY-1", "symbol": "BTC-USDT", "side": "BUY", "position_side": "LONG", "price": 100.0, "qty": 3.0, "time": open_ts + 1000, "realized_pnl": 0.0, "fee": -0.03, "fee_asset": "USDT"},
+        {"trade_id": "close-fill-1", "order_id": "EARLY-CLOSE", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 102.0, "qty": 1.0, "time": close_ts - 10_000, "realized_pnl": 2.0, "fee": -0.01, "fee_asset": "USDT"},
+        {"trade_id": "close-fill-2", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 103.0, "qty": 1.0, "time": close_ts - 2_000, "realized_pnl": 3.0, "fee": -0.01, "fee_asset": "USDT"},
     ]
     if not incomplete:
         # Same final market order, two fills with different timestamps. The final
         # order average must use both fills, not only the latest timestamp row.
-        fills.append({"trade_id": "close-fill-3", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 104.0, "qty": 1.0, "time": close_ts - 1000, "realized_pnl": 4.0, "fee": -0.01})
+        fills.append({"trade_id": "close-fill-3", "order_id": "FINAL-MARKET", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 104.0, "qty": 1.0, "time": close_ts - 1000, "realized_pnl": 4.0, "fee": -0.01, "fee_asset": "USDT"})
     return opened, closed, fills
 
 
@@ -112,6 +139,71 @@ def test_data_error_reconstruction_uses_full_final_order_average_and_preserves_c
     assert rebuilt["fees_usdt"] == pytest.approx(-0.06)
 
 
+def test_data_error_reconstruction_rejects_unlinked_symbol_time_quantity_coincidence():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, fills = _close_fixture()
+    closed.pop("entry_order_id", None)
+    opened["execution"].pop("order_id", None)
+    # No journaled exit IDs and no known protective order IDs. These rows match
+    # symbol, side, time window, and total quantity but may belong to another trade.
+    closed.pop("exit_order_ids", None)
+    fills = [
+        {"trade_id": "foreign-fill", "order_id": "FOREIGN-ORDER", "symbol": "BTC-USDT",
+         "side": "SELL", "position_side": "LONG", "price": 90.0, "qty": 3.0,
+         "time": closed["closed_ts"] - 1000, "realized_pnl": -30.0, "fee": -0.03, "fee_asset": "USDT"}
+    ]
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+    assert rebuilt is None
+    assert error == "missing_entry_order_id_for_reconstruction"
+
+
+def test_data_error_reconstruction_rejects_foreign_exit_fills_even_when_entry_id_exists():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, fills = _close_fixture()
+    closed.pop("exit_order_ids", None)
+    fills = [fills[0], {
+        "trade_id": "foreign-fill", "order_id": "FOREIGN-ORDER", "symbol": "BTC-USDT",
+        "side": "SELL", "position_side": "LONG", "price": 90.0, "qty": 3.0,
+        "time": closed["closed_ts"] - 1000, "realized_pnl": -30.0, "fee": -0.03, "fee_asset": "USDT",
+    }]
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+    assert rebuilt is None
+    assert error == "missing_direct_exit_order_ids_for_reconstruction"
+
+
+def test_data_error_reconstruction_does_not_fallback_to_foreign_fills_when_protection_id_exists():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, fills = _close_fixture()
+    opened["result"]["protection"]["sl_result"] = {"order_id": "SL-OWN-TRADE"}
+    closed.pop("exit_order_ids", None)
+    fills = [fills[0], {
+        "trade_id": "foreign-fill", "order_id": "FOREIGN-ORDER", "symbol": "BTC-USDT",
+        "side": "SELL", "position_side": "LONG", "price": 90.0, "qty": 3.0,
+        "time": closed["closed_ts"] - 1000, "realized_pnl": -30.0, "fee": -0.03, "fee_asset": "USDT",
+    }]
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+    assert rebuilt is None
+    assert error == "no_fills_for_journaled_exit_order_ids"
+
+
+def test_data_error_reconstruction_uses_entry_order_fill_vwap_not_journal_estimate():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, fills = _close_fixture()
+    # Split the confirmed entry order into two partial fills at different prices.
+    fills[0]["qty"] = 1.5
+    fills[0]["price"] = 99.0
+    second = dict(fills[0], trade_id="entry-fill-2", qty=1.5, price=101.0, time=fills[0]["time"] + 1)
+    fills.insert(1, second)
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+    assert error is None
+    assert rebuilt is not None
+    assert rebuilt["entry_price"] == pytest.approx(100.0)
+
+
 def test_successful_recovery_persists_pnl_provenance_and_cost_uncertainty(tmp_path, monkeypatch):
     import event_engine.tracker as tracker
 
@@ -119,10 +211,15 @@ def test_successful_recovery_persists_pnl_provenance_and_cost_uncertainty(tmp_pa
     opened, closed, fills = _close_fixture(incomplete=False)
     journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
     monkeypatch.setattr(tracker, "TRADES_PATH", journal)
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+    query_kwargs = []
+    def fake_fill_history(*args, **kwargs):
+        query_kwargs.append(dict(kwargs))
+        return {"status": "ok", "fills": fills}
+    monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
 
     recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert recovered == 1
+    assert query_kwargs and query_kwargs[0].get("currency") == "USDT"
     rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
     close = next(row for row in rows if row.get("record_type") == "TRADE_CLOSE")
     assert close["realized_pnl_pct_source"] == "BINGX_FILL_HISTORY_PRICE_WEIGHTED"

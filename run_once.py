@@ -10,6 +10,8 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
+APP_VERSION = "V10.4.4"
+
 import pandas as pd
 import requests
 
@@ -41,6 +43,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
     get_positions,
+    get_position_mode,
     get_open_protection_directional,
     get_open_orders_snapshot,
     ensure_directional_protection,
@@ -249,11 +252,12 @@ if ENTRY_QUALITY_MODE not in {"off", "shadow", "enforce"}:
     ENTRY_QUALITY_MODE = "shadow"
 ENTRY_WEAK_ENGINE_BLOCK_ENABLED = os.environ.get("ENTRY_WEAK_ENGINE_BLOCK_ENABLED", "false").lower() == "true"
 # Explicit hard denylist, separate from the experimental/shadow Entry Quality gate.
-# CRT_BEARISH is disabled by default based on the cross-version event audit; set
-# DISABLED_EVENT_TYPES="" only when intentionally re-enabling event types.
+# V10.4.4 preserves the research-window event policy while hardening fill reconciliation.
 DISABLED_EVENT_TYPES = {
     x.strip().upper()
-    for x in os.environ.get("DISABLED_EVENT_TYPES", "CRT_BEARISH").split(",")
+    for x in os.environ.get(
+        "DISABLED_EVENT_TYPES", "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"
+    ).split(",")
     if x.strip()
 }
 
@@ -266,12 +270,20 @@ ENTRY_BLOCKED_EVENT_TYPES = {
     x.strip().upper()
     for x in os.environ.get(
         "ENTRY_BLOCKED_EVENT_TYPES",
-        "MA_COMPRESSION_BREAKOUT,CRT_BULLISH,CRT_BEARISH,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH",
+        "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION",
     ).split(",")
     if x.strip()
 }
 SHORT_OI_VETO_ENABLED = os.environ.get("SHORT_OI_VETO_ENABLED", "false").lower() == "true"
 SHORT_OI_VETO_PCT = float(os.environ.get("SHORT_OI_VETO_PCT", "-5.0"))
+# Targeted risk gates from the approved research plan. These do not enable the
+# global trend filter: BTC regime veto affects LONG entries only.
+LONG_LS_GATE_ENABLED = os.environ.get("LONG_LS_GATE_ENABLED", "false").strip().lower() == "true"
+LONG_LS_MAX = float(os.environ.get("LONG_LS_MAX", "1.36"))
+LONG_OI_CHG4H_MAX = float(os.environ.get("LONG_OI_CHG4H_MAX", "3.0"))
+LONG_FR_BAND_MIN = float(os.environ.get("LONG_FR_BAND_MIN", "0.0009"))
+LONG_FR_BAND_MAX = float(os.environ.get("LONG_FR_BAND_MAX", "0.00665"))
+LONG_BTC_VETO_ENABLED = os.environ.get("LONG_BTC_VETO_ENABLED", "false").strip().lower() == "true"
 COMPOUND_CVD_LIQ_VETO_ENABLED = os.environ.get("COMPOUND_CVD_LIQ_VETO_ENABLED", "false").lower() == "true"
 COMPOUND_CVD_MAX = float(os.environ.get("COMPOUND_CVD_MAX", "25"))
 COMPOUND_LIQ_LONG_MIN = float(os.environ.get("COMPOUND_LIQ_LONG_MIN", "150000"))
@@ -309,18 +321,33 @@ AJAY_SR_REQUIRE_DATA = os.environ.get("AJAY_SR_REQUIRE_DATA", "false").lower() =
 # observed and statistically evaluated. Live-like modes keep the production limits.
 _EXECUTION_MODE_HINT = os.environ.get("EXECUTION_MODE", os.environ.get("BINGX_ENV", "vst")).strip().lower()
 _RESEARCH_UNLIMITED_ENTRY_MODES = {"vst", "test", "demo", "simulated"}
-RESEARCH_UNLIMITED_ENTRIES = os.environ.get(
-    "RESEARCH_UNLIMITED_ENTRIES",
-    "true" if _EXECUTION_MODE_HINT in _RESEARCH_UNLIMITED_ENTRY_MODES else "false",
-).strip().lower() == "true"
+# In the named research/sandbox modes this is a hard invariant, not a workflow-only
+# convention: a stale RESEARCH_UNLIMITED_ENTRIES=false secret cannot re-enable caps.
+RESEARCH_UNLIMITED_ENTRIES = (
+    _EXECUTION_MODE_HINT in _RESEARCH_UNLIMITED_ENTRY_MODES
+    or os.environ.get("RESEARCH_UNLIMITED_ENTRIES", "false").strip().lower() == "true"
+)
 PORTFOLIO_CAP_ENABLED = os.environ.get(
     "PORTFOLIO_CAP_ENABLED",
     "false" if RESEARCH_UNLIMITED_ENTRIES else "true",
 ).strip().lower() == "true"
 MAX_TRADES = int(os.environ.get("MAX_TRADES_PER_CYCLE", "0" if RESEARCH_UNLIMITED_ENTRIES else "3"))
-# Prevent rapid re-entry/churn on the same instrument, including opposite-direction flips.
-SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "15"))
-SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN", "45"))
+# VST/research unlimited mode is an invariant: conflicting deployment variables
+# must not silently re-introduce a global, directional, or per-cycle entry cap.
+if RESEARCH_UNLIMITED_ENTRIES:
+    PORTFOLIO_CAP_ENABLED = False
+    MAX_TRADES = 0
+# Symbol cooldowns are opt-in restrictions, disabled by default for research runs.
+SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SYMBOL_ENTRY_COOLDOWN_MIN", "0" if RESEARCH_UNLIMITED_ENTRIES else "15"))
+SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = float(os.environ.get("SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN", "0" if RESEARCH_UNLIMITED_ENTRIES else "45"))
+# Research-unlimited means no hidden time- or loss-based re-entry throttles either.
+# Strategy vetoes and exchange-state safety checks remain in force.
+if RESEARCH_UNLIMITED_ENTRIES:
+    SYMBOL_ENTRY_COOLDOWN_MIN = 0.0
+    SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN = 0.0
+    SYMBOL_LOSS_COOLDOWN_MIN = 0.0
+    SYMBOL_MAX_CONSECUTIVE_LOSSES = 0
+    SYMBOL_QUARANTINE_MIN = 0.0
 # Funding values are in percentage points as parsed from Coinalyze
 # (e.g. 0.05 == +0.05%, -0.05 == -0.05%).
 MAX_SHORT_SQUEEZE_ADVERSE_FUNDING = float(os.environ.get("MAX_SHORT_SQUEEZE_ADVERSE_FUNDING", "-0.10"))
@@ -369,6 +396,12 @@ ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED",
 MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
 MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
 MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
+# Do not merely disable the cap flag: normalise the numeric caps too so telemetry,
+# future refactors, and deployment overrides cannot re-introduce caps in research.
+if RESEARCH_UNLIMITED_ENTRIES:
+    MAX_ACTIVE_TRADES = 0
+    MAX_ACTIVE_LONGS = 0
+    MAX_ACTIVE_SHORTS = 0
 EXECUTION_MODE = _EXECUTION_MODE_HINT
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
@@ -419,6 +452,12 @@ def _validate_execution_config() -> tuple[bool, str]:
 
     if POSITION_MODE != "HEDGE":
         return False, f"This engine requires BINGX_POSITION_MODE=HEDGE, got {POSITION_MODE!r}"
+
+    exchange_mode = get_position_mode()
+    if exchange_mode.get("status") != "ok":
+        return False, f"Cannot verify BingX position mode: {exchange_mode.get('error', 'unknown error')}"
+    if exchange_mode.get("mode") != "HEDGE":
+        return False, f"This engine requires BingX Hedge Mode; exchange reports {exchange_mode.get('mode')!r}"
 
     return True, "OK"
 
@@ -2144,6 +2183,69 @@ def _entry_quality_gate(
     return not reasons, reasons, terminal
 
 
+def _long_market_risk_gate_reasons(row: Any) -> list[str]:
+    """Return approved long-only crowding/OI/funding veto reasons.
+
+    Missing or malformed values are unknown, not a numeric zero, and therefore
+    do not independently trigger a veto (owner-approved B4 semantics).
+    """
+    if not LONG_LS_GATE_ENABLED:
+        return []
+
+    def finite_attr(name: str) -> float | None:
+        try:
+            raw = getattr(row, name, None)
+            if raw in (None, ""):
+                return None
+            value = float(raw)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    reasons: list[str] = []
+    ls = finite_attr("ls_accounts")
+    oi4h = finite_attr("oi_chg4h_pct")
+    funding = finite_attr("fr_oiw")
+    if ls is not None and ls > LONG_LS_MAX:
+        reasons.append(f"LONG_LS:{ls:.5f}>{LONG_LS_MAX:.5f}")
+    if oi4h is not None and oi4h > LONG_OI_CHG4H_MAX:
+        reasons.append(f"LONG_OI4H:{oi4h:.5f}%>{LONG_OI_CHG4H_MAX:.5f}%")
+    if funding is not None and LONG_FR_BAND_MIN <= funding <= LONG_FR_BAND_MAX:
+        reasons.append(f"LONG_FR:{funding:.8g} in [{LONG_FR_BAND_MIN:.8g},{LONG_FR_BAND_MAX:.8g}]")
+    return reasons
+
+
+def _long_btc_regime_veto_reason(direction: str, trend_snapshot: Any, enabled: bool | None = None) -> str | None:
+    """Only permit LONG when the causal BTC regime is explicitly bullish.
+
+    SHORT is never evaluated by this veto. Unknown/missing BTC context fails
+    closed for LONG as required by the approved research plan. The global
+    TREND_FILTER_MODE remains shadow.
+    """
+    apply_veto = LONG_BTC_VETO_ENABLED if enabled is None else bool(enabled)
+    if not apply_veto or str(direction or "").upper() != "LONG":
+        return None
+    if not isinstance(trend_snapshot, dict):
+        return "LONG_BTC_REGIME:NO_DATA"
+    raw = trend_snapshot.get("btc_regime")
+    regime = str(raw or "UNKNOWN").strip().upper()
+    if regime in {"BULL", "BULLISH"}:
+        return None
+    # The BTC contract's own trend snapshot marks the cross-asset BTC field as
+    # SELF. For BTC itself, use its causal 4H trend label; do not unconditionally
+    # veto every BTC LONG simply because BTC cannot be its own cross-asset input.
+    if regime == "SELF":
+        own_4h = str(trend_snapshot.get("trend_4h") or "UNKNOWN").strip().upper()
+        if own_4h in {"BULL", "BULLISH"}:
+            return None
+        if own_4h in {"", "UNKNOWN", "NONE", "N/A"}:
+            own_4h = "NO_DATA"
+        return f"LONG_BTC_REGIME_SELF_{own_4h}"
+    if regime in {"", "UNKNOWN", "NONE", "N/A"}:
+        regime = "NO_DATA"
+    return f"LONG_BTC_REGIME:{regime}"
+
+
 def _entry_drift_pct(signal_price: float, trigger_price: float, direction: str) -> float | None:
     """Absolute percentage distance from signal price to trigger price.
 
@@ -2996,11 +3098,16 @@ def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction
     sl_orders: list[dict] = []
     tp_orders: list[dict] = []
     for order in orders:
+        if not str(order.get("symbol") or "").strip() or not str(order.get("type") or "").strip():
+            return None
+        order_type = str(order.get("type", "")).upper()
+        order_side = str(order.get("positionSide", "")).upper()
+        if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"} and order_side not in {"LONG", "SHORT", "BOTH"}:
+            return None
         if symbol_key(order.get("symbol")) != target_symbol:
             continue
-        if str(order.get("positionSide", "")).upper() not in {target_direction, "BOTH"}:
+        if order_side not in {target_direction, "BOTH"}:
             continue
-        order_type = str(order.get("type", "")).upper()
         if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
             tp_orders.append(order)
         elif order_type in {"STOP", "STOP_MARKET"}:
@@ -4131,10 +4238,15 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         final_status = "opened_rolled_back"
         try:
             post_close = get_position_directional(symbol, direction)
-            if str(post_close.get("status", "")).lower() != "found":
+            if str(post_close.get("status", "")).lower() == "not_found":
                 position = {**position, "positionAmt": 0.0}
-        except Exception:
-            pass
+            elif str(post_close.get("status", "")).lower() != "found":
+                log.critical(
+                    "[EXECUTION] Rollback was reported closed but post-close position state is unknown for %s %s: %s",
+                    direction, symbol, post_close.get("error", post_close.get("status")),
+                )
+        except Exception as exc:
+            log.critical("[EXECUTION] Rollback was reported closed but post-close position verification failed for %s %s: %s", direction, symbol, exc)
     elif protection_status == "PROTECTED":
         final_status = "opened_protected"
     elif protection_status == "SL_ONLY":
@@ -4224,7 +4336,7 @@ def main() -> None:
         log.critical("[ACTION_JOURNAL] Startup rotation failed; aborting cycle before exchange work: %s", exc, exc_info=True)
         return
 
-    log.info("========== [ENGINE] CYCLE START: %s UTC | Mode: %s | Exec: %s ==========", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
+    log.info("========== [ENGINE] CYCLE START: version=%s | %s UTC | Mode: %s | Exec: %s ==========", APP_VERSION, pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"), EXECUTION_MODE, EXECUTION_ENABLED)
 
     config_ok, config_reason = _validate_execution_config()
     if not config_ok:
@@ -5097,6 +5209,36 @@ def main() -> None:
                         continue
             else:
                 trend_snapshot = None
+
+            # The owner-approved B4/B5 directional protections are hard gates,
+            # independent of ENTRY_QUALITY_MODE="shadow". The global trend filter
+            # itself remains in shadow; only LONG candidates use BTC-regime veto.
+            if direction == "LONG" and LONG_LS_GATE_ENABLED:
+                long_risk_reasons = _long_market_risk_gate_reasons(r)
+                if long_risk_reasons:
+                    stats["rejected_long_risk_gate"] = stats.get("rejected_long_risk_gate", 0) + 1
+                    tf_stats["rejected_long_risk_gate"] = tf_stats.get("rejected_long_risk_gate", 0) + 1
+                    log.info("[LONG_RISK_GATE] %s %s rejected: %s", symbol, event_type_name, ";".join(long_risk_reasons))
+                    reject_candidate(
+                        "DIRECTION_RISK", long_risk_reasons[0],
+                        long_risk_gate_reasons=long_risk_reasons,
+                        long_ls_max=LONG_LS_MAX,
+                        long_oi_chg4h_max=LONG_OI_CHG4H_MAX,
+                        long_fr_band=[LONG_FR_BAND_MIN, LONG_FR_BAND_MAX],
+                    )
+                    continue
+
+            btc_veto_reason = _long_btc_regime_veto_reason(direction, trend_snapshot)
+            if btc_veto_reason:
+                stats["rejected_long_btc_regime"] = stats.get("rejected_long_btc_regime", 0) + 1
+                tf_stats["rejected_long_btc_regime"] = tf_stats.get("rejected_long_btc_regime", 0) + 1
+                log.info("[LONG_BTC_VETO] %s %s rejected: %s", symbol, event_type_name, btc_veto_reason)
+                reject_candidate(
+                    "DIRECTION_RISK", btc_veto_reason,
+                    btc_regime=(trend_snapshot.get("btc_regime") if isinstance(trend_snapshot, dict) else None),
+                    trend_filter_mode=TREND_FILTER_MODE,
+                )
+                continue
 
             if REQUIRE_CVD:
                 try:

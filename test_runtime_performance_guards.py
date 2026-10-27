@@ -57,7 +57,7 @@ def test_recovery_logs_duration_and_individual_fill_requests(tmp_path, monkeypat
         "record_type": "TRADE_CLOSE", "event_id": "EVT_TIMING", "symbol": "BTC", "direction": "LONG",
         "closed_ts": 1_700_000_060_000, "entry_price": 100.0, "exit_price": None,
         "exit_reason": "DATA_ERROR", "realized_pnl_pct": None, "total_closed_qty": 1.0,
-        "initial_qty": 1.0, "entry_order_id": "ENTRY-1", "planned_risk_pct": 1.0,
+        "initial_qty": 1.0, "entry_order_id": "ENTRY-1", "exit_order_ids": ["CLOSE-1"], "planned_risk_pct": 1.0,
     }
     journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
     fills = [

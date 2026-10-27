@@ -107,6 +107,9 @@ def test_vst_research_mode_disables_entry_caps(monkeypatch):
     )
     assert portfolio_cap_hit is False
     assert run_once.MAX_TRADES <= 0
+    assert run_once.MAX_ACTIVE_TRADES == 0
+    assert run_once.MAX_ACTIVE_LONGS == 0
+    assert run_once.MAX_ACTIVE_SHORTS == 0
 
 
 def test_vst_workflow_has_unlimited_cycle_entry_cap():
@@ -715,6 +718,7 @@ def _set_execution_config(monkeypatch, *, mode, base, allow_live="false"):
     monkeypatch.setattr(run_once, "API_KEY", "test-key")
     monkeypatch.setattr(run_once, "SECRET_KEY", "test-secret")
     monkeypatch.setattr(run_once, "POSITION_MODE", "HEDGE")
+    monkeypatch.setattr(run_once, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(run_once, "EXECUTION_MODE", mode)
     monkeypatch.setattr(run_once, "BASE_URL", base)
     monkeypatch.setenv("ALLOW_LIVE_TRADING", allow_live)
@@ -729,6 +733,26 @@ def test_execution_config_accepts_supported_vst_modes_and_exact_vst_base(monkeyp
         ok, reason = run_once._validate_execution_config()
         assert ok, (mode, reason)
         assert reason == "OK"
+
+
+def test_execution_config_rejects_exchange_one_way_position_mode(monkeypatch):
+    run_once = _set_execution_config(
+        monkeypatch, mode="vst", base="https://open-api-vst.bingx.com"
+    )
+    monkeypatch.setattr(run_once, "get_position_mode", lambda: {"status": "ok", "mode": "ONE_WAY", "dualSidePosition": False})
+    ok, reason = run_once._validate_execution_config()
+    assert not ok
+    assert "exchange reports 'ONE_WAY'" in reason
+
+
+def test_execution_config_rejects_unverifiable_exchange_position_mode(monkeypatch):
+    run_once = _set_execution_config(
+        monkeypatch, mode="vst", base="https://open-api-vst.bingx.com"
+    )
+    monkeypatch.setattr(run_once, "get_position_mode", lambda: {"status": "error", "error": "missing dualSidePosition"})
+    ok, reason = run_once._validate_execution_config()
+    assert not ok
+    assert "Cannot verify BingX position mode" in reason
 
 
 def test_execution_config_rejects_unknown_mode(monkeypatch):
@@ -1040,10 +1064,12 @@ def test_emergency_close_transport_error_uses_order_lookup_without_duplicate_pos
     qty_states = iter([
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "not_found", "positionAmt": "0"},
+        {"status": "not_found", "positionAmt": "0"},
     ])
     calls = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(bx, "get_position_directional", lambda symbol, direction: next(qty_states))
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 
@@ -1075,6 +1101,7 @@ def test_emergency_close_transport_error_does_not_retry_when_order_lookup_unknow
     calls = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(
         bx, "get_position_directional",
         lambda symbol, direction: {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
@@ -1106,11 +1133,13 @@ def test_emergency_close_transport_absent_lookup_retries_same_client_order_id(mo
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "not_found", "positionAmt": "0"},
+        {"status": "not_found", "positionAmt": "0"},
     ])
     calls = []
     lookups = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(bx, "get_position_directional", lambda symbol, direction: next(states))
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 
@@ -1145,11 +1174,13 @@ def test_emergency_close_retry_after_verified_cancel_uses_new_client_order_id(mo
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "not_found", "positionAmt": "0"},
+        {"status": "not_found", "positionAmt": "0"},
     ])
     calls = []
     lookup_calls = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(bx, "get_position_directional", lambda symbol, direction: next(states))
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 
@@ -1187,6 +1218,7 @@ def test_emergency_close_acknowledged_fill_with_stale_position_refuses_duplicate
     ])
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: next(position_states))
 
     def fake_request(method, path, params):
@@ -1218,10 +1250,12 @@ def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monke
         {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
         {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
         {"status": "not_found", "positionAmt": "0"},
+        {"status": "not_found", "positionAmt": "0"},
     ])
     calls = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(bx, "get_position_directional", lambda symbol, direction: next(states))
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 

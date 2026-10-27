@@ -11,13 +11,18 @@ def test_clean_release_executes_divergence_events():
     assert 'DIVERGENCE_SHADOW_ONLY: "false"' in _workflow()
 
 
-def test_crt_bearish_is_hard_disabled_without_enforcing_other_shadow_filters():
+def test_bearish_event_families_are_reenabled_but_weak_bullish_families_stay_disabled():
     workflow = _workflow()
-    assert 'DISABLED_EVENT_TYPES: "CRT_BEARISH"' in workflow
+    assert 'DISABLED_EVENT_TYPES: "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"' in workflow
     assert 'ENTRY_QUALITY_MODE: "shadow"' in workflow
+    assert 'ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION"' in workflow
     import run_once
-    assert run_once._event_type_is_disabled("CRT_BEARISH")
-    assert not run_once._event_type_is_disabled("CRT_BULLISH")
+    assert not run_once._event_type_is_disabled("CRT_BEARISH")
+    assert not run_once._event_type_is_disabled("BREAKER_BLOCK_BEARISH")
+    assert run_once._event_type_is_disabled("CRT_BULLISH")
+    assert run_once._event_type_is_disabled("BREAKER_BLOCK_BULLISH")
+    assert 'SHORT_OI_VETO_ENABLED:' not in workflow
+    assert 'SHORT_OI_VETO_PCT:' not in workflow
 
 
 def test_clean_release_has_pre_order_drift_retry_budget():
@@ -314,3 +319,103 @@ def test_candidate_decision_journal_uses_actual_stage_timestamp():
     reject_helper = source.index('def reject_candidate(stage: str, reason: str, **details: Any) -> None:')
     reject_end = source.index('if not event_id:', reject_helper)
     assert 'evaluation_ts=int(time.time() * 1000)' in source[reject_helper:reject_end]
+
+
+def test_research_unlimited_entries_are_unlimited_without_hidden_entry_throttles():
+    workflow = _workflow()
+    # The mode is inferred from EXECUTION_MODE=vst, not explicitly pinned with a
+    # second flag that could drift out of sync. Conflicting numeric caps are not set.
+    assert 'EXECUTION_MODE: vst' in workflow
+    assert 'RESEARCH_UNLIMITED_ENTRIES:' not in workflow
+    assert 'MAX_TRADES_PER_CYCLE: "0"' in workflow
+    assert 'PORTFOLIO_CAP_ENABLED: "false"' in workflow
+    assert 'SYMBOL_ENTRY_COOLDOWN_MIN: "0"' in workflow
+    assert 'SQUEEZE_SYMBOL_ENTRY_COOLDOWN_MIN: "0"' in workflow
+    assert 'SYMBOL_LOSS_COOLDOWN_MIN: "0"' in workflow
+    assert 'SYMBOL_MAX_CONSECUTIVE_LOSSES: "0"' in workflow
+    assert 'SYMBOL_QUARANTINE_MIN: "0"' in workflow
+    for cap in ('MAX_ACTIVE_TRADES:', 'MAX_ACTIVE_LONGS:', 'MAX_ACTIVE_SHORTS:'):
+        assert cap not in workflow
+    blocked_line = next(line for line in workflow.splitlines() if 'ENTRY_BLOCKED_EVENT_TYPES:' in line)
+    assert 'MA_COMPRESSION_BREAKOUT' in blocked_line
+    runtime_source = Path('run_once.py').read_text(encoding='utf-8')
+    assert 'MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION' in runtime_source
+    assert 'MAX_ACTIVE_TRADES = 0' in runtime_source
+    assert 'MAX_ACTIVE_LONGS = 0' in runtime_source
+    assert 'MAX_ACTIVE_SHORTS = 0' in runtime_source
+    import run_once
+    assert run_once.RESEARCH_UNLIMITED_ENTRIES is True
+    assert run_once.MAX_TRADES == 0
+    assert run_once.PORTFOLIO_CAP_ENABLED is False
+    assert run_once.MAX_ACTIVE_TRADES == run_once.MAX_ACTIVE_LONGS == run_once.MAX_ACTIVE_SHORTS == 0
+    assert run_once.SYMBOL_LOSS_COOLDOWN_MIN == 0
+
+    assert 'EARLY_LOSS_CUT_ENABLED: "true"' in workflow
+    assert 'EARLY_LOSS_CUT_2H_MIN: "120"' in workflow
+    assert 'EARLY_LOSS_CUT_2H_PNL: "-1.50"' in workflow
+    assert 'EARLY_LOSS_CUT_4H_MIN: "240"' in workflow
+    assert 'EARLY_LOSS_CUT_4H_PNL: "-2.50"' in workflow
+    assert 'LONG_LS_GATE_ENABLED: "true"' in workflow
+    assert 'LONG_LS_MAX: "1.36"' in workflow
+    assert 'LONG_OI_CHG4H_MAX: "3.0"' in workflow
+    assert 'LONG_FR_BAND_MIN: "0.0009"' in workflow
+    assert 'LONG_FR_BAND_MAX: "0.00665"' in workflow
+    assert 'LONG_BTC_VETO_ENABLED: "true"' in workflow
+    assert 'TREND_FILTER_MODE: "shadow"' in workflow
+
+
+def test_long_gate_missing_metrics_do_not_veto_and_explicit_thresholds_do():
+    from types import SimpleNamespace
+    import run_once
+
+    run_once.LONG_LS_GATE_ENABLED = True
+    run_once.LONG_LS_MAX = 1.36
+    run_once.LONG_OI_CHG4H_MAX = 3.0
+    run_once.LONG_FR_BAND_MIN = 0.0009
+    run_once.LONG_FR_BAND_MAX = 0.00665
+    assert run_once._long_market_risk_gate_reasons(SimpleNamespace(ls_accounts=None, oi_chg4h_pct=None, fr_oiw=None)) == []
+    assert run_once._long_market_risk_gate_reasons(SimpleNamespace(ls_accounts=1.36, oi_chg4h_pct=3.0, fr_oiw=0.0008)) == []
+    reasons = run_once._long_market_risk_gate_reasons(SimpleNamespace(ls_accounts=1.37, oi_chg4h_pct=3.1, fr_oiw=0.001))
+    assert any(reason.startswith("LONG_LS:") for reason in reasons)
+    assert any(reason.startswith("LONG_OI4H:") for reason in reasons)
+    assert any(reason.startswith("LONG_FR:") for reason in reasons)
+
+
+def test_long_btc_regime_gate_fails_closed_only_for_long_and_handles_btc_self():
+    import run_once
+
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "BULLISH"}, enabled=True) is None
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "BEARISH"}, enabled=True)
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "MIXED"}, enabled=True)
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "UNKNOWN"}, enabled=True)
+    assert run_once._long_btc_regime_veto_reason("LONG", None, enabled=True)
+    assert run_once._long_btc_regime_veto_reason("SHORT", {"btc_regime": "BEARISH"}, enabled=True) is None
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BULL"}, enabled=True) is None
+    assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BEAR"}, enabled=True)
+
+def test_release_version_and_billing_modes_documented():
+    assert Path('VERSION').read_text(encoding='utf-8').strip() == 'V10.4.4'
+    runtime = Path('run_once.py').read_text(encoding='utf-8')
+    assert 'APP_VERSION = "V10.4.4"' in runtime
+    assert 'version=%s' in runtime
+    notes = Path('RELEASE_NOTES_V10_4_4.md').read_text(encoding='utf-8')
+    assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
+    assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
+    assert 'estimated_gross_pnl_usdt' in notes
+    assert 'active_trades.json' in notes
+    assert 'scripts/reconcile_daily.py' in notes
+
+
+def test_release_runs_bounded_read_only_reconciliation_after_engine():
+    workflow = _workflow()
+    script = Path("scripts/reconcile_daily.py").read_text(encoding="utf-8")
+    assert "Read-only BingX position and daily ledger reconciliation" in workflow
+    assert workflow.index("Run engine") < workflow.index("Read-only BingX position and daily ledger reconciliation")
+    assert workflow.index("Stop Binance WireProxy") < workflow.index("Read-only BingX position and daily ledger reconciliation")
+    assert workflow.index("Read-only BingX position and daily ledger reconciliation") < workflow.index("Commit state")
+    assert 'RECONCILIATION_MAX_SYMBOLS: "2"' in workflow
+    assert 'RECONCILIATION_INCOME_REQUEST_BUDGET: "4"' in workflow
+    assert "get_positions" in script and "get_open_protection_directional" in script and "get_income_history" in script
+    assert "emergency_close_position(" not in script
+    assert "place_order(" not in script
+    assert "cancel_order(" not in script

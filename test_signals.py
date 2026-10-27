@@ -2257,6 +2257,7 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
 
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: contract)
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(
         bx,
         "get_position_directional",
@@ -2293,6 +2294,7 @@ def test_emergency_close_reports_unflattened_after_two_attempts(monkeypatch):
     calls = []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
     monkeypatch.setattr(
         bx,
         "get_position_directional",
@@ -2722,6 +2724,50 @@ def test_liquidation_squeeze_predicate_is_not_used_for_volatility_squeeze_fundin
     assert "VOLATILITY" in reason or "NORMAL" in reason
 
 
+
+def test_early_loss_cut_does_not_claim_exit_when_position_was_already_absent(tmp_path, monkeypatch):
+    import event_engine.tracker as tr
+    import time
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    notify_path = tmp_path / "notifications.json"
+    now_ms = int(time.time() * 1000)
+    trade = {
+        "event_id": "EVT_ELC_RACE", "symbol": "TEST", "direction": "LONG",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0,
+        "entry_ts": now_ms - 3 * 60 * 60 * 1000, "tp_orders": [],
+        "sl_order": {"order_id": "SL-ELC", "stop_price": 90.0}, "sl_order_history": [],
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
+        "realized_pnl_weighted_sum": 0.0, "closed": False, "manual_exit_reason": None,
+    }
+    active_path.write_text(json.dumps({"EVT_ELC_RACE": trade}), encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tr, "NOTIFICATIONS_PATH", notify_path)
+    monkeypatch.setattr(tr, "EARLY_LOSS_CUT_ENABLED", True)
+    monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
+    queued = []
+    monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: queued.append((a, k)))
+    states = iter([
+        {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0},
+        {"status": "not_found", "positionAmt": 0},
+    ])
+    monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: 98.0)
+    monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 98.0, "high": 99.0, "low": 97.0, "close_time": now_ms}])
+    monkeypatch.setattr(tr, "_early_loss_cut_guard", lambda *a, **k: (True, "ok", 1.0))
+    monkeypatch.setattr(tr, "emergency_close_position", lambda *a, **k: {"status": "closed", "verification": "two_not_found_reads"})
+    monkeypatch.setattr(tr, "_get_filled_sl_from_trade", lambda *a, **k: (None, None))
+    monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+
+    tr.update_active_trades()
+
+    row = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert row["exit_reason"] == "DATA_ERROR"
+    assert row["exit_price"] is None
+    assert any(kwargs.get("kind") == "EARLY_LOSS_CUT_CLOSE_ATTRIBUTION_UNKNOWN" for _, kwargs in queued)
+
 def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
     import event_engine.tracker as tr
     monkeypatch.setattr(tr, "EARLY_LOSS_CUT_ENABLED", True)
@@ -2818,7 +2864,7 @@ def test_donchian_engine_can_detect_valid_long_breakout():
     df=pd.DataFrame(rows)
     dc_high=float(df["high"].iloc[-21:-1].max())
     prev=float(df["close"].iloc[-2])
-    df.loc[df.index[-1], ["open","low","high","close","volume"]] = [prev, prev-0.15, dc_high+1.80, dc_high+1.50, 1800.0]
+    df.loc[df.index[-1], ["open","low","high","close","volume"]] = [prev, prev-0.15, dc_high+0.80, dc_high+0.50, 1800.0]
     events=detect_donchian_retest(df,"TEST","1h")
     assert any(e["direction"]=="LONG" and e["event_type"]=="DONCHIAN_RETEST_BREAKOUT" for e in events)
 
@@ -3258,7 +3304,7 @@ def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypat
         lambda symbol, order_id: (
             {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 101.0}
             if order_id == "TP1"
-            else {"status": "ok", "order_status": "FILLED", "avg_price": 94.0}
+            else {"status": "ok", "order_status": "FILLED", "executed_qty": 75.0, "avg_price": 94.0}
         ),
     )
     monkeypatch.setattr(
@@ -3302,7 +3348,7 @@ def test_tracker_partial_tp_plus_break_even_fill_is_realized(monkeypatch, tmp_pa
     monkeypatch.setattr(tr, "get_live_price", lambda *a, **k: None)
     monkeypatch.setattr(tr, "get_order", lambda _symbol, order_id: (
         {"status": "ok", "order_status": "FILLED", "executed_qty": 25.0, "avg_price": 101.0}
-        if order_id == "TP1" else {"status": "ok", "order_status": "FILLED", "avg_price": 100.0}
+        if order_id == "TP1" else {"status": "ok", "order_status": "FILLED", "executed_qty": 75.0, "avg_price": 100.0}
     ))
     monkeypatch.setattr(tr, "fetch_klines", lambda *a, **k: [{"close": 99.0, "high": 100.0, "low": 98.0, "close_time": 2_000}])
     monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
