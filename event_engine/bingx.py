@@ -8,8 +8,10 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from decimal import (
     Decimal,
     ROUND_CEILING,
@@ -59,6 +61,15 @@ ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+OPEN_ORDERS_COOLDOWN_STATE_PATH = Path(
+    os.environ.get(
+        "BINGX_OPEN_ORDERS_COOLDOWN_PATH",
+        str(Path(os.environ.get("DIVERGENCE_DATA_DIR", Path(__file__).resolve().parents[1] / "data")) / "bingx_open_orders_cooldown.json"),
+    )
+)
+OPEN_ORDERS_COOLDOWN_FALLBACK_SEC = 900.0
+_OPEN_ORDERS_COOLDOWN_UNTIL_MS = 0
+_OPEN_ORDERS_COOLDOWN_REASON = ""
 FILL_HISTORY_PATH = "/openApi/swap/v2/trade/fillHistory"
 INCOME_HISTORY_PATH = "/openApi/swap/v2/user/income"
 POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
@@ -148,6 +159,99 @@ def _update_server_time_offset(response: requests.Response) -> bool:
     return True
 
 
+def _parse_open_orders_unblock_ms(message: object) -> int | None:
+    """Parse BingX's absolute endpoint cooldown timestamp when supplied."""
+    text = str(message or "")
+    match = re.search(
+        r"(?:unblocked\s+after|retry\s+after\s+time\s*:)[\s:=]*(\d{13})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _read_open_orders_cooldown(now_ms: int | None = None) -> tuple[int, str] | None:
+    """Load the openOrders cooldown across workflow processes; never query while active."""
+    global _OPEN_ORDERS_COOLDOWN_UNTIL_MS, _OPEN_ORDERS_COOLDOWN_REASON
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    until_ms = int(_OPEN_ORDERS_COOLDOWN_UNTIL_MS or 0)
+    reason = _OPEN_ORDERS_COOLDOWN_REASON
+    try:
+        if OPEN_ORDERS_COOLDOWN_STATE_PATH.exists():
+            state = json.loads(OPEN_ORDERS_COOLDOWN_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(state, dict) and state.get("base_url", BASE_URL) == BASE_URL:
+                stored_until = int(state.get("cooldown_until_ms", 0) or 0)
+                if stored_until > until_ms:
+                    until_ms = stored_until
+                    reason = str(state.get("reason") or reason or "BingX code 100410")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        # Cooldown persistence is best-effort; the in-process deadline still applies.
+        pass
+    if until_ms > now_ms:
+        _OPEN_ORDERS_COOLDOWN_UNTIL_MS = until_ms
+        _OPEN_ORDERS_COOLDOWN_REASON = reason
+        return until_ms, reason
+    if until_ms:
+        _OPEN_ORDERS_COOLDOWN_UNTIL_MS = 0
+        _OPEN_ORDERS_COOLDOWN_REASON = ""
+        try:
+            state = json.loads(OPEN_ORDERS_COOLDOWN_STATE_PATH.read_text(encoding="utf-8")) if OPEN_ORDERS_COOLDOWN_STATE_PATH.exists() else {}
+            if not isinstance(state, dict) or state.get("base_url", BASE_URL) == BASE_URL:
+                OPEN_ORDERS_COOLDOWN_STATE_PATH.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return None
+
+
+def _persist_open_orders_cooldown(until_ms: int, reason: str) -> None:
+    """Persist a rate-limit deadline atomically so the next workflow run respects it."""
+    global _OPEN_ORDERS_COOLDOWN_UNTIL_MS, _OPEN_ORDERS_COOLDOWN_REASON
+    _OPEN_ORDERS_COOLDOWN_UNTIL_MS = max(int(until_ms), int(_OPEN_ORDERS_COOLDOWN_UNTIL_MS or 0))
+    _OPEN_ORDERS_COOLDOWN_REASON = str(reason or "BingX code 100410")
+    path = OPEN_ORDERS_COOLDOWN_STATE_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump({
+                "base_url": BASE_URL,
+                "endpoint": OPEN_ORDERS_PATH,
+                "cooldown_until_ms": _OPEN_ORDERS_COOLDOWN_UNTIL_MS,
+                "reason": _OPEN_ORDERS_COOLDOWN_REASON,
+                "updated_at_ms": int(time.time() * 1000),
+            }, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    except OSError as exc:
+        log.warning("[BINGX] Could not persist openOrders rate-limit cooldown: %s", exc)
+
+
+def _clear_open_orders_cooldown() -> None:
+    global _OPEN_ORDERS_COOLDOWN_UNTIL_MS, _OPEN_ORDERS_COOLDOWN_REASON
+    _OPEN_ORDERS_COOLDOWN_UNTIL_MS = 0
+    _OPEN_ORDERS_COOLDOWN_REASON = ""
+    try:
+        state = json.loads(OPEN_ORDERS_COOLDOWN_STATE_PATH.read_text(encoding="utf-8")) if OPEN_ORDERS_COOLDOWN_STATE_PATH.exists() else {}
+        if not isinstance(state, dict) or state.get("base_url", BASE_URL) == BASE_URL:
+            OPEN_ORDERS_COOLDOWN_STATE_PATH.unlink(missing_ok=True)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+
 def _request(
     method: str,
     path: str,
@@ -157,6 +261,19 @@ def _request(
     timeout_sec: float | None = None,
     retryable: bool = True,
 ):
+    is_open_orders = method.upper() == "GET" and path == OPEN_ORDERS_PATH
+    if is_open_orders:
+        cooldown = _read_open_orders_cooldown()
+        if cooldown is not None:
+            until_ms, reason = cooldown
+            return {
+                "code": 100410,
+                "msg": f"The endpoint trigger frequency limit rule is currently in the disabled period and will be unblocked after {until_ms}",
+                "retry_after_ms": until_ms,
+                "local_cooldown": True,
+                "cooldown_reason": reason,
+            }
+
     base_params = dict(params or {})
     try:
         request_timeout = float(timeout_sec) if timeout_sec is not None else float(os.environ.get("BINGX_HTTP_TIMEOUT_SEC", "10"))
@@ -193,6 +310,19 @@ def _request(
             code = int(payload.get("code"))
         except (TypeError, ValueError, AttributeError):
             code = None
+
+        if is_open_orders and code == 100410:
+            now_ms = int(time.time() * 1000)
+            retry_after_ms = _parse_open_orders_unblock_ms(payload.get("msg") if isinstance(payload, dict) else "")
+            if retry_after_ms is None or retry_after_ms <= now_ms:
+                retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
+            _persist_open_orders_cooldown(retry_after_ms, str(payload.get("msg") or "BingX code 100410") if isinstance(payload, dict) else "BingX code 100410")
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["retry_after_ms"] = retry_after_ms
+                payload["rate_limited"] = True
+        elif is_open_orders and code == 0:
+            _clear_open_orders_cooldown()
 
         if signed and code == 109400 and attempt < max_timestamp_retries and _update_server_time_offset(response):
             continue
@@ -560,7 +690,18 @@ def get_open_orders_snapshot(
 
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         error = resp.get("msg", "openOrders snapshot failed") if isinstance(resp, dict) else "invalid openOrders response"
-        return {"status": "error", "error": str(error), "orders": []}
+        code = resp.get("code") if isinstance(resp, dict) else None
+        try:
+            code_int = int(code)
+        except (TypeError, ValueError, OverflowError):
+            code_int = None
+        return {
+            "status": "error", "error": f"openOrders snapshot failed: code={code} {error}", "orders": [],
+            "code": code_int if code_int is not None else code,
+            "retry_after_ms": resp.get("retry_after_ms") if isinstance(resp, dict) else None,
+            "rate_limited": bool(isinstance(resp, dict) and (resp.get("rate_limited") or resp.get("local_cooldown") or code_int == 100410)),
+            "local_cooldown": bool(isinstance(resp, dict) and resp.get("local_cooldown")),
+        }
 
     data = resp.get("data")
     if isinstance(data, list):
@@ -1950,7 +2091,17 @@ def get_open_protection_directional(
         retryable=retryable,
     )
     if resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
+        try:
+            code_int = int(resp.get("code"))
+        except (TypeError, ValueError, OverflowError):
+            code_int = None
+        return {
+            "status": "error", "error": f"openOrders failed: code={resp.get('code')}:{resp.get('msg')}",
+            "tp_orders": [], "sl_orders": [], "code": code_int if code_int is not None else resp.get("code"),
+            "retry_after_ms": resp.get("retry_after_ms"),
+            "rate_limited": bool(resp.get("rate_limited") or resp.get("local_cooldown") or code_int == 100410),
+            "local_cooldown": bool(resp.get("local_cooldown")),
+        }
 
     try:
         orders = _normalize_orders_list(resp)

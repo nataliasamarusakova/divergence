@@ -216,6 +216,40 @@ def _exchange_positions(rows: list[dict]) -> tuple[dict[tuple[str, str], float],
     return dict(positions), errors
 
 
+def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction: str) -> dict:
+    """Derive one position's protection from a single validated account-wide snapshot."""
+    if not isinstance(snapshot, dict) or str(snapshot.get("status", "")).lower() != "ok":
+        return {"status": "error", "error": "account_open_orders_snapshot_unavailable", "sl_orders": [], "tp_orders": []}
+    orders = snapshot.get("orders")
+    if not isinstance(orders, list) or not all(isinstance(order, dict) for order in orders):
+        return {"status": "error", "error": "account_open_orders_snapshot_has_invalid_rows", "sl_orders": [], "tp_orders": []}
+
+    sl_orders: list[dict] = []
+    tp_orders: list[dict] = []
+    for order in orders:
+        row_symbol = str(order.get("symbol") or "").strip()
+        order_type = str(order.get("type") or "").strip().upper()
+        if not row_symbol or not order_type:
+            return {"status": "error", "error": "account_open_orders_snapshot_has_unidentifiable_row", "sl_orders": [], "tp_orders": []}
+        protective_type = order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"}
+        order_side = str(order.get("positionSide") or "").strip().upper()
+        if protective_type and order_side not in {"LONG", "SHORT", "BOTH"}:
+            return {"status": "error", "error": "account_open_orders_snapshot_has_unidentifiable_protection_side", "sl_orders": [], "tp_orders": []}
+        if _canonical_position_symbol(row_symbol) != symbol:
+            continue
+        if order_side not in {direction, "BOTH"}:
+            continue
+        if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+            tp_orders.append(order)
+        elif order_type in {"STOP", "STOP_MARKET"}:
+            sl_orders.append(order)
+    return {
+        "status": "ok", "symbol": symbol, "positionSide": direction,
+        "sl_orders": sl_orders, "tp_orders": tp_orders,
+        "source": "account_open_orders_snapshot",
+    }
+
+
 def _append_health(path: Path, report: dict) -> str | None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,65 +382,127 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         report["checks"]["exchange_positions"] = {"status": "ERROR", "error": f"{type(exc).__name__}:{exc}"}
         report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_QUERY_FAILED", "detail": str(exc)})
 
-    # Confirm that each visible exchange position has one identifiable SL.
-    # This is read-only; ambiguous openOrders data never becomes "no protection".
+    # Fetch one account-wide snapshot. Querying openOrders once per position can
+    # trip BingX's endpoint trigger-frequency breaker, and symbol-by-symbol retries
+    # after code 100410 only amplify the outage. Unknown remains CRITICAL, but the
+    # report is aggregated and no fallback requests are made from this read-only job.
     protection_results: dict[str, dict] = {}
-    for (symbol, direction), exchange_qty in sorted(exchange_positions.items()):
-        key = f"{symbol}:{direction}"
+    protection_snapshot: dict[str, Any] = {"status": "not_requested", "orders": []}
+    protection_snapshot_error: str | None = None
+    protection_snapshot_rate_limited = False
+    protection_retry_after_ms = None
+    if exchange_positions:
         try:
-            protection = bingx.get_open_protection_directional(
-                symbol, direction, timeout_sec=3.0, retryable=False,
-            )
+            candidate_snapshot = bingx.get_open_orders_snapshot(timeout_sec=3.0, retryable=False)
         except Exception as exc:
-            protection = {"status": "error", "error": f"{type(exc).__name__}:{exc}", "sl_orders": [], "tp_orders": []}
-        if not isinstance(protection, dict) or str(protection.get("status", "")).lower() != "ok":
-            detail = str(protection.get("error", "invalid_protection_response")) if isinstance(protection, dict) else "invalid_protection_response"
-            protection_results[key] = {"status": "ERROR", "error": detail}
-            report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN", "symbol": symbol, "direction": direction, "detail": detail})
-            continue
-        sl_orders = protection.get("sl_orders")
-        tp_orders = protection.get("tp_orders")
-        if not isinstance(sl_orders, list) or not isinstance(tp_orders, list):
-            protection_results[key] = {"status": "ERROR", "error": "protective_orders_not_lists"}
-            report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN", "symbol": symbol, "direction": direction, "detail": "protective_orders_not_lists"})
-            continue
-        sl_info = []
-        for order in sl_orders:
-            if not isinstance(order, dict):
-                sl_info.append({"valid": False, "reason": "sl_row_not_object"})
-                continue
-            order_id = str(order.get("orderId") or order.get("orderID") or order.get("clientOrderId") or "")
-            order_type = str(order.get("type") or "").strip().upper()
-            order_side = str(order.get("positionSide") or "").strip().upper()
-            try:
-                order_qty = abs(float(order.get("origQty") or order.get("quantity") or 0))
-            except (TypeError, ValueError, OverflowError):
-                order_qty = 0.0
-            raw_stop_price = next(
-                (order.get(key) for key in ("stopPrice", "triggerPrice", "stop_price") if order.get(key) not in (None, "")),
-                0,
+            candidate_snapshot = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
+        if isinstance(candidate_snapshot, dict) and str(candidate_snapshot.get("status", "")).lower() == "ok":
+            protection_snapshot = candidate_snapshot
+        else:
+            protection_snapshot_error = (
+                str(candidate_snapshot.get("error") or "account_open_orders_snapshot_unavailable")
+                if isinstance(candidate_snapshot, dict) else "invalid_account_open_orders_snapshot_response"
             )
             try:
-                stop_price = float(raw_stop_price)
+                protection_code = int(candidate_snapshot.get("code")) if isinstance(candidate_snapshot, dict) else None
             except (TypeError, ValueError, OverflowError):
-                stop_price = 0.0
-            qty_ok = math.isfinite(order_qty) and order_qty > 0 and abs(order_qty - exchange_qty) <= max(1e-8, exchange_qty * 0.01)
-            trigger_ok = math.isfinite(stop_price) and stop_price > 0
-            valid = bool(order_id and order_type in {"STOP", "STOP_MARKET"} and order_side in {direction, "BOTH"} and qty_ok and trigger_ok)
-            sl_info.append({"order_id": order_id or None, "type": order_type or None, "position_side": order_side or None, "quantity": order_qty, "quantity_matches_position": qty_ok, "stop_price": stop_price if trigger_ok else None, "trigger_price_valid": trigger_ok, "valid": valid})
-        status = "OK"
-        if len(sl_orders) != 1 or len(sl_info) != 1 or not sl_info[0].get("valid"):
-            status = "ERROR"
-            detail = "missing_or_duplicate_stop_loss" if not sl_orders or len(sl_orders) > 1 else "stop_loss_identity_type_side_qty_or_trigger_price_invalid"
-            report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_STOP_LOSS_NOT_VERIFIED", "symbol": symbol, "direction": direction, "detail": detail, "sl_orders": sl_info, "exchange_qty": exchange_qty})
-        elif not tp_orders:
-            status = "WARNING"
-            report["discrepancies"].append({"level": "WARNING", "code": "EXCHANGE_TAKE_PROFIT_NOT_VISIBLE", "symbol": symbol, "direction": direction, "detail": "one verified SL is visible, but no open TP order is visible"})
-        protection_results[key] = {"status": status, "sl_orders": sl_info, "tp_order_count": len(tp_orders)}
+                protection_code = None
+            protection_snapshot_rate_limited = bool(
+                isinstance(candidate_snapshot, dict)
+                and (candidate_snapshot.get("rate_limited") or candidate_snapshot.get("local_cooldown"))
+            ) or protection_code == 100410
+            protection_retry_after_ms = candidate_snapshot.get("retry_after_ms") if isinstance(candidate_snapshot, dict) else None
+
+    if protection_snapshot_error is not None:
+        affected_positions = []
+        for (symbol, direction), exchange_qty in sorted(exchange_positions.items()):
+            key = f"{symbol}:{direction}"
+            affected_positions.append(key)
+            protection_results[key] = {
+                "status": "UNKNOWN", "error": protection_snapshot_error,
+                "exchange_qty": exchange_qty, "source": "account_open_orders_snapshot",
+            }
+        if protection_snapshot_rate_limited:
+            # Exclude the server's millisecond-changing unblock timestamp from the
+            # discrepancy fingerprint so identical 100410 incidents deduplicate.
+            detail = (
+                "BingX openOrders endpoint rate-limited (code 100410); protection state "
+                f"remains unknown for {len(affected_positions)} position(s). "
+                "No per-symbol retries were attempted."
+            )
+        else:
+            detail = (
+                "Account-wide openOrders snapshot unavailable; protection state remains "
+                f"unknown for {len(affected_positions)} position(s). No per-symbol retries were attempted."
+            )
+        report["discrepancies"].append({
+            "level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN",
+            "position_count": len(affected_positions), "positions": affected_positions,
+            "rate_limited": protection_snapshot_rate_limited, "detail": detail,
+        })
+    else:
+        # Confirm that each visible exchange position has one identifiable SL.
+        # This is read-only; ambiguous openOrders data never becomes "no protection".
+        for (symbol, direction), exchange_qty in sorted(exchange_positions.items()):
+            key = f"{symbol}:{direction}"
+            protection = _protection_from_open_orders_snapshot(protection_snapshot, symbol, direction)
+            if not isinstance(protection, dict) or str(protection.get("status", "")).lower() != "ok":
+                detail = str(protection.get("error", "invalid_protection_response")) if isinstance(protection, dict) else "invalid_protection_response"
+                protection_results[key] = {"status": "ERROR", "error": detail}
+                report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN", "symbol": symbol, "direction": direction, "detail": detail})
+                continue
+            sl_orders = protection.get("sl_orders")
+            tp_orders = protection.get("tp_orders")
+            if not isinstance(sl_orders, list) or not isinstance(tp_orders, list):
+                protection_results[key] = {"status": "ERROR", "error": "protective_orders_not_lists"}
+                report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN", "symbol": symbol, "direction": direction, "detail": "protective_orders_not_lists"})
+                continue
+            sl_info = []
+            for order in sl_orders:
+                if not isinstance(order, dict):
+                    sl_info.append({"valid": False, "reason": "sl_row_not_object"})
+                    continue
+                order_id = str(order.get("orderId") or order.get("orderID") or order.get("clientOrderId") or "")
+                order_type = str(order.get("type") or "").strip().upper()
+                order_side = str(order.get("positionSide") or "").strip().upper()
+                try:
+                    order_qty = abs(float(order.get("origQty") or order.get("quantity") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    order_qty = 0.0
+                raw_stop_price = next(
+                    (order.get(field) for field in ("stopPrice", "triggerPrice", "stop_price") if order.get(field) not in (None, "")),
+                    0,
+                )
+                try:
+                    stop_price = float(raw_stop_price)
+                except (TypeError, ValueError, OverflowError):
+                    stop_price = 0.0
+                qty_ok = math.isfinite(order_qty) and order_qty > 0 and abs(order_qty - exchange_qty) <= max(1e-8, exchange_qty * 0.01)
+                trigger_ok = math.isfinite(stop_price) and stop_price > 0
+                valid = bool(order_id and order_type in {"STOP", "STOP_MARKET"} and order_side in {direction, "BOTH"} and qty_ok and trigger_ok)
+                sl_info.append({"order_id": order_id or None, "type": order_type or None, "position_side": order_side or None, "quantity": order_qty, "quantity_matches_position": qty_ok, "stop_price": stop_price if trigger_ok else None, "trigger_price_valid": trigger_ok, "valid": valid})
+            status = "OK"
+            if len(sl_orders) != 1 or len(sl_info) != 1 or not sl_info[0].get("valid"):
+                status = "ERROR"
+                detail = "missing_or_duplicate_stop_loss" if not sl_orders or len(sl_orders) > 1 else "stop_loss_identity_type_side_qty_or_trigger_price_invalid"
+                report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_STOP_LOSS_NOT_VERIFIED", "symbol": symbol, "direction": direction, "detail": detail, "sl_orders": sl_info, "exchange_qty": exchange_qty})
+            elif not tp_orders:
+                status = "WARNING"
+                report["discrepancies"].append({"level": "WARNING", "code": "EXCHANGE_TAKE_PROFIT_NOT_VISIBLE", "symbol": symbol, "direction": direction, "detail": "one verified SL is visible, but no open TP order is visible"})
+            protection_results[key] = {"status": status, "sl_orders": sl_info, "tp_order_count": len(tp_orders), "source": "account_open_orders_snapshot"}
+    protection_check_status = "OK"
+    if any(item.get("status") == "UNKNOWN" for item in protection_results.values()):
+        protection_check_status = "UNKNOWN"
+    elif any(item.get("status") != "OK" for item in protection_results.values()):
+        protection_check_status = "WARNING"
     report["checks"]["exchange_protection"] = {
-        "status": "OK" if all(item.get("status") == "OK" for item in protection_results.values()) else ("UNKNOWN" if not protection_results else "WARNING"),
+        "status": protection_check_status,
         "positions_checked": len(protection_results), "by_position": protection_results,
-        "note": "Requires exactly one identifiable STOP/STOP_MARKET SL with a finite positive trigger price, expected directional side, and approximate live quantity; no order is modified.",
+        "source": "account_open_orders_snapshot" if exchange_positions else "not_needed_no_open_positions",
+        "error": protection_snapshot_error,
+        "rate_limited": protection_snapshot_rate_limited,
+        "retry_after_ms": protection_retry_after_ms,
+        "note": "Requires exactly one identifiable STOP/STOP_MARKET SL with a finite positive trigger price, expected directional side, and approximate live quantity; uses one account-wide read-only snapshot and never modifies orders.",
     }
 
     journal, journal_errors = _load_journal(trades_path)
