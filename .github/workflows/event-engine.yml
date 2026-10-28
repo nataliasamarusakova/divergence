@@ -485,9 +485,24 @@ jobs:
           print(f"[COMMIT_STATE] scheduler state version=2 symbols={len(symbols)}")
           PY
 
-          git add -f data/timeframe_scan_state.json
-          git add data/*.jsonl data/*.json 2>/dev/null || true
+          # Stage the complete runtime-state directory, including tracked deletions.
+          # Shell-expanded data/*.jsonl and data/*.json omit paths that no longer
+          # exist, leaving their deletions unstaged; git rebase then refuses to run.
+          git add -A -- data/
+          git add -f -- data/timeframe_scan_state.json
           git add -f data/archive/*.jsonl.gz 2>/dev/null || true
+
+          if ! git diff --quiet; then
+            echo "[COMMIT_STATE] ERROR: unstaged tracked changes remain after staging runtime state" >&2
+            git status --short
+            exit 1
+          fi
+          untracked_paths="$(git ls-files --others --exclude-standard)"
+          if [ -n "$untracked_paths" ]; then
+            echo "[COMMIT_STATE] ERROR: unexpected untracked files remain before commit" >&2
+            printf '%s\n' "$untracked_paths" >&2
+            exit 1
+          fi
 
           if git diff --cached --quiet; then
             echo "[COMMIT_STATE] No runtime state changes"
@@ -509,6 +524,11 @@ jobs:
           fi
 
           git commit -m "event engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "[COMMIT_STATE] ERROR: worktree is not clean after runtime snapshot commit" >&2
+            git status --short
+            exit 1
+          fi
 
           max_attempts=5
           for attempt in $(seq 1 "$max_attempts"); do
