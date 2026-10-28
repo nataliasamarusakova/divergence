@@ -419,9 +419,9 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.15"' in runtime
+    assert 'APP_VERSION = "V10.4.16"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_15.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_16.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes
@@ -436,6 +436,7 @@ def test_release_version_and_billing_modes_documented():
     assert not Path('RELEASE_NOTES_V10_4_11.md').exists()
     assert not Path('RELEASE_NOTES_V10_4_12.md').exists()
     assert not Path('RELEASE_NOTES_V10_4_14.md').exists()
+    assert not Path('RELEASE_NOTES_V10_4_15.md').exists()
 
 
 def test_release_runs_bounded_read_only_reconciliation_after_engine():
@@ -449,7 +450,8 @@ def test_release_runs_bounded_read_only_reconciliation_after_engine():
     assert 'RECONCILIATION_INCOME_REQUEST_BUDGET: "4"' in workflow
     assert "python -m event_engine.reconcile_daily" in workflow
     assert "scripts/reconcile_daily.py" not in workflow
-    assert "get_positions" in script and "get_open_protection_directional" in script and "get_income_history" in script
+    assert "get_positions" in script and "get_open_orders_snapshot" in script and "get_income_history" in script
+    assert "get_open_protection_directional" not in script
     assert "emergency_close_position(" not in script
     assert "place_order(" not in script
     assert "cancel_order(" not in script

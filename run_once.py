@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.15"
+APP_VERSION = "V10.4.16"
 
 import pandas as pd
 import requests
@@ -3250,6 +3250,7 @@ def reconcile_all_open_positions() -> None:
             break
 
     protection_snapshot = None
+    snapshot_rate_limited = False
     snapshot_started = time.monotonic()
     if has_valid_position:
         try:
@@ -3262,7 +3263,19 @@ def reconcile_all_open_positions() -> None:
                 )
             else:
                 snapshot_error = snapshot_result.get("error", "invalid snapshot response") if isinstance(snapshot_result, dict) else "invalid snapshot response"
-                log.warning("[RECONCILIATION] Account-wide order snapshot unavailable; falling back to symbol queries: %s", snapshot_error)
+                snapshot_code = snapshot_result.get("code") if isinstance(snapshot_result, dict) else None
+                try:
+                    snapshot_code = int(snapshot_code)
+                except (TypeError, ValueError, OverflowError):
+                    snapshot_code = None
+                snapshot_rate_limited = bool(
+                    isinstance(snapshot_result, dict)
+                    and (snapshot_result.get("rate_limited") or snapshot_result.get("local_cooldown"))
+                ) or snapshot_code == 100410
+                if snapshot_rate_limited:
+                    log.error("[RECONCILIATION] BingX openOrders rate-limited; per-symbol fallback is disabled to avoid repeating the blocked endpoint: %s", snapshot_error)
+                else:
+                    log.warning("[RECONCILIATION] Account-wide order snapshot unavailable; falling back to symbol queries: %s", snapshot_error)
         except Exception as exc:
             log.warning("[RECONCILIATION] Account-wide order snapshot failed; falling back to symbol queries: %s", exc)
 
@@ -3314,6 +3327,16 @@ def reconcile_all_open_positions() -> None:
                 prot = get_open_protection_directional(
                     bx_symbol, direction, timeout_sec=recon_timeout, retryable=False,
                 )
+        elif snapshot_rate_limited:
+            protection_source = "account_snapshot_rate_limited"
+            # Do not fan out one failed account-wide 100410 into one blocked
+            # per-symbol request for every position. Protection remains unknown;
+            # the engine will neither repair nor close on an ambiguous read.
+            prot = {
+                "status": "error",
+                "error": "openOrders rate-limit cooldown active; per-symbol fallback skipped",
+                "sl_orders": [], "tp_orders": [],
+            }
         else:
             protection_source = "symbol_query_fallback"
             prot = get_open_protection_directional(

@@ -175,13 +175,13 @@ def _reconciliation_fixture(tmp_path, monkeypatch, *, local_symbol, local_qty, e
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
         "symbol": exchange_symbol, "positionSide": "SHORT", "positionAmt": -abs(exchange_qty),
     }])
-    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", lambda symbol, direction, **kwargs: {
-        "status": "ok",
-        "sl_orders": [{
-            "orderId": "SL-1", "type": "STOP_MARKET", "stopPrice": "101",
-            "positionSide": direction, "origQty": str(abs(exchange_qty)),
-        }],
-        "tp_orders": [{"orderId": "TP-1", "type": "TAKE_PROFIT_MARKET", "positionSide": direction, "origQty": str(abs(exchange_qty))}],
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {
+        "status": "ok", "orders": [
+            {"symbol": exchange_symbol, "orderId": "SL-1", "type": "STOP_MARKET", "stopPrice": "101",
+             "positionSide": "SHORT", "origQty": str(abs(exchange_qty))},
+            {"symbol": exchange_symbol, "orderId": "TP-1", "type": "TAKE_PROFIT_MARKET",
+             "positionSide": "SHORT", "origQty": str(abs(exchange_qty))},
+        ],
     })
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *args, **kwargs: {
         "status": "ok", "complete": True, "records": [],

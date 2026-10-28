@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 from event_engine import reconcile_daily as recon
 
 
-def _stub_protection(symbol, direction, **kwargs):
-    qty = 2.0 if symbol.startswith("BTC") else 0.5
-    return {
-        "status": "ok",
-        "sl_orders": [{"orderId": "SL-TEST", "type": "STOP_MARKET", "stopPrice": "95.0", "positionSide": direction, "origQty": str(qty)}],
-        "tp_orders": [{"orderId": "TP-TEST", "type": "TAKE_PROFIT_MARKET", "positionSide": direction, "origQty": str(qty)}],
-    }
+def _stub_snapshot(**kwargs):
+    return {"status": "ok", "orders": [
+        {"symbol": "BTC-USDT", "orderId": "SL-BTC", "type": "STOP_MARKET", "stopPrice": "95.0", "positionSide": "LONG", "origQty": "2.0"},
+        {"symbol": "BTC-USDT", "orderId": "TP-BTC", "type": "TAKE_PROFIT_MARKET", "positionSide": "LONG", "origQty": "2.0"},
+        {"symbol": "ETH-USDT", "orderId": "SL-ETH", "type": "STOP_MARKET", "stopPrice": "105.0", "positionSide": "SHORT", "origQty": "0.5"},
+        {"symbol": "ETH-USDT", "orderId": "TP-ETH", "type": "TAKE_PROFIT_MARKET", "positionSide": "SHORT", "origQty": "0.5"},
+    ]}
 
 
 def _now_ms():
@@ -31,7 +31,7 @@ def test_daily_reconciliation_detects_position_mismatch_and_persists_health(tmp_
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
         "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2.0",
     }])
-    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", _stub_protection)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "ok", "complete": True, "records": [
             {"symbol": "BTC-USDT", "asset": "USDT", "income_type": "REALIZED_PNL", "amount": -1.0},
@@ -60,7 +60,7 @@ def test_missing_active_state_is_unknown_not_interpreted_as_empty(tmp_path, monk
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
         "symbol": "ETH-USDT", "positionSide": "SHORT", "positionAmt": "0.5",
     }])
-    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", _stub_protection)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "ok", "complete": True, "records": [],
     })
@@ -79,11 +79,9 @@ def test_daily_reconciliation_rejects_stop_order_without_positive_trigger_price(
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
         "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2.0",
     }])
-    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", lambda *a, **k: {
-        "status": "ok", "sl_orders": [{
-            "orderId": "SL-NO-TRIGGER", "type": "STOP_MARKET", "positionSide": "LONG", "origQty": "2.0",
-        }], "tp_orders": [],
-    })
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **k: {"status": "ok", "orders": [{
+        "symbol": "BTC-USDT", "orderId": "SL-NO-TRIGGER", "type": "STOP_MARKET", "positionSide": "LONG", "origQty": "2.0",
+    }]})
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "ok", "complete": True, "records": [],
     })
@@ -103,12 +101,10 @@ def test_daily_reconciliation_does_not_hide_zero_stop_price_with_conflicting_ali
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
         "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2.0",
     }])
-    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", lambda *a, **k: {
-        "status": "ok", "sl_orders": [{
-            "orderId": "SL-CONFLICT", "type": "STOP_MARKET", "stopPrice": "0",
-            "triggerPrice": "95", "positionSide": "LONG", "origQty": "2.0",
-        }], "tp_orders": [],
-    })
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **k: {"status": "ok", "orders": [{
+        "symbol": "BTC-USDT", "orderId": "SL-CONFLICT", "type": "STOP_MARKET", "stopPrice": "0",
+        "triggerPrice": "95", "positionSide": "LONG", "origQty": "2.0",
+    }]})
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "ok", "complete": True, "records": [],
     })
@@ -166,3 +162,73 @@ def test_main_failure_alert_contains_real_newline(tmp_path, monkeypatch):
     assert len(alerts) == 1
     assert "</b>\\n<code>" not in alerts[0]
     assert "</b>\n<code>" in alerts[0]
+
+
+def test_daily_reconciliation_uses_one_account_wide_open_orders_snapshot(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    positions = [
+        {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2.0"},
+        {"symbol": "ETH-USDT", "positionSide": "SHORT", "positionAmt": "-0.5"},
+        {"symbol": "SOL-USDT", "positionSide": "LONG", "positionAmt": "3.0"},
+    ]
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: positions)
+    calls = []
+    def snapshot(**kwargs):
+        calls.append(kwargs)
+        return {"status": "ok", "orders": _stub_snapshot()["orders"] + [
+            {"symbol": "SOL-USDT", "orderId": "SL-SOL", "type": "STOP_MARKET", "stopPrice": "95", "positionSide": "LONG", "origQty": "3"},
+            {"symbol": "SOL-USDT", "orderId": "TP-SOL", "type": "TAKE_PROFIT_MARKET", "positionSide": "LONG", "origQty": "3"},
+        ]}
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", snapshot)
+    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not issue per-symbol openOrders calls")))
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {"status": "ok", "complete": True, "records": []})
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+    assert len(calls) == 1
+    assert report["checks"]["exchange_protection"]["positions_checked"] == 3
+    assert report["checks"]["exchange_protection"]["source"] == "account_open_orders_snapshot"
+    assert not any(item["code"] == "EXCHANGE_PROTECTION_STATE_UNKNOWN" for item in report["discrepancies"])
+
+
+def test_open_orders_100410_is_aggregated_and_repeat_alert_is_stable(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    positions = [
+        {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2.0"},
+        {"symbol": "ETH-USDT", "positionSide": "SHORT", "positionAmt": "-0.5"},
+        {"symbol": "SOL-USDT", "positionSide": "LONG", "positionAmt": "3.0"},
+    ]
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: positions)
+    timeouts = iter((1793193767293, 1793193767294))
+    snapshot_calls = []
+    def limited_snapshot(**kwargs):
+        snapshot_calls.append(kwargs)
+        unblock_ms = next(timeouts)
+        return {
+            "status": "error", "code": 100410, "rate_limited": True,
+            "retry_after_ms": unblock_ms,
+            "error": f"openOrders snapshot failed: code=100410:The endpoint trigger frequency limit rule is currently in the disabled period and will be unblocked after {unblock_ms}",
+        }
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", limited_snapshot)
+    monkeypatch.setattr(recon.bingx, "get_open_protection_directional", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retry the rate-limited endpoint per symbol")))
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {"status": "ok", "complete": True, "records": []})
+    alerts = []
+    monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"chat": {"sent": True}})
+
+    first = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=True)
+    second = recon.run_reconciliation(now_ms=_now_ms() + 30_000, data_dir=data, notify=True)
+    errors = [item for item in first["discrepancies"] if item["code"] == "EXCHANGE_PROTECTION_STATE_UNKNOWN"]
+    assert first["status"] == "CRITICAL"
+    assert len(errors) == 1
+    assert errors[0]["position_count"] == 3
+    assert first["checks"]["exchange_protection"]["status"] == "UNKNOWN"
+    assert first["checks"]["exchange_protection"]["retry_after_ms"] == 1793193767293
+    assert second["notification"]["status"] == "SUPPRESSED_REPEAT"
+    assert len(snapshot_calls) == 2  # one account-level call per reconciliation, never one per position
+    assert len(alerts) == 1
+    assert "No per-symbol retries were attempted" in alerts[0]
