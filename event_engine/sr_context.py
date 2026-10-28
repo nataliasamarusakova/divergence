@@ -466,10 +466,16 @@ def evaluate_sr_room(
 
     if d == "LONG":
         opposing.sort(key=lambda z: float(z["lower"]) - entry_price if float(z["lower"]) > entry_price else 0.0)
-        supporting.sort(key=lambda z: abs(entry_price - float(z["upper"])))
+        supporting.sort(key=lambda z: (
+            0 if z.get("entry_overlap") == "supporting" else 1,
+            abs(entry_price - float(z["upper"])),
+        ))
     else:
         opposing.sort(key=lambda z: entry_price - float(z["upper"]) if float(z["upper"]) < entry_price else 0.0)
-        supporting.sort(key=lambda z: abs(float(z["lower"]) - entry_price))
+        supporting.sort(key=lambda z: (
+            0 if z.get("entry_overlap") == "supporting" else 1,
+            abs(float(z["lower"]) - entry_price),
+        ))
 
     nearest_opp = opposing[0] if opposing else None
     nearest_support = supporting[0] if supporting else None

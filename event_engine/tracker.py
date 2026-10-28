@@ -63,6 +63,32 @@ def _be_milestone_reached(hit_legs: set[str], is_single_tp: bool) -> bool:
 
 
 
+def _durable_replace_text(path: Path, payload: str) -> None:
+    """Atomically replace a JSON state file with file and directory durability."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Atomic replacement still applies on filesystems without directory fsync.
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _load_notifications() -> dict[str, dict]:
     if not NOTIFICATIONS_PATH.exists():
         return {}
@@ -75,10 +101,8 @@ def _load_notifications() -> dict[str, dict]:
 
 
 def _save_notifications(data: dict[str, dict]) -> None:
-    NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = NOTIFICATIONS_PATH.with_name(NOTIFICATIONS_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(json_safe(data), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-    os.replace(tmp, NOTIFICATIONS_PATH)
+    payload = json.dumps(json_safe(data), ensure_ascii=False, indent=2, allow_nan=False)
+    _durable_replace_text(NOTIFICATIONS_PATH, payload)
 
 
 def _notification_id(event_id: str, kind: str, leg: str | None = None) -> str:
@@ -155,25 +179,32 @@ def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbo
 def _retry_pending_notifications() -> None:
     notifications = _load_notifications()
     changed = False
-    pending = [
-        (nid, item) for nid, item in notifications.items()
-        if isinstance(item, dict) and not bool(item.get("resolved"))
-    ]
-    for nid, item in pending:
-        # BE activation is intentionally local-only. Suppress any legacy queued
-        # record as well, so a restart cannot resend an old BE_ACTIVATED alert.
+
+    # Apply legacy suppressions before delivery. _deliver_notification reloads and
+    # persists the latest file for each item; saving this original snapshot after
+    # those deliveries would roll sent/resolved flags back and cause Telegram spam.
+    for nid, item in notifications.items():
+        if not isinstance(item, dict) or bool(item.get("resolved")):
+            continue
         if str(item.get("kind", "")).upper() == "BE_ACTIVATED":
             item["resolved"] = True
             item["suppressed"] = True
             notifications[nid] = item
             changed = True
-            continue
-        try:
-            _deliver_notification(nid, item)
-        except Exception as exc:
-            log.warning("[TELEGRAM] Pending notification retry failed %s: %s", nid, exc)
     if changed:
         _save_notifications(notifications)
+
+    pending_ids = [
+        nid for nid, item in notifications.items()
+        if isinstance(item, dict)
+        and not bool(item.get("resolved"))
+        and str(item.get("kind", "")).upper() != "BE_ACTIVATED"
+    ]
+    for nid in pending_ids:
+        try:
+            _deliver_notification(nid, notifications.get(nid, {}))
+        except Exception as exc:
+            log.warning("[TELEGRAM] Pending notification retry failed %s: %s", nid, exc)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -232,11 +263,8 @@ def _load_active_trades() -> dict[str, dict]:
 
 
 def _save_active_trades(trades: dict[str, dict]) -> None:
-    ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
     payload = json.dumps(json_safe(trades), ensure_ascii=False, indent=2, allow_nan=False)
-    tmp_path.write_text(payload, encoding="utf-8")
-    os.replace(tmp_path, ACTIVE_TRADES_PATH)
+    _durable_replace_text(ACTIVE_TRADES_PATH, payload)
 
 
 def queue_protection_cleanup_pending(
@@ -1047,7 +1075,14 @@ def _notify_position_state_unknown(
 ) -> None:
     """Queue a durable operator alert when exchange position state is ambiguous."""
     try:
-        eid = str(event_id or f"{symbol}:{direction}:{kind}")
+        now_ms = int(time.time() * 1000)
+        detail_key = hashlib.sha256(str(detail).strip().encode("utf-8")).hexdigest()[:12].upper()
+        incident_key = f"{str(symbol).upper()}:{str(direction).upper()}:{kind}:{detail_key}:{now_ms // 3_600_000}"
+        # The trading event id can change when an exchange position is re-adopted.
+        # Alert identity is based on the unresolved incident and an hourly bucket,
+        # so repeated polling sends at most one copy per hour, while persistent
+        # incidents still remind the operator on a later hour.
+        eid = incident_key
         nid = _notification_id(eid, kind)
         text = (
             f"🚨 <b>BingX position state requires verification ({symbol} {direction})</b>\n"

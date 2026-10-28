@@ -198,13 +198,13 @@ def add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) 
 def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
     """Append cumulative VWAP using HLC3 and base volume."""
     work = df.copy()
-    high = pd.to_numeric(work.get("high"), errors="coerce")
-    low = pd.to_numeric(work.get("low"), errors="coerce")
-    close = pd.to_numeric(work.get("close"), errors="coerce")
-    volume = pd.to_numeric(work.get("volume"), errors="coerce")
-    if high is None or low is None or close is None or volume is None:
+    if not {"high", "low", "close", "volume"}.issubset(work.columns):
         work["vwap"] = float("nan")
         return work
+    high = pd.to_numeric(work["high"], errors="coerce")
+    low = pd.to_numeric(work["low"], errors="coerce")
+    close = pd.to_numeric(work["close"], errors="coerce")
+    volume = pd.to_numeric(work["volume"], errors="coerce")
 
     typical_price = (high + low + close) / 3.0
     volume_cum = volume.clip(lower=0).cumsum()
@@ -216,13 +216,13 @@ def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
 def add_mfi(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
     """Append Money Flow Index using HLC3 and signed rolling money flow."""
     work = df.copy()
-    high = pd.to_numeric(work.get("high"), errors="coerce")
-    low = pd.to_numeric(work.get("low"), errors="coerce")
-    close = pd.to_numeric(work.get("close"), errors="coerce")
-    volume = pd.to_numeric(work.get("volume"), errors="coerce")
-    if high is None or low is None or close is None or volume is None:
+    if not {"high", "low", "close", "volume"}.issubset(work.columns):
         work["mfi"] = float("nan")
         return work
+    high = pd.to_numeric(work["high"], errors="coerce")
+    low = pd.to_numeric(work["low"], errors="coerce")
+    close = pd.to_numeric(work["close"], errors="coerce")
+    volume = pd.to_numeric(work["volume"], errors="coerce")
 
     typical_price = (high + low + close) / 3.0
     raw_money_flow = typical_price * volume.clip(lower=0)
@@ -241,13 +241,13 @@ def add_mfi(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
 def add_cmf(df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
     """Append Chaikin Money Flow using rolling money-flow volume."""
     work = df.copy()
-    high = pd.to_numeric(work.get("high"), errors="coerce")
-    low = pd.to_numeric(work.get("low"), errors="coerce")
-    close = pd.to_numeric(work.get("close"), errors="coerce")
-    volume = pd.to_numeric(work.get("volume"), errors="coerce")
-    if high is None or low is None or close is None or volume is None:
+    if not {"high", "low", "close", "volume"}.issubset(work.columns):
         work["cmf"] = float("nan")
         return work
+    high = pd.to_numeric(work["high"], errors="coerce")
+    low = pd.to_numeric(work["low"], errors="coerce")
+    close = pd.to_numeric(work["close"], errors="coerce")
+    volume = pd.to_numeric(work["volume"], errors="coerce")
 
     hl_range = high - low
     mfm = ((close - low) - (high - close)) / hl_range.replace(0.0, np.nan)
@@ -2098,10 +2098,11 @@ def detect_liquidation_squeeze(
 
     Hard factors (both required): price spike (close breaks the previous bar's
     extreme by >= LIQ_SQUEEZE_PRICE_SPIKE_ATR * ATR14) and a liquidation ratio
-    liq24/oi >= LIQ_SQUEEZE_MIN_LIQ_OI_RATIO. Soft factors (at least one
-    required): 4h OI surge, extreme OI-weighted funding, crowded L/S accounts.
-    All factor values are stored in event_fact for later review. Returns []
-    whenever Coinalyze data is unavailable instead of guessing.
+    liq24/oi >= LIQ_SQUEEZE_MIN_LIQ_OI_RATIO. At least one directional crowding
+    factor is also required: extreme OI-weighted funding or crowded L/S accounts.
+    A 4h OI surge is retained as context in event_fact, but is not sufficient on
+    its own because OI growth alone does not establish directional crowding.
+    Returns [] whenever Coinalyze data is unavailable instead of guessing.
     """
     if row is None or df is None or not isinstance(df, pd.DataFrame) or len(df) < 30:
         return []

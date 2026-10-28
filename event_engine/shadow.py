@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -36,10 +37,30 @@ def _load_state(path: Path) -> dict[str, dict]:
 
 
 def _save_state(path: Path, state: dict[str, dict]) -> None:
+    """Durably replace the paper-state snapshot after writing the full payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(json_safe(state), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
-    tmp.replace(path)
+    payload = json.dumps(json_safe(state), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+    try:
+        with tmp.open("w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is not supported by every filesystem.
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _symbol_key(value: str) -> str:
@@ -81,15 +102,20 @@ def record_divergence_shadow_open(
     state = _load_state(path)
     key = str(event_id)
     if key in state:
-        return {"status": "already_opened", **state[key]}
+        existing = dict(state[key])
+        existing_state = str(existing.get("status") or "UNKNOWN")
+        existing["state_status"] = existing_state
+        existing["status"] = "already_opened"
+        return existing
 
     entry = float(entry_price)
     risk_pct = float(setup.get("risk_pct", 0.0) or 0.0)
     if entry <= 0 or risk_pct <= 0:
         raise ValueError(f"Invalid shadow setup for {event_id}")
-    # Rebase protection/target to the paper entry price rather than the original
-    # signal reference. This mirrors live protection, which is rebuilt from the
-    # actual fill price after trigger confirmation.
+    # Anchor shadow protection to the paper entry rather than the original signal
+    # reference, as live protection is anchored to the confirmed fill. The shadow
+    # model's 0.75R/1.50R tracking thresholds and 2.50R terminal target are
+    # research metrics, not a simulation of the live NORMAL_TP_RR ladder.
     if str(direction).upper() == "LONG":
         sl = entry * (1.0 - risk_pct / 100.0)
         target = entry * (1.0 + 2.50 * risk_pct / 100.0)
