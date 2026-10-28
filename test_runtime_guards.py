@@ -434,6 +434,13 @@ def test_divergence_shadow_state_records_and_closes(tmp_path):
         entry_price=100.0, setup=setup, score=70.0, opened_ts=1000,
     )
     assert opened['status'] == 'opened'
+    duplicate = record_divergence_shadow_open(
+        path, event_id='EVT1', symbol='TEST', direction='LONG',
+        event_type='REGULAR_BULLISH_RSI', timeframe='1h',
+        entry_price=100.0, setup=setup, score=70.0, opened_ts=1001,
+    )
+    assert duplicate['status'] == 'already_opened'
+    assert duplicate['state_status'] == 'ACTIVE'
     result = update_divergence_shadow_state(path, {'TEST': 106.25}, 2000)
     assert result['closed'] == 1
     data = __import__('json').loads(path.read_text())
@@ -976,6 +983,83 @@ def test_open_market_retry_does_not_reuse_canceled_status_from_previous_attempt(
     assert out["order_id"] == "OID-RETRY"
     assert out["open_attempt"] == 2
     assert out["order_status"] == "UNKNOWN"
+
+
+def test_open_market_missing_ack_order_id_cancels_and_verifies_new_zero_fill_order(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    cancel_calls = []
+    post_calls = []
+    lookup_calls = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bx, "_request", lambda _method, _path, params: post_calls.append(dict(params)) or {"code": 0, "data": {"order": {}}})
+
+    def fake_lookup(_symbol, client_id):
+        lookup_calls.append(client_id)
+        if len(lookup_calls) == 1:
+            return {"status": "ok", "order_id": "OID-PENDING", "order_status": "NEW", "executed_qty": 0.0, "client_order_id": client_id}
+        return {"status": "ok", "order_id": "OID-FILLED", "order_status": "FILLED", "executed_qty": 0.2, "client_order_id": client_id}
+
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", fake_lookup)
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancel_calls.append((symbol, str(order_id))) or {"code": 0})
+    monkeypatch.setattr(bx, "get_order", lambda _symbol, order_id: {
+        "status": "ok", "order_id": str(order_id), "order_status": "CANCELED", "executed_qty": 0.0,
+    })
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD_NEW_ZERO_FILL")
+
+    assert out["status"] == "opened"
+    assert out["order_id"] == "OID-FILLED"
+    assert out["order_status"] == "FILLED"
+    assert out["open_attempt"] == 2
+    assert cancel_calls == [("TEST", "OID-PENDING")]
+    assert len(post_calls) == 2
+    assert post_calls[0]["clientOrderId"] != post_calls[1]["clientOrderId"]
+
+
+def test_open_market_missing_ack_order_id_returns_unknown_if_new_order_cannot_be_canceled(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    cancel_calls = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_args, **kwargs: True)
+    monkeypatch.setattr(bx, "_request", lambda *_args, **_kwargs: {"code": 0, "data": {"order": {}}})
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda _symbol, client_id: {
+        "status": "ok", "order_id": "OID-STILL-NEW", "order_status": "NEW",
+        "executed_qty": 0.0, "client_order_id": client_id,
+    })
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancel_calls.append(str(order_id)) or {"code": -1, "msg": "cancel uncertain"})
+    monkeypatch.setattr(bx, "get_order", lambda _symbol, order_id: {
+        "status": "ok", "order_id": str(order_id), "order_status": "NEW", "executed_qty": 0.0,
+    })
+    monkeypatch.setattr(bx, "get_position_directional", lambda *_args, **_kwargs: {"status": "not_found"})
+    monkeypatch.setattr(bx.time, "sleep", lambda *_args: None)
+
+    out = bx.open_market("TEST", "LONG", 100.0, "TRD_NEW_UNCANCELLED")
+
+    assert out["status"] == "unknown"
+    assert out["escalation_required"] is True
+    assert out["order_id"] == "OID-STILL-NEW"
+    assert len(cancel_calls) == 3
 
 
 def test_open_market_transport_error_queries_client_order_id_before_accepting_fill(monkeypatch):
@@ -2345,3 +2429,54 @@ def test_shadow_health_counts_unknown_outcomes_separately(tmp_path):
     assert result["divergence_shadow"]["wins"] == 1
     assert result["divergence_shadow"]["losses"] == 1
     assert result["divergence_shadow"]["unknown_outcomes"] == 1
+
+
+def test_execute_new_position_fails_closed_when_bingx_reference_price_is_missing(monkeypatch):
+    import run_once as ro
+
+    actions = []
+    monkeypatch.setattr(ro, "_pending_protection_cleanup_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: None)
+    monkeypatch.setattr(ro, "record_action", lambda action: actions.append(action))
+
+    result = ro.execute_new_position(
+        "TEST", "LONG", 100.0, {"event_type": "DIVERGENCE", "signal_price": 100.0}, "EVT_PRICE_MISSING"
+    )
+
+    assert result["status"] == "PRE_ORDER_PRICE_UNAVAILABLE"
+    assert not result.get("order_id")
+    assert actions and actions[0]["reason"] == "BINGX_REFERENCE_PRICE_INVALID"
+
+
+def test_position_state_unknown_alert_deduplicates_event_ids_within_hour(monkeypatch):
+    import event_engine.tracker as tracker
+
+    queued = []
+    current = [1_798_000_000.0]  # fixed instant, not near an hour boundary
+    monkeypatch.setattr(tracker.time, "time", lambda: current[0])
+    monkeypatch.setattr(tracker, "_queue_notification", lambda notification_id, **kwargs: queued.append((notification_id, kwargs)) or True)
+    detail = "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate"
+
+    tracker._notify_position_state_unknown("ZRO", "SHORT", detail, "event-A")
+    tracker._notify_position_state_unknown("ZRO", "SHORT", detail, "event-B")
+    assert len(queued) == 2
+    assert queued[0][0] == queued[1][0]
+
+    current[0] += 3600.0
+    tracker._notify_position_state_unknown("ZRO", "SHORT", detail, "event-C")
+    assert queued[2][0] != queued[0][0]
+
+
+def test_bingx_kline_missing_close_time_uses_inclusive_interval_end(monkeypatch):
+    import time
+    import event_engine.bingx as bx
+
+    open_time = int(time.time() * 1000) - 3 * 3_600_000
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(
+        bx, "_request",
+        lambda *args, **kwargs: {"code": 0, "data": [[open_time, "100", "101", "99", "100.5", "10"]]},
+    )
+    rows = bx.fetch_klines("TEST", "1h", 1)
+    assert len(rows) == 1
+    assert rows[0]["close_time"] == open_time + 3_600_000 - 1

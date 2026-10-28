@@ -638,3 +638,19 @@ def test_quantity_prefixed_spot_price_scale_matches_futures_unit():
     futures_price = 0.00589
     ratio = futures_price / spot_price
     assert ratio == pytest.approx(1000.0, rel=1e-6)
+
+
+def test_entry_overlapping_support_zone_wins_over_closer_nonoverlapping_zone(monkeypatch):
+    import event_engine.sr_context as sr
+
+    monkeypatch.setattr(sr, "_build_zones", lambda snapshot: [
+        {"center": 99.55, "lower": 99.40, "upper": 99.70, "kind": "L", "distance_from_entry": 0.30},
+        {"center": 100.0, "lower": 99.50, "upper": 100.50, "kind": "L"},
+    ])
+    out = sr.evaluate_sr_room(
+        _snapshot((99.5, "L")), entry_price=100.0, direction="LONG",
+        risk_pct=2.0, target_rrs=(0.65, 1.50),
+    )
+    assert out["supporting_zone_confirmation"] is True
+    assert out["directional_zone_alignment"] == "LONG_IN_DEMAND"
+    assert out["nearest_supporting_zone"]["entry_overlap"] == "supporting"

@@ -410,6 +410,7 @@ def test_execute_new_position_blocks_cross_exchange_drift(monkeypatch):
 def test_execute_new_position_defines_pre_order_price(monkeypatch):
     import run_once as ro
     monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 3.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
 
     monkeypatch.setattr(ro, "open_market", lambda symbol, direction, price, trade_id: {
         "status": "opened", "order_id": "O1", "order_reference_price": 100.0,
@@ -617,6 +618,36 @@ def test_event_cache_merge_keeps_existing_fresh_events_independent_of_universe()
     new = {"event_id": "E2", "symbol": "ABC", "timeframe": "4h", "timestamps": {"detected_at_ts": 2}}
     merged = ro._merge_event_cache([old], [new])
     assert {x["event_id"] for x in merged} == {"E1", "E2"}
+
+
+def test_event_cache_preserves_reconciled_journal_payload_on_same_id_redetection():
+    import run_once as ro
+    canonical = {"event_id": "E1", "event_fact": {"displacement_atr": 1.057007525510436}}
+    recalculated = {"event_id": "E1", "event_fact": {"displacement_atr": 1.057007525510437}}
+    another = {"event_id": "E2", "event_fact": {"displacement_atr": 0.5}}
+
+    merged = ro._merge_event_cache([canonical], [recalculated, another], preserve_existing=True)
+
+    by_id = {event["event_id"]: event for event in merged}
+    assert by_id["E1"] == canonical
+    assert by_id["E2"] == another
+
+
+def test_terminal_event_cache_is_persisted_without_newly_retired_events(tmp_path, monkeypatch):
+    import json
+    import run_once as ro
+    monkeypatch.setattr(ro, "EVENT_CACHE", tmp_path / "recent_event_cache.json")
+    events = [
+        {"event_id": "EVT_ACTIVE", "symbol": "BTC"},
+        {"event_id": "EVT_TERMINAL", "symbol": "ETH"},
+    ]
+
+    active = ro._persist_terminal_filtered_event_cache(events, {"EVT_TERMINAL"})
+    persisted = json.loads(ro.EVENT_CACHE.read_text(encoding="utf-8"))
+
+    assert active == [{"event_id": "EVT_ACTIVE", "symbol": "BTC"}]
+    assert persisted["events"] == active
+    assert persisted["updated_ts"] > 0
 
 
 def test_scheduler_uses_rate_limited_scan_wrapper():
@@ -1631,6 +1662,49 @@ def test_legacy_be_activation_notification_is_suppressed_on_retry(monkeypatch, t
     assert saved[legacy_id]["suppressed"] is True
 
 
+def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppression(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    tr.NOTIFICATIONS_PATH = tmp_path / "notifications.json"
+    legacy_id = tr._notification_id("EVT_OLD_BE", "BE_ACTIVATED")
+    pending_id = tr._notification_id("EVT_CLOSE", "TRADE_CLOSE")
+    tr.NOTIFICATIONS_PATH.write_text(json.dumps({
+        legacy_id: {
+            "notification_id": legacy_id,
+            "event_id": "EVT_OLD_BE",
+            "kind": "BE_ACTIVATED",
+            "resolved": False,
+            "chats": {"A": {"sent": False, "attempts": 0}},
+            "text": "legacy BE message",
+        },
+        pending_id: {
+            "notification_id": pending_id,
+            "event_id": "EVT_CLOSE",
+            "kind": "TRADE_CLOSE",
+            "resolved": False,
+            "chats": {"A": {"sent": False, "attempts": 0}},
+            "text": "close notification",
+        },
+    }), encoding="utf-8")
+    delivered = []
+
+    def fake_send(text, *, only_chat_ids=None):
+        delivered.append((text, list(only_chat_ids or [])))
+        return {chat_id: {"sent": True, "message_id": 101} for chat_id in (only_chat_ids or [])}
+
+    monkeypatch.setattr(tr, "send_detailed", fake_send)
+    tr._retry_pending_notifications()
+
+    saved = json.loads(tr.NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
+    assert len(delivered) == 1
+    assert delivered[0][0] == "close notification"
+    assert saved[legacy_id]["resolved"] is True
+    assert saved[legacy_id]["suppressed"] is True
+    assert saved[pending_id]["resolved"] is True
+    assert saved[pending_id]["chats"]["A"]["sent"] is True
+    assert saved[pending_id]["chats"]["A"]["message_id"] == 101
+
+
 def test_tp_leg_identity_works_without_client_order_id():
     from event_engine import bingx as bx
     order = {"type": "TAKE_PROFIT_MARKET", "stopPrice": "105.00", "origQty": "1"}
@@ -2099,6 +2173,7 @@ def test_liquidation_squeeze_family_id_is_stable_across_consecutive_spikes():
 
 def test_execute_new_position_extracts_nested_bingx_101400(monkeypatch):
     import run_once as ro
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
 
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: {
         "status": "error",
@@ -2637,9 +2712,41 @@ def test_execute_new_position_flattens_when_protection_install_fails(monkeypatch
     assert calls
 
 
+def test_execute_new_position_records_protection_failure_when_emergency_close_is_unconfirmed(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 2.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: {
+        "status": "opened", "order_id": "O-UNCONFIRMED", "leverage": 10, "order_reference_price": 100.0,
+    })
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **k: {
+        "status": "found", "positionAmt": "1", "avgPrice": "100", "entryPrice": "100",
+    })
+    monkeypatch.setattr(ro, "install_protection", lambda **k: {
+        "status": "PROTECTION_FAILED", "error": "SL could not be verified", "rolled_back": False,
+    })
+    monkeypatch.setattr(ro, "_finalize_rollback_protection_cleanup", lambda *a, **k: {"status": "deferred"})
+    monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: {
+        "status": "unknown", "error": "close outcome unknown", "escalation_required": True,
+    })
+
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        "EVT_PROTECTION_CLOSE_UNKNOWN",
+    )
+
+    assert out["status"] == "opened_protection_failed"
+    assert out["position"]["positionAmt"] == pytest.approx(1.0)
+    assert out["protection"]["emergency_close"]["status"] == "unknown"
+    assert out["protection"]["rollback_protection_cleanup"]["status"] == "deferred"
+
+
 def test_execute_new_position_rolls_back_excessive_entry_drift(monkeypatch):
     import run_once as ro
     monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 2.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "open_market", lambda *a, **k: {
         "status": "opened", "order_id": "O1", "leverage": 10, "order_reference_price": 100.0,
     })
@@ -4051,3 +4158,18 @@ def test_liquidation_squeeze_docstring_matches_required_soft_factors():
     assert "directional crowding" in doc
     assert "not sufficient on" in doc
     assert "extreme OI-weighted funding or crowded L/S accounts" in doc
+
+
+def test_optional_volume_indicators_and_divergence_detector_accept_missing_volume():
+    """Volume is optional to detect_divergences' public minimum-column contract."""
+    import event_engine.signals as sig
+
+    df = _generate_synthetic_candles(80).drop(columns=["volume"])
+    for func, column in ((sig.add_vwap, "vwap"), (sig.add_mfi, "mfi"), (sig.add_cmf, "cmf")):
+        out = func(df)
+        assert column in out.columns
+        assert out[column].isna().all()
+
+    # detect_divergences requires close/high/low/close_time, not volume.
+    events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=5, max_bars=16)
+    assert isinstance(events, list)

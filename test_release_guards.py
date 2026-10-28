@@ -49,7 +49,9 @@ def test_scheduler_state_uses_v9_style_persistent_data_without_pre_run_cleanup()
     workflow = _workflow()
     assert 'data/timeframe_scan_state.json' in workflow
     assert 'recent_event_cache.json' not in workflow  # runtime path is owned by run_once.py
-    assert 'git add -f data/timeframe_scan_state.json' in workflow
+    assert 'git add -f -- data/timeframe_scan_state.json' in workflow
+    assert 'git add -A -- data/' in workflow
+    assert 'git diff --quiet' in workflow
     assert 'git fetch --prune --no-tags origin main' in workflow
     assert 'merged scheduler state' in workflow
     assert 'Synchronize persistent scheduler state before tests' not in workflow
@@ -417,9 +419,9 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.12"' in runtime
+    assert 'APP_VERSION = "V10.4.15"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_12.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_15.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes
@@ -432,6 +434,8 @@ def test_release_version_and_billing_modes_documented():
     assert not Path('RELEASE_NOTES_V10_4_9.md').exists()
     assert not Path('RELEASE_NOTES_V10_4_10.md').exists()
     assert not Path('RELEASE_NOTES_V10_4_11.md').exists()
+    assert not Path('RELEASE_NOTES_V10_4_12.md').exists()
+    assert not Path('RELEASE_NOTES_V10_4_14.md').exists()
 
 
 def test_release_runs_bounded_read_only_reconciliation_after_engine():

@@ -329,3 +329,34 @@ def test_tracker_conversion_uses_unused_leg_when_one_pending_tp_has_known_tp2():
     assert len({row["leg"] for row in tp}) == 2
     assert next(row for row in tp if row["order_id"] == "TP-KNOWN-2")["leg"] == "tp2"
     assert next(row for row in tp if row["order_id"] == "TP-UNKNOWN")["leg"] == "tp1"
+
+
+def test_active_trade_notification_and_shadow_snapshots_fsync_before_replace(tmp_path, monkeypatch):
+    import os
+    import stat
+    import event_engine.tracker as tracker
+    import event_engine.shadow as shadow
+
+    active_path = tmp_path / "active_trades.json"
+    notifications_path = tmp_path / "notifications.json"
+    shadow_path = tmp_path / "shadow_state.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tracker, "NOTIFICATIONS_PATH", notifications_path)
+
+    original_fsync = os.fsync
+    regular_file_fsyncs = []
+
+    def tracked_fsync(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            regular_file_fsyncs.append(fd)
+        return original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
+    tracker._save_active_trades({"EVT1": {"symbol": "TEST", "qty": 1.0}})
+    tracker._save_notifications({"TG1": {"resolved": True, "chats": {}}})
+    shadow._save_state(shadow_path, {"EVT1": {"status": "ACTIVE"}})
+
+    assert len(regular_file_fsyncs) >= 3
+    assert json.loads(active_path.read_text(encoding="utf-8"))["EVT1"]["qty"] == 1.0
+    assert json.loads(notifications_path.read_text(encoding="utf-8"))["TG1"]["resolved"] is True
+    assert json.loads(shadow_path.read_text(encoding="utf-8"))["EVT1"]["status"] == "ACTIVE"

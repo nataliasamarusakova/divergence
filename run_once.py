@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.12"
+APP_VERSION = "V10.4.15"
 
 import pandas as pd
 import requests
@@ -995,16 +995,50 @@ def _mark_symbol_scanned(state: dict, symbol: str, timeframe: str, completed_buc
     rec["updated_ts"] = int(time.time() * 1000)
 
 
-def _merge_event_cache(existing: list[dict], new_events: list[dict]) -> list[dict]:
-    """Merge by event_id while preserving events independent of current universe."""
+def _merge_event_cache(
+    existing: list[dict], new_events: list[dict], *, preserve_existing: bool = False,
+) -> list[dict]:
+    """Merge by event_id while preserving events independent of current universe.
+
+    By default, later records win. ``preserve_existing=True`` is used when the
+    existing list has already been reconciled against the durable event journal:
+    a same-ID re-detection must not replace that canonical event payload with
+    numerically different recalculated fields.
+    """
     by_id: dict[str, dict] = {}
     for ev in existing + new_events:
         if not isinstance(ev, dict):
             continue
         eid = ev.get("event_id")
-        if eid:
-            by_id[str(eid)] = ev
+        if not eid:
+            continue
+        key = str(eid)
+        if preserve_existing and key in by_id:
+            continue
+        by_id[key] = ev
     return list(by_id.values())
+
+
+def _filter_terminal_cached_events(events: list[dict], terminal_ids: set[str]) -> list[dict]:
+    """Return only cache entries not retired by durable EVENT_TERMINAL records."""
+    retired = {str(event_id) for event_id in terminal_ids if event_id}
+    return [
+        event for event in events
+        if isinstance(event, dict)
+        and event.get("event_id")
+        and str(event.get("event_id")) not in retired
+    ]
+
+
+def _persist_terminal_filtered_event_cache(events: list[dict], terminal_ids: set[str]) -> list[dict]:
+    """Commit a clean end-of-cycle cache when this cycle retired any cached event."""
+    active_events = _filter_terminal_cached_events(events, terminal_ids)
+    if len(active_events) != len(events):
+        _save_json_atomic(
+            EVENT_CACHE,
+            {"updated_ts": int(time.time() * 1000), "events": active_events},
+        )
+    return active_events
 
 
 OI_HISTORY = DATA / "oi_history.json"
@@ -4058,6 +4092,21 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         })
         return {"status": "PRE_ORDER_PRICE_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "error": unavailable_error}
 
+    live_reference_value = _safe_float(live_reference, 0.0)
+    if live_reference_value <= 0:
+        unavailable_error = f"BingX reference price unavailable or invalid: {live_reference!r}"
+        record_action({
+            "record_type": "PRE_ORDER_PRICE_UNAVAILABLE",
+            "event_id": event_id, "symbol": symbol, "direction": direction,
+            "reason": "BINGX_REFERENCE_PRICE_INVALID", "error": unavailable_error,
+            "ts": int(time.time() * 1000),
+        })
+        return {
+            "status": "PRE_ORDER_PRICE_UNAVAILABLE", "mode": EXECUTION_MODE,
+            "order_id": None, "error": unavailable_error,
+        }
+    live_reference = live_reference_value
+
     execution_quality_guard = {}
     if CROSS_EXCHANGE_PRICE_GUARD_ENABLED and MARKET_DATA_SOURCE == "binance":
         try:
@@ -4561,6 +4610,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             last_known_avg_price=actual_avg_price,
         )
     elif protection_status not in {"PROTECTED", "SL_ONLY"} and isinstance(protection.get("emergency_close"), dict):
+        # The emergency close was attempted but did not verify a flat position.
+        # Keep the still-live position visible in tracker state and never fall
+        # through to the summary with final_status undefined.
+        final_status = "opened_protection_failed"
         protection["rollback_protection_cleanup"] = _finalize_rollback_protection_cleanup(
             symbol, direction, event_id, protection.get("emergency_close")
         )
@@ -5010,7 +5063,10 @@ def main() -> None:
         int(_tf_stats(stats, "4h").get("scanned", 0)),
         len(scan_klines_cache),
     )
-    merged_event_cache = _merge_event_cache(event_cache, new_1h + new_4h)
+    # event_cache was rebuilt with durable journal rows taking precedence over
+    # recalculated duplicates. Keep that canonical payload if the same event_id
+    # is emitted again by a detector (including sub-ULP float differences).
+    merged_event_cache = _merge_event_cache(event_cache, new_1h + new_4h, preserve_existing=True)
     event_cache = []
     for cached_event in merged_event_cache:
         if _event_is_fresh(cached_event, now_ms, _event_max_age_min(cached_event)):
@@ -6320,6 +6376,17 @@ def main() -> None:
             execution_quality=_journal_safe(execution_result.get("execution_quality")),
             protection=_journal_safe(execution_result.get("protection")),
         )
+
+    # The initial cache snapshot is written before candidate evaluation so a
+    # failed cycle can recover safely. Candidate processing can append new
+    # EVENT_TERMINAL rows afterwards; commit the cleaned cache again so the
+    # persisted derived state agrees with the durable terminal journal at rest.
+    cached_count_before_cleanup = len(event_cache)
+    event_cache = _persist_terminal_filtered_event_cache(event_cache, terminal_event_ids)
+    removed_terminal_count = cached_count_before_cleanup - len(event_cache)
+    if removed_terminal_count > 0:
+        stats["cached_events"] = len(event_cache)
+        log.info("[EVENT_CACHE] removed %d newly terminal event(s) from persisted cache", removed_terminal_count)
 
     try:
         append_shadow_health(events_path=EVENTS, health_path=HEALTH, trades_path=TRADES, divergence_shadow_path=DIVERGENCE_SHADOW_STATE, cycle_stats=stats)
