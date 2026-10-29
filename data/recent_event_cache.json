@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793310724148,
+  "updated_ts": 1793311018850,
   "events": [
     {
       "event_id": "EVT_0537A3D4B60A0ABB",
@@ -7252,6 +7252,168 @@
         "mss_level": 0.10004,
         "broken_ts": 1793033999999,
         "bos_ts": 1792943999999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_553E0EB706D756A5",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1793307599999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05807,
+        "compression_ratio": 0.35612890185986074,
+        "ma_spread_atr": 0.19881001819425903,
+        "compression_threshold": 0.5582529728870256,
+        "breakout_atr": 1.7423580394986278,
+        "volume_ratio": 6.668916187967422,
+        "requires_retest": true,
+        "trigger_level": 0.06157,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_77261BF248297294",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1793307599999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05807,
+        "donchian_high": 0.06878,
+        "donchian_low": 0.06157,
+        "breakout_atr": 1.7423580394986278,
+        "volume_ratio": 6.668916187967422,
+        "adx": 20.568047793387553,
+        "ema200": 0.06900485886969487,
+        "compressed_recent": false,
+        "bb_width": 0.11921841889416983,
+        "trigger_level": 0.06157,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_036F2DC053E892B3",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1793307599999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "ema_fast": 0.0644563328813913,
+        "ema_slow": 0.06564785063527294,
+        "ema200": 0.06900485886969487,
+        "body_atr": 3.2358077876403084,
+        "volume_ratio": 6.668916187967422,
+        "trigger_level": 0.0644563328813913,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_10D84746127F27A9",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793264399999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.06529,
+        "zone_high": 0.06789,
+        "zone_low": 0.06529,
+        "bos_level": 0.06181,
+        "ob_ts": 1793289599999,
+        "displacement_atr": 3.2358077876403084,
+        "volume_ratio": 6.668916187967422,
+        "body_fraction": 0.7602339181286555,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_FAFD26D37347E598",
+      "symbol": "MARSCOIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793023199999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.06397,
+        "zone_high": 0.06539,
+        "zone_low": 0.06397,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1793224799999,
+        "liquidity_sweep_level": 0.0696,
+        "mss_ts": 1793242799999,
+        "mss_pivot_ts": 1793206799999,
+        "mss_level": 0.06552,
+        "broken_ts": 1793242799999,
+        "bos_ts": 1793026799999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_9B1B6D3213E407E9",
+      "symbol": "MARSCOIN",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1793303999999,
+        "pivot_2_ts": 1793303999999,
+        "detected_at_ts": 1793303999999
+      },
+      "event_fact": {
+        "ema_fast": 0.06648829286637459,
+        "ema_slow": 0.06993529529791347,
+        "ema200": 0.08583138769046385,
+        "body_atr": 1.0266151568840138,
+        "volume_ratio": 1.1866252587964838,
+        "trigger_level": 0.06648829286637459,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
