@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793311675461,
+  "updated_ts": 1793311922154,
   "events": [
     {
       "event_id": "EVT_03080F865C3A7D0A",
@@ -5997,6 +5997,126 @@
         "displacement_atr": 1.4026430293615193,
         "volume_ratio": 4.384743858787336,
         "body_fraction": 0.8413597733711053,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4BB7F57E92F095D0",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1793307599999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "ema_fast": 0.07438912185794828,
+        "ema_slow": 0.07450077842808496,
+        "ema200": 0.0736024404871208,
+        "body_atr": 3.8219449394762792,
+        "volume_ratio": 5.631868321102096,
+        "trigger_level": 0.07438912185794828,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_2A92E4C89239BC75",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793282399999,
+        "pivot_2_ts": 1793307599999,
+        "detected_at_ts": 1793307599999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.07437,
+        "zone_high": 0.07502,
+        "zone_low": 0.07437,
+        "bos_level": 0.0732,
+        "ob_ts": 1793303999999,
+        "displacement_atr": 3.8219449394762792,
+        "volume_ratio": 5.631868321102096,
+        "body_fraction": 0.9351351351351359,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "HAR_4646FB5B83898C92",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "HARMONIC_CYPHER_SHORT",
+      "timestamps": {
+        "x_ts": 1793174399999,
+        "a_ts": 1793221199999,
+        "b_ts": 1793235599999,
+        "c_ts": 1793249999999,
+        "d_ts": 1793293199999,
+        "detected_at_ts": 1793311199999
+      },
+      "event_fact": {
+        "trigger_level": 0.0778,
+        "detection_close_price": 0.06829,
+        "pattern": "CYPHER",
+        "x_price": 0.07928,
+        "a_price": 0.07419,
+        "b_price": 0.0766,
+        "c_price": 0.07225,
+        "d_price": 0.0778,
+        "ab_xa": 0.4734774066797636,
+        "bc_ab": 1.8049792531120394,
+        "bc_xa": 0.854616895874265,
+        "xc_xa": 1.3811394891945015,
+        "cd_bc": 1.2758620689655151,
+        "cd_xc": 0.7894736842105253,
+        "ad_xa": 0.7092337917485246,
+        "xd_xa": 0.2907662082514754,
+        "xd_xc": 0.21052631578947473,
+        "ratio_tolerance": 0.05,
+        "engine": "HARMONIC_PATTERN",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_8D3B77DAB63F5268",
+      "symbol": "ZAMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793023199999,
+        "pivot_2_ts": 1793311199999,
+        "detected_at_ts": 1793311199999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.06958,
+        "zone_high": 0.07077,
+        "zone_low": 0.06958,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1793235599999,
+        "liquidity_sweep_level": 0.07645,
+        "mss_ts": 1793307599999,
+        "mss_pivot_ts": 1793221199999,
+        "mss_level": 0.07419,
+        "broken_ts": 1793307599999,
+        "bos_ts": 1793026799999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
