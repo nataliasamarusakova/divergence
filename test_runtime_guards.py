@@ -1365,7 +1365,15 @@ def test_emergency_close_acknowledged_fill_with_stale_position_refuses_duplicate
     import event_engine.bingx as bx
 
     calls = []
+    # Initial live read, immediate post-order read, and five bounded follow-up
+    # polls all return the same quantity: treat as stale/unresolved, never submit
+    # another MARKET merely because the first is marked FILLED.
     position_states = iter([
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
     ])
@@ -1392,7 +1400,81 @@ def test_emergency_close_acknowledged_fill_with_stale_position_refuses_duplicate
     out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="STALE_POSITION")
     assert out["status"] == "unknown"
     assert out["escalation_required"] is True
+    assert out["position_poll_count"] == 5
+    assert out["position_poll_stable"] is True
+    assert out["position_poll_quantities"] == [1.25, 1.25, 1.25, 1.25, 1.25]
+    assert "residual_qty=1.25" in out["error"]
     assert len(calls) == 1
+
+
+def test_emergency_close_filled_order_rechecks_position_and_accepts_confirmed_flat(monkeypatch):
+    import event_engine.bingx as bx
+
+    calls = []
+    states = iter([
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},  # before POST
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},  # immediate stale view
+        {"status": "not_found"},
+        {"status": "not_found"},  # explicit absence confirmation
+    ])
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
+    monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(bx, "_request", lambda method, path, params: calls.append(dict(params)) or {
+        "code": 0, "data": {"order": {"orderId": "CLOSE1", "avgPrice": "99.5"}},
+    })
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda *a, **k: {
+        "status": "ok", "order_id": "CLOSE1", "order_status": "FILLED", "executed_qty": 1.25, "avg_price": 99.5,
+    })
+    monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
+
+    out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="POST_FILLED_FLAT")
+    assert out["status"] == "closed"
+    assert out["verification"] == "two_not_found_reads_after_filled_order"
+    assert len(calls) == 1
+
+
+def test_emergency_close_filled_order_recloses_only_stable_smaller_residual_with_fresh_id(monkeypatch):
+    import event_engine.bingx as bx
+
+    calls = []
+    # Original position, immediate lagging read, five agreeing follow-up polls
+    # of a smaller residual, a fresh pre-retry read, then two absence reads.
+    states = iter([
+        {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "not_found"},
+        {"status": "not_found"},
+    ])
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
+    monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
+
+    def request(method, path, params):
+        calls.append(dict(params))
+        return {"code": 0, "data": {"order": {"orderId": f"CLOSE{len(calls)}", "avgPrice": "99.5"}}}
+
+    monkeypatch.setattr(bx, "_request", request)
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda symbol, client_id: {
+        "status": "ok", "order_id": "CLOSE1", "client_order_id": client_id,
+        "order_status": "FILLED", "executed_qty": 1.25, "avg_price": 99.5,
+    })
+
+    out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="STABLE_RESIDUAL")
+    assert out["status"] == "closed"
+    assert len(calls) == 2
+    assert calls[0]["clientOrderId"] != calls[1]["clientOrderId"]
+    assert calls[0]["quantity"] == "1.250"
+    assert calls[1]["quantity"] == "0.750"
 
 
 def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monkeypatch):

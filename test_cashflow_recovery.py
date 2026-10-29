@@ -429,3 +429,37 @@ def test_income_history_background_request_budget_fails_closed(monkeypatch):
     assert result["status"] == "error"
     assert result["complete"] is False
     assert result["error"] == "income_history_query_budget_exhausted"
+
+
+def test_income_history_accepts_known_nested_income_wrappers(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0,
+        "data": {"incomeHistory": {"result": {"rows": [
+            {"tranId": "NESTED-1", "tradeId": "T-NESTED", "symbol": "BTC-USDT",
+             "incomeType": "TRADING_FEE", "income": "-0.03", "asset": "USDT", "time": 1_700_000_002_000}
+        ], "total": 1}}},
+    })
+    result = bingx.get_income_history("BTC", 1_700_000_000_000, 1_700_000_003_000)
+    assert result["status"] == "ok" and result["complete"] is True
+    assert len(result["records"]) == 1
+    assert result["records"][0]["amount"] == pytest.approx(-0.03)
+
+
+def test_income_history_unknown_shape_returns_safe_diagnostics_not_zero(monkeypatch, caplog):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "BTC-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0, "data": {"responseMeta": {"status": "success", "payloadKind": "opaque"}}
+    })
+    result = bingx.get_income_history("BTC", 1_700_000_000_000, 1_700_000_003_000)
+    assert result["status"] == "error"
+    assert result["complete"] is False
+    assert result["records"] == []
+    assert result["error"] == "income_history_unexpected_data_shape"
+    assert result.get("shape_fingerprint")
+    assert "responseMeta" in result.get("shape_summary", "")
+    assert "fingerprint=" in caplog.text

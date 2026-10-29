@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.16"
+APP_VERSION = "V10.4.21"
 
 import pandas as pd
 import requests
@@ -258,7 +258,7 @@ ENTRY_WEAK_ENGINE_BLOCK_ENABLED = os.environ.get("ENTRY_WEAK_ENGINE_BLOCK_ENABLE
 DISABLED_EVENT_TYPES = {
     x.strip().upper()
     for x in os.environ.get(
-        "DISABLED_EVENT_TYPES", "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"
+        "DISABLED_EVENT_TYPES", ""
     ).split(",")
     if x.strip()
 }
@@ -272,7 +272,7 @@ ENTRY_BLOCKED_EVENT_TYPES = {
     x.strip().upper()
     for x in os.environ.get(
         "ENTRY_BLOCKED_EVENT_TYPES",
-        "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION",
+        "CRT_BULLISH,MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION",
     ).split(",")
     if x.strip()
 }
@@ -5606,9 +5606,10 @@ def main() -> None:
             else:
                 trend_snapshot = None
 
-            # The owner-approved B4/B5 directional protections are hard gates,
-            # independent of ENTRY_QUALITY_MODE="shadow". The global trend filter
-            # itself remains in shadow; only LONG candidates use BTC-regime veto.
+            # Optional B4/B5 directional protections are hard gates when enabled,
+            # independent of ENTRY_QUALITY_MODE="shadow". The current research policy
+            # keeps the LONG crowding/OI/funding gate and LONG BTC-regime veto off;
+            # the global trend filter itself remains shadow-only.
             if direction == "LONG" and LONG_LS_GATE_ENABLED:
                 long_risk_reasons = _long_market_risk_gate_reasons(r)
                 if long_risk_reasons:

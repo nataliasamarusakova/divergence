@@ -22,10 +22,15 @@ def format_price(value: float | None, tick_size: float | None) -> str:
     if tick_size is not None and tick_size > 0:
         try:
             quantum = Decimal(str(tick_size))
-            rounded = Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP)
-            places = max(0, -quantum.as_tuple().exponent)
+            # Decimal.quantize(tick) controls decimal places, not tick multiples.
+            # Round the number of ticks first, then convert back to a price.
+            tick_count = (Decimal(str(value)) / quantum).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+            rounded = tick_count * quantum
+            places = max(0, -quantum.normalize().as_tuple().exponent)
             return f"{rounded:.{places}f}"
-        except (InvalidOperation, ValueError):
+        except (InvalidOperation, ValueError, ZeroDivisionError):
             pass
     text = f"{float(value):.12f}".rstrip("0").rstrip(".")
     return text or "0"

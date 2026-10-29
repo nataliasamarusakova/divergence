@@ -11,16 +11,17 @@ def test_clean_release_executes_divergence_events():
     assert 'DIVERGENCE_SHADOW_ONLY: "false"' in _workflow()
 
 
-def test_bearish_event_families_are_reenabled_but_weak_bullish_families_stay_disabled():
+def test_v10418_event_policy_keeps_requested_families_enabled_and_shadow_only():
     workflow = _workflow()
-    assert 'DISABLED_EVENT_TYPES: "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"' in workflow
+    assert 'DISABLED_EVENT_TYPES: ""' in workflow
     assert 'ENTRY_QUALITY_MODE: "shadow"' in workflow
-    assert 'ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION"' in workflow
+    assert 'CRT_BULLISH,CRT_BEARISH,MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH' in workflow
+    assert 'ENABLE_BREAKOUT_MOMENTUM_ENGINE: "true"' in workflow
     import run_once
     assert not run_once._event_type_is_disabled("CRT_BEARISH")
-    assert not run_once._event_type_is_disabled("BREAKER_BLOCK_BEARISH")
-    assert run_once._event_type_is_disabled("CRT_BULLISH")
-    assert run_once._event_type_is_disabled("BREAKER_BLOCK_BULLISH")
+    assert not run_once._event_type_is_disabled("CRT_BULLISH")
+    assert not run_once._event_type_is_disabled("BREAKOUT_MOMENTUM")
+    assert not run_once._event_type_is_disabled("BREAKER_BLOCK_BULLISH")
     assert 'SHORT_OI_VETO_ENABLED:' not in workflow
     assert 'SHORT_OI_VETO_PCT:' not in workflow
 
@@ -371,17 +372,17 @@ def test_research_unlimited_entries_are_unlimited_without_hidden_entry_throttles
     assert run_once.MAX_ACTIVE_TRADES == run_once.MAX_ACTIVE_LONGS == run_once.MAX_ACTIVE_SHORTS == 0
     assert run_once.SYMBOL_LOSS_COOLDOWN_MIN == 0
 
-    assert 'EARLY_LOSS_CUT_ENABLED: "true"' in workflow
+    assert 'EARLY_LOSS_CUT_ENABLED: "false"' in workflow
     assert 'EARLY_LOSS_CUT_2H_MIN: "120"' in workflow
     assert 'EARLY_LOSS_CUT_2H_PNL: "-1.50"' in workflow
     assert 'EARLY_LOSS_CUT_4H_MIN: "240"' in workflow
     assert 'EARLY_LOSS_CUT_4H_PNL: "-2.50"' in workflow
-    assert 'LONG_LS_GATE_ENABLED: "true"' in workflow
+    assert 'LONG_LS_GATE_ENABLED: "false"' in workflow
     assert 'LONG_LS_MAX: "1.36"' in workflow
     assert 'LONG_OI_CHG4H_MAX: "3.0"' in workflow
     assert 'LONG_FR_BAND_MIN: "0.0009"' in workflow
     assert 'LONG_FR_BAND_MAX: "0.00665"' in workflow
-    assert 'LONG_BTC_VETO_ENABLED: "true"' in workflow
+    assert 'LONG_BTC_VETO_ENABLED: "false"' in workflow
     assert 'TREND_FILTER_MODE: "shadow"' in workflow
 
 
@@ -419,14 +420,18 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.16"' in runtime
+    assert 'APP_VERSION = "V10.4.21"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_16.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_21.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes
     assert 'active_trades.json' in notes
     assert 'event_engine/reconcile_daily.py' in notes
+    tracker = Path('event_engine/tracker.py').read_text(encoding='utf-8')
+    assert 'EARLY_LOSS_CUT_ENABLED = False' in tracker
+    assert 'EARLY_LOSS_CUT_ENV_REQUESTED' in tracker
+    assert 'income_history_unexpected_data_shape' in Path('event_engine/bingx.py').read_text(encoding='utf-8')
     # The current release note documents the current package; obsolete notes are not runtime/test dependencies.
     assert not Path('RELEASE_NOTES_V10_4_4.md').exists()
     assert not Path('RELEASE_NOTES_V10_4_7.md').exists()
@@ -455,3 +460,19 @@ def test_release_runs_bounded_read_only_reconciliation_after_engine():
     assert "emergency_close_position(" not in script
     assert "place_order(" not in script
     assert "cancel_order(" not in script
+
+
+def test_early_loss_cut_is_hard_disabled_even_if_environment_requests_true():
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env["EARLY_LOSS_CUT_ENABLED"] = "true"
+    proc = subprocess.run(
+        [sys.executable, "-c", "from event_engine.tracker import EARLY_LOSS_CUT_ENABLED; print(EARLY_LOSS_CUT_ENABLED)"],
+        cwd=Path.cwd(), env=env, text=True, capture_output=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "False"
+    assert "hard-disabled in this release" in proc.stderr

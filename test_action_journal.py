@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gzip
 import json
-from pathlib import Path
 
 import run_once as ro
 

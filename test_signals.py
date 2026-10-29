@@ -43,11 +43,10 @@ from event_engine.bingx import (
     CACHE,
     _allocate_tp_quantities,
 )
-from event_engine.tracker import _update_mfe_mae, _extract_setup_metrics, _load_active_trades
+from event_engine.tracker import _extract_setup_metrics, _load_active_trades
 from run_once import (
     build_event_setup,
     build_tp_levels,
-    calculate_setup_score,
     execute_new_position,
     load_successful_telegram_ids,
     check_funding_filter,

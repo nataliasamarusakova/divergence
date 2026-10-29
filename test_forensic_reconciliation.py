@@ -1,6 +1,5 @@
 """Focused regression tests for forensic trade recovery, candidate logging and protection audit."""
 import json
-from pathlib import Path
 
 import pytest
 

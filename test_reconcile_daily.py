@@ -232,3 +232,67 @@ def test_open_orders_100410_is_aggregated_and_repeat_alert_is_stable(tmp_path, m
     assert len(snapshot_calls) == 2  # one account-level call per reconciliation, never one per position
     assert len(alerts) == 1
     assert "No per-symbol retries were attempted" in alerts[0]
+
+
+def test_daily_income_reconciliation_retries_once_after_incomplete_timeout(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_CLOSE", "event_id": "EVT-RETRY", "symbol": "BTC-USDT",
+        "direction": "LONG", "closed_ts": now_ms, "exit_reason": "STOP_LOSS",
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
+    monkeypatch.setattr(recon, "INCOME_TIMEOUT_SEC", 3.0)
+    monkeypatch.setattr(recon, "INCOME_REQUEST_BUDGET", 4)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 1)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    calls = []
+    def income(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"status": "error", "error": "read timeout", "complete": False, "records": []}
+        return {"status": "ok", "complete": True, "records": [
+            {"symbol": "BTC-USDT", "asset": "USDT", "income_type": "TRADING_FEE", "amount": -0.01},
+        ]}
+    monkeypatch.setattr(recon.bingx, "get_income_history", income)
+    monkeypatch.setattr(recon.time, "sleep", lambda *_: None)
+
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    assert len(calls) == 2
+    assert calls[0]["timeout_sec"] == 3.0
+    summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert summary["status"] == "OK"
+    assert summary["attempts"] == 2
+    assert summary["trading_fees"] == -0.01
+    assert not any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in report["discrepancies"])
+
+
+def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-INCOME-SHAPE", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
+        "records": [], "shape_fingerprint": "ABC123", "shape_summary": "dict:fields=incomeHistory:dict",
+    })
+    alerts = []
+    monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
+    monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "V10.4.21")
+
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=True)
+    warning = next(item for item in report["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
+    assert "shape_fingerprint=ABC123" in warning["detail"]
+    assert "incomeHistory" in warning["detail"]
+    assert report["build_version"] == "V10.4.21"
+    assert "Build: <code>V10.4.21</code>" in alerts[0]
