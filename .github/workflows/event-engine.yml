@@ -26,6 +26,7 @@ jobs:
       COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
       BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+      DIVERGENCE_BUILD_VERSION: "V10.4.21"
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
@@ -44,7 +45,7 @@ jobs:
       REQUIRE_CVD_CONFIRMATION: "false"
       ENTRY_QUALITY_GATE_ENABLED: "true"
       ENTRY_QUALITY_MODE: "shadow"
-      DISABLED_EVENT_TYPES: "CRT_BULLISH,BREAKOUT_MOMENTUM,BREAKER_BLOCK_BULLISH"
+      DISABLED_EVENT_TYPES: ""
       MIN_SETUP_SCORE: "60"
       MIN_SHORT_SETUP_SCORE: "75"
       # Trend Filter v1 starts in shadow: it records causal 4H/1H/BTC state but does not block trades yet.
@@ -82,7 +83,7 @@ jobs:
       AJAY_SR_MAX_DATA_AGE_MIN: "130"
       MAX_SR_DATA_REJECTIONS: "3"
       ENTRY_WEAK_ENGINE_BLOCK_ENABLED: "true"
-      ENTRY_BLOCKED_EVENT_TYPES: "MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION"
+      ENTRY_BLOCKED_EVENT_TYPES: "CRT_BULLISH,CRT_BEARISH,MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH"
       COMPOUND_CVD_LIQ_VETO_ENABLED: "true"
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
@@ -124,10 +125,12 @@ jobs:
       REQUIRE_4H_CONTEXT_FOR_1H: "true"
       ENABLE_MACD_4H_ENGINE: "true"
       ENABLE_MA_COMPRESSION_ENGINE: "true"
-      # MA compression detector stays enabled for telemetry, but its event type is
-      # deliberately in ENTRY_BLOCKED_EVENT_TYPES during this research window (shadow only).
-      # Breakout momentum is disabled at detector level as well as by event policy.
-      ENABLE_BREAKOUT_MOMENTUM_ENGINE: "false"
+      # Pattern activation is explicitly held to V12 parity: every detector enabled
+      # in V12 remains enabled; detector families disabled in V12 remain disabled.
+      # ENTRY_BLOCKED_EVENT_TYPES is telemetry-only while ENTRY_QUALITY_MODE=shadow.
+      # The hard DISABLED_EVENT_TYPES denylist is empty so these event types can execute.
+      ENABLE_DIVERGENCE_ENGINE: "true"
+      ENABLE_BREAKOUT_MOMENTUM_ENGINE: "true"
       ENABLE_DONCHIAN_RETEST_ENGINE: "true"
       ENABLE_LIQUIDITY_SWEEP_ENGINE: "true"
       ENABLE_EMA_PULLBACK_ENGINE: "true"
@@ -141,14 +144,14 @@ jobs:
       EXTREME_SHORT_FUNDING: "-0.50"
       EXTREME_LONG_FUNDING: "0.50"
       FUNDING_REQUIRED: "false"
-      LONG_LS_GATE_ENABLED: "true"
+      LONG_LS_GATE_ENABLED: "false"
       LONG_LS_MAX: "1.36"
       LONG_OI_CHG4H_MAX: "3.0"
       LONG_FR_BAND_MIN: "0.0009"
       LONG_FR_BAND_MAX: "0.00665"
-      LONG_BTC_VETO_ENABLED: "true"
+      LONG_BTC_VETO_ENABLED: "false"
       BE_AFTER_LEG: "tp1"
-      EARLY_LOSS_CUT_ENABLED: "true"
+      EARLY_LOSS_CUT_ENABLED: "false"
       EARLY_LOSS_CUT_2H_MIN: "120"
       EARLY_LOSS_CUT_2H_PNL: "-1.50"
       EARLY_LOSS_CUT_4H_MIN: "240"
@@ -366,8 +369,9 @@ jobs:
         if: always() && !cancelled()
         env:
           RECONCILIATION_MAX_SYMBOLS: "2"
-          RECONCILIATION_INCOME_TIMEOUT_SEC: "2"
+          RECONCILIATION_INCOME_TIMEOUT_SEC: "3"
           RECONCILIATION_INCOME_REQUEST_BUDGET: "4"
+          RECONCILIATION_INCOME_RETRIES: "1"
         run: |
           python -m event_engine.reconcile_daily
 
