@@ -14,7 +14,6 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from decimal import (
     Decimal,
-    ROUND_CEILING,
     ROUND_DOWN,
     ROUND_FLOOR,
 )
@@ -810,14 +809,26 @@ def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
     return _query_order(symbol, client_order_id=client_order_id)
 
 
-def _extract_known_rows(payload: Any, row_keys: tuple[str, ...], *, depth: int = 0) -> tuple[list[dict] | None, Any]:
-    """Extract rows from known API wrappers only; never guess an arbitrary list key."""
+def _extract_known_rows(
+    payload: Any,
+    row_keys: tuple[str, ...],
+    *,
+    depth: int = 0,
+    recursive_wrapper_keys: set[str] | frozenset[str] | None = None,
+) -> tuple[list[dict] | None, Any]:
+    """Extract rows from explicitly named API wrappers; never guess arbitrary list keys.
+
+    Callers can expand the wrapper set for one endpoint without changing parsing
+    behavior for other endpoints that use this shared helper.
+    """
     if isinstance(payload, list):
         if all(isinstance(row, dict) for row in payload):
             return payload, None
         return None, "non_object_row"
     if not isinstance(payload, dict) or depth > 4:
         return None, "unexpected_shape"
+    if recursive_wrapper_keys is None:
+        recursive_wrapper_keys = {"result", "data", "resultData", "response"}
     for key in row_keys:
         if key not in payload:
             continue
@@ -826,8 +837,12 @@ def _extract_known_rows(payload: Any, row_keys: tuple[str, ...], *, depth: int =
             if all(isinstance(row, dict) for row in value):
                 return value, payload.get("total")
             return None, "non_object_row"
-        if isinstance(value, dict) and key in {"result", "data", "resultData", "response"}:
-            rows, total = _extract_known_rows(value, row_keys, depth=depth + 1)
+        # Some gateway responses may nest fund-flow rows under these documented-
+        # meaning names. Recurse only through this endpoint's named wrappers.
+        if isinstance(value, dict) and key in recursive_wrapper_keys:
+            rows, total = _extract_known_rows(
+                value, row_keys, depth=depth + 1, recursive_wrapper_keys=recursive_wrapper_keys,
+            )
             if rows is not None:
                 return rows, total
     return None, "unexpected_shape"
@@ -1041,6 +1056,7 @@ def get_income_history(
     limit = min(limit, 1000)
     seen: set[str] = set()
     request_count = 0
+    last_shape_diagnostics: dict[str, str] = {}
     # Bound recursive time-range splitting so a dense account history cannot
     # turn a single recovery into thousands of signed API requests. Callers
     # doing secondary/background reconciliation may choose a smaller budget;
@@ -1064,10 +1080,29 @@ def get_income_history(
             err = response.get("msg", response) if isinstance(response, dict) else response
             return None, str(err)
         data = response.get("data")
-        rows, meta = _extract_known_rows(data, ("list", "rows", "records", "income", "incomeList", "income_list", "incomeRecords", "income_records", "result", "data", "resultData", "response"))
+        income_row_keys = (
+            "list", "rows", "records", "income", "incomeList", "income_list",
+            "incomeRecords", "income_records", "incomeHistory", "income_history",
+            "incomeData", "income_data", "incomeHistoryList", "income_history_list",
+            "incomeRecordsList", "income_records_list", "dataList", "data_list",
+            "result", "data", "resultData", "response",
+        )
+        income_recursive_wrappers = frozenset({
+            "result", "data", "resultData", "response",
+            "income", "incomeHistory", "income_history", "incomeData", "income_data",
+            "incomeRecords", "income_records", "incomeList", "income_list",
+            "incomeHistoryList", "income_history_list", "records", "rows",
+            "dataList", "data_list", "incomeRecordsList", "income_records_list",
+        })
+        rows, meta = _extract_known_rows(
+            data, income_row_keys, recursive_wrapper_keys=income_recursive_wrappers,
+        )
         if rows is None:
             fp, desc = _shape_fingerprint(data)
             log.warning("[BINGX] income history unexpected shape fingerprint=%s shape=%s", fp, desc)
+            # Keep the accounting result UNKNOWN, but propagate only structural
+            # diagnostics (keys/types), never raw account values, to health/alerts.
+            last_shape_diagnostics.update({"shape_fingerprint": fp, "shape_summary": desc, "data_type": type(data).__name__})
             return None, "income_history_unexpected_data_shape"
         if len(rows) < limit:
             return rows, None
@@ -1086,7 +1121,9 @@ def get_income_history(
 
     rows, error = fetch_range(start_ts, end_ts)
     if error or rows is None:
-        return {"status": "error", "error": error or "income_history_unavailable", "records": [], "complete": False}
+        result = {"status": "error", "error": error or "income_history_unavailable", "records": [], "complete": False}
+        result.update(last_shape_diagnostics)
+        return result
 
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -1624,6 +1661,63 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             return {"status": "not_found", "symbol": bx_symbol, "positionSide": direction, "absence_reads": 2}
         return confirmed
 
+    def _poll_after_filled_close() -> dict:
+        """Re-read a lagging position view before declaring a filled close unresolved.
+
+        This function is read-only. It never submits an order. A confirmed flat
+        state requires the existing two-read absence check; a residual is only
+        considered stable after two consecutive positive position reads agree
+        within the contract's quantity precision.
+        """
+        observations: list[tuple[float, dict]] = []
+        errors: list[str] = []
+        # Position snapshots can lag behind a FILLED MARKET order. Keep these
+        # GET-only polls bounded (~5.25s sleep total) before raising an operator
+        # alert; do not assume stale quantity is flat and do not blind-retry it.
+        poll_delays = (0.25, 0.50, 1.00, 1.50, 2.00)
+        qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
+        for delay in poll_delays:
+            time.sleep(delay)
+            try:
+                state = get_position_directional(symbol, direction)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}:{exc}")
+                continue
+            status = str(state.get("status", "")).lower() if isinstance(state, dict) else "unknown"
+            if status == "not_found":
+                state = _confirm_absence(state)
+                status = str(state.get("status", "")).lower() if isinstance(state, dict) else "unknown"
+                if status == "not_found":
+                    return {
+                        "status": "closed", "verification": "two_not_found_reads_after_filled_order",
+                        "poll_count": len(observations) + len(errors) + 1,
+                    }
+            if status == "found":
+                try:
+                    value = abs(float(state.get("positionAmt", 0) or 0))
+                except (TypeError, ValueError, OverflowError):
+                    value = 0.0
+                if math.isfinite(value) and value > 0:
+                    observations.append((value, state))
+                else:
+                    errors.append("position_read_found_with_invalid_quantity")
+            else:
+                errors.append(str(state.get("error") or status or "unknown_position_state") if isinstance(state, dict) else "invalid_position_response")
+
+        if observations:
+            residual_qty, last_state = observations[-1]
+            stable = len(observations) >= 2 and abs(observations[-1][0] - observations[-2][0]) <= qty_tolerance
+            return {
+                "status": "found", "position": last_state, "remaining_qty": residual_qty,
+                "stable": stable, "poll_count": len(observations) + len(errors),
+                "observed_quantities": [round(value, max(0, precision) + 2) for value, _ in observations],
+                "last_error": errors[-1] if errors else None,
+            }
+        return {
+            "status": "unknown", "error": errors[-1] if errors else "no_position_state_returned_during_post_fill_polls",
+            "poll_count": len(errors),
+        }
+
     for attempt in range(2):
         try:
             live = get_position_directional(symbol, direction)
@@ -1723,12 +1817,53 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
                             "escalation_required": True,
                         }
                     if order_status == "FILLED":
+                        post_fill = _poll_after_filled_close()
+                        if post_fill.get("status") == "closed":
+                            return {
+                                "status": "closed", "symbol": bx_symbol, "direction": direction,
+                                "client_order_id": client_order_id, "order_id": queried.get("order_id"),
+                                "execution_price": queried.get("avg_price") or None,
+                                "idempotency": "order_queried_after_transport_error",
+                                "verification": post_fill.get("verification"),
+                                "position_poll_count": post_fill.get("poll_count"),
+                            }
+                        if post_fill.get("status") == "found":
+                            residual_qty = float(post_fill.get("remaining_qty") or 0.0)
+                            qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
+                            # A stable residual smaller than the pre-order position
+                            # is a newly confirmed remaining quantity. Retry only
+                            # once, with a fresh clientOrderId and a fresh position
+                            # read at the top of the loop. An unchanged/stale view
+                            # is escalated without another MARKET POST.
+                            if (post_fill.get("stable") is True and residual_qty < live_qty - qty_tolerance
+                                    and attempt + 1 < 2):
+                                digest = hashlib.sha256(
+                                    f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:FILLED_RESIDUAL:{attempt}".upper().encode()
+                                ).hexdigest().upper()[:24]
+                                client_order_id = f"EVTCLOSE{digest}"
+                                continue
+                            return {
+                                "status": "unknown",
+                                "error": (
+                                    "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate "
+                                    f"(residual_qty={residual_qty}; polls={post_fill.get('poll_count')}; "
+                                    f"stable={post_fill.get('stable')}; observed_qty={post_fill.get('observed_quantities', [])})"
+                                ),
+                                "symbol": bx_symbol, "direction": direction,
+                                "client_order_id": client_order_id,
+                                "remaining_qty": residual_qty, "position_poll_count": post_fill.get("poll_count"),
+                                "position_poll_stable": post_fill.get("stable"),
+                                "position_poll_quantities": post_fill.get("observed_quantities", []),
+                                "escalation_required": True,
+                            }
                         return {
                             "status": "unknown",
-                            "error": "MARKET close order is FILLED but position remains; refusing blind duplicate",
+                            "error": "MARKET close order outcome confirmed FILLED but position verification stayed unknown after bounded polls",
                             "symbol": bx_symbol, "direction": direction,
                             "client_order_id": client_order_id,
-                            "remaining_qty": residual_qty, "escalation_required": True,
+                            "position_poll_count": post_fill.get("poll_count"),
+                            "position_poll_error": post_fill.get("error"),
+                            "escalation_required": True,
                         }
                     # A verified partial fill justifies one fresh order for the
                     # exact residual quantity. Never reuse the filled order id.
@@ -1848,14 +1983,52 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
         residual_qty = after_qty
 
         if verified_status == "FILLED" and residual_qty > 0:
+            post_fill = _poll_after_filled_close()
+            if post_fill.get("status") == "closed":
+                return {
+                    "status": "closed", "symbol": bx_symbol, "direction": direction,
+                    "client_order_id": client_order_id,
+                    "order_id": str(actual_order_id) if actual_order_id not in (None, "") else str(verified_order.get("order_id") or "") or None,
+                    "execution_price": execution_price or verified_order.get("avg_price") or None,
+                    "verification": post_fill.get("verification"),
+                    "position_poll_count": post_fill.get("poll_count"),
+                }
+            if post_fill.get("status") == "found":
+                residual_qty = float(post_fill.get("remaining_qty") or 0.0)
+                qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
+                if (post_fill.get("stable") is True and residual_qty < live_qty - qty_tolerance
+                        and attempt + 1 < 2):
+                    digest = hashlib.sha256(
+                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:FILLED_RESIDUAL:{attempt}".upper().encode()
+                    ).hexdigest().upper()[:24]
+                    client_order_id = f"EVTCLOSE{digest}"
+                    continue
+                return {
+                    "status": "unknown",
+                    "error": (
+                        "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate "
+                        f"(residual_qty={residual_qty}; polls={post_fill.get('poll_count')}; "
+                        f"stable={post_fill.get('stable')}; observed_qty={post_fill.get('observed_quantities', [])})"
+                    ),
+                    "symbol": bx_symbol,
+                    "direction": direction,
+                    "client_order_id": client_order_id,
+                    "remaining_qty": residual_qty,
+                    "executed_qty": verified_executed_qty,
+                    "position_poll_count": post_fill.get("poll_count"),
+                    "position_poll_stable": post_fill.get("stable"),
+                    "position_poll_quantities": post_fill.get("observed_quantities", []),
+                    "escalation_required": True,
+                }
             return {
                 "status": "unknown",
-                "error": "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate",
+                "error": "MARKET close order FILLED but position verification stayed unknown after bounded polls",
                 "symbol": bx_symbol,
                 "direction": direction,
                 "client_order_id": client_order_id,
-                "remaining_qty": residual_qty,
                 "executed_qty": verified_executed_qty,
+                "position_poll_count": post_fill.get("poll_count"),
+                "position_poll_error": post_fill.get("error"),
                 "escalation_required": True,
             }
 

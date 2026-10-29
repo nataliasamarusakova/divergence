@@ -35,8 +35,9 @@ HEALTH_PATH = DATA_DIR / "health.jsonl"
 ALERT_STATE_PATH = DATA_DIR / "reconciliation_alert_state.json"
 ALERT_REPEAT_SUPPRESSION_SEC = max(0.0, min(24 * 3600.0, float(os.environ.get("RECONCILIATION_ALERT_REPEAT_SUPPRESSION_SEC", "3600"))))
 MAX_INCOME_SYMBOLS = max(0, min(3, int(os.environ.get("RECONCILIATION_MAX_SYMBOLS", "2"))))
-INCOME_TIMEOUT_SEC = max(1.0, min(3.0, float(os.environ.get("RECONCILIATION_INCOME_TIMEOUT_SEC", "2"))))
+INCOME_TIMEOUT_SEC = max(1.0, min(3.0, float(os.environ.get("RECONCILIATION_INCOME_TIMEOUT_SEC", "3"))))
 INCOME_REQUEST_BUDGET = max(1, min(4, int(os.environ.get("RECONCILIATION_INCOME_REQUEST_BUDGET", "4"))))
+INCOME_RETRIES = max(0, min(2, int(os.environ.get("RECONCILIATION_INCOME_RETRIES", "1"))))
 
 
 def _timestamp_ms(value: Any) -> int:
@@ -330,6 +331,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     report: dict[str, Any] = {
         "record_type": "DAILY_RECONCILIATION",
         "ts": now_ms,
+        "build_version": str(os.environ.get("DIVERGENCE_BUILD_VERSION", "UNKNOWN")),
         "utc_day": utc_now.date().isoformat(),
         "mode": "READ_ONLY",
         "status": "OK",
@@ -560,19 +562,38 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         candidate_symbols[sym] += 1
     income_summaries: dict[str, dict] = {}
     for symbol, _count in candidate_symbols.most_common(MAX_INCOME_SYMBOLS):
-        try:
-            income = bingx.get_income_history(
-                symbol, day_start, max(day_start + 1, now_ms), limit=1000,
-                timeout_sec=INCOME_TIMEOUT_SEC, max_range_requests=INCOME_REQUEST_BUDGET,
-            )
-        except Exception as exc:
-            income = {"status": "error", "error": f"{type(exc).__name__}:{exc}", "complete": False, "records": []}
+        income: dict[str, Any] = {"status": "error", "error": "income_query_not_attempted", "complete": False, "records": []}
+        attempts = 0
+        for attempt in range(INCOME_RETRIES + 1):
+            attempts = attempt + 1
+            try:
+                income = bingx.get_income_history(
+                    symbol, day_start, max(day_start + 1, now_ms), limit=1000,
+                    timeout_sec=INCOME_TIMEOUT_SEC, max_range_requests=INCOME_REQUEST_BUDGET,
+                )
+            except Exception as exc:
+                income = {"status": "error", "error": f"{type(exc).__name__}:{exc}", "complete": False, "records": []}
+            if isinstance(income, dict) and income.get("status") == "ok" and income.get("complete") is True:
+                break
+            if attempt < INCOME_RETRIES:
+                # One bounded retry helps with brief API latency spikes without
+                # turning read-only reconciliation into an unbounded request loop.
+                time.sleep(min(0.25 * (attempt + 1), 0.5))
         if not isinstance(income, dict) or income.get("status") != "ok" or income.get("complete") is not True:
             detail = str(income.get("error", "incomplete_income_response")) if isinstance(income, dict) else "invalid_income_response"
-            income_summaries[symbol] = {"status": "ERROR", "error": detail}
-            report["discrepancies"].append({"level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE", "symbol": symbol, "detail": detail})
+            shape_fingerprint = income.get("shape_fingerprint") if isinstance(income, dict) else None
+            shape_summary = income.get("shape_summary") if isinstance(income, dict) else None
+            if shape_fingerprint:
+                detail += f"; shape_fingerprint={shape_fingerprint}"
+            if shape_summary:
+                detail += f"; response_shape={shape_summary}"
+            income_summaries[symbol] = {
+                "status": "ERROR", "error": detail, "attempts": attempts,
+                "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
+            }
+            report["discrepancies"].append({"level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE", "symbol": symbol, "detail": f"{detail} (attempts={attempts})"})
             continue
-        totals = {"realized_pnl": 0.0, "trading_fees": 0.0, "funding_fees": 0.0, "other_known": 0.0, "records": len(income.get("records", []))}
+        totals = {"realized_pnl": 0.0, "trading_fees": 0.0, "funding_fees": 0.0, "other_known": 0.0, "records": len(income.get("records", [])), "attempts": attempts}
         for row in income.get("records", []):
             if not isinstance(row, dict) or str(row.get("asset") or "").upper() != "USDT":
                 continue
@@ -627,7 +648,11 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         if report["discrepancies"] and suppress:
             report["notification"] = {"status": "SUPPRESSED_REPEAT", "reason": suppression_reason}
         elif report["discrepancies"]:
-            lines = [f"<b>Divergence daily reconciliation: {report['status']}</b>", f"UTC day: <code>{report['utc_day']}</code>"]
+            lines = [
+                f"<b>Divergence daily reconciliation: {report['status']}</b>",
+                f"Build: <code>{report.get('build_version', 'UNKNOWN')}</code>",
+                f"UTC day: <code>{report['utc_day']}</code>",
+            ]
             for item in report["discrepancies"][:12]:
                 detail = _discrepancy_message_detail(item)
                 lines.append(f"• <b>{item.get('level')}</b> {item.get('code')}: <code>{str(detail)[:350]}</code>")

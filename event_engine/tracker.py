@@ -41,7 +41,13 @@ ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 NOTIFICATIONS_PATH = DATA / "notifications.json"
 
-EARLY_LOSS_CUT_ENABLED = os.environ.get("EARLY_LOSS_CUT_ENABLED", "false").lower() == "true"
+# Early-loss exits were explicitly disabled by the operator. Keep the old
+# thresholds only for historical compatibility/telemetry, but fail closed in
+# code even if a stale workflow/environment accidentally sets the flag true.
+EARLY_LOSS_CUT_ENV_REQUESTED = os.environ.get("EARLY_LOSS_CUT_ENABLED", "false").strip().lower() == "true"
+EARLY_LOSS_CUT_ENABLED = False
+if EARLY_LOSS_CUT_ENV_REQUESTED:
+    log.error("[CONFIG_GUARD] EARLY_LOSS_CUT_ENABLED=true was requested by the environment but is hard-disabled in this release.")
 EARLY_LOSS_CUT_2H_MIN = float(os.environ.get("EARLY_LOSS_CUT_2H_MIN", "120"))
 EARLY_LOSS_CUT_2H_PNL = float(os.environ.get("EARLY_LOSS_CUT_2H_PNL", "-1.50"))
 EARLY_LOSS_CUT_4H_MIN = float(os.environ.get("EARLY_LOSS_CUT_4H_MIN", "240"))
