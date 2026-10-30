@@ -26,7 +26,7 @@ jobs:
       COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
       BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-      DIVERGENCE_BUILD_VERSION: "V10.4.21"
+      DIVERGENCE_BUILD_VERSION: "V10.4.25"
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
@@ -58,16 +58,18 @@ jobs:
       TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
       TREND_FILTER_HISTORY_BUFFER_BARS: "12"
       TREND_FILTER_REQUIRE_PERSISTENCE: "false"
-      # Demand/Supply (Ajay R5.41 S/R room) is temporarily disabled for the VST evaluation run.
-      # Keep the implementation and diagnostics intact so the gate can be re-enabled later
-      # without changing the event/entry strategy itself.
-      AJAY_SR_ROOM_ENABLED: "false"
-      AJAY_SR_ROOM_MODE: "off"
-      # If S/R is re-enabled later, missing Binance Spot S/R source/data remains diagnostic only.
-      AJAY_SR_REQUIRE_DATA: "false"
+      # Mandatory strict 3H Binance Spot Demand/Supply direction gate.
+      # Binance Spot has no native 3h kline interval: the code aggregates three closed 1h Spot candles.
+      # Demand (pivot low) permits LONG only; Supply (pivot high) permits SHORT only.
+      # The live Spot price must be within 5% of the nearest unbroken directional zone.
+      # Data failure, stale 3H candles, missing zones, or ambiguous zones fail closed.
       AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"
       AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"
       AJAY_SR_KLINE_LIMIT_1H: "1000"
+      # Optional legacy TP1-room geometry remains off; strict directional gate is separate.
+      AJAY_SR_ROOM_ENABLED: "false"
+      AJAY_SR_ROOM_MODE: "off"
+      AJAY_SR_REQUIRE_DATA: "true"
       AJAY_SR_RB: "10"
       AJAY_SR_PRD: "284"
       AJAY_SR_CHANNEL_W: "10"
@@ -80,7 +82,7 @@ jobs:
       AJAY_SR_HTTP_TIMEOUT_SEC: "5"
       AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"
       AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"
-      AJAY_SR_MAX_DATA_AGE_MIN: "130"
+      AJAY_SR_MAX_DATA_AGE_MIN: "190"
       MAX_SR_DATA_REJECTIONS: "3"
       ENTRY_WEAK_ENGINE_BLOCK_ENABLED: "true"
       ENTRY_BLOCKED_EVENT_TYPES: "CRT_BULLISH,CRT_BEARISH,MA_COMPRESSION_BREAKOUT,EMA_PULLBACK_CONTINUATION,LIQUIDITY_SWEEP_RECLAIM,VOLUME_PROFILE_DISTRIBUTION,BREAKER_BLOCK_BEARISH"

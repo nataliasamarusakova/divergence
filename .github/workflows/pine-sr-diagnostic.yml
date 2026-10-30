@@ -9,7 +9,7 @@ on:
         default: "BTC-USDT"
         type: string
       bars:
-        description: "Closed 1H bars (300-1000)"
+        description: "Binance Spot 1H source bars aggregated into 3H (900-1000)"
         required: false
         default: "1000"
         type: string
@@ -52,19 +52,25 @@ jobs:
           if [[ -z "$symbol" ]]; then symbol="${EVENT_SYMBOL:-BTC-USDT}"; fi
           if [[ -z "$bars" ]]; then bars="${EVENT_BARS:-1000}"; fi
           echo "symbol=$symbol" >> "$GITHUB_OUTPUT"
+          if ! [[ "$bars" =~ ^[0-9]+$ ]] || (( bars < 900 || bars > 1000 )); then
+            echo "bars must be an integer from 900 to 1000 (1H source candles; at least 296 closed 3H bars are required)" >&2
+            exit 1
+          fi
           echo "bars=$bars" >> "$GITHUB_OUTPUT"
 
-      - name: Run exact Pine SR diagnostic
+      - name: Run 3H Pine SR diagnostic
         env:
           DIAG_SYMBOL: ${{ steps.inputs.outputs.symbol }}
           DIAG_BARS: ${{ steps.inputs.outputs.bars }}
         run: |
           set -euo pipefail
-          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit "$DIAG_BARS" | tee pine-sr-diagnostic.log
+          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit "$DIAG_BARS" --output pine-sr-zones.csv | tee pine-sr-diagnostic.log
 
       - name: Upload diagnostic log
         uses: actions/upload-artifact@v4
         with:
           name: pine-sr-${{ steps.inputs.outputs.symbol }}
-          path: pine-sr-diagnostic.log
+          path: |
+            pine-sr-diagnostic.log
+            pine-sr-zones.csv
           if-no-files-found: error
