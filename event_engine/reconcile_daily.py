@@ -72,6 +72,8 @@ _KNOWN_POSITION_SYMBOL_ALIASES = {
     "LIT-USDT": "LIGHTER-USDT",
     "LITUSDT": "LIGHTER-USDT",
     "LIT": "LIGHTER-USDT",
+    "TRUMP-USDT": "TRUMP-USDT",
+    "TRUMPSOL-USDT": "TRUMP-USDT",
 }
 
 
@@ -86,6 +88,12 @@ def _canonical_position_symbol(value: Any) -> str:
     raw = _symbol(value)
     if not raw:
         return raw
+
+    # BingX may return the historical Futures API identifier TRUMPSOL-USDT
+    # for the token displayed as TRUMPUSDT. This is reconciliation-only; SOL-USDT
+    # and the literal TRUMP-SOL-USDT remain independent instrument identities.
+    if raw in {"TRUMP-USDT", "TRUMPSOL-USDT"}:
+        return "TRUMP-USDT"
 
     configured = getattr(bingx, "SYMBOL_MAP", {})
     if isinstance(configured, dict):

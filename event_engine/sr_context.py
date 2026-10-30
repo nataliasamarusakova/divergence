@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Lazy Ajay R5.41 S/R context for final entry validation.
+"""Binance Spot 3H Demand/Supply context for strict pre-order validation.
 
-The trading engine requests S/R ONLY for already-selected candidates immediately
-before an order. The current source is Binance SPOT 1H, deliberately configurable
-and isolated from the Binance Futures signal client. Futures can be added later
-without changing the room/gate logic.
+S/R levels are calculated only from fully closed Binance Spot 3H candles. The
+entry gate uses the current Binance Spot ticker price and allows LONG only near
+a valid Demand (pivot-low) zone, SHORT only near a valid Supply (pivot-high)
+zone. No fallback to 1H, futures klines, or stale snapshots is permitted.
 """
 
 import logging
@@ -23,7 +23,16 @@ log = logging.getLogger("event_engine")
 
 SR_SPOT_BASE_URL = os.environ.get("AJAY_SR_SPOT_BASE_URL", "https://data-api.binance.vision").rstrip("/")
 SR_SPOT_KLINES_URL = f"{SR_SPOT_BASE_URL}/api/v3/klines"
-SR_KLINE_LIMIT = max(300, min(1000, int(os.environ.get("AJAY_SR_KLINE_LIMIT_1H", "1000"))))
+SR_SPOT_TICKER_PRICE_URL = f"{SR_SPOT_BASE_URL}/api/v3/ticker/price"
+SR_TIMEFRAME = "3h"
+SR_INTERVAL_MS = 3 * 60 * 60 * 1000
+# Binance Spot REST does not expose a 3h kline interval. We request up to 1000
+# closed 1h Spot candles, then aggregate exact UTC-aligned groups of three into 3h.
+SR_SOURCE_KLINE_LIMIT_1H = max(300, min(1000, int(os.environ.get("AJAY_SR_KLINE_LIMIT_1H", "1000"))))
+SR_SOURCE_INTERVAL_MS = 60 * 60 * 1000
+# User-approved hard rule: a candidate must be within 5.0% of the nearest
+# actionable 3H Demand/Supply zone. Changing it requires a code/release change.
+SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0
 SR_RB = int(os.environ.get("AJAY_SR_RB", "10"))
 SR_PRD = int(os.environ.get("AJAY_SR_PRD", "284"))
 SR_CHANNEL_W = float(os.environ.get("AJAY_SR_CHANNEL_W", "10"))
@@ -35,11 +44,11 @@ SR_TARGET_BUFFER_R = max(0.0, float(os.environ.get("AJAY_SR_TARGET_BUFFER_R", "0
 SR_SUPPORT_CONTEXT_MAX_R = max(0.0, float(os.environ.get("AJAY_SR_SUPPORT_CONTEXT_MAX_R", "3.0")))
 SR_HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("AJAY_SR_HTTP_TIMEOUT_SEC", "5")))
 SR_REQUEST_MIN_INTERVAL_SEC = max(0.0, float(os.environ.get("AJAY_SR_REQUEST_MIN_INTERVAL_SEC", "0.10")))
-SR_MAX_DATA_AGE_MIN = max(30.0, float(os.environ.get("AJAY_SR_MAX_DATA_AGE_MIN", "130")))
+SR_MAX_DATA_AGE_MIN = max(30.0, float(os.environ.get("AJAY_SR_MAX_DATA_AGE_MIN", "190")))
 SR_SPOT_EXCHANGE_INFO_TTL_SEC = max(30.0, float(os.environ.get("AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC", "900")))
 SR_SPOT_EXCHANGE_INFO_URL = f"{SR_SPOT_BASE_URL}/api/v3/exchangeInfo"
 # Quantity-prefixed Binance perpetuals (e.g. 1000SHIBUSDT) can use the
-# underlying Spot pair for 1H S/R. Keep the prefix vocabulary deliberately
+# underlying Spot pair for the 1H source candles aggregated into 3H S/R. Keep the prefix vocabulary deliberately
 # narrow so ordinary symbols such as 1INCH are never treated as multipliers.
 SR_NUMERIC_PREFIXES: tuple[int, ...] = (1_000_000, 100_000, 10_000, 1_000)
 
@@ -219,19 +228,30 @@ def _rate_limit_before_request() -> None:
         _LAST_REQUEST_MONOTONIC = time.monotonic()
 
 
-def _fetch_closed_1h_spot(
+def _fetch_closed_spot(
     symbol: str,
     *,
+    interval: str,
     resolved: dict[str, Any] | None = None,
     limit: int | None = None,
 ) -> tuple[list[Candle], dict[str, Any]]:
+    """Fetch fully closed Spot klines for a supported interval.
+
+    Binance Spot's supported raw source interval is ``1h``. The trading snapshot
+    aggregates these rows into exact, closed 3h bars in ``_fetch_closed_3h_spot``.
+    """
+    interval_key = str(interval or "").strip().lower()
+    interval_ms = {"1h": SR_SOURCE_INTERVAL_MS}.get(interval_key)
+    if interval_ms is None:
+        raise ValueError(f"Unsupported raw Binance Spot S/R source interval: {interval!r}; use 1h and aggregate to 3h")
+
     resolved = dict(resolved or resolve_spot_symbol(symbol))
-    kline_limit = SR_KLINE_LIMIT if limit is None else max(300, min(1000, int(limit)))
+    kline_limit = SR_SOURCE_KLINE_LIMIT_1H if limit is None else max(300, min(1000, int(limit)))
     for attempt in range(2):
         _rate_limit_before_request()
         payload_response = _SESSION.get(
             SR_SPOT_KLINES_URL,
-            params={"symbol": resolved["source_symbol"], "interval": "1h", "limit": kline_limit},
+            params={"symbol": resolved["source_symbol"], "interval": interval_key, "limit": kline_limit},
             timeout=SR_HTTP_TIMEOUT_SEC,
         )
         if payload_response.status_code == 400 and attempt == 0:
@@ -248,30 +268,159 @@ def _fetch_closed_1h_spot(
         volume_scale = float(resolved.get("source_volume_scale", 1.0))
         if not math.isfinite(price_scale) or price_scale <= 0 or not math.isfinite(volume_scale) or volume_scale <= 0:
             raise ValueError(f"Invalid Spot source scales for {resolved}")
+        previous_open_time: int | None = None
         for row in rows:
             if not isinstance(row, list) or len(row) < 6:
                 continue
             try:
                 open_time = int(row[0])
-                close_time = int(row[6]) if len(row) > 6 else open_time + 3_599_999
-                if close_time > now_ms:
-                    continue
-                candles.append(
-                    Candle(
-                        ts=open_time,
-                        open=float(row[1]) * price_scale,
-                        high=float(row[2]) * price_scale,
-                        low=float(row[3]) * price_scale,
-                        close=float(row[4]) * price_scale,
-                        volume=float(row[5]) * volume_scale,
-                    )
+                close_time = int(row[6]) if len(row) > 6 else open_time + interval_ms - 1
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if close_time > now_ms:
+                continue
+            if previous_open_time is not None and open_time <= previous_open_time:
+                raise ValueError(
+                    f"Binance SPOT {interval_key} klines are duplicated or out of order for {resolved['source_symbol']}"
+                )
+            try:
+                candle = Candle(
+                    ts=open_time,
+                    open=float(row[1]) * price_scale,
+                    high=float(row[2]) * price_scale,
+                    low=float(row[3]) * price_scale,
+                    close=float(row[4]) * price_scale,
+                    volume=float(row[5]) * volume_scale,
                 )
             except (TypeError, ValueError, OverflowError):
                 continue
+            values = (candle.open, candle.high, candle.low, candle.close, candle.volume)
+            if (
+                not all(math.isfinite(value) for value in values)
+                or min(candle.open, candle.high, candle.low, candle.close) <= 0
+                or candle.volume < 0
+                or candle.high < max(candle.open, candle.close, candle.low)
+                or candle.low > min(candle.open, candle.close, candle.high)
+            ):
+                continue
+            candles.append(candle)
+            previous_open_time = open_time
         if len(candles) < SR_PRD + SR_RB + 2:
-            raise ValueError(f"Only {len(candles)} closed SPOT 1H candles available from {resolved['source_symbol']}")
+            raise ValueError(
+                f"Only {len(candles)} closed SPOT {interval_key.upper()} candles available from {resolved['source_symbol']}"
+            )
+        if any(b.ts <= a.ts for a, b in zip(candles, candles[1:])):
+            raise ValueError(f"Non-monotonic Binance SPOT {interval_key} candles for {resolved['source_symbol']}")
         return candles, resolved
-    raise RuntimeError(f"Spot kline retry exhausted for {symbol}")
+    raise RuntimeError(f"Spot kline retry exhausted for {symbol}/{interval_key}")
+
+
+def _aggregate_closed_3h_candles(hourly_candles: list[Candle]) -> list[Candle]:
+    """Aggregate closed 1h Spot candles into exact UTC-aligned 3h candles.
+
+    A 3h bar is emitted only when all three expected 1h open timestamps exist.
+    Incomplete groups are discarded; OHLCV aggregation is first-open, max-high,
+    min-low, last-close and summed base volume.
+    """
+    groups: dict[int, dict[int, Candle]] = {}
+    previous_ts: int | None = None
+    for candle in hourly_candles:
+        ts = int(candle.ts)
+        if previous_ts is not None and ts <= previous_ts:
+            raise ValueError("Binance Spot 1h candles are duplicated or out of order before 3h aggregation")
+        previous_ts = ts
+        bucket_open = (ts // SR_INTERVAL_MS) * SR_INTERVAL_MS
+        groups.setdefault(bucket_open, {})[ts] = candle
+
+    aggregated: list[Candle] = []
+    for bucket_open in sorted(groups):
+        members = groups[bucket_open]
+        expected = (bucket_open, bucket_open + SR_SOURCE_INTERVAL_MS, bucket_open + 2 * SR_SOURCE_INTERVAL_MS)
+        if any(ts not in members for ts in expected):
+            continue
+        bars = [members[ts] for ts in expected]
+        aggregated.append(Candle(
+            ts=bucket_open,
+            open=float(bars[0].open),
+            high=max(float(bar.high) for bar in bars),
+            low=min(float(bar.low) for bar in bars),
+            close=float(bars[-1].close),
+            volume=sum(float(bar.volume) for bar in bars),
+        ))
+    return aggregated
+
+
+def _fetch_closed_3h_spot(
+    symbol: str,
+    *,
+    resolved: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> tuple[list[Candle], dict[str, Any]]:
+    """Build the trading 3h S/R series from supported Binance Spot 1h klines."""
+    hourly_candles, meta = _fetch_closed_spot(
+        symbol, interval="1h", resolved=resolved, limit=limit
+    )
+    minimum = SR_PRD + SR_RB + 2
+    minimum_hourly = minimum * 3
+    if limit is not None and int(limit) < minimum_hourly:
+        raise ValueError(
+            f"Requested {limit} source 1H candles cannot build {minimum} closed 3H bars; "
+            f"at least {minimum_hourly} source 1H candles are required"
+        )
+    candles_3h = _aggregate_closed_3h_candles(hourly_candles)
+    if len(candles_3h) < minimum:
+        raise ValueError(
+            f"Only {len(candles_3h)} complete closed SPOT 3H candles can be aggregated from "
+            f"{len(hourly_candles)} 1H candles for {meta.get('source_symbol')}; need {minimum}"
+        )
+    gaps = [
+        (left.ts, right.ts)
+        for left, right in zip(candles_3h, candles_3h[1:])
+        if right.ts - left.ts != SR_INTERVAL_MS
+    ]
+    if gaps:
+        first_left, first_right = gaps[0]
+        raise ValueError(
+            "Incomplete 3H Spot history: missing one or more UTC-aligned 3H buckets "
+            f"between {first_left} and {first_right} for {meta.get('source_symbol')}"
+        )
+    return candles_3h, meta
+
+
+def _fetch_closed_1h_spot(
+    symbol: str,
+    *,
+    resolved: dict[str, Any] | None = None,
+    limit: int | None = None,
+) -> tuple[list[Candle], dict[str, Any]]:
+    """Legacy diagnostic helper; the trading S/R snapshot does not call this."""
+    return _fetch_closed_spot(symbol, interval="1h", resolved=resolved, limit=limit)
+
+
+def get_spot_current_price(symbol: str, *, snapshot: dict[str, Any] | None = None) -> float:
+    """Get the current Binance Spot ticker price in the logical symbol's unit."""
+    if isinstance(snapshot, dict) and snapshot.get("source_symbol"):
+        resolved = {
+            "source_symbol": str(snapshot["source_symbol"]),
+            "source_price_scale": snapshot.get("source_price_scale", 1.0),
+        }
+    else:
+        resolved = resolve_spot_symbol(symbol)
+    _rate_limit_before_request()
+    response = _SESSION.get(
+        SR_SPOT_TICKER_PRICE_URL,
+        params={"symbol": resolved["source_symbol"]},
+        timeout=SR_HTTP_TIMEOUT_SEC,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Binance SPOT ticker response is not an object")
+    raw_price = _safe_price(payload.get("price"))
+    scale = float(resolved.get("source_price_scale", 1.0))
+    if raw_price is None or not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"Invalid Binance SPOT ticker price for {resolved['source_symbol']}: {payload!r}")
+    return raw_price * scale
 
 
 def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str, Any]:
@@ -282,9 +431,18 @@ def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str
         with _CACHE_LOCK:
             cached = _CACHE.get(key)
             if cached is not None:
-                return dict(cached)
+                cached_copy = dict(cached)
+                cached_ts = int(cached_copy.get("latest_closed_timestamp") or 0)
+                cached_age = max(
+                    0.0,
+                    (time.time() * 1000 - (cached_ts + SR_INTERVAL_MS - 1)) / 60_000.0,
+                )
+                if cached_ts > 0 and cached_age <= SR_MAX_DATA_AGE_MIN:
+                    cached_copy["latest_closed_age_min"] = cached_age
+                    return cached_copy
+                _CACHE.pop(key, None)
 
-    fetched = _fetch_closed_1h_spot(symbol, limit=limit) if limit is not None else _fetch_closed_1h_spot(symbol)
+    fetched = _fetch_closed_3h_spot(symbol, limit=limit) if limit is not None else _fetch_closed_3h_spot(symbol)
     if isinstance(fetched, tuple) and len(fetched) == 2:
         candles, resolved = fetched
     else:
@@ -308,13 +466,16 @@ def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str
         channel_w=SR_CHANNEL_W,
         strength_sr=SR_STRENGTH,
     )
-    latest_age_min = max(0.0, (time.time() * 1000 - (latest_ts + 3_599_999)) / 60_000.0)
+    latest_age_min = max(0.0, (time.time() * 1000 - (latest_ts + SR_INTERVAL_MS - 1)) / 60_000.0)
     if latest_age_min > SR_MAX_DATA_AGE_MIN:
         raise ValueError(f"SR SPOT data stale: latest_closed_age={latest_age_min:.2f}m > {SR_MAX_DATA_AGE_MIN:.2f}m")
 
     snapshot = dict(state)
     snapshot.update({
         "source": "binance_spot",
+        "timeframe": SR_TIMEFRAME,
+        "interval_ms": SR_INTERVAL_MS,
+        "closed_candle_count_3h": len(candles),
         "source_symbol": resolved["source_symbol"],
         "source_symbol_requested": resolved["requested_symbol"],
         "source_price_scale": resolved["source_price_scale"],
@@ -378,6 +539,145 @@ def _room_buffer(entry_price: float, risk_distance: float) -> float:
         entry_price * SR_TARGET_BUFFER_PCT / 100.0,
         risk_distance * SR_TARGET_BUFFER_R,
     )
+
+
+
+def evaluate_sr_directional_zone(
+    snapshot: dict[str, Any],
+    *,
+    current_price: float,
+    direction: str,
+) -> dict[str, Any]:
+    """Hard directional S/R gate for a closed 3H Binance Spot snapshot.
+
+    A pivot-low zone (``L`` / Demand) permits LONG only; a pivot-high zone
+    (``H`` / Supply) permits SHORT only. Only unbroken zones on the actionable
+    side of price are candidates. The nearest candidate zone decides the current
+    directional regime. Mixed-type ties are ambiguous and fail closed.
+
+    Distance is measured from the live Spot price to the nearest zone boundary,
+    divided by the live Spot price. Being inside the zone has distance zero.
+    """
+    d = str(direction or "").strip().upper()
+    if d not in {"LONG", "SHORT"}:
+        raise ValueError(f"Invalid direction={direction!r}")
+    price = _safe_price(current_price)
+    if price is None:
+        raise ValueError(f"Invalid Binance Spot current price={current_price!r}")
+    timeframe = str(snapshot.get("timeframe") or "").strip().lower()
+    if timeframe != "3h":
+        return {
+            "reject": True,
+            "reject_reason": "SR_TIMEFRAME_MISMATCH",
+            "expected_timeframe": "3h",
+            "actual_timeframe": timeframe or None,
+            "current_price": price,
+            "direction": d,
+        }
+    # The user-specified 5% rule is a hard invariant; callers cannot widen it.
+    limit_pct = SR_DIRECTIONAL_MAX_DISTANCE_PCT
+
+    eligible: list[dict[str, Any]] = []
+    for zone in _build_zones(snapshot):
+        lower = float(zone["lower"])
+        upper = float(zone["upper"])
+        kind = str(zone.get("kind", "")).upper()
+        if kind == "L":
+            # A Demand zone only remains actionable while price is in or above it.
+            # If price has broken below the entire zone, do not treat it as support.
+            if price < lower:
+                continue
+            distance = 0.0 if price <= upper else (price - upper) / price * 100.0
+            zone_type = "DEMAND"
+            allowed_direction = "LONG"
+        elif kind == "H":
+            # A Supply zone only remains actionable while price is in or below it.
+            # If price has broken above the entire zone, do not treat it as resistance.
+            if price > upper:
+                continue
+            distance = 0.0 if price >= lower else (lower - price) / price * 100.0
+            zone_type = "SUPPLY"
+            allowed_direction = "SHORT"
+        else:
+            continue
+        eligible.append({
+            **zone,
+            "zone_type": zone_type,
+            "allowed_direction": allowed_direction,
+            "distance_pct": max(0.0, float(distance)),
+        })
+
+    base = {
+        "source": snapshot.get("source"),
+        "timeframe": timeframe,
+        "source_symbol": snapshot.get("source_symbol"),
+        "snapshot_latest_closed_timestamp": snapshot.get("latest_closed_timestamp"),
+        "snapshot_latest_closed_age_min": snapshot.get("latest_closed_age_min"),
+        "current_price": price,
+        "direction": d,
+        "max_distance_pct": limit_pct,
+    }
+    if not eligible:
+        return {
+            **base,
+            "reject": True,
+            "reject_reason": "NO_VALID_DEMAND_OR_SUPPLY_ZONE",
+            "nearest_zone": None,
+            "allowed_direction": None,
+            "distance_pct": None,
+        }
+
+    eligible.sort(key=lambda z: (
+        float(z["distance_pct"]),
+        -int(z.get("points", 0)),
+        -int(z.get("countpp", 0)),
+        float(z["center"]),
+    ))
+    nearest_distance = float(eligible[0]["distance_pct"])
+    tied = [z for z in eligible if abs(float(z["distance_pct"]) - nearest_distance) <= 1e-9]
+    tied_types = {str(z["zone_type"]) for z in tied}
+    if len(tied_types) > 1:
+        return {
+            **base,
+            "reject": True,
+            "reject_reason": "AMBIGUOUS_NEAREST_DEMAND_SUPPLY_ZONE",
+            "nearest_zone": tied,
+            "allowed_direction": None,
+            "distance_pct": nearest_distance,
+        }
+
+    nearest = eligible[0]
+    allowed = str(nearest["allowed_direction"])
+    if nearest_distance > limit_pct + 1e-9:
+        return {
+            **base,
+            "reject": True,
+            "reject_reason": "NO_DIRECTIONAL_ZONE_WITHIN_DISTANCE",
+            "nearest_zone": nearest,
+            "zone_type": nearest["zone_type"],
+            "allowed_direction": allowed,
+            "distance_pct": nearest_distance,
+        }
+    if d != allowed:
+        return {
+            **base,
+            "reject": True,
+            "reject_reason": "DIRECTION_CONTRADICTS_CURRENT_ZONE",
+            "nearest_zone": nearest,
+            "zone_type": nearest["zone_type"],
+            "allowed_direction": allowed,
+            "distance_pct": nearest_distance,
+        }
+    return {
+        **base,
+        "reject": False,
+        "reject_reason": None,
+        "nearest_zone": nearest,
+        "zone_type": nearest["zone_type"],
+        "allowed_direction": allowed,
+        "distance_pct": nearest_distance,
+        "alignment": "LONG_IN_DEMAND" if allowed == "LONG" else "SHORT_IN_SUPPLY",
+    }
 
 
 def evaluate_sr_room(
