@@ -150,6 +150,8 @@ def test_release_uses_fixed_seven_percent_stop():
     assert 'TREND_FILTER_MIN_1H_BARS: "400"' in workflow
     assert 'TREND_FILTER_MIN_4H_BARS: "400"' in workflow
     assert 'TREND_FILTER_REQUIRE_PERSISTENCE: "false"' in workflow
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = True' in Path("run_once.py").read_text(encoding="utf-8")
+    assert 'SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0' in Path("event_engine/sr_context.py").read_text(encoding="utf-8")
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
     assert 'MAX_ENTRY_RISK_PCT: "7.00"' in workflow
@@ -162,14 +164,17 @@ def test_release_has_no_legacy_sr_tp3_cap_setting():
     assert "apply_sr_tp3_cap" not in workflow
 
 
-def test_release_temporarily_disables_ajay_sr_room():
+def test_release_enforces_directional_3h_spot_gate_and_keeps_optional_room_off():
     workflow = _workflow()
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = True' in Path("run_once.py").read_text(encoding="utf-8")
+    assert 'SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0' in Path("event_engine/sr_context.py").read_text(encoding="utf-8")
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
-    assert 'AJAY_SR_REQUIRE_DATA: "false"' in workflow
+    assert 'AJAY_SR_REQUIRE_DATA: "true"' in workflow
     assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
     assert 'AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"' in workflow
     assert 'AJAY_SR_KLINE_LIMIT_1H: "1000"' in workflow
+    assert 'AJAY_SR_MAX_DATA_AGE_MIN: "190"' in workflow
     assert 'AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"' in workflow
     assert 'AJAY_SR_RB: "10"' in workflow
     assert 'AJAY_SR_PRD: "284"' in workflow
@@ -182,12 +187,15 @@ def test_pine_sr_manual_diagnostic_workflow_is_spot_only():
     assert 'BTC-USDT' in wf
 
 
-def test_release_keeps_sr_room_disabled_and_uses_lazy_cached_snapshot():
+def test_release_has_mandatory_3h_direction_gate_and_cached_spot_snapshot():
     workflow = _workflow()
     runtime = Path('run_once.py').read_text(encoding='utf-8')
-    assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
-    assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
+    sr_source = Path('event_engine/sr_context.py').read_text(encoding='utf-8')
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = True' in runtime
     assert 'get_cached_sr_snapshot' in runtime
+    assert 'evaluate_sr_directional_zone' in runtime
+    assert 'interval="1h"' in sr_source
+    assert '_aggregate_closed_3h_candles' in sr_source
     assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
 
 
@@ -420,9 +428,9 @@ def test_release_version_and_billing_modes_documented():
     # VERSION marker is intentionally not required by runtime or CI.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.21"' in runtime
+    assert 'APP_VERSION = "V10.4.25"' in runtime
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_21.md').read_text(encoding='utf-8')
+    notes = Path('RELEASE_NOTES_V10_4_25.md').read_text(encoding='utf-8')
     assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
     assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
     assert 'estimated_gross_pnl_usdt' in notes

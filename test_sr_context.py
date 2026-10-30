@@ -28,6 +28,8 @@ def _snapshot(*zones):
         accepted.append({"price": center, "kind": kind, "points": 2, "countpp": len(accepted) + 1})
     return {
         "source": "binance_spot",
+        "timeframe": "3h",
+        "interval_ms": 10_800_000,
         "source_symbol": "TESTUSDT",
         "latest_closed_timestamp": 1_000_000,
         "latest_closed_age_min": 10.0,
@@ -216,10 +218,14 @@ def test_lazy_sr_fetch_is_cached_per_latest_closed_bar(monkeypatch):
     import event_engine.sr_context as sr
     sr.clear_sr_cache()
     calls = {"n": 0}
-    candles = [sr.Candle(i * 3_600_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
-    fake_now = (candles[-1].ts + 3_599_999 + 60_000) / 1000.0
+    candles = [sr.Candle(i * 10_800_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
+    fake_now = (candles[-1].ts + 10_799_999 + 60_000) / 1000.0
     monkeypatch.setattr(sr.time, "time", lambda: fake_now)
-    monkeypatch.setattr(sr, "_fetch_closed_1h_spot", lambda symbol: calls.__setitem__("n", calls["n"] + 1) or candles)
+    monkeypatch.setattr(sr, "_fetch_closed_3h_spot", lambda symbol: calls.__setitem__("n", calls["n"] + 1) or (candles, {
+        "requested_symbol": "TESTUSDT", "source_symbol": "TESTUSDT", "underlying_asset": "TEST",
+        "source_price_scale": 1.0, "source_volume_scale": 1.0, "source_contract_multiplier": 1.0,
+        "source_alias_kind": "EXACT",
+    }))
     monkeypatch.setattr(sr, "compute_current_sr", lambda *args, **kwargs: {
         "levels": [1.0], "sr_levels": [None, 1.0], "highestph": 2.0, "lowestpl": 0.5,
         "cwidth": 0.1, "event_idx": 250, "event_timestamp": candles[250].ts, "accepted": [],
@@ -557,7 +563,7 @@ def test_custom_sr_limit_is_passed_to_spot_klines_without_using_cache(monkeypatc
     import event_engine.sr_context as sr
     sr.clear_sr_cache()
     seen = {}
-    candles = [sr.Candle(i * 3_600_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
+    candles = [sr.Candle(i * 10_800_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
     def fake_fetch(symbol, **kwargs):
         seen.update(kwargs)
         return candles, {
@@ -569,8 +575,8 @@ def test_custom_sr_limit_is_passed_to_spot_klines_without_using_cache(monkeypatc
             "source_contract_multiplier": 1.0,
             "source_alias_kind": "EXACT",
         }
-    monkeypatch.setattr(sr, "_fetch_closed_1h_spot", fake_fetch)
-    monkeypatch.setattr(sr.time, "time", lambda: (candles[-1].ts + 3_599_999 + 60_000) / 1000.0)
+    monkeypatch.setattr(sr, "_fetch_closed_3h_spot", fake_fetch)
+    monkeypatch.setattr(sr.time, "time", lambda: (candles[-1].ts + 10_799_999 + 60_000) / 1000.0)
     monkeypatch.setattr(sr, "compute_current_sr", lambda *args, **kwargs: {
         "levels": [1.0], "sr_levels": [None, 1.0], "highestph": 2.0, "lowestpl": 0.5,
         "cwidth": 0.1, "event_idx": 250, "event_timestamp": candles[250].ts, "accepted": [],

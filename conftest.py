@@ -23,6 +23,7 @@ def isolate_production_entry_gates(monkeypatch, tmp_path):
 
     # Keep ordinary unit/integration tests deterministic even when CI exports
     # production VST settings such as AJAY_SR_ROOM_MODE=enforce.
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
     monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", False)

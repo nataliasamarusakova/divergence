@@ -66,8 +66,9 @@ def test_source_tick_size_fails_closed_on_catalog_error(monkeypatch):
     ) is None
 
 
-def test_main_prints_resolved_snapshot_without_network(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["pine_sr_diagnostic.py", "--symbol", "BTC-USDT", "--limit", "400"])
+def test_main_prints_resolved_snapshot_and_exports_zone_bands_without_network(monkeypatch, capsys, tmp_path):
+    output_csv = tmp_path / "zones.csv"
+    monkeypatch.setattr(sys, "argv", ["pine_sr_diagnostic.py", "--symbol", "BTC-USDT", "--limit", "900", "--output", str(output_csv)])
     monkeypatch.setattr(
         diagnostic,
         "resolve_spot_symbol",
@@ -82,16 +83,34 @@ def test_main_prints_resolved_snapshot_without_network(monkeypatch, capsys):
     monkeypatch.setattr(
         diagnostic,
         "get_cached_sr_snapshot",
-        lambda symbol, limit: {"highestph": 100.0, "levels": [99.5, 98.75], "lowestpl": 97.0, "cwidth": 0.02},
+        lambda symbol, limit: {"highestph": 100.0, "levels": [99.5, 98.75], "lowestpl": 97.0, "cwidth": 0.02, "zone_scale": 1.0, "accepted": [{"price": 99.5, "kind": "L", "points": 3, "countpp": 1}], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333, "latest_closed_age_min": 12.0},
     )
     monkeypatch.setattr(diagnostic, "_source_tick_size", lambda resolved: 0.25)
+    monkeypatch.setattr(diagnostic, "get_spot_current_price", lambda symbol, snapshot: 100.0)
 
     assert diagnostic.main() == 0
     output = capsys.readouterr().out
     assert "REQUESTED=BTCUSDT" in output
     assert "SOURCE_SYMBOL=BTCUSDT" in output
+    assert "TIMEFRAME=3h | SOURCE_KLINE_INTERVAL=1h_AGGREGATED" in output
     assert "HIGH LEVEL: 100.00" in output
     assert "99.50" in output
     assert "98.75" in output
     assert "LOW LEVEL: 97.00" in output
     assert "CWIDTH: 0.02" in output
+    assert "DEMAND | center=99.50 | band=[99.50, 99.50]" in output
+    assert "CLOSED_3H_BARS=333" in output
+    assert "ZONE_COUNT=1" in output
+    assert output_csv.exists()
+    import csv
+    with output_csv.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["zone_type"] == "DEMAND"
+    assert float(rows[0]["center"]) == pytest.approx(99.5)
+
+
+def test_main_rejects_too_few_source_hours(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["pine_sr_diagnostic.py", "--symbol", "BTC-USDT", "--limit", "899"])
+    with pytest.raises(SystemExit) as exc:
+        diagnostic.main()
+    assert exc.value.code == 2

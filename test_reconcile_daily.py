@@ -288,11 +288,22 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     })
     alerts = []
     monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
-    monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "V10.4.21")
+    monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "V10.4.25")
 
     report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=True)
     warning = next(item for item in report["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
     assert "shape_fingerprint=ABC123" in warning["detail"]
     assert "incomeHistory" in warning["detail"]
-    assert report["build_version"] == "V10.4.21"
-    assert "Build: <code>V10.4.21</code>" in alerts[0]
+    assert report["build_version"] == "V10.4.25"
+    assert "Build: <code>V10.4.25</code>" in alerts[0]
+
+
+def test_trump_legacy_exchange_symbol_is_canonicalized_without_merging_sol():
+    assert recon._canonical_position_symbol("TRUMP") == "TRUMP-USDT"
+    assert recon._canonical_position_symbol("TRUMPUSDT") == "TRUMP-USDT"
+    assert recon._canonical_position_symbol("TRUMP-USDT") == "TRUMP-USDT"
+    assert recon._canonical_position_symbol("TRUMPSOL-USDT") == "TRUMP-USDT"
+    assert recon._canonical_position_symbol("TRUMPSOLUSDT") == "TRUMP-USDT"
+    assert recon._canonical_position_symbol("SOL") == "SOL-USDT"
+    assert recon._canonical_position_symbol("SOL-USDT") == "SOL-USDT"
+    assert recon._canonical_position_symbol("TRUMP-SOL-USDT") == "TRUMP-SOL-USDT"

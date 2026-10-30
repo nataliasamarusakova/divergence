@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.21"
+APP_VERSION = "V10.4.25"
 
 import pandas as pd
 import requests
@@ -85,7 +85,10 @@ from event_engine.signals import (
 )
 from event_engine.sr_context import (
     get_cached_sr_snapshot,
+    get_spot_current_price,
+    evaluate_sr_directional_zone,
     evaluate_sr_room,
+    SR_DIRECTIONAL_MAX_DISTANCE_PCT,
     SRSymbolUnavailableError,
 )
 from event_engine.telegram import send as send_tg, format_signal
@@ -310,8 +313,12 @@ SQUEEZE_TP_RR = (1.00, 1.50)
 SQUEEZE_TP_FRACTIONS = (0.30, 0.70)
 SQUEEZE_PLANNED_WEIGHTED_RR = 1.3500
 
-# Ajay R5.41 S/R room is intentionally evaluated lazily for final candidates only.
-# Current source is Binance SPOT 1H. Keep venue expansion explicit and independently tested.
+# Mandatory 3H Binance Spot Demand/Supply direction gate. This is deliberately
+# separate from the optional TP-room geometry below: the direction gate is a
+# hard pre-order rule and defaults ON; the legacy TP-room check remains optional.
+SR_3H_DIRECTIONAL_GATE_ENABLED = True  # hard invariant; no environment variable can disable it
+
+# Optional Ajay R5.41 opposing-zone/TP-room check, now sourced from the same 3H snapshot.
 AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
 AJAY_SR_ROOM_MODE = os.environ.get("AJAY_SR_ROOM_MODE", "shadow").strip().lower()
 if AJAY_SR_ROOM_MODE not in {"off", "shadow", "enforce"}:
@@ -4253,17 +4260,78 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "execution_quality": {"signal_to_pre_order_drift_pct": pre_order_drift, "trigger_to_pre_order_drift_pct": trigger_live_drift, "pre_order_price": live_reference, "drift_limit_pct": drift_limit},
         }
 
-    # Final, lazy S/R room check: only now, for a candidate that survived all
-    # previous gates and has a current BingX price. The S/R source is deliberately
-    # Binance SPOT 1H for now; the rest of the execution path remains unchanged.
+    # Mandatory final 3H Binance Spot Demand/Supply direction check. It is
+    # independent of the optional TP-room setting below and always runs before
+    # open_market(). Binance Spot price is used for zone distance; BingX remains
+    # the execution venue and its live price above remains the execution reference.
     sr_result: dict[str, Any] | None = None
     sr_snapshot: dict[str, Any] | None = None
-    if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off":
-        # Data retrieval is the only part of the S/R path that may be bypassed
-        # when AJAY_SR_REQUIRE_DATA=false. Geometry/evaluation errors are fail-safe: they
-        # must never silently turn into an unvalidated market entry.
+    if SR_3H_DIRECTIONAL_GATE_ENABLED:
         try:
             sr_snapshot = get_cached_sr_snapshot(symbol)
+            sr_spot_price = get_spot_current_price(symbol, snapshot=sr_snapshot)
+            sr_direction_result = evaluate_sr_directional_zone(
+                sr_snapshot,
+                current_price=float(sr_spot_price),
+                direction=direction,
+            )
+        except SRSymbolUnavailableError as exc:
+            record_action({
+                "record_type": "SR_3H_DIRECTIONAL_GATE",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "event_type": event_type_for_risk,
+                "decision": "BLOCKED", "reason": "SR_SYMBOL_UNAVAILABLE",
+                "error": str(exc), "ts": int(time.time() * 1000),
+            })
+            return {"status": "SR_SYMBOL_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
+        except Exception as exc:
+            record_action({
+                "record_type": "SR_3H_DIRECTIONAL_GATE",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "event_type": event_type_for_risk,
+                "decision": "BLOCKED", "reason": "SR_3H_DATA_UNAVAILABLE",
+                "error": str(exc), "ts": int(time.time() * 1000),
+            })
+            log.warning("[SR_3H] %s %s blocked: 3H Spot S/R or current Spot price unavailable: %s", direction, symbol, exc)
+            return {"status": "SR_DATA_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
+
+        setup["sr_3h_directional_context"] = sr_direction_result
+        record_action({
+            "record_type": "SR_3H_DIRECTIONAL_GATE",
+            "event_id": event_id, "symbol": symbol, "direction": direction,
+            "event_type": event_type_for_risk,
+            "decision": "BLOCKED" if sr_direction_result.get("reject") else "ALLOWED",
+            "reason": sr_direction_result.get("reject_reason"),
+            "sr_3h": sr_direction_result,
+            "ts": int(time.time() * 1000),
+        })
+        if sr_direction_result.get("reject"):
+            log.info(
+                "[SR_3H] %s %s entry rejected: reason=%s zone=%s allowed=%s distance_pct=%s max_pct=%.4f",
+                direction, symbol, sr_direction_result.get("reject_reason"),
+                sr_direction_result.get("zone_type"), sr_direction_result.get("allowed_direction"),
+                sr_direction_result.get("distance_pct"), SR_DIRECTIONAL_MAX_DISTANCE_PCT,
+            )
+            return {
+                "status": "SR_3H_DIRECTIONAL_REJECTED", "mode": EXECUTION_MODE,
+                "order_id": None, "position": {},
+                "error": str(sr_direction_result.get("reject_reason") or "SR_3H_DIRECTIONAL_REJECTED"),
+                "sr_3h": sr_direction_result,
+            }
+        log.info(
+            "[SR_3H] %s %s allowed: %s zone distance=%.4f%% (limit %.4f%%)",
+            direction, symbol, sr_direction_result.get("zone_type"),
+            float(sr_direction_result.get("distance_pct", 0.0)), SR_DIRECTIONAL_MAX_DISTANCE_PCT,
+        )
+
+    # Optional TP-room geometry check. It reuses the mandatory 3H snapshot when
+    # the directional gate is enabled; it never fetches a second timeframe.
+    if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off":
+        # Data retrieval may be optional only for this legacy TP-room check. The
+        # mandatory direction gate above has already failed closed when required.
+        try:
+            if sr_snapshot is None:
+                sr_snapshot = get_cached_sr_snapshot(symbol)
         except SRSymbolUnavailableError as exc:
             record_action({
                 "event_id": event_id, "symbol": symbol, "direction": direction,
@@ -6153,6 +6221,10 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif status_now == "SR_3H_DIRECTIONAL_REJECTED":
+                    terminal_reason = "SR_3H_DIRECTIONAL_REJECTED"
+                    stats["rejected_sr_3h_direction"] = stats.get("rejected_sr_3h_direction", 0) + 1
+                    log.info("[SR_3H] %s (%s) rejected by mandatory 3H Demand/Supply direction gate: %s", symbol, direction, execution_result.get("error"))
                 elif status_now == "SR_SYMBOL_UNAVAILABLE":
                     terminal_reason = "SR_SYMBOL_UNAVAILABLE"
                     stats["rejected_sr_symbol"] = stats.get("rejected_sr_symbol", 0) + 1

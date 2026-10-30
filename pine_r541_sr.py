@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Standalone, exact-ish reproduction of the supplied Ajay R5.41 Pine S/R block.
 
-This module only computes the visible SR state from closed 1H OHLCV candles.
+This module only computes the visible SR state from closed 3H OHLCV candles.
 It does not import or modify the trading engine.
 
 Parameters reproduced from the supplied block:
