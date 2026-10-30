@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793376121631,
+  "updated_ts": 1793376577842,
   "events": [
     {
       "event_id": "EVT_C723A06A37462ED7",
@@ -3200,6 +3200,86 @@
         "range_high": 0.029117,
         "range_low": 0.028044,
         "manipulation_depth_atr": 0.10653496444142486,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4D08DFF9C4E7FCCC",
+      "symbol": "BLESS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_MACD",
+      "timestamps": {
+        "pivot_1_ts": 1793339999999,
+        "pivot_2_ts": 1793368799999,
+        "detected_at_ts": 1793375999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.009853,
+        "p1_price": 0.013394,
+        "p2_price": 0.013938,
+        "p1_indicator": 0.0006256768252096735,
+        "p2_indicator": 0.0005977368000450161,
+        "bars_between": 8,
+        "price_delta_atr": 0.6720535255897472,
+        "price_delta_pct": 4.0615200836195395,
+        "volume_ratio_20": 3.7374139414456806,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.011429757697038153,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_2E799C5D36DFACB4",
+      "symbol": "BLESS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1793375999999,
+        "pivot_2_ts": 1793375999999,
+        "detected_at_ts": 1793375999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.009853,
+        "bb_width": 0.0030440515370145672,
+        "kc_width": 0.002923394987497368,
+        "squeeze_duration_bars": 5,
+        "compression_ratio": 1.041272749673998,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.011290602506251315,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E6145FD86D113694",
+      "symbol": "BLESS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793321999999,
+        "pivot_2_ts": 1793375999999,
+        "detected_at_ts": 1793375999999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.013467,
+        "zone_high": 0.013938,
+        "zone_low": 0.013467,
+        "bos_level": 0.011725,
+        "ob_ts": 1793368799999,
+        "displacement_atr": 3.557269032873346,
+        "volume_ratio": 3.7374139414456806,
+        "body_fraction": 0.9503121748178984,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
