@@ -36,10 +36,18 @@ from event_engine.json_safe import json_safe
 
 log = logging.getLogger("event_engine.tracker")
 
+
+class ActiveTradeStateError(RuntimeError):
+    """Raised when persisted position state cannot be trusted safely."""
+
+
 DATA = Path("data")
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 NOTIFICATIONS_PATH = DATA / "notifications.json"
+# Separate durable fallback for unresolved entry-order quarantines when the main
+# active-trade state cannot be read or atomically updated. It is never auto-cleared.
+ENTRY_ORDER_QUARANTINE_LATCH_PATH = DATA / "entry_order_quarantine_latch.json"
 
 # Early-loss exits were explicitly disabled by the operator. Keep the old
 # thresholds only for historical compatibility/telemetry, but fail closed in
@@ -225,47 +233,93 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _load_entry_order_quarantine_latches() -> dict[str, dict]:
+    """Read fail-closed fallback entry locks; malformed latch state blocks entries."""
+    if not ENTRY_ORDER_QUARANTINE_LATCH_PATH.exists():
+        return {}
+    try:
+        data = json.loads(ENTRY_ORDER_QUARANTINE_LATCH_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ActiveTradeStateError(f"entry-order quarantine latch is unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ActiveTradeStateError("entry-order quarantine latch root must be a JSON object")
+    result: dict[str, dict] = {}
+    for lock_id, lock in data.items():
+        if not isinstance(lock, dict):
+            raise ActiveTradeStateError(f"entry-order quarantine latch {lock_id!r} must be an object")
+        symbol = str(lock.get("symbol") or "").strip()
+        direction = str(lock.get("direction") or "").upper()
+        if not symbol or direction not in {"LONG", "SHORT"}:
+            raise ActiveTradeStateError(f"entry-order quarantine latch {lock_id!r} has invalid symbol/direction")
+        result[str(lock_id)] = dict(lock)
+    return result
+
+
+def _save_entry_order_quarantine_latches(latches: dict[str, dict]) -> None:
+    payload = json.dumps(json_safe(latches), ensure_ascii=False, indent=2, allow_nan=False)
+    _durable_replace_text(ENTRY_ORDER_QUARANTINE_LATCH_PATH, payload)
+
+
 def _load_active_trades() -> dict[str, dict]:
+    """Load trusted active-position state or raise; never silently return empty.
+
+    A corrupt or structurally invalid file may contain the only local record of
+    an open/unprotected position or an entry-order quarantine. Returning ``{}``
+    here would convert an unknown state into permission to open another trade.
+    Legacy ``tp_orders: null`` remains normalized for backward compatibility.
+    """
     if not ACTIVE_TRADES_PATH.exists():
         return {}
     try:
         data = json.loads(ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            normalized = {}
-            for event_id, trade in data.items():
-                if not isinstance(trade, dict):
-                    log.error("[TRACKER] Invalid state record %s: expected object, got %s; skipping record", event_id, type(trade).__name__)
-                    continue
-                try:
-                    t = dict(trade)
-                    tp_orders = t.get("tp_orders")
-                    if tp_orders is None:
-                        t["tp_orders"] = []
-                    elif not isinstance(tp_orders, list):
-                        log.error("[TRACKER] Invalid tp_orders for state record %s: expected list, got %s; normalizing to []", event_id, type(tp_orders).__name__)
-                        t["tp_orders"] = []
-                    t.setdefault("mae_pct", 0.0)
-                    t.setdefault("max_drawdown_pct", 0.0)
-                    t.setdefault("be_required", False)
-                    t.setdefault("be_last_error", None)
-                    t.setdefault("sl_order_history", [])
-                    tp_order_count = len(t["tp_orders"])
-                    t.setdefault("tp_mode", "single_tp" if tp_order_count == 1 else ("two_tp" if tp_order_count == 2 else "multi_tp"))
-                    t.setdefault("effective_tp_levels", t.get("tp_levels", []))
-                    t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.6625))
-                    t.setdefault("close_journal_pending", False)
-                    t.setdefault("close_notification_pending", False)
-                    t.setdefault("close_cleanup_pending", False)
-                    t.setdefault("close_cleanup_last_error", None)
-                    normalized[str(event_id)] = t
-                except Exception as exc:
-                    log.error("[TRACKER] Invalid state record %s: %s; skipping record", event_id, exc)
-            return normalized
-        log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
-        return {}
     except Exception as exc:
-        log.error("[TRACKER] Corrupt state in %s: %s", ACTIVE_TRADES_PATH, exc)
-        return {}
+        log.critical("[TRACKER] Active trade state is unreadable (%s): %s", ACTIVE_TRADES_PATH, exc)
+        raise ActiveTradeStateError(f"active trade state is unreadable: {ACTIVE_TRADES_PATH}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        message = f"active trade state root must be a JSON object, got {type(data).__name__}"
+        log.critical("[TRACKER] %s", message)
+        raise ActiveTradeStateError(message)
+
+    normalized: dict[str, dict] = {}
+    for event_id, trade in data.items():
+        if not isinstance(trade, dict):
+            message = f"active trade record {event_id!r} must be an object, got {type(trade).__name__}"
+            log.critical("[TRACKER] %s", message)
+            raise ActiveTradeStateError(message)
+        try:
+            t = dict(trade)
+            tp_orders = t.get("tp_orders")
+            if tp_orders is None:
+                t["tp_orders"] = []
+            elif not isinstance(tp_orders, list):
+                raise TypeError(f"tp_orders must be a list or null, got {type(tp_orders).__name__}")
+            if any(not isinstance(order, dict) for order in t["tp_orders"]):
+                raise TypeError("tp_orders must contain only objects")
+            if not isinstance(t.get("sl_order_history", []), list):
+                raise TypeError("sl_order_history must be a list")
+            effective_tp_levels = t.get("effective_tp_levels", t.get("tp_levels", []))
+            if effective_tp_levels is not None and not isinstance(effective_tp_levels, list):
+                raise TypeError("effective_tp_levels/tp_levels must be a list")
+            t.setdefault("mae_pct", 0.0)
+            t.setdefault("max_drawdown_pct", 0.0)
+            t.setdefault("be_required", False)
+            t.setdefault("be_last_error", None)
+            t.setdefault("sl_order_history", [])
+            tp_order_count = len(t["tp_orders"])
+            t.setdefault("tp_mode", "single_tp" if tp_order_count == 1 else ("two_tp" if tp_order_count == 2 else "multi_tp"))
+            t.setdefault("effective_tp_levels", t.get("tp_levels", []))
+            t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.6625))
+            t.setdefault("close_journal_pending", False)
+            t.setdefault("close_notification_pending", False)
+            t.setdefault("close_cleanup_pending", False)
+            t.setdefault("close_cleanup_last_error", None)
+            normalized[str(event_id)] = t
+        except Exception as exc:
+            message = f"invalid active trade record {event_id!r}: {exc}"
+            log.critical("[TRACKER] %s", message)
+            raise ActiveTradeStateError(message) from exc
+    return normalized
 
 
 def _save_active_trades(trades: dict[str, dict]) -> None:
@@ -309,6 +363,90 @@ def queue_protection_cleanup_pending(
     _save_active_trades(trades)
     log.critical("[TRACKER] Persisted rollback protection cleanup pending for %s %s (id=%s): %s", canonical_symbol, direction, cleanup_id, reason)
     return cleanup_id
+
+
+def queue_entry_order_resolution_pending(
+    symbol: str,
+    direction: str,
+    reason: str,
+    *,
+    source_event_id: str | None = None,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+    order_status: str | None = None,
+    position_snapshot: dict | None = None,
+) -> str:
+    """Persist a fail-closed symbol-side lock for an unresolved MARKET entry.
+
+    Unlike ordinary protection-cleanup records, this quarantine must not be
+    auto-cleared by the closed-position cleanup routine: an entry order may
+    still be live and could fill after a currently empty position snapshot.
+    It remains visible in active_trades.json for operator reconciliation.
+    """
+    direction = str(direction or "").upper()
+    canonical_symbol = to_bx_symbol(symbol) or str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if direction not in {"LONG", "SHORT"} or not canonical_symbol:
+        raise ValueError("valid symbol and LONG/SHORT direction are required for entry-order quarantine")
+    quarantine_id = "ENTRY_ORDER_PENDING_" + hashlib.sha256(
+        f"{canonical_symbol}|{direction}".encode("utf-8")
+    ).hexdigest()[:20].upper()
+    quarantine_record = {
+        "event_id": quarantine_id,
+        "symbol": canonical_symbol,
+        "direction": direction,
+        "closed": False,
+        "remaining_qty": 0.0,
+        "initial_qty": 0.0,
+        "entry_price": 0.0,
+        "close_cleanup_pending": True,
+        "close_cleanup_last_error": str(reason)[:1000],
+        "entry_order_resolution_pending": True,
+        "entry_order_id": str(order_id or ""),
+        "entry_client_order_id": str(client_order_id or ""),
+        "entry_order_status": str(order_status or "UNKNOWN").upper(),
+        "entry_order_resolution_source_event_id": str(source_event_id or ""),
+        "entry_position_snapshot": position_snapshot if isinstance(position_snapshot, dict) else None,
+        "close_notification_pending": False,
+        "close_journal_pending": False,
+    }
+    try:
+        trades = _load_active_trades()
+        prior = trades.get(quarantine_id, {}) if isinstance(trades.get(quarantine_id), dict) else {}
+        prior.update(quarantine_record)
+        trades[quarantine_id] = prior
+        _save_active_trades(trades)
+    except Exception as primary_exc:
+        # Keep a second durable lock outside active_trades.json. If that state
+        # file is malformed/read-only, a successful fallback write still blocks
+        # future entries. The latch requires explicit operator resolution.
+        try:
+            latches = _load_entry_order_quarantine_latches()
+            latches[quarantine_id] = {
+                **quarantine_record,
+                "fallback_latch": True,
+                "primary_state_error": str(primary_exc)[:1000],
+            }
+            _save_entry_order_quarantine_latches(latches)
+        except Exception as fallback_exc:
+            log.critical(
+                "[TRACKER] FAILED TO PERSIST both active-state quarantine and fallback latch for %s %s: primary=%s fallback=%s",
+                canonical_symbol, direction, primary_exc, fallback_exc,
+            )
+            raise ActiveTradeStateError(
+                f"could not persist unresolved entry quarantine for {canonical_symbol} {direction}: "
+                f"active-state error={primary_exc}; fallback-latch error={fallback_exc}"
+            ) from fallback_exc
+        log.critical(
+            "[TRACKER] Primary active state write failed; persisted fallback entry quarantine for %s %s (id=%s): %s",
+            canonical_symbol, direction, quarantine_id, primary_exc,
+        )
+        return quarantine_id
+
+    log.critical(
+        "[TRACKER] Persisted unresolved MARKET entry quarantine for %s %s (id=%s, order_id=%s, client_order_id=%s): %s",
+        canonical_symbol, direction, quarantine_id, order_id or "UNKNOWN", client_order_id or "UNKNOWN", reason,
+    )
+    return quarantine_id
 
 
 def _load_close_record(event_id: str) -> dict | None:
@@ -2379,6 +2517,13 @@ def update_active_trades() -> None:
                 continue
 
             trade["closed"] = False
+            updated_trades[event_id] = trade
+            continue
+
+        if trade.get("entry_order_resolution_pending"):
+            # The entry order may still execute after an empty position snapshot.
+            # Do not run closed-position cleanup or auto-release this symbol-side
+            # lock until the order is independently reconciled by an operator.
             updated_trades[event_id] = trade
             continue
 

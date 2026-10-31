@@ -777,13 +777,45 @@ def _query_order(symbol: str, *, order_id: str | int | None = None, client_order
                 continue
             try:
                 value = float(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(value) and value > 0:
                 return value
         return 0.0
 
-    executed_qty = _first_positive_float("executedQty", "cumQty", "stopExecutedQty", "executedQuantity", "cumulatedQuantity")
+    def _first_nonnegative_float(*keys: str) -> float | None:
+        """Return an explicit finite non-negative exchange value, else None.
+
+        Missing/malformed execution quantity is UNKNOWN, not a confirmed zero.
+        This distinction is safety-critical because entry retry is allowed only
+        after the exchange explicitly confirms that no quantity was executed.
+        """
+        saw_explicit_zero = False
+        saw_malformed_value = False
+        for key in keys:
+            if key not in order:
+                continue
+            raw = order.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                saw_malformed_value = True
+                continue
+            if not math.isfinite(value) or value < 0:
+                saw_malformed_value = True
+                continue
+            if value > 0:
+                # Some BingX conditional-order payloads expose executedQty=0
+                # while stopExecutedQty/cumulatedQuantity reports the fill.
+                return value
+            saw_explicit_zero = True
+        if saw_malformed_value:
+            return None
+        return 0.0 if saw_explicit_zero else None
+
+    executed_qty = _first_nonnegative_float("executedQty", "cumQty", "stopExecutedQty", "executedQuantity", "cumulatedQuantity")
     avg_price = _first_positive_float("avgPrice", "avgFillPrice", "fillAvgPrice", "averagePrice", "executedAvgPrice")
     trigger_price = _first_float("stopPrice", "triggerPrice", "activationPrice")
     orig_qty = _first_positive_float("origQty", "quantity", "qty")
@@ -1235,6 +1267,184 @@ def _new_open_client_order_id(bx_symbol: str, trade_id: str, retry_index: int = 
     return f"EVTOPEN{digest}"
 
 
+def _resolve_submitted_market_entry_order(
+    symbol: str,
+    direction: str,
+    *,
+    order_id: str | None = None,
+    client_order_id: str,
+) -> dict:
+    """Resolve a submitted MARKET entry to a terminal exchange order state.
+
+    A successful POST acknowledgement or the presence of an order ID is not a
+    fill confirmation. Active orders are canceled and queried until a terminal
+    state is observed. Any unresolved state is returned as UNKNOWN and must not
+    be retried as a new entry.
+    """
+    requested_order_id = str(order_id or "").strip()
+    try:
+        queried = (
+            get_order(symbol, requested_order_id)
+            if requested_order_id
+            else get_order_by_client_order_id(symbol, client_order_id)
+        )
+    except Exception as exc:
+        queried = {"status": "error", "error": f"order_lookup_exception:{type(exc).__name__}:{exc}"}
+
+    if not isinstance(queried, dict) or queried.get("status") != "ok":
+        return {
+            "resolution": "unknown",
+            "lookup_failed": True,
+            "error": str((queried or {}).get("error") or "entry_order_lookup_failed") if isinstance(queried, dict) else "entry_order_lookup_invalid_response",
+            "order_id": requested_order_id or None,
+            "client_order_id": client_order_id,
+            "order_lookup": queried,
+        }
+
+    resolved_order_id = str(queried.get("order_id") or requested_order_id or "").strip()
+    if not resolved_order_id:
+        return {
+            "resolution": "unknown", "lookup_failed": True,
+            "error": "entry_order_lookup_did_not_return_order_id",
+            "order_id": None, "client_order_id": client_order_id,
+            "order_lookup": queried,
+        }
+    if requested_order_id and resolved_order_id != requested_order_id:
+        return {
+            "resolution": "unknown", "lookup_failed": True,
+            "error": "entry_order_lookup_order_id_mismatch",
+            "order_id": requested_order_id, "resolved_order_id": resolved_order_id,
+            "client_order_id": client_order_id, "order_lookup": queried,
+        }
+    queried_client_order_id = str(queried.get("client_order_id") or "").strip()
+    if queried_client_order_id and client_order_id and queried_client_order_id.upper() != str(client_order_id).strip().upper():
+        return {
+            "resolution": "unknown", "lookup_failed": True,
+            "error": "entry_order_lookup_client_order_id_mismatch",
+            "order_id": resolved_order_id, "client_order_id": client_order_id,
+            "resolved_client_order_id": queried_client_order_id, "order_lookup": queried,
+        }
+
+    terminal_states = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+    active_states = {"NEW", "PENDING", "PARTIALLY_FILLED"}
+    order_status = str(queried.get("order_status") or "").strip().upper()
+    raw_executed_qty = queried.get("executed_qty")
+    try:
+        executed_qty = float(raw_executed_qty) if raw_executed_qty is not None else None
+    except (TypeError, ValueError, OverflowError):
+        executed_qty = None
+    if executed_qty is not None and (not math.isfinite(executed_qty) or executed_qty < 0):
+        executed_qty = None
+    avg_price = _safe_float(queried.get("avg_price"), 0.0)
+    if not math.isfinite(avg_price) or avg_price < 0:
+        avg_price = 0.0
+    cancel_response = None
+
+    if order_status in active_states:
+        latest_query = queried
+        for cancel_attempt in range(3):
+            try:
+                cancel_response = cancel_order(symbol, resolved_order_id)
+            except Exception as exc:
+                cancel_response = {"status": "error", "error": f"cancel_exception:{type(exc).__name__}:{exc}"}
+            try:
+                latest_query = get_order(symbol, resolved_order_id)
+            except Exception as exc:
+                latest_query = {"status": "error", "error": f"order_recheck_exception:{type(exc).__name__}:{exc}"}
+            latest_status = str(latest_query.get("order_status") or "").strip().upper() if isinstance(latest_query, dict) else ""
+            if isinstance(latest_query, dict) and latest_query.get("status") == "ok" and latest_status in terminal_states:
+                queried = latest_query
+                order_status = latest_status
+                raw_executed_qty = queried.get("executed_qty")
+                try:
+                    executed_qty = float(raw_executed_qty) if raw_executed_qty is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    executed_qty = None
+                if executed_qty is not None and (not math.isfinite(executed_qty) or executed_qty < 0):
+                    executed_qty = None
+                avg_price = _safe_float(queried.get("avg_price"), 0.0)
+                if not math.isfinite(avg_price) or avg_price < 0:
+                    avg_price = 0.0
+                break
+            if cancel_attempt < 2:
+                time.sleep(0.2 * (cancel_attempt + 1))
+        else:
+            try:
+                position_snapshot = get_position_directional(symbol, str(direction).upper())
+            except Exception as exc:
+                position_snapshot = {"status": "error", "error": f"position_lookup_exception:{type(exc).__name__}:{exc}"}
+            return {
+                "resolution": "unknown",
+                "cancel_unconfirmed": True,
+                "error": "entry_order_remains_active_or_unresolved_after_cancel_attempts",
+                "order_id": resolved_order_id,
+                "client_order_id": client_order_id,
+                "order_status": order_status or "UNKNOWN",
+                "executed_qty": executed_qty,
+                "avg_price": avg_price,
+                "cancel_response": cancel_response,
+                "order_lookup": latest_query,
+                "position_snapshot": position_snapshot,
+            }
+
+    if order_status in terminal_states:
+        if executed_qty is not None and executed_qty > 0:
+            return {
+                "resolution": "filled", "order_id": resolved_order_id,
+                "client_order_id": client_order_id, "order_status": order_status,
+                "executed_qty": executed_qty, "avg_price": avg_price,
+                "order_lookup": queried, "cancel_response": cancel_response,
+            }
+        if order_status == "FILLED":
+            # A terminal FILLED state with no usable executedQty is malformed for
+            # sizing/protection. Accept only if the directional position snapshot
+            # independently supplies a valid non-zero quantity and average price.
+            try:
+                position_snapshot = get_position_directional(symbol, str(direction).upper())
+            except Exception as exc:
+                position_snapshot = {"status": "error", "error": f"position_lookup_exception:{type(exc).__name__}:{exc}"}
+            if isinstance(position_snapshot, dict) and str(position_snapshot.get("status", "")).lower() == "found":
+                position_qty = abs(_safe_float(position_snapshot.get("positionAmt"), 0.0))
+                position_avg = _safe_float(position_snapshot.get("avgPrice") or position_snapshot.get("entryPrice"), 0.0)
+                if math.isfinite(position_qty) and position_qty > 0 and math.isfinite(position_avg) and position_avg > 0:
+                    return {
+                        "resolution": "filled", "order_id": resolved_order_id,
+                        "client_order_id": client_order_id, "order_status": order_status,
+                        "executed_qty": position_qty, "avg_price": position_avg,
+                        "order_lookup": queried, "position_snapshot": position_snapshot,
+                    }
+            return {
+                "resolution": "unknown", "error": "FILLED_entry_order_has_no_executed_quantity_or_confirmed_position",
+                "order_id": resolved_order_id, "client_order_id": client_order_id,
+                "order_status": order_status, "order_lookup": queried,
+                "position_snapshot": position_snapshot,
+            }
+        if order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
+            if executed_qty is None:
+                return {
+                    "resolution": "unknown",
+                    "error": f"{order_status}_entry_order_missing_trustworthy_executed_quantity",
+                    "order_id": resolved_order_id,
+                    "client_order_id": client_order_id,
+                    "order_status": order_status,
+                    "executed_qty": None,
+                    "order_lookup": queried,
+                }
+            if executed_qty == 0:
+                return {
+                    "resolution": "retryable_zero_fill", "order_id": resolved_order_id,
+                    "client_order_id": client_order_id, "order_status": order_status,
+                    "executed_qty": 0.0, "order_lookup": queried,
+                }
+
+    return {
+        "resolution": "unknown", "error": f"entry_order_has_unrecognized_or_nonterminal_status:{order_status or 'UNKNOWN'}",
+        "order_id": resolved_order_id, "client_order_id": client_order_id,
+        "order_status": order_status or "UNKNOWN", "executed_qty": executed_qty,
+        "order_lookup": queried,
+    }
+
+
 def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1311,291 +1521,172 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         "clientOrderId": client_order_id,
     }
 
-    # A confirmed CANCELED/EXPIRED order is no longer active and BingX forbids
-    # reusing its clientOrderId. One deterministic fresh-ID retry is safe.
-    # NEW/unknown or failed lookup states remain UNKNOWN and are never blindly
-    # retried from inside this call.
-    for open_attempt in range(2):
-        # Per-attempt state must not leak from a previously canceled order into
-        # the result of a later retry.
-        order_status = ""
-        response = _request("POST", ORDER_PATH, params)
-
-        if isinstance(response, dict) and response.get("code") not in (0, "0"):
-            # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
-            # the outcome unknown -- the order may have been created even though we
-            # did not receive an ack. Never blindly retry a POST; verify the result
-            # via the position instead. The pre-flight has_open_position check above
-            # guarantees any position present now was opened by THIS order.
-            transport_error = (
-                response.get("code") == -1
-                and "missing bingx credentials" not in str(response.get("msg", "")).lower()
-            )
-            if transport_error:
-                log.warning("[BINGX] Order POST transport error for %s (%s); querying clientOrderId before retry/reconciliation...", bx, response.get("msg"))
-                try:
-                    queried = get_order_by_client_order_id(symbol, client_order_id)
-                except Exception as exc:
-                    queried = {"status": "error", "error": str(exc)}
-
-                if queried.get("status") == "ok":
-                    order_status = str(queried.get("order_status", "")).upper()
-                    executed_qty = float(queried.get("executed_qty", 0) or 0)
-                    if executed_qty > 0 or order_status in {"FILLED", "PARTIALLY_FILLED"}:
-                        log.warning(
-                            "[BINGX] Order %s found after transport error with status=%s executed_qty=%s; treating entry as accepted.",
-                            client_order_id, order_status, executed_qty,
-                        )
-                        return {
-                            "status": "opened",
-                            "symbol": bx,
-                            "qty": qty,
-                            "leverage": leverage,
-                            "sizing_price": sizing_price,
-                            "signal_price": float(price),
-                            "order_reference_price": sizing_price,
-                            "order_id": queried.get("order_id"),
-                            "client_order_id": client_order_id,
-                            "idempotency": "order_queried_after_transport_error",
-                            "order_status": order_status,
-                            "executed_qty": executed_qty,
-                            "response": response,
-                        }
-                    if order_status in {"CANCELED", "EXPIRED"}:
-                        if open_attempt == 0:
-                            retry_client_order_id = _new_open_client_order_id(bx, trade_id, retry_index=1)
-                            log.warning(
-                                "[BINGX] Entry order %s is %s after transport error; retrying once with fresh clientOrderId=%s.",
-                                client_order_id, order_status, retry_client_order_id,
-                            )
-                            client_order_id = retry_client_order_id
-                            params["clientOrderId"] = client_order_id
-                            continue
-                        return {
-                            "status": "error",
-                            "error": f"market entry retry order {client_order_id} is {order_status} after transport error",
-                            "symbol": bx, "clientOrderId": client_order_id,
-                            "order_id": queried.get("order_id"),
-                            "order_status": order_status,
-                            "retry_exhausted": True,
-                            "response": response,
-                        }
-                    # NEW/unknown exchange states are not safe to retry inside this call.
-                    return {
-                        "status": "unknown",
-                        "error": f"market order outcome remains pending after transport error: status={order_status or 'unknown'}",
-                        "symbol": bx, "clientOrderId": client_order_id,
-                        "order_id": queried.get("order_id"),
-                        "order_status": order_status,
-                        "response": response,
-                    }
-
-                try:
-                    if has_open_position(symbol, direction):
-                        log.warning("[BINGX] Position found after transport error; treating deterministic clientOrderId entry as accepted.")
-                        return {
-                            "status": "opened",
-                            "symbol": bx,
-                            "qty": qty,
-                            "leverage": leverage,
-                            "sizing_price": sizing_price,
-                            "signal_price": float(price),
-                            "order_reference_price": sizing_price,
-                            "order_id": None,
-                            "client_order_id": client_order_id,
-                            "entry_ack_missing_order_id": True,
-                            "idempotency": "position_verified_after_transport_error",
-                            "response": response,
-                        }
-                except Exception as exc:
-                    log.error("[BINGX] Post-error position verification failed: %s", exc)
-
-                return {
-                    "status": "unknown",
-                    "error": f"market order outcome unknown after transport error: {response.get('msg', '')}",
-                    "symbol": bx, "clientOrderId": client_order_id,
-                    "response": response,
-                }
-
-            return {"status": "error", "error": str(response.get("msg", "")), "symbol": bx, "clientOrderId": client_order_id, "response": response}
-
-        data = response.get("data") or {}
-        order = data.get("order") or {} if isinstance(data, dict) else {}
-        order_id = (order.get("orderId") or order.get("orderID") or data.get("orderId") or data.get("orderID")) if isinstance(data, dict) else None
-        linked_client_order_id = order.get("clientOrderId") or client_order_id if isinstance(order, dict) else client_order_id
-        if not order_id:
-            # A success code without an order ID is not a complete execution ack.
-            # Try resolving the deterministic client id; if the exchange still
-            # cannot provide a direct ID, return UNKNOWN so main() terminalizes the
-            # event and reconciliation adopts any live position rather than losing
-            # the audit link or blindly opening again.
-            try:
-                queried = get_order_by_client_order_id(symbol, str(linked_client_order_id))
-            except Exception as exc:
-                queried = {"status": "error", "error": str(exc)}
-            if not isinstance(queried, dict):
-                queried = {"status": "error", "error": "order lookup returned a non-object response"}
-            queried_id = str(queried.get("order_id") or "").strip()
-            queried_status = str(queried.get("order_status") or "").upper()
-            queried_executed_qty = _safe_float(queried.get("executed_qty"), 0.0)
-
-            # A successful HTTP/API envelope plus an order id does not prove that
-            # a MARKET order filled. In particular, NEW with zero executed quantity
-            # must not enter the normal protection path while the entry order can
-            # still execute later. Cancel and verify any still-active order first.
-            if queried.get("status") == "ok" and queried_id and queried_status in {"NEW", "PARTIALLY_FILLED"}:
-                cancel_response = None
-                latest_query = queried
-                terminal_order_states = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
-                for cancel_attempt in range(3):
-                    try:
-                        cancel_response = cancel_order(symbol, queried_id)
-                    except Exception as exc:
-                        cancel_response = {"status": "error", "error": str(exc)}
-                    try:
-                        latest_query = get_order(symbol, queried_id)
-                    except Exception as exc:
-                        latest_query = {"status": "error", "error": str(exc)}
-                    latest_status = str(latest_query.get("order_status") or "").upper() if isinstance(latest_query, dict) else ""
-                    if isinstance(latest_query, dict) and latest_query.get("status") == "ok" and latest_status in terminal_order_states:
-                        queried = latest_query
-                        queried_status = latest_status
-                        queried_executed_qty = _safe_float(queried.get("executed_qty"), 0.0)
-                        break
-                    if cancel_attempt < 2:
-                        time.sleep(0.2 * (cancel_attempt + 1))
-                else:
-                    # Cancellation was attempted but not verified. Do not claim
-                    # success or allow a new entry retry while the old order may
-                    # still execute; expose the unresolved order for escalation.
-                    try:
-                        live_position = get_position_directional(symbol, direction)
-                    except Exception as exc:
-                        live_position = {"status": "error", "error": str(exc)}
-                    if isinstance(live_position, dict) and str(live_position.get("status", "")).lower() == "found":
-                        try:
-                            live_qty = abs(float(live_position.get("positionAmt", 0) or 0))
-                            live_avg = float(live_position.get("avgPrice") or live_position.get("entryPrice") or 0)
-                        except (TypeError, ValueError, OverflowError):
-                            live_qty = live_avg = 0.0
-                        if live_qty > 0 and math.isfinite(live_qty) and live_avg > 0 and math.isfinite(live_avg):
-                            log.critical(
-                                "[BINGX] Entry order %s remains non-terminal after cancel attempts; a live %s %s position exists, proceeding to protect observed quantity",
-                                queried_id, direction, bx,
-                            )
-                            return {
-                                "status": "opened", "symbol": bx, "qty": live_qty,
-                                "leverage": leverage, "sizing_price": sizing_price,
-                                "signal_price": float(price), "order_reference_price": sizing_price,
-                                "order_id": queried_id, "client_order_id": str(linked_client_order_id),
-                                "order_status": queried_status or "UNKNOWN",
-                                "entry_order_cancel_unconfirmed": True,
-                                "entry_cancel_response": cancel_response,
-                                "entry_position_snapshot": live_position,
-                                "response": response, "order_lookup": latest_query,
-                            }
-                    return {
-                        "status": "unknown",
-                        "error": "market entry order remains non-terminal after cancel attempts; refusing to treat it as filled or retry blindly",
-                        "symbol": bx, "qty": qty, "leverage": leverage,
-                        "sizing_price": sizing_price, "signal_price": float(price),
-                        "order_reference_price": sizing_price,
-                        "client_order_id": str(linked_client_order_id), "order_id": queried_id,
-                        "order_status": queried_status or "UNKNOWN",
-                        "escalation_required": True,
-                        "entry_cancel_response": cancel_response,
-                        "response": response, "order_lookup": latest_query,
-                        "entry_ack_missing_order_id": True,
-                    }
-
-
-            if (
-                queried.get("status") == "ok"
-                and queried_id
-                and queried_status in {"CANCELED", "EXPIRED", "REJECTED"}
-                and queried_executed_qty <= 0
-            ):
-                if open_attempt == 0:
-                    retry_client_order_id = _new_open_client_order_id(bx, trade_id, retry_index=1)
-                    log.warning(
-                        "[BINGX] Entry order %s is %s with verified zero fills; retrying once with fresh clientOrderId=%s",
-                        queried_id, queried_status, retry_client_order_id,
-                    )
-                    client_order_id = retry_client_order_id
-                    params["clientOrderId"] = client_order_id
-                    continue
-                return {
-                    "status": "unknown",
-                    "error": f"market entry retry order {queried_id} is {queried_status} with zero fills; retry budget exhausted",
-                    "symbol": bx, "order_id": queried_id,
-                    "client_order_id": str(linked_client_order_id),
-                    "order_status": queried_status, "executed_qty": queried_executed_qty,
-                    "response": response, "order_lookup": queried,
-                    "entry_ack_missing_order_id": True,
-                }
-
-            if queried.get("status") == "ok" and queried_id and (
-                queried_executed_qty > 0 or queried_status == "FILLED"
-            ):
-                order_id = queried_id
-                order_status = queried_status
-            else:
-                try:
-                    live_position = get_position_directional(symbol, direction)
-                except Exception as exc:
-                    live_position = {"status": "error", "error": str(exc)}
-                if isinstance(live_position, dict) and str(live_position.get("status", "")).lower() == "found":
-                    try:
-                        live_qty = abs(float(live_position.get("positionAmt", 0) or 0))
-                        live_avg = float(live_position.get("avgPrice") or live_position.get("entryPrice") or 0)
-                    except (TypeError, ValueError, OverflowError):
-                        live_qty = live_avg = 0.0
-                    if live_qty > 0 and math.isfinite(live_qty) and live_avg > 0 and math.isfinite(live_avg):
-                        log.critical(
-                            "[BINGX] MARKET entry ack had no orderId but a live %s %s position is confirmed; continuing to protection with clientOrderId=%s and unresolved direct order id",
-                            direction, bx, linked_client_order_id,
-                        )
-                        return {
-                            "status": "opened",
-                            "symbol": bx,
-                            "qty": live_qty,
-                            "leverage": leverage,
-                            "sizing_price": sizing_price,
-                            "signal_price": float(price),
-                            "order_reference_price": sizing_price,
-                            "order_id": queried_id or None,
-                            "client_order_id": str(linked_client_order_id),
-                            "order_status": queried_status or "POSITION_CONFIRMED",
-                            "entry_ack_missing_order_id": True,
-                            "entry_position_snapshot": live_position,
-                            "response": response,
-                            "order_lookup": queried,
-                        }
-                return {
-                    "status": "unknown",
-                    "error": "market entry success response missing orderId; direct order lookup and live-position confirmation did not resolve it",
-                    "symbol": bx, "qty": qty, "leverage": leverage,
-                    "sizing_price": sizing_price, "signal_price": float(price),
-                    "order_reference_price": sizing_price,
-                    "client_order_id": str(linked_client_order_id),
-                    "order_status": queried_status or "UNKNOWN",
-                    "response": response, "order_lookup": queried,
-                    "position_lookup": live_position,
-                    "entry_ack_missing_order_id": True,
-                }
-        return {
+    # Every accepted acknowledgement is resolved against the exchange order
+    # endpoint. An orderId alone is not proof of a fill. Only a terminal order
+    # with a confirmed executed quantity may enter the protection workflow.
+    def _opened_result(resolved: dict, *, idempotency: str | None = None, source_response: dict | None = None) -> dict:
+        executed_qty = _safe_float(resolved.get("executed_qty"), 0.0)
+        avg_price = _safe_float(resolved.get("avg_price"), 0.0)
+        result = {
             "status": "opened",
             "symbol": bx,
-            "qty": qty,
+            "qty": executed_qty,
+            "executed_qty": executed_qty,
+            "avg_price": avg_price if avg_price > 0 else None,
             "leverage": leverage,
             "sizing_price": sizing_price,
             "signal_price": float(price),
             "order_reference_price": sizing_price,
-            "order_id": str(order_id),
-            "client_order_id": str(linked_client_order_id),
-            "order_status": str(order_status or order.get("status") or "UNKNOWN").upper(),
-            "response": response,
+            "order_id": resolved.get("order_id"),
+            "client_order_id": client_order_id,
+            "order_status": str(resolved.get("order_status") or "UNKNOWN").upper(),
+            "order_lookup": resolved.get("order_lookup"),
+            "response": source_response,
             "open_attempt": open_attempt + 1,
+        }
+        if idempotency:
+            result["idempotency"] = idempotency
+        if isinstance(resolved.get("position_snapshot"), dict):
+            result["entry_position_snapshot"] = resolved["position_snapshot"]
+        if resolved.get("cancel_response") is not None:
+            result["entry_cancel_response"] = resolved.get("cancel_response")
+        return result
+
+    def _retry_with_fresh_client_order_id(resolved: dict) -> bool:
+        nonlocal client_order_id
+        if open_attempt != 0:
+            return False
+        retry_client_order_id = _new_open_client_order_id(bx, trade_id, retry_index=1)
+        log.warning(
+            "[BINGX] Entry order %s is %s with verified zero fills; retrying once with fresh clientOrderId=%s.",
+            resolved.get("order_id") or client_order_id, resolved.get("order_status"), retry_client_order_id,
+        )
+        client_order_id = retry_client_order_id
+        params["clientOrderId"] = client_order_id
+        return True
+
+    for open_attempt in range(2):
+        response = _request("POST", ORDER_PATH, params)
+        transport_error = (
+            isinstance(response, dict)
+            and response.get("code") == -1
+            and "missing bingx credentials" not in str(response.get("msg", "")).lower()
+        )
+        if isinstance(response, dict) and response.get("code") not in (0, "0") and not transport_error:
+            return {
+                "status": "error", "error": str(response.get("msg", "")),
+                "symbol": bx, "clientOrderId": client_order_id, "response": response,
+            }
+
+        ack_order_id = None
+        linked_client_order_id = client_order_id
+        if not transport_error:
+            data = response.get("data") or {} if isinstance(response, dict) else {}
+            order = data.get("order") or {} if isinstance(data, dict) else {}
+            ack_order_id = (
+                order.get("orderId") or order.get("orderID")
+                or data.get("orderId") or data.get("orderID")
+            ) if isinstance(data, dict) else None
+            if isinstance(order, dict):
+                linked_client_order_id = str(order.get("clientOrderId") or client_order_id)
+
+        log_method = "[BINGX] Resolving MARKET entry %s for %s (%s)..."
+        log.warning(log_method, client_order_id, bx, "transport error" if transport_error else "POST acknowledgement")
+        resolved = _resolve_submitted_market_entry_order(
+            symbol, direction, order_id=str(ack_order_id) if ack_order_id else None,
+            client_order_id=linked_client_order_id,
+        )
+        resolution = str(resolved.get("resolution") or "unknown")
+
+        if resolution == "filled":
+            return _opened_result(
+                resolved,
+                idempotency="order_queried_after_transport_error" if transport_error else None,
+                source_response=response if isinstance(response, dict) else None,
+            )
+
+        if resolution == "retryable_zero_fill":
+            if _retry_with_fresh_client_order_id(resolved):
+                continue
+            return {
+                "status": "unknown",
+                "error": "market entry retry exhausted after terminal zero-fill order; event must not be retried blindly",
+                "symbol": bx, "order_id": resolved.get("order_id"),
+                "client_order_id": client_order_id,
+                "order_status": resolved.get("order_status"),
+                "executed_qty": 0.0, "retry_exhausted": True,
+                "response": response if isinstance(response, dict) else None,
+                "order_lookup": resolved.get("order_lookup"),
+            }
+
+        # Preserve the existing lost-ACK recovery for a confirmed directional
+        # position when the order lookup itself failed and no order identity was
+        # supplied by the POST response. A known active order whose cancellation
+        # was not verified is never promoted to OPENED.
+        if transport_error and resolved.get("lookup_failed") and not resolved.get("cancel_unconfirmed"):
+            try:
+                live_position = get_position_directional(symbol, direction)
+            except Exception as exc:
+                live_position = {"status": "error", "error": str(exc)}
+            if isinstance(live_position, dict) and str(live_position.get("status", "")).lower() == "found":
+                live_qty = abs(_safe_float(live_position.get("positionAmt"), 0.0))
+                live_avg = _safe_float(live_position.get("avgPrice") or live_position.get("entryPrice"), 0.0)
+                if math.isfinite(live_qty) and live_qty > 0 and math.isfinite(live_avg) and live_avg > 0:
+                    return {
+                        "status": "opened", "symbol": bx, "qty": live_qty,
+                        "executed_qty": live_qty, "avg_price": live_avg,
+                        "leverage": leverage, "sizing_price": sizing_price,
+                        "signal_price": float(price), "order_reference_price": sizing_price,
+                        "order_id": None, "client_order_id": linked_client_order_id,
+                        "order_status": "POSITION_CONFIRMED",
+                        "entry_ack_missing_order_id": True,
+                        "entry_position_snapshot": live_position,
+                        "idempotency": "position_verified_after_transport_error",
+                        "response": response, "order_lookup": resolved.get("order_lookup"),
+                    }
+
+        if not transport_error and not ack_order_id and resolved.get("lookup_failed"):
+            # A success envelope without an order ID is still recoverable only
+            # when a live directional position is independently visible.
+            try:
+                live_position = get_position_directional(symbol, direction)
+            except Exception as exc:
+                live_position = {"status": "error", "error": str(exc)}
+            if isinstance(live_position, dict) and str(live_position.get("status", "")).lower() == "found":
+                live_qty = abs(_safe_float(live_position.get("positionAmt"), 0.0))
+                live_avg = _safe_float(live_position.get("avgPrice") or live_position.get("entryPrice"), 0.0)
+                if math.isfinite(live_qty) and live_qty > 0 and math.isfinite(live_avg) and live_avg > 0:
+                    return {
+                        "status": "opened", "symbol": bx, "qty": live_qty,
+                        "executed_qty": live_qty, "avg_price": live_avg,
+                        "leverage": leverage, "sizing_price": sizing_price,
+                        "signal_price": float(price), "order_reference_price": sizing_price,
+                        "order_id": None, "client_order_id": linked_client_order_id,
+                        "order_status": "POSITION_CONFIRMED",
+                        "entry_ack_missing_order_id": True,
+                        "entry_position_snapshot": live_position,
+                        "response": response, "order_lookup": resolved.get("order_lookup"),
+                    }
+
+        return {
+            "status": "unknown",
+            "error": str(resolved.get("error") or "market order outcome is not confirmed terminal"),
+            "symbol": bx, "qty": qty, "leverage": leverage,
+            "sizing_price": sizing_price, "signal_price": float(price),
+            "order_reference_price": sizing_price,
+            "order_id": resolved.get("order_id") or (str(ack_order_id) if ack_order_id else None),
+            "client_order_id": linked_client_order_id,
+            "order_status": resolved.get("order_status") or "UNKNOWN",
+            "executed_qty": resolved.get("executed_qty", 0.0),
+            "entry_ack_missing_order_id": not bool(ack_order_id),
+            "entry_order_cancel_unconfirmed": bool(resolved.get("cancel_unconfirmed")),
+            "entry_order_resolution_required": not bool(resolved.get("retry_exhausted")),
+            "entry_position_snapshot": resolved.get("position_snapshot"),
+            "order_lookup": resolved.get("order_lookup"),
+            "cancel_response": resolved.get("cancel_response"),
+            "response": response if isinstance(response, dict) else None,
+            "retry_exhausted": bool(resolved.get("retry_exhausted")),
+            "escalation_required": True,
         }
 
     return {
@@ -1607,13 +1698,26 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     }
 
 
-def emergency_close_position(symbol: str, direction: str, qty: float | None = None, reason_token: str | None = None) -> dict:
+def emergency_close_position(
+    symbol: str,
+    direction: str,
+    qty: float | None = None,
+    reason_token: str | None = None,
+    *,
+    require_live_position: bool = False,
+) -> dict:
     """Fail-safe close used when a freshly opened position cannot be protected.
 
     It never blindly retries the same MARKET request. After each POST we query
     the live directional position and, when necessary, close only the remaining
     quantity with a fresh clientOrderId. This keeps the emergency path idempotent
     even when the exchange acknowledgement is lost.
+
+    ``require_live_position`` is used after an entry order was independently
+    confirmed FILLED. In that case, two ``not_found`` position reads are not
+    proof that the position was closed: the position endpoint may be lagging.
+    The function returns UNKNOWN and submits no close order until the directional
+    position becomes visible, allowing the caller to retain quarantine.
     """
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1728,6 +1832,18 @@ def emergency_close_position(symbol: str, direction: str, qty: float | None = No
             live = _confirm_absence(live)
             live_status = str(live.get("status", "")).lower()
             if live_status == "not_found":
+                if require_live_position:
+                    return {
+                        "status": "unknown",
+                        "error": "entry_fill_was_confirmed_but_directional_position_is_not_visible; refusing to claim rollback complete",
+                        "symbol": bx_symbol,
+                        "direction": direction,
+                        "attempts": attempt,
+                        "verification": "two_not_found_reads_after_confirmed_entry",
+                        "entry_fill_confirmed": True,
+                        "close_order_submitted": False,
+                        "escalation_required": True,
+                    }
                 return {"status": "closed", "symbol": bx_symbol, "direction": direction, "attempts": attempt, "verification": "two_not_found_reads"}
         if live_status != "found":
             return {
@@ -3192,7 +3308,11 @@ def ensure_directional_protection(
         resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
         if resp.get("code") not in (0, "0"):
             log.error("[BINGX] SL failed: code=%s msg=%s", resp.get("code"), resp.get("msg"))
-            rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLFAIL:{trade_id or bx_symbol}")
+            rollback = emergency_close_position(
+                symbol, direction, position_qty,
+                reason_token=f"SLFAIL:{trade_id or bx_symbol}",
+                require_live_position=True,
+            )
             return {
                 "status": "PROTECTION_FAILED",
                 "error": f"SL failed: {resp.get('msg')}; emergency_close={rollback.get('status')}",
@@ -3222,7 +3342,11 @@ def ensure_directional_protection(
         # confirms missing/duplicate/mismatched protection, try to flatten the
         # just-opened residual. A query error is explicitly identified as UNKNOWN
         # in the journal payload rather than described as proof that SL is absent.
-        rollback = emergency_close_position(symbol, direction, position_qty, reason_token=f"SLVERIFY:{trade_id or bx_symbol}")
+        rollback = emergency_close_position(
+            symbol, direction, position_qty,
+            reason_token=f"SLVERIFY:{trade_id or bx_symbol}",
+            require_live_position=True,
+        )
         return {
             "status": "SL_UNVERIFIED",
             "symbol": symbol,
