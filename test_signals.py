@@ -1307,11 +1307,16 @@ def test_open_market_verifies_position_after_transport_error(monkeypatch):
     }
     CACHE["ts"] = 9_999_999_999
 
-    position_states = iter([False, True])
-    monkeypatch.setattr(bx, "has_open_position", lambda s, d: next(position_states))
+    monkeypatch.setattr(bx, "has_open_position", lambda s, d: False)
     monkeypatch.setattr(bx, "_current_close_price", lambda s: 100.0)
     monkeypatch.setattr(bx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bx, "_request", lambda *a, **k: {"code": -1, "msg": "HTTPSConnectionPool read timed out"})
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda *_a, **_k: {
+        "status": "error", "error": "order query unavailable",
+    })
+    monkeypatch.setattr(bx, "get_position_directional", lambda *_a, **_k: {
+        "status": "found", "positionAmt": "0.1", "avgPrice": "100.0",
+    })
 
     out = bx.open_market("TEST", "LONG", 100.0, "TRD1")
     assert out["status"] == "opened"
@@ -1842,7 +1847,7 @@ def test_load_active_trades_normalizes_null_tp_orders_without_losing_other_recor
     assert state["BAD_NULL"]["tp_mode"] == "multi_tp"
 
 
-def test_load_active_trades_isolates_invalid_tp_orders_type(tmp_path, monkeypatch):
+def test_load_active_trades_rejects_invalid_tp_orders_type_fail_closed(tmp_path, monkeypatch):
     import event_engine.tracker as tr
 
     active_path = tmp_path / "active_trades.json"
@@ -1852,27 +1857,37 @@ def test_load_active_trades_isolates_invalid_tp_orders_type(tmp_path, monkeypatc
     }), encoding="utf-8")
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
 
-    state = _load_active_trades()
-
-    assert set(state) == {"GOOD", "BAD_TYPE"}
-    assert state["BAD_TYPE"]["tp_orders"] == []
-    assert state["BAD_TYPE"]["tp_mode"] == "multi_tp"
+    with pytest.raises(tr.ActiveTradeStateError, match="tp_orders must be a list"):
+        _load_active_trades()
 
 
-def test_load_active_trades_skips_only_invalid_non_object_record(tmp_path, monkeypatch):
+def test_load_active_trades_rejects_invalid_non_object_record_fail_closed(tmp_path, monkeypatch):
     import event_engine.tracker as tr
 
     active_path = tmp_path / "active_trades.json"
-    active_path.write_text(json.dumps({
+    original = {
         "GOOD": {"tp_orders": []},
         "BAD_SCALAR": None,
         "GOOD2": {"tp_orders": [{"order_id": "TP2"}]},
-    }), encoding="utf-8")
+    }
+    active_path.write_text(json.dumps(original), encoding="utf-8")
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
 
-    state = _load_active_trades()
+    with pytest.raises(tr.ActiveTradeStateError, match="must be an object"):
+        _load_active_trades()
+    # A failed read must never rewrite/discard the original position state.
+    assert json.loads(active_path.read_text(encoding="utf-8")) == original
 
-    assert set(state) == {"GOOD", "GOOD2"}
+
+def test_load_active_trades_corrupt_json_raises_state_error(tmp_path, monkeypatch):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    active_path.write_text('{"EVT_OPEN": ', encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+
+    with pytest.raises(tr.ActiveTradeStateError, match="unreadable"):
+        _load_active_trades()
 
 
 def test_trade_registration_has_stable_trade_id():
@@ -4172,3 +4187,14 @@ def test_optional_volume_indicators_and_divergence_detector_accept_missing_volum
     # detect_divergences requires close/high/low/close_time, not volume.
     events = sig.detect_divergences(df, "TEST-USDT", "1h", min_bars=5, max_bars=16)
     assert isinstance(events, list)
+
+
+def test_load_active_trades_rejects_invalid_root_type(tmp_path, monkeypatch):
+    import event_engine.tracker as tr
+
+    active_path = tmp_path / "active_trades.json"
+    active_path.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)
+
+    with pytest.raises(tr.ActiveTradeStateError, match="root must be a JSON object"):
+        tr._load_active_trades()

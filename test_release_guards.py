@@ -423,33 +423,21 @@ def test_long_btc_regime_gate_fails_closed_only_for_long_and_handles_btc_self():
     assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BULL"}, enabled=True) is None
     assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BEAR"}, enabled=True)
 
-def test_release_version_and_billing_modes_documented():
-    # APP_VERSION in the entry point is the single source of truth; a separate
-    # VERSION marker is intentionally not required by runtime or CI.
+def test_application_version_and_runtime_guards():
+    # APP_VERSION is the single application-version source of truth.
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION = "V10.4.25"' in runtime
+    workflow = _workflow()
+    assert 'APP_VERSION = "V10.4.27"' in runtime
+    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.27"' in workflow
     assert 'version=%s' in runtime
-    notes = Path('RELEASE_NOTES_V10_4_25.md').read_text(encoding='utf-8')
-    assert 'BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED' in notes
-    assert 'UNKNOWN_DIRECT_FILL_LINK_REQUIRED' in notes
-    assert 'estimated_gross_pnl_usdt' in notes
-    assert 'active_trades.json' in notes
-    assert 'event_engine/reconcile_daily.py' in notes
     tracker = Path('event_engine/tracker.py').read_text(encoding='utf-8')
     assert 'EARLY_LOSS_CUT_ENABLED = False' in tracker
     assert 'EARLY_LOSS_CUT_ENV_REQUESTED' in tracker
-    assert 'income_history_unexpected_data_shape' in Path('event_engine/bingx.py').read_text(encoding='utf-8')
-    # The current release note documents the current package; obsolete notes are not runtime/test dependencies.
-    assert not Path('RELEASE_NOTES_V10_4_4.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_7.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_8.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_9.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_10.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_11.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_12.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_14.md').exists()
-    assert not Path('RELEASE_NOTES_V10_4_15.md').exists()
+    bingx = Path('event_engine/bingx.py').read_text(encoding='utf-8')
+    assert '_resolve_submitted_market_entry_order' in bingx
+    assert 'entry_order_remains_active_or_unresolved_after_cancel_attempts' in bingx
+    assert 'income_history_unexpected_data_shape' in bingx
 
 
 def test_release_runs_bounded_read_only_reconciliation_after_engine():

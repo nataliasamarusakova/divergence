@@ -165,10 +165,14 @@ def test_verified_rollback_is_terminalized_in_main():
 
     assert run_once._rollback_terminal_reason("opened_rolled_back") == "EXECUTION_ROLLED_BACK"
     assert run_once._rollback_terminal_reason("OPENED_ROLLED_BACK") == "EXECUTION_ROLLED_BACK"
+    assert run_once._rollback_terminal_reason("opened_rollback_unconfirmed") == "ENTRY_ROLLBACK_UNCONFIRMED"
     assert run_once._rollback_terminal_reason("opened_protected") is None
     source = inspect.getsource(run_once.main)
     assert "terminal_reason = _rollback_terminal_reason(status_now)" in source
     assert 'record_trade({' in source and '"record_type": "EVENT_TERMINAL"' in source
+    execute_source = inspect.getsource(run_once.execute_new_position)
+    assert 'queue_entry_order_resolution_pending(' in execute_source
+    assert '"record_type": "ENTRY_ROLLBACK_UNCONFIRMED"' in execute_source
 
 
 def test_terminal_event_ids_are_loaded(tmp_path):
@@ -962,8 +966,8 @@ def test_open_market_retry_does_not_reuse_canceled_status_from_previous_attempt(
         post_calls.append(dict(params))
         if len(post_calls) == 1:
             return {"code": -1, "msg": "read timed out"}
-        # Deliberately omit status: the accepted retry must not inherit the
-        # CANCELED status obtained while reconciling attempt one.
+        # Deliberately omit status in the POST ACK. The separate order query
+        # must confirm the retry as FILLED rather than inherit CANCELED.
         return {"code": 0, "data": {"order": {
             "orderId": "OID-RETRY", "clientOrderId": params["clientOrderId"],
         }}}
@@ -976,13 +980,21 @@ def test_open_market_retry_does_not_reuse_canceled_status_from_previous_attempt(
             "executed_qty": 0.0, "client_order_id": client_id,
         },
     )
+    monkeypatch.setattr(
+        bx, "get_order",
+        lambda _symbol, order_id: {
+            "status": "ok", "order_id": str(order_id), "order_status": "FILLED",
+            "executed_qty": 0.2, "avg_price": 100.1,
+        },
+    )
 
     out = bx.open_market("TEST", "LONG", 100.0, "TRD_CANCELED_RETRY_STATUS")
 
     assert out["status"] == "opened"
     assert out["order_id"] == "OID-RETRY"
     assert out["open_attempt"] == 2
-    assert out["order_status"] == "UNKNOWN"
+    assert out["order_status"] == "FILLED"
+    assert out["executed_qty"] == pytest.approx(0.2)
 
 
 def test_open_market_missing_ack_order_id_cancels_and_verifies_new_zero_fill_order(monkeypatch):
@@ -1025,6 +1037,267 @@ def test_open_market_missing_ack_order_id_cancels_and_verifies_new_zero_fill_ord
     assert cancel_calls == [("TEST", "OID-PENDING")]
     assert len(post_calls) == 2
     assert post_calls[0]["clientOrderId"] != post_calls[1]["clientOrderId"]
+
+
+def test_open_market_direct_order_id_new_is_canceled_and_retried_with_fresh_id(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    posts, cancels, order_reads = [], [], []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_a, **_k: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_a, **_k: True)
+
+    def fake_post(_method, _path, params):
+        posts.append(dict(params))
+        order_id = "OID-DIRECT-NEW" if len(posts) == 1 else "OID-DIRECT-FILLED"
+        return {"code": 0, "data": {"order": {"orderId": order_id, "clientOrderId": params["clientOrderId"]}}}
+
+    def fake_get_order(_symbol, order_id):
+        order_reads.append(str(order_id))
+        if order_id == "OID-DIRECT-NEW":
+            if order_reads.count(str(order_id)) == 1:
+                return {"status": "ok", "order_id": str(order_id), "order_status": "NEW", "executed_qty": 0.0}
+            return {"status": "ok", "order_id": str(order_id), "order_status": "CANCELED", "executed_qty": 0.0}
+        return {"status": "ok", "order_id": str(order_id), "order_status": "FILLED", "executed_qty": 0.2, "avg_price": 100.1}
+
+    monkeypatch.setattr(bx, "_request", fake_post)
+    monkeypatch.setattr(bx, "get_order", fake_get_order)
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancels.append((symbol, str(order_id))) or {"code": 0})
+    monkeypatch.setattr(bx.time, "sleep", lambda *_a: None)
+
+    result = bx.open_market("TEST", "LONG", 100.0, "TRD_DIRECT_ACK_NEW")
+
+    assert result["status"] == "opened"
+    assert result["order_id"] == "OID-DIRECT-FILLED"
+    assert result["order_status"] == "FILLED"
+    assert result["executed_qty"] == pytest.approx(0.2)
+    assert len(posts) == 2
+    assert posts[0]["clientOrderId"] != posts[1]["clientOrderId"]
+    assert cancels == [("TEST", "OID-DIRECT-NEW")]
+
+
+def test_open_market_direct_order_id_new_uncancelled_returns_unknown_without_retry(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    posts, cancels = [], []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_a, **_k: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_a, **_k: True)
+    monkeypatch.setattr(bx, "_request", lambda _m, _p, params: posts.append(dict(params)) or {
+        "code": 0, "data": {"order": {"orderId": "OID-DIRECT-STILL-NEW", "clientOrderId": params["clientOrderId"]}},
+    })
+    monkeypatch.setattr(bx, "get_order", lambda _symbol, order_id: {
+        "status": "ok", "order_id": str(order_id), "order_status": "NEW", "executed_qty": 0.0,
+    })
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancels.append(str(order_id)) or {
+        "code": -1, "msg": "cancel result uncertain",
+    })
+    monkeypatch.setattr(bx, "get_position_directional", lambda *_a, **_k: {"status": "not_found"})
+    monkeypatch.setattr(bx.time, "sleep", lambda *_a: None)
+
+    result = bx.open_market("TEST", "LONG", 100.0, "TRD_DIRECT_ACK_UNRESOLVED")
+
+    assert result["status"] == "unknown"
+    assert result["order_id"] == "OID-DIRECT-STILL-NEW"
+    assert result["entry_order_resolution_required"] is True
+    assert result["entry_order_cancel_unconfirmed"] is True
+    assert len(posts) == 1
+    assert cancels == ["OID-DIRECT-STILL-NEW"] * 3
+
+
+def test_query_order_keeps_missing_executed_qty_unknown(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "_request", lambda *_a, **_k: {
+        "code": 0,
+        "data": {"order": {"orderId": "OID-MISSING-QTY", "status": "CANCELED"}},
+    })
+
+    result = bx._query_order("TEST", order_id="OID-MISSING-QTY")
+
+    assert result["status"] == "ok"
+    assert result["order_status"] == "CANCELED"
+    assert result["executed_qty"] is None
+
+
+def test_open_market_does_not_retry_canceled_order_without_explicit_executed_qty(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    posts = []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_a, **_k: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_a, **_k: True)
+    monkeypatch.setattr(bx, "_request", lambda _m, _p, params: posts.append(dict(params)) or {
+        "code": 0, "data": {"order": {"orderId": "OID-CANCELED-MISSING-QTY", "clientOrderId": params["clientOrderId"]}},
+    })
+    monkeypatch.setattr(bx, "get_order", lambda *_a, **_k: {
+        "status": "ok", "order_id": "OID-CANCELED-MISSING-QTY", "order_status": "CANCELED",
+        "executed_qty": None,
+    })
+
+    result = bx.open_market("TEST", "LONG", 100.0, "TRD_CANCELED_MISSING_QTY")
+
+    assert result["status"] == "unknown"
+    assert "missing_trustworthy_executed_quantity" in result["error"]
+    assert result["entry_order_resolution_required"] is True
+    assert result["executed_qty"] is None
+    assert len(posts) == 1
+
+
+def test_emergency_close_after_confirmed_entry_never_treats_not_found_as_closed(monkeypatch):
+    from event_engine import bingx as bx
+
+    calls = []
+    states = iter([{"status": "not_found"}, {"status": "not_found"}])
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: {"quantityPrecision": 3})
+    monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
+    monkeypatch.setattr(bx, "get_position_directional", lambda *_a, **_k: next(states))
+    monkeypatch.setattr(bx, "_request", lambda *a, **k: calls.append((a, k)) or pytest.fail("must not submit close without visible live position"))
+    monkeypatch.setattr(bx.time, "sleep", lambda *_a: None)
+
+    result = bx.emergency_close_position(
+        "TEST", "LONG", 0.25, reason_token="CONFIRMED_ENTRY_LAG",
+        require_live_position=True,
+    )
+
+    assert result["status"] == "unknown"
+    assert result["entry_fill_confirmed"] is True
+    assert result["close_order_submitted"] is False
+    assert result["escalation_required"] is True
+    assert calls == []
+
+
+def test_open_market_direct_order_id_partial_fill_is_canceled_and_actual_fill_is_used(monkeypatch):
+    from event_engine import bingx as bx
+
+    contract = {
+        "symbol": "TEST-USDT", "status": 1, "apiStateOpen": "true",
+        "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "tradeMinUSDT": 2, "maxLongLeverage": 10, "maxShortLeverage": 10,
+    }
+    reads, cancels, posts = [], [], []
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_contract", lambda _symbol: contract)
+    monkeypatch.setattr(bx, "contract_exists", lambda _symbol: True)
+    monkeypatch.setattr(bx, "has_open_position", lambda *_a, **_k: False)
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(bx, "_set_leverage", lambda *_a, **_k: True)
+    monkeypatch.setattr(bx, "_request", lambda _m, _p, params: posts.append(dict(params)) or {
+        "code": 0, "data": {"order": {"orderId": "OID-PARTIAL", "clientOrderId": params["clientOrderId"]}},
+    })
+
+    def fake_get_order(_symbol, order_id):
+        reads.append(str(order_id))
+        status = "PARTIALLY_FILLED" if len(reads) == 1 else "CANCELED"
+        return {
+            "status": "ok", "order_id": str(order_id), "order_status": status,
+            "executed_qty": 0.075, "avg_price": 99.8,
+        }
+
+    monkeypatch.setattr(bx, "get_order", fake_get_order)
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancels.append(str(order_id)) or {"code": 0})
+    monkeypatch.setattr(bx.time, "sleep", lambda *_a: None)
+
+    result = bx.open_market("TEST", "LONG", 100.0, "TRD_DIRECT_ACK_PARTIAL")
+
+    assert result["status"] == "opened"
+    assert result["order_status"] == "CANCELED"
+    assert result["executed_qty"] == pytest.approx(0.075)
+    assert result["qty"] == pytest.approx(0.075)
+    assert result["avg_price"] == pytest.approx(99.8)
+    assert len(posts) == 1
+    assert cancels == ["OID-PARTIAL"]
+
+
+def test_entry_quarantine_falls_back_to_separate_durable_latch_when_active_state_write_fails(tmp_path, monkeypatch):
+    from event_engine import tracker
+    import run_once as ro
+
+    active_path = tmp_path / "active_trades.json"
+    latch_path = tmp_path / "entry_order_quarantine_latch.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tracker, "ENTRY_ORDER_QUARANTINE_LATCH_PATH", latch_path)
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(ro, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(tracker, "_save_active_trades", lambda _rows: (_ for _ in ()).throw(OSError("active state read-only")))
+
+    quarantine_id = tracker.queue_entry_order_resolution_pending(
+        "TEST", "LONG", "entry close is unconfirmed", source_event_id="EVT_FALLBACK",
+        order_id="OID-ENTRY", client_order_id="EVTOPEN123", order_status="FILLED",
+    )
+
+    persisted = json.loads(latch_path.read_text(encoding="utf-8"))
+    assert persisted[quarantine_id]["fallback_latch"] is True
+    assert persisted[quarantine_id]["entry_order_id"] == "OID-ENTRY"
+    assert ro._pending_protection_cleanup_for("TEST", "LONG") == quarantine_id
+
+
+def test_pending_entry_guard_fails_closed_when_active_state_is_corrupt(tmp_path, monkeypatch):
+    from event_engine import tracker
+    import run_once as ro
+
+    active_path = tmp_path / "active_trades.json"
+    active_path.write_text('{"BROKEN": ', encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+
+    assert ro._pending_protection_cleanup_for("TEST", "LONG") == "UNKNOWN_ACTIVE_TRADE_STATE"
+
+
+def test_entry_order_resolution_quarantine_is_persisted_and_not_auto_closed(tmp_path, monkeypatch):
+    from event_engine import tracker
+    import run_once as ro
+
+    state_path = tmp_path / "active_trades.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", state_path)
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    quarantine_id = tracker.queue_entry_order_resolution_pending(
+        "TEST", "LONG", "cancel status unresolved", source_event_id="EVT_ENTRY",
+        order_id="OID-PENDING", client_order_id="EVTOPENABC", order_status="NEW",
+        position_snapshot={"status": "not_found"},
+    )
+
+    stored = json.loads(state_path.read_text(encoding="utf-8"))[quarantine_id]
+    assert stored["entry_order_resolution_pending"] is True
+    assert stored["entry_order_id"] == "OID-PENDING"
+    assert stored["entry_client_order_id"] == "EVTOPENABC"
+    assert stored["close_cleanup_pending"] is True
+    assert ro._pending_protection_cleanup_for("TEST", "LONG") == quarantine_id
+    assert ro._find_active_trade_for_position("TEST-USDT", "LONG", {quarantine_id: stored}) is None
+
+    # The tracker must preserve this record rather than clear it after empty
+    # position reads; resolution requires explicit order/position reconciliation.
+    monkeypatch.setattr(tracker, "_load_active_trades", lambda: {quarantine_id: stored.copy()})
+    saved = {}
+    monkeypatch.setattr(tracker, "_save_active_trades", lambda rows: saved.update(rows))
+    monkeypatch.setattr(tracker, "_cleanup_closed_trade_protection", lambda _trade: pytest.fail("entry-order quarantine must not auto-clean"))
+    tracker.update_active_trades()
+    assert saved[quarantine_id]["entry_order_resolution_pending"] is True
 
 
 def test_open_market_missing_ack_order_id_returns_unknown_if_new_order_cannot_be_canceled(monkeypatch):
@@ -1127,6 +1400,13 @@ def test_open_market_transport_canceled_retries_once_with_fresh_client_order_id(
             "executed_qty": 0.0, "client_order_id": client_id,
         },
     )
+    monkeypatch.setattr(
+        bx, "get_order",
+        lambda _symbol, order_id: {
+            "status": "ok", "order_id": str(order_id), "order_status": "FILLED",
+            "executed_qty": 0.2, "avg_price": 100.1,
+        },
+    )
 
     out = bx.open_market("TEST", "LONG", 100.0, "TRD_CANCELED_RETRY")
 
@@ -1179,7 +1459,7 @@ def test_open_market_transport_error_does_not_claim_pending_order_as_filled(monk
 
     assert out["status"] == "unknown"
     assert out["order_status"] == "NEW"
-    assert out["clientOrderId"].startswith("EVTOPEN")
+    assert out["client_order_id"].startswith("EVTOPEN")
 
 
 def test_protection_success_without_order_id_is_not_accepted(monkeypatch):
@@ -2160,6 +2440,10 @@ def test_micro_position_no_longer_blocked_by_three_tp_requirement(monkeypatch):
             "code": 0, "data": {"order": {"orderId": "O1"}}
         },
     )
+    monkeypatch.setattr(bx, "get_order", lambda _symbol, order_id: {
+        "status": "ok", "order_id": str(order_id), "order_status": "FILLED",
+        "executed_qty": 2.0, "avg_price": 100.0,
+    })
 
     # qty=2 meets minQty but cannot support the historical 3-leg ladder. The market
     # entry must still be allowed; protection will adapt after the confirmed fill.
@@ -2562,3 +2846,99 @@ def test_bingx_kline_missing_close_time_uses_inclusive_interval_end(monkeypatch)
     rows = bx.fetch_klines("TEST", "1h", 1)
     assert len(rows) == 1
     assert rows[0]["close_time"] == open_time + 3_600_000 - 1
+
+
+def test_engine_aborts_before_market_scan_when_active_trade_state_is_untrusted(monkeypatch):
+    import run_once as ro
+    from event_engine.tracker import ActiveTradeStateError
+
+    monkeypatch.setattr(ro, "EXECUTION_ENABLED", True)
+    monkeypatch.setattr(ro, "_ensure_action_journal_safe", lambda: None)
+    monkeypatch.setattr(ro, "_validate_execution_config", lambda: (True, ""))
+    monkeypatch.setattr(ro, "_begin_kline_request_cache_cycle", lambda: None)
+    monkeypatch.setattr(ro, "update_active_trades", lambda: (_ for _ in ()).throw(ActiveTradeStateError("broken active state")))
+    monkeypatch.setattr(ro, "fetch_data", lambda: pytest.fail("universe scan must not run after active state failure"))
+
+    assert ro.main() is None
+
+
+def test_unpersisted_unknown_entry_quarantine_activates_process_safety_latch(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "_ENTRY_EXECUTION_SAFETY_LATCH_REASON", None)
+    monkeypatch.setattr(ro, "_pending_protection_cleanup_for", lambda *_a, **_k: None)
+    monkeypatch.setattr(ro, "_current_close_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 0.0)
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", True)
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda *_a, **_k: {"snapshot": True})
+    monkeypatch.setattr(ro, "get_spot_current_price", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(ro, "evaluate_sr_directional_zone", lambda *_a, **_k: {
+        "reject": False, "zone_type": "DEMAND", "distance_pct": 0.0,
+    })
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
+    monkeypatch.setattr(ro, "open_market", lambda *_a, **_k: {
+        "status": "unknown", "order_id": "OID-UNKNOWN", "client_order_id": "EVTOPEN-UNKNOWN",
+        "order_status": "UNKNOWN", "entry_order_resolution_required": True,
+    })
+    monkeypatch.setattr(
+        ro, "queue_entry_order_resolution_pending",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("primary and fallback storage unavailable")),
+    )
+    monkeypatch.setattr(ro, "record_action", lambda *_a, **_k: None)
+
+    first = ro.execute_new_position("TEST", "LONG", 100.0, {"event_type": "DIVERGENCE"}, "EVT_UNKNOWN_PERSIST")
+    assert first["status"] == "OPEN_FAILED"
+    assert "could not be persisted" in ro._ENTRY_EXECUTION_SAFETY_LATCH_REASON
+
+    second = ro.execute_new_position("OTHER", "SHORT", 100.0, {"event_type": "DIVERGENCE"}, "EVT_BLOCKED_BY_PROCESS_LATCH")
+    assert second["status"] == "ENTRY_SAFETY_LATCH_ACTIVE"
+
+
+def test_rollback_cleanup_persistence_failure_uses_entry_quarantine_fallback(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "_ENTRY_EXECUTION_SAFETY_LATCH_REASON", None)
+    monkeypatch.setattr(ro, "cleanup_directional_protection_after_close", lambda *_a, **_k: {
+        "status": "pending", "error": "open order state unavailable",
+    })
+    monkeypatch.setattr(ro, "queue_protection_cleanup_pending", lambda *_a, **_k: (_ for _ in ()).throw(OSError("active state read-only")))
+    fallback_calls = []
+    monkeypatch.setattr(
+        ro, "queue_entry_order_resolution_pending",
+        lambda *a, **k: fallback_calls.append((a, k)) or "ENTRY_LOCK_FALLBACK",
+    )
+    monkeypatch.setattr(ro, "record_action", lambda *_a, **_k: None)
+    monkeypatch.setattr(ro, "send_tg", lambda *_a, **_k: None)
+
+    result = ro._finalize_rollback_protection_cleanup(
+        "TEST", "LONG", "EVT_ROLLBACK_CLEANUP",
+        {"status": "closed"},
+    )
+
+    assert result["status"] == "pending"
+    assert result["pending_cleanup_id"] == "ENTRY_LOCK_FALLBACK"
+    assert fallback_calls and fallback_calls[0][1]["order_status"] == "ROLLBACK_OR_PROTECTION_CLEANUP_UNKNOWN"
+    assert ro._ENTRY_EXECUTION_SAFETY_LATCH_REASON is None
+
+
+def test_rollback_cleanup_and_quarantine_persistence_failure_sets_process_latch(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "_ENTRY_EXECUTION_SAFETY_LATCH_REASON", None)
+    monkeypatch.setattr(ro, "cleanup_directional_protection_after_close", lambda *_a, **_k: {
+        "status": "pending", "error": "open order state unavailable",
+    })
+    monkeypatch.setattr(ro, "queue_protection_cleanup_pending", lambda *_a, **_k: (_ for _ in ()).throw(OSError("active state read-only")))
+    monkeypatch.setattr(ro, "queue_entry_order_resolution_pending", lambda *_a, **_k: (_ for _ in ()).throw(OSError("fallback latch read-only")))
+    monkeypatch.setattr(ro, "record_action", lambda *_a, **_k: None)
+    monkeypatch.setattr(ro, "send_tg", lambda *_a, **_k: None)
+
+    result = ro._finalize_rollback_protection_cleanup(
+        "TEST", "SHORT", "EVT_ROLLBACK_BOTH_PERSIST_FAIL",
+        {"status": "closed"},
+    )
+
+    assert result["status"] == "pending"
+    assert result["pending_cleanup_id"] is None
+    assert "could not be persisted" in ro._ENTRY_EXECUTION_SAFETY_LATCH_REASON

@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.25"
+APP_VERSION = "V10.4.27"
 
 import pandas as pd
 import requests
@@ -100,7 +100,10 @@ from event_engine.tracker import (
     register_active_trade,
     update_active_trade_protection,
     queue_protection_cleanup_pending,
+    queue_entry_order_resolution_pending,
     _load_active_trades,
+    ActiveTradeStateError,
+    _load_entry_order_quarantine_latches,
 )
 
 logging.basicConfig(
@@ -108,6 +111,7 @@ logging.basicConfig(
     format="%(message)s",
 )
 log = logging.getLogger("event_engine")
+_ENTRY_EXECUTION_SAFETY_LATCH_REASON: str | None = None
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -1989,8 +1993,11 @@ def _rollback_terminal_reason(status: Any) -> str | None:
     would otherwise reopen a position that can immediately hit the same protection
     failure on every scheduler cycle.
     """
-    if str(status or "").strip().lower() == "opened_rolled_back":
+    normalized = str(status or "").strip().lower()
+    if normalized == "opened_rolled_back":
         return "EXECUTION_ROLLED_BACK"
+    if normalized == "opened_rollback_unconfirmed":
+        return "ENTRY_ROLLBACK_UNCONFIRMED"
     return None
 
 
@@ -3102,7 +3109,7 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
 def _find_active_trade_for_position(bx_symbol: str, direction: str, active_trades: dict) -> dict | None:
     want_dir = str(direction).upper()
     for trade in active_trades.values():
-        if trade.get("closed", False):
+        if trade.get("closed", False) or trade.get("entry_order_resolution_pending"):
             continue
         t_bx = to_bx_symbol(trade.get("symbol", ""))
         t_dir = str(trade.get("direction", "")).upper()
@@ -3871,17 +3878,24 @@ def _symbol_identity_for_state(value: Any) -> str:
 
 
 def _pending_protection_cleanup_for(symbol: str, direction: str) -> str | None:
-    """Return a pending cleanup record for this canonical exchange symbol-side, if any."""
+    """Return a pending cleanup/entry-quarantine record for this symbol-side."""
     target_direction = str(direction or "").upper()
+    if _ENTRY_EXECUTION_SAFETY_LATCH_REASON:
+        return "PROCESS_ENTRY_SAFETY_LATCH"
     try:
         trades = _load_active_trades()
+        fallback_latches = _load_entry_order_quarantine_latches()
     except Exception:
-        # If local state cannot be inspected, don't guess that cleanup is absent.
+        # If either durable state cannot be inspected, don't guess that the
+        # symbol-side is clear.
         return "UNKNOWN_ACTIVE_TRADE_STATE"
     pending = [
         (record_id, trade) for record_id, trade in trades.items()
-        if isinstance(trade, dict) and trade.get("close_cleanup_pending")
+        if isinstance(trade, dict) and (trade.get("close_cleanup_pending") or trade.get("entry_order_resolution_pending"))
     ]
+    pending.extend(
+        (record_id, trade) for record_id, trade in fallback_latches.items()
+    )
     if not pending:
         return None
     target_symbol = _symbol_identity_for_state(symbol)
@@ -3897,6 +3911,7 @@ def _finalize_rollback_protection_cleanup(
     symbol: str, direction: str, event_id: str, rollback: dict | None
 ) -> dict:
     """Clean rollback-created protection or persist a retryable cleanup-only state."""
+    global _ENTRY_EXECUTION_SAFETY_LATCH_REASON
     rollback = rollback if isinstance(rollback, dict) else {}
     rollback_status = str(rollback.get("status", "unknown") or "unknown").lower()
     if rollback_status != "closed":
@@ -3924,6 +3939,19 @@ def _finalize_rollback_protection_cleanup(
     except Exception as exc:
         pending_id = None
         reason = f"{reason}; failed_to_persist_cleanup_queue:{type(exc).__name__}:{exc}"
+        # The ordinary cleanup queue is not durable. Convert this into the
+        # stronger entry-order quarantine, whose tracker implementation has an
+        # independent fallback latch outside active_trades.json.
+        try:
+            pending_id = queue_entry_order_resolution_pending(
+                symbol, direction, reason, source_event_id=event_id,
+                order_status="ROLLBACK_OR_PROTECTION_CLEANUP_UNKNOWN",
+            )
+        except Exception as quarantine_exc:
+            _ENTRY_EXECUTION_SAFETY_LATCH_REASON = (
+                f"Rollback protection quarantine could not be persisted for {symbol} {direction}: {quarantine_exc}"
+            )
+            reason = f"{reason}; failed_to_persist_entry_quarantine:{type(quarantine_exc).__name__}:{quarantine_exc}"
     record_action({
         "record_type": "ROLLBACK_PROTECTION_CLEANUP_PENDING",
         "event_id": event_id, "symbol": symbol, "direction": direction,
@@ -4087,9 +4115,16 @@ def _handle_rollback_followup(
 
 
 def execute_new_position(symbol: str, direction: str, price: float, setup: dict, event_id: str) -> dict:
+    global _ENTRY_EXECUTION_SAFETY_LATCH_REASON
     direction = str(direction).upper()
     trade_id = event_id.replace("EVT_", "")
 
+    if _ENTRY_EXECUTION_SAFETY_LATCH_REASON:
+        return {
+            "status": "ENTRY_SAFETY_LATCH_ACTIVE", "mode": EXECUTION_MODE,
+            "order_id": None, "position": {},
+            "error": _ENTRY_EXECUTION_SAFETY_LATCH_REASON,
+        }
     pending_cleanup_id = _pending_protection_cleanup_for(symbol, direction)
     if pending_cleanup_id:
         reason = f"protection cleanup is pending for {symbol} {direction} ({pending_cleanup_id})"
@@ -4442,6 +4477,41 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         if exchange_code is None:
             exchange_code = nested_response.get("code")
         error_text = opened.get("error") or opened.get("msg") or nested_response.get("msg") or open_status
+        if open_status == "unknown" and opened.get("entry_order_resolution_required", True) and not opened.get("retry_exhausted"):
+            try:
+                quarantine_id = queue_entry_order_resolution_pending(
+                    symbol, direction, str(error_text), source_event_id=event_id,
+                    order_id=opened.get("order_id"),
+                    client_order_id=opened.get("client_order_id") or opened.get("clientOrderId"),
+                    order_status=opened.get("order_status"),
+                    position_snapshot=opened.get("entry_position_snapshot"),
+                )
+                record_action({
+                    "record_type": "ENTRY_ORDER_RESOLUTION_PENDING", "event_id": event_id,
+                    "symbol": symbol, "direction": direction, "order_id": opened.get("order_id"),
+                    "client_order_id": opened.get("client_order_id") or opened.get("clientOrderId"),
+                    "order_status": opened.get("order_status"),
+                    "quarantine_id": quarantine_id, "error": str(error_text),
+                    "ts": int(time.time() * 1000),
+                })
+                try:
+                    send_tg(
+                        f"🚨 <b>Unresolved BingX MARKET entry</b>\n"
+                        f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
+                        f"Order: <code>{opened.get('order_id') or 'unknown'}</code>\n"
+                        f"Client ID: <code>{opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'}</code>\n"
+                        "The symbol-side is quarantined. Verify the exchange order before releasing it."
+                    )
+                except Exception as notify_exc:
+                    log.error("[EXECUTION] Could not notify unresolved entry-order quarantine %s: %s", quarantine_id, notify_exc)
+            except Exception as quarantine_exc:
+                _ENTRY_EXECUTION_SAFETY_LATCH_REASON = (
+                    f"Unresolved entry-order quarantine could not be persisted for {symbol} {direction}: {quarantine_exc}"
+                )
+                log.critical(
+                    "[EXECUTION] FAILED TO PERSIST unresolved entry-order quarantine for %s %s; all further entries in this process are blocked: %s",
+                    symbol, direction, quarantine_exc,
+                )
         return {
             "status": "EXISTING_POSITION" if open_status == "existing_position" else "OPEN_FAILED",
             "mode": EXECUTION_MODE,
@@ -4459,20 +4529,66 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             symbol, direction,
             qty=_safe_float((position or {}).get("positionAmt"), 0.0) if isinstance(position, dict) else None,
             reason_token=f"ENTRYFAIL:{trade_id}:{status}",
+            require_live_position=True,
         )
+        rolled_back = str(rollback.get("status", "")).lower() == "closed"
         result = {
-            "status": status,
+            # The entry order was accepted. Retire this event whether the close
+            # is verified or unresolved; reusing it could duplicate a late fill.
+            "status": "opened_rolled_back" if rolled_back else "opened_rollback_unconfirmed",
+            "entry_failure_status": status,
             "mode": EXECUTION_MODE,
             "order_id": order_id,
             "open_result": opened,
             "position": position or {},
             "error": error,
             "emergency_close": rollback,
-            "rolled_back": rollback.get("status") == "closed",
+            "rolled_back": rolled_back,
+            "rollback_state_unknown": not rolled_back,
         }
-        if result["rolled_back"]:
+        if rolled_back:
             result["position"] = {**(position or {}), "positionAmt": 0.0}
         result["protection_cleanup"] = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
+        if not rolled_back:
+            try:
+                quarantine_id = queue_entry_order_resolution_pending(
+                    symbol, direction,
+                    f"entry rollback is not confirmed: {status}; {rollback.get('error') or rollback.get('status')}",
+                    source_event_id=event_id,
+                    order_id=order_id,
+                    client_order_id=opened.get("client_order_id") or opened.get("clientOrderId"),
+                    order_status=opened.get("order_status"),
+                    position_snapshot=position if isinstance(position, dict) else None,
+                )
+                record_action({
+                    "record_type": "ENTRY_ROLLBACK_UNCONFIRMED",
+                    "event_id": event_id, "symbol": symbol, "direction": direction,
+                    "order_id": order_id,
+                    "client_order_id": opened.get("client_order_id") or opened.get("clientOrderId"),
+                    "order_status": opened.get("order_status"),
+                    "quarantine_id": quarantine_id,
+                    "entry_failure_status": status,
+                    "rollback": rollback,
+                    "ts": int(time.time() * 1000),
+                })
+                try:
+                    send_tg(
+                        f"🚨 <b>Entry rollback not confirmed</b>\n"
+                        f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
+                        f"Order: <code>{order_id or 'unknown'}</code>\n"
+                        f"Client ID: <code>{opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'}</code>\n"
+                        "The symbol-side is quarantined until the order and position are reconciled."
+                    )
+                except Exception as notify_exc:
+                    log.error("[EXECUTION] Could not notify unresolved rollback quarantine %s: %s", quarantine_id, notify_exc)
+            except Exception as quarantine_exc:
+                _ENTRY_EXECUTION_SAFETY_LATCH_REASON = (
+                    f"Unresolved entry rollback quarantine could not be persisted for {symbol} {direction}: {quarantine_exc}"
+                )
+                log.critical(
+                    "[EXECUTION] FAILED TO PERSIST unresolved rollback quarantine for %s %s; all further entries in this process are blocked: %s",
+                    symbol, direction, quarantine_exc,
+                )
         return result
 
     try:
@@ -4522,7 +4638,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     fill_drift_pct = _entry_drift_pct(signal_price_for_risk, actual_avg_price, direction)
     execution_quality["signal_to_fill_distance_pct"] = fill_drift_pct
     if drift_limit > 0 and fill_drift_pct is not None and fill_drift_pct > drift_limit:
-        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"DRIFTFAIL:{trade_id}")
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"DRIFTFAIL:{trade_id}", require_live_position=True)
         flattened = rollback.get("status") == "closed"
         log.error(
             "[EXECUTION] Entry drift exceeded for %s %s: %.2f%% > %.2f%%; emergency_close=%s",
@@ -4575,7 +4691,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         setup_for_fill["realized_rr"] = None
 
     except (TypeError, ValueError) as exc:
-        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"SETUPFAIL:{trade_id}")
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"SETUPFAIL:{trade_id}", require_live_position=True)
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
@@ -4618,7 +4734,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             setup_for_fill["sr_context"] = post_fill_sr
             if post_fill_sr.get("reject"):
                 rollback = emergency_close_position(
-                    symbol, direction, actual_qty, reason_token=f"SRPOSTFAIL:{trade_id}"
+                    symbol, direction, actual_qty, reason_token=f"SRPOSTFAIL:{trade_id}",
+                    require_live_position=True,
                 )
                 flattened = rollback.get("status") == "closed"
                 return {
@@ -4638,7 +4755,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         # only rejects when TP1 itself is blocked; post-TP1 zones are recorded for
         # research/management context without changing the planned targets.
     except Exception as exc:
-        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}")
+        rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}", require_live_position=True)
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
@@ -4688,7 +4805,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             rollback = protection["emergency_close"]
             protection["rollback_reason"] = protection.get("rollback_reason") or "protection_installer_rollback_already_attempted"
         else:
-            rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"PROTECTIONFAIL:{trade_id}")
+            rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"PROTECTIONFAIL:{trade_id}", require_live_position=True)
             protection["emergency_close"] = rollback
             protection["rollback_reason"] = "post_entry_protection_not_verified"
         protection["rolled_back"] = str(rollback.get("status", "")).lower() == "closed"
@@ -4810,12 +4927,18 @@ def main() -> None:
         try:
             log.info("[TRACKER] Checking active trades lifecycle & TP execution...")
             update_active_trades()
+        except ActiveTradeStateError as exc:
+            log.critical("[TRACKER] Active position state is not trustworthy; aborting cycle before scanning entries: %s", exc)
+            return
         except Exception as exc:
             log.error("[TRACKER] Update error: %s", exc)
 
         try:
             log.info("[RECONCILIATION] Reconciling open positions and protection...")
             reconcile_all_open_positions()
+        except ActiveTradeStateError as exc:
+            log.critical("[RECONCILIATION] Active position state is not trustworthy; aborting cycle before scanning entries: %s", exc)
+            return
         except Exception as exc:
             log.error("[RECONCILIATION] Error: %s", exc)
 
@@ -6183,10 +6306,14 @@ def main() -> None:
                 err_str = str(execution_result.get("error", "")).lower()
                 status_now = str(execution_result.get("status", ""))
                 terminal_reason = _rollback_terminal_reason(status_now)
-                if terminal_reason:
+                if terminal_reason == "EXECUTION_ROLLED_BACK":
                     log.warning(
-                        "[EXECUTION] %s (%s) opened position was verified rolled back; "
-                        "terminalizing event %s to prevent repeating the same open/rollback cycle.",
+                        "[EXECUTION] %s (%s) entry was verified rolled back; terminalizing event %s.",
+                        symbol, direction, event_id,
+                    )
+                elif terminal_reason == "ENTRY_ROLLBACK_UNCONFIRMED":
+                    log.critical(
+                        "[EXECUTION] %s (%s) entry rollback is not confirmed; terminalizing event %s and retaining cleanup quarantine.",
                         symbol, direction, event_id,
                     )
                 elif status_now == "PRE_ORDER_DRIFT_EXCEEDED":
