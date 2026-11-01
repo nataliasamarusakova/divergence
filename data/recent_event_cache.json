@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793499991172,
+  "updated_ts": 1793500318771,
   "events": [
     {
       "event_id": "EVT_E9A235B34DC6D621",
@@ -62,34 +62,6 @@
       }
     },
     {
-      "event_id": "EVT_48C6BD6F813F8B61",
-      "symbol": "MAGMA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "BREAKOUT_MOMENTUM",
-      "timestamps": {
-        "pivot_1_ts": 1793494799999,
-        "pivot_2_ts": 1793494799999,
-        "detected_at_ts": 1793494799999
-      },
-      "event_fact": {
-        "detection_close_price": 0.44874,
-        "donchian_high": 0.43944,
-        "donchian_low": 0.37046,
-        "breakout_atr": 0.6420455126440308,
-        "bb_width": 0.12268907526773153,
-        "bb_width_threshold": 0.144164310147904,
-        "volume_ratio": 2.592132880471418,
-        "adx": 53.34056519683834,
-        "requires_retest": true,
-        "trigger_level": 0.43944,
-        "engine": "BREAKOUT_MOMENTUM",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_33FF1C3AB9784193",
       "symbol": "MAGMA",
       "timeframe": "1h",
@@ -115,7 +87,11 @@
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.33504692233242794,
+        "htf_slope50": 0.01940730820317932,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -170,7 +146,11 @@
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.026033353869175595,
+        "htf_slope50": -0.0006749706441842619,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -373,31 +353,6 @@
       }
     },
     {
-      "event_id": "EVT_7AD9DDB181194F2F",
-      "symbol": "BNB",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "EMA_PULLBACK_CONTINUATION",
-      "timestamps": {
-        "pivot_1_ts": 1793498399999,
-        "pivot_2_ts": 1793498399999,
-        "detected_at_ts": 1793498399999
-      },
-      "event_fact": {
-        "ema_fast": 704.872053675946,
-        "ema_slow": 710.4526031853342,
-        "ema200": 726.5027786185026,
-        "body_atr": 0.4658354531173507,
-        "volume_ratio": 1.013838656907694,
-        "trigger_level": 704.872053675946,
-        "requires_retest": true,
-        "engine": "EMA_PULLBACK",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_2F0692E4B6D6176A",
       "symbol": "AAVE",
       "timeframe": "1h",
@@ -526,34 +481,11 @@
         "engine": "MA_COMPRESSION",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_8A513A8DC9A5C56C",
-      "symbol": "APR",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "ORDER_BLOCK_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1793465999999,
-        "pivot_2_ts": 1793498399999,
-        "detected_at_ts": 1793498399999
-      },
-      "event_fact": {
-        "engine": "ORDER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.05642,
-        "zone_high": 0.05642,
-        "zone_low": 0.05493,
-        "bos_level": 0.05652,
-        "ob_ts": 1793494799999,
-        "displacement_atr": 1.5893171840035147,
-        "volume_ratio": 3.3503782795575194,
-        "body_fraction": 0.6131386861313873,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.047149766361691506,
+        "htf_slope50": 0.0016805473965496587,
+        "context_timeframe": "4h"
       }
     },
     {
