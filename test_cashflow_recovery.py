@@ -68,6 +68,133 @@ def test_income_history_normalizes_actual_signed_cashflows(monkeypatch):
     assert captured["kwargs"]["retryable"] is False
 
 
+def test_cashflow_symbol_uses_canonical_bingx_display_name(monkeypatch):
+    from event_engine import bingx, tracker
+
+    monkeypatch.setattr(bingx, "CACHE", {
+        "ts": 1_800_000_000.0,
+        "data": {"NIULAI-USDT": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+        "by_display_name": {"牛来": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+    })
+    assert tracker._cashflow_symbol("牛来") == "NIULAI-USDT"
+    assert tracker._cashflow_symbol("NIULAI-USDT") == "NIULAI-USDT"
+
+
+def test_canonical_bingx_symbol_honors_compact_operator_symbol_map(monkeypatch):
+    from event_engine import bingx, tracker
+
+    monkeypatch.setattr(bingx, "SYMBOL_MAP", {"LOCALCOIN": "REMOTECOINUSDT"})
+    monkeypatch.setattr(bingx, "CACHE", {"ts": 0, "data": {}, "by_display_name": {}})
+
+    assert tracker._cashflow_symbol("LOCALCOIN") == "REMOTECOIN-USDT"
+    assert tracker._cashflow_symbol("LOCALCOIN-USDT") == "REMOTECOIN-USDT"
+
+
+def test_cashflow_recovery_matches_chinese_display_name_to_bingx_fill_and_income_symbol(tmp_path, monkeypatch):
+    from event_engine import bingx, tracker
+
+    journal = tmp_path / "trades.jsonl"
+    open_ts = 1_700_000_000_000
+    close_ts = open_ts + 60 * 60_000
+    rows = [
+        {
+            "record_type": "TRADE_OPEN", "event_id": "EVT_NIULAI", "symbol": "牛来",
+            "direction": "SHORT", "ts": open_ts,
+            "execution": {"fill_ts_ms": open_ts + 1000, "order_id": "ENTRY-N"},
+            "protection": {"tp_orders": [{"order_id": "TP-N"}]},
+        },
+        {
+            "record_type": "TRADE_CLOSE", "event_id": "EVT_NIULAI", "symbol": "牛来",
+            "direction": "SHORT", "closed_ts": close_ts, "exit_reason": "TAKE_PROFIT_FULL",
+            "exit_order_ids": ["TP-N"], "realized_pnl_usdt": None,
+            "fees_usdt": None, "funding_usdt": None, "net_pnl_usdt": None,
+            "pnl_costs_status": "UNVERIFIED_POSITION_ATTRIBUTION",
+            "cashflow_recovery": {"status": "PENDING", "attempts": 0, "next_retry_ts": 0},
+        },
+    ]
+    journal.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(tracker, "TRADES_PATH", journal)
+
+    def load_catalog():
+        bingx.CACHE.update(
+            ts=1_800_000_000.0,
+            data={"NIULAI-USDT": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+            by_display_name={"牛来": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+        )
+        return bingx.CACHE["data"]
+
+    monkeypatch.setattr(tracker, "bingx_contracts", load_catalog)
+
+    def fake_fill_history(symbol, start, end, *, order_id=None, **kwargs):
+        assert symbol == "牛来"
+        assert tracker._cashflow_symbol(symbol) == "NIULAI-USDT"
+        rows_by_order = {
+            "ENTRY-N": [{
+                "trade_id": "FILL-ENTRY", "order_id": "ENTRY-N", "symbol": "NIULAI-USDT",
+                "position_side": "SHORT", "time": open_ts + 1000, "qty": 1.0,
+                "price": 0.1, "realized_pnl": 0.0, "fee": -0.01, "fee_asset": "USDT",
+            }],
+            "TP-N": [{
+                "trade_id": "FILL-EXIT", "order_id": "TP-N", "symbol": "NIULAI-USDT",
+                "position_side": "SHORT", "time": close_ts - 1000, "qty": 1.0,
+                "price": 0.09, "realized_pnl": 0.1, "fee": -0.01, "fee_asset": "USDT",
+            }],
+        }
+        return {"status": "ok", "has_more": False, "fills": rows_by_order[str(order_id)]}
+
+    monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
+    monkeypatch.setattr(tracker, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [
+            {"record_id": "INC-PNL", "trade_id": "FILL-EXIT", "symbol": "NIULAI-USDT", "time": close_ts - 1000, "asset": "USDT", "income_type": "REALIZED_PNL", "amount": 0.1},
+            {"record_id": "INC-FEE-1", "trade_id": "FILL-ENTRY", "symbol": "NIULAI-USDT", "time": open_ts + 1000, "asset": "USDT", "income_type": "TRADING_FEE", "amount": -0.01},
+            {"record_id": "INC-FEE-2", "trade_id": "FILL-EXIT", "symbol": "NIULAI-USDT", "time": close_ts - 1000, "asset": "USDT", "income_type": "TRADING_FEE", "amount": -0.01},
+        ],
+    })
+
+    recovered = tracker._recover_trade_cashflows(now_ms=close_ts + 10_000, max_records=2)
+    assert recovered == 1
+    close_record = json.loads(journal.read_text(encoding="utf-8").splitlines()[1])
+    assert close_record["pnl_costs_status"] == "BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED"
+    assert close_record["realized_pnl_usdt"] == pytest.approx(0.1)
+    assert close_record["fees_usdt"] == pytest.approx(-0.02)
+    assert close_record["net_pnl_usdt"] == pytest.approx(0.08)
+
+
+def test_fill_history_none_data_is_not_misreported_as_empty_and_has_envelope_diagnostics(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "ZEC-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0, "msg": "", "data": None,
+    })
+
+    result = bingx.get_fill_history("ZEC", 1_700_000_000_000, 1_700_000_001_000, order_id="ENTRY-1")
+
+    assert result["status"] == "error"
+    assert result["error"] == "fill_history_unexpected_data_shape"
+    assert result["response_code"] == 0
+    assert result["response_data_type"] == "NoneType"
+    assert result["response_keys"] == ["code", "data", "msg"]
+
+
+def test_income_history_none_data_remains_incomplete_with_envelope_diagnostics(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "ZEC-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0, "msg": "", "data": None,
+    })
+
+    result = bingx.get_income_history("ZEC", 1_700_000_000_000, 1_700_000_001_000)
+
+    assert result["status"] == "error"
+    assert result["complete"] is False
+    assert result["error"] == "income_history_unexpected_data_shape"
+    assert result["response_code"] == 0
+    assert result["response_data_type"] == "NoneType"
+    assert result["response_keys"] == ["code", "data", "msg"]
+
+
 def _journal_fixture(tmp_path: Path, *, overlapping: bool = False):
     journal = tmp_path / "trades.jsonl"
     open_ts = 1_700_000_000_000
@@ -463,3 +590,33 @@ def test_income_history_unknown_shape_returns_safe_diagnostics_not_zero(monkeypa
     assert result.get("shape_fingerprint")
     assert "responseMeta" in result.get("shape_summary", "")
     assert "fingerprint=" in caplog.text
+
+
+def test_fill_recovery_error_preserves_bounded_exchange_envelope_diagnostics(monkeypatch):
+    from event_engine import tracker
+
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *a, **k: {
+        "status": "error", "error": "fill_history_unexpected_data_shape",
+        "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
+        "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
+        "shape_summary": "NoneType", "shape_fingerprint": "ABC123",
+    })
+    close_ts = 1_700_000_100_000
+    opened = {
+        "symbol": "BTC", "direction": "LONG", "ts": close_ts - 60_000,
+        "execution": {"fill_ts_ms": close_ts - 60_000, "order_id": "ENTRY-1"},
+        "protection": {"tp_orders": [{"order_id": "TP-1"}]},
+    }
+    closed = {
+        "symbol": "BTC", "direction": "LONG", "closed_ts": close_ts,
+        "exit_order_ids": ["TP-1"],
+    }
+
+    fills, error = tracker._fetch_trade_fill_history(closed, opened, close_ts + 1000)
+
+    assert fills == []
+    assert "fill_history_unexpected_data_shape" in error
+    assert "response_code=0" in error
+    assert "response_data_type=NoneType" in error
+    assert "response_keys=code,data,msg" in error
+    assert "shape_fingerprint=ABC123" in error

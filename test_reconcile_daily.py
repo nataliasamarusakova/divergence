@@ -285,6 +285,8 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
         "records": [], "shape_fingerprint": "ABC123", "shape_summary": "dict:fields=incomeHistory:dict",
+        "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
+        "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
     })
     alerts = []
     monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
@@ -294,6 +296,9 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     warning = next(item for item in report["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
     assert "shape_fingerprint=ABC123" in warning["detail"]
     assert "incomeHistory" in warning["detail"]
+    assert "response_data_type\":\"NoneType" in warning["detail"]
+    assert warning["response_diagnostics"]["response_code"] == 0
+    assert warning["response_diagnostics"]["response_keys"] == ["code", "data", "msg"]
     assert report["build_version"] == "V10.4.25"
     assert "Build: <code>V10.4.25</code>" in alerts[0]
 
@@ -307,3 +312,120 @@ def test_trump_legacy_exchange_symbol_is_canonicalized_without_merging_sol():
     assert recon._canonical_position_symbol("SOL") == "SOL-USDT"
     assert recon._canonical_position_symbol("SOL-USDT") == "SOL-USDT"
     assert recon._canonical_position_symbol("TRUMP-SOL-USDT") == "TRUMP-SOL-USDT"
+
+
+def test_bingx_display_name_is_canonicalized_from_loaded_contract_catalog(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "CACHE", {
+        "ts": 1_800_000_000.0,
+        "data": {"NIULAI-USDT": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+        "by_display_name": {"牛来": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+    })
+
+    assert recon._canonical_position_symbol("牛来") == "NIULAI-USDT"
+    assert recon._canonical_position_symbol("牛来-USDT") == "NIULAI-USDT"
+    assert recon._canonical_position_symbol("NIULAI-USDT") == "NIULAI-USDT"
+
+
+def test_reconciliation_loads_catalog_once_to_match_display_name_and_api_symbol(tmp_path, monkeypatch):
+    from event_engine import bingx
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-NIULAI": {
+            "symbol": "牛来", "direction": "SHORT", "remaining_qty": 144.4,
+            "closed": False,
+            "sl_order": {"order_id": "SL-N", "stop_price": 0.074, "qty": 144.4},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP-N", "price": 0.066, "qty": 144.4}],
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+
+    catalog_calls = []
+    def load_catalog():
+        catalog_calls.append(True)
+        bingx.CACHE.update(
+            ts=1_800_000_000.0,
+            data={"NIULAI-USDT": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+            by_display_name={"牛来": {"symbol": "NIULAI-USDT", "displayName": "牛来"}},
+        )
+        return bingx.CACHE["data"]
+
+    monkeypatch.setattr(recon.bingx, "contracts", load_catalog)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "NIULAI-USDT", "positionSide": "SHORT", "positionAmt": "144.4",
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": [
+        {"symbol": "NIULAI-USDT", "orderId": "SL-N", "type": "STOP_MARKET", "stopPrice": "0.074", "positionSide": "SHORT", "side": "BUY", "origQty": "144.4"},
+        {"symbol": "NIULAI-USDT", "orderId": "TP-N", "type": "TAKE_PROFIT_MARKET", "stopPrice": "0.066", "positionSide": "SHORT", "side": "BUY", "origQty": "144.4"},
+    ]})
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert catalog_calls == [True]
+    assert report["checks"]["bingx_contract_catalog"]["status"] == "OK"
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    assert report["checks"]["exchange_positions"]["active_position_keys"] == 1
+
+
+
+
+def test_reconciliation_keeps_non_latin_identity_unknown_if_catalog_cannot_resolve(tmp_path, monkeypatch):
+    from event_engine import bingx
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-NIULAI": {"symbol": "牛来", "direction": "SHORT", "remaining_qty": 144.4, "closed": False},
+    }, ensure_ascii=False), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(bingx, "CACHE", {"ts": 0, "data": {}, "by_display_name": {}})
+    catalog_calls = []
+    monkeypatch.setattr(recon.bingx, "contracts", lambda: catalog_calls.append(True) or {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "NIULAI-USDT", "positionSide": "SHORT", "positionAmt": -144.4,
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert catalog_calls == [True]
+    assert any(item["code"] == "POSITION_SYMBOL_IDENTITY_UNRESOLVED" for item in report["discrepancies"])
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    assert report["checks"]["exchange_protection"]["by_position"]["NIULAI-USDT:SHORT"]["status"] == "UNKNOWN"
+
+
+
+def test_catalog_unavailable_does_not_hide_unmatched_ascii_position(tmp_path, monkeypatch):
+    from event_engine import bingx
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-LOCAL": {"symbol": "LOCALCOIN", "direction": "SHORT", "remaining_qty": 2.0, "closed": False},
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(bingx, "CACHE", {"ts": 0, "data": {}, "by_display_name": {}})
+    monkeypatch.setattr(recon.bingx, "contracts", lambda: {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "OTHERCOIN-USDT", "positionSide": "SHORT", "positionAmt": -2.0,
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert any(item["code"] == "POSITION_SYMBOL_CATALOG_UNAVAILABLE" for item in report["discrepancies"])
+    mismatch = [item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
+    assert len(mismatch) == 2
+    assert {item["symbol"] for item in mismatch} == {"LOCALCOIN-USDT", "OTHERCOIN-USDT"}

@@ -463,6 +463,41 @@ def test_disabled_event_type_policy_is_narrow_and_case_insensitive(monkeypatch):
     assert not _ro._event_type_is_disabled("DONCHIAN_RETEST_BREAKOUT")
 
 
+def test_telegram_symbol_is_compact_usdt_pair_and_does_not_duplicate_suffix():
+    from event_engine.formatting import format_telegram_symbol
+
+    assert format_telegram_symbol("OP") == "OPUSDT"
+    assert format_telegram_symbol("OP-USDT") == "OPUSDT"
+    assert format_telegram_symbol("OP/USDT") == "OPUSDT"
+    assert format_telegram_symbol("OP_USDT") == "OPUSDT"
+    assert format_telegram_symbol("OPUSDT") == "OPUSDT"
+    assert format_telegram_symbol("TRUMP-SOL-USDT") == "TRUMP-SOLUSDT"
+    assert format_telegram_symbol("") == "—"
+
+
+def test_telegram_signal_header_contains_copy_friendly_usdt_ticker_for_both_directions():
+    from event_engine.telegram import format_signal
+
+    long_message = format_signal({"direction": "LONG", "symbol": "OP", "event_type": "X", "event_fact": {}, "timestamps": {}})
+    short_message = format_signal({"direction": "SHORT", "symbol": "OP-USDT", "event_type": "X", "event_fact": {}, "timestamps": {}})
+
+    assert "🟢 LONG - OP (OPUSDT)" in long_message
+    assert "🔴 SHORT - OP-USDT (OPUSDT)" in short_message
+
+
+def test_closed_trade_message_shows_compact_ticker_and_open_direction():
+    from event_engine.tracker import format_trade_closed_message
+
+    msg = format_trade_closed_message(
+        name="RENDER", symbol="RENDER", direction="SHORT", entry_price=1.63, exit_price=1.48250799,
+        pnl_pct=9.05, realized_rr=1.29, planned_rr=1.29, duration_min=247.2, peak_pnl=11.04,
+        max_drawdown=-6.93, exit_reason="TAKE_PROFIT_FULL", event_type="CRT_BEARISH", timeframe="4h",
+    )
+
+    assert "RENDER (RENDERUSDT) — сделка закрыта" in msg
+    assert "Направление: <b>SHORT</b>" in msg
+
+
 def test_telegram_message_uses_clean_setup_values_and_omits_confirmation_field():
     from event_engine.telegram import format_signal
     msg = format_signal(
