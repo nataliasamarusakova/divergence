@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import requests
 
-from .formatting import format_number, format_percent, format_price, format_rr, tp_price_from_pnl
+from .formatting import format_number, format_percent, format_price, format_rr, format_telegram_symbol, tp_price_from_pnl
 
 
 def _chat_ids() -> list[str]:
@@ -82,7 +82,7 @@ def format_signal(
         return html.escape("—" if v is None or v == "" else str(v), quote=False)
 
     name = getattr(coinalyze_row, "name", None) or event.get("symbol", "")
-    symbol = event.get("symbol", "")
+    symbol = format_telegram_symbol(event.get("symbol", ""))
     event_type = event.get("event_type", "")
     timeframe = event.get("timeframe", "1h")
     price = fact.get("detection_close_price") or fact.get("close")

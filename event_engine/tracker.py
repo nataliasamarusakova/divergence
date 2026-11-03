@@ -25,16 +25,47 @@ from event_engine.bingx import (
     _format_price,
     _format_qty,
     _request,
+    contracts as bingx_contracts,
+    canonical_contract_symbol,
     ORDER_PATH,
     _post_protection_order_verified,
     _cancel_protection_order_verified,
     emergency_close_position,
 )
 from event_engine.telegram import send_detailed
-from event_engine.formatting import format_price, format_rr
+from event_engine.formatting import format_price, format_rr, format_telegram_symbol
 from event_engine.json_safe import json_safe
 
 log = logging.getLogger("event_engine.tracker")
+
+
+def _format_exchange_response_diagnostics(response: Any) -> str:
+    """Format only bounded BingX response-envelope metadata for recovery logs.
+
+    Never include the raw response/data payload: it may contain account-specific
+    details. These fields are sufficient to distinguish API errors from shape
+    changes such as ``data=None`` without inventing an empty financial result.
+    """
+    if not isinstance(response, dict):
+        return f"response_type={type(response).__name__}"
+    parts = [f"response_type=dict"]
+    if response.get("response_code") is not None:
+        parts.append(f"response_code={response.get('response_code')}")
+    if response.get("response_data_type") is not None:
+        parts.append(f"response_data_type={response.get('response_data_type')}")
+    if response.get("response_msg") not in (None, ""):
+        message = str(response.get("response_msg")).replace("\n", " ").replace("\r", " ")[:240]
+        parts.append(f"response_msg={message}")
+    keys = response.get("response_keys")
+    if isinstance(keys, list):
+        parts.append("response_keys=" + ",".join(str(key)[:80] for key in keys[:40]))
+    shape = response.get("shape_summary")
+    if shape not in (None, ""):
+        parts.append(f"shape_summary={str(shape)[:240]}")
+    fingerprint = response.get("shape_fingerprint")
+    if fingerprint not in (None, ""):
+        parts.append(f"shape_fingerprint={str(fingerprint)[:32]}")
+    return "; ".join(parts)
 
 
 class ActiveTradeStateError(RuntimeError):
@@ -595,6 +626,9 @@ def _fetch_trade_fill_history(record: dict, opened_record: dict | None, now_ms: 
             last_request_monotonic = time.monotonic()
             if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
                 response_error = str(response.get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
+                diagnostic = _format_exchange_response_diagnostics(response)
+                if diagnostic:
+                    response_error = f"{response_error}; {diagnostic}"
                 log.warning(
                     "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=ERROR error=%s",
                     event_id, symbol, page_index, request_elapsed, response_error,
@@ -1159,9 +1193,14 @@ def format_trade_closed_message(
     planned_rr_text = format_rr(planned_rr, decimals=2) if planned_rr is not None else "—"
 
     exit_text = format_price(exit_price) if exit_price is not None and _safe_float(exit_price, 0.0) > 0 else "UNKNOWN"
+    direction_text = str(direction or "").strip().upper()
+    if direction_text not in {"LONG", "SHORT"}:
+        direction_text = "UNKNOWN"
+    display_symbol = format_telegram_symbol(symbol)
     lines = [
-        f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
+        f"{emoji} <b>{name} ({display_symbol}) — сделка закрыта</b>",
         "",
+        f"Направление: <b>{direction_text}</b>",
         f"Вход <code>{format_price(entry_price)}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
@@ -1907,16 +1946,14 @@ def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
 
 
 def _cashflow_symbol(symbol: Any) -> str:
-    value = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
-    if not value:
-        return ""
-    value = value.replace("--", "-")
-    if "-" not in value:
-        if value.endswith("USDT") and len(value) > 4:
-            value = value[:-4] + "-USDT"
-        else:
-            value += "-USDT"
-    return value
+    """Return the canonical BingX contract symbol for cashflow comparisons.
+
+    The active process loads the public contract catalog before recovery.  This
+    resolves display names (including non-Latin names such as 牛来) to the same
+    API symbol used by fillHistory/income.  Unknown names remain normalized but
+    are never guessed into another instrument.
+    """
+    return canonical_contract_symbol(symbol)
 
 
 def _event_timestamp_ms(opened: dict | None) -> int:
@@ -2039,6 +2076,9 @@ def _load_exchange_fill_evidence(
             return None, f"fill_history_exception_for_order:{order_id}:{exc}"
         if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
             error = response.get("error", "fill_history_invalid_response") if isinstance(response, dict) else "fill_history_invalid_response"
+            diagnostic = _format_exchange_response_diagnostics(response)
+            if diagnostic:
+                error = f"{error}; {diagnostic}"
             return None, f"fill_history_failed_for_order:{order_id}:{error}"
         if response.get("has_more") is True:
             return None, f"fill_history_truncated_for_order:{order_id}"
@@ -2131,6 +2171,24 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
                 ts *= 1000
             close_ts_by_event[event_id] = max(close_ts_by_event.get(event_id, 0), ts)
             close_indices_by_event.setdefault(event_id, []).append(index)
+
+    # Non-Latin display names (e.g. 牛来) cannot be joined to API symbols until
+    # the process has the public BingX contract catalog.  Load it once, and only
+    # when such a name is present, before overlap detection and fill matching.
+    # Normal ASCII-symbol recovery stays network-free here; its usual caller
+    # already initialized the catalog during the main market cycle.
+    has_non_ascii_symbol = any(
+        isinstance(record, dict)
+        and str(record.get("symbol") or "").strip()
+        and not str(record.get("symbol") or "").strip().isascii()
+        for record in parsed if isinstance(record, dict)
+    )
+    if has_non_ascii_symbol:
+        try:
+            if not bingx_contracts():
+                log.warning("[TRACKER_CASHFLOW] BingX contract catalog unavailable; non-Latin display-name symbols remain unresolved")
+        except Exception as exc:
+            log.warning("[TRACKER_CASHFLOW] BingX contract catalog load failed for display-name symbols: %s", exc)
 
     replacements: dict[int, str] = {}
     attempts_this_cycle = 0
@@ -2285,6 +2343,9 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
         error = None
         if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok" or response.get("complete") is not True:
             error = str(response.get("error", "income_history_incomplete")) if isinstance(response, dict) else "income_history_invalid_response"
+            diagnostic = _format_exchange_response_diagnostics(response)
+            if diagnostic:
+                error = f"{error}; {diagnostic}"
             records = []
         elif not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
             error, records = "income_history_invalid_records", []

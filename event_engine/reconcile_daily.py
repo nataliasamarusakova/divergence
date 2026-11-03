@@ -108,26 +108,11 @@ def _canonical_position_symbol(value: Any) -> str:
     if known:
         return known
 
-    # Use an already-populated in-process contract catalog only. Never call
-    # to_bx_symbol/get_contract here because they may issue a network request.
-    cache = getattr(bingx, "CACHE", {})
-    catalog = cache.get("data", {}) if isinstance(cache, dict) else {}
-    by_name = cache.get("by_display_name", {}) if isinstance(cache, dict) else {}
-    if isinstance(catalog, dict) and raw in catalog:
-        return raw
-    if isinstance(by_name, dict):
-        for candidate in (raw, raw.replace("-", ""), raw.replace("-USDT", "USDT")):
-            contract = by_name.get(candidate)
-            if isinstance(contract, dict) and contract.get("symbol"):
-                return _symbol(contract.get("symbol"))
-    if isinstance(catalog, dict):
-        raw_compact = raw.replace("-", "").replace("/", "")
-        for contract in catalog.values():
-            if not isinstance(contract, dict):
-                continue
-            display = _symbol(contract.get("displayName")).replace("-", "").replace("/", "")
-            if display == raw_compact and contract.get("symbol"):
-                return _symbol(contract.get("symbol"))
+    # Use the common in-memory contract resolver.  It performs no network I/O;
+    # run_reconciliation loads the catalog once before comparing positions.
+    resolver = getattr(bingx, "canonical_contract_symbol", None)
+    if callable(resolver):
+        return _symbol(resolver(value))
     return raw
 
 
@@ -350,6 +335,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
 
     active, active_error = _load_json_object(active_path)
     local_positions: dict[tuple[str, str], float] = {}
+    active_errors: list[str] = []
     if active is None:
         report["checks"]["local_active_state"] = {"status": "UNKNOWN", "error": active_error}
         report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_UNAVAILABLE", "detail": active_error})
@@ -375,8 +361,97 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         }
         for detail in exchange_errors:
             report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_ROW_UNIDENTIFIABLE", "detail": detail})
+        catalog_status = "NOT_NEEDED"
+        catalog_count = 0
+        catalog_error = None
+        identity_unresolved = False
+        identity_unresolved_keys: set[tuple[str, str]] = set()
+        has_non_ascii_identity = any(
+            not str(trade.get("symbol") or "").strip().isascii()
+            for trade in (active.values() if isinstance(active, dict) else [])
+            if isinstance(trade, dict) and not bool(trade.get("closed"))
+        ) or any(
+            not str(row.get("symbol") or "").strip().isascii()
+            for row in exchange_rows if isinstance(row, dict)
+        )
+        # Only refresh the public catalog when local and exchange identity keys
+        # do not line up.  This avoids adding a network request to normal runs
+        # while resolving display-name aliases (for example 牛来 → NIULAI-USDT)
+        # in the separate reconciliation process.  The catalog is fetched at
+        # most once and then shared by position and protection normalization.
+        if active is not None and not active_errors and not exchange_errors and (
+            has_non_ascii_identity
+            or (local_positions and exchange_positions and set(local_positions) != set(exchange_positions))
+        ):
+            catalog_status = "UNKNOWN"
+            try:
+                contract_catalog = bingx.contracts()
+                catalog_count = len(contract_catalog) if isinstance(contract_catalog, dict) else 0
+                if catalog_count:
+                    local_positions, active_errors = _active_local_positions(active)
+                    exchange_positions, exchange_errors = _exchange_positions(exchange_rows)
+                    catalog_status = "LOADED"
+                    report["checks"]["local_active_state"].update({
+                        "status": "OK" if not active_errors else "WARNING",
+                        "active_position_keys": len(local_positions),
+                        "parse_errors": active_errors,
+                    })
+                    report["checks"]["exchange_positions"].update({
+                        "status": "OK" if not exchange_errors else "WARNING",
+                        "active_position_keys": len(exchange_positions),
+                        "parse_errors": exchange_errors,
+                    })
+                else:
+                    catalog_error = "empty_or_unavailable_contract_catalog"
+            except Exception as exc:
+                catalog_error = f"{type(exc).__name__}:{exc}"
+            unmatched_keys = set(local_positions) ^ set(exchange_positions)
+            non_ascii_keys = {
+                key for key in (set(local_positions) | set(exchange_positions))
+                if not key[0].isascii()
+            }
+            # Only a non-Latin display-name identity is inherently ambiguous
+            # when the catalog cannot be loaded.  An unmatched ASCII symbol is
+            # not presumed to be an alias: retain the strict quantity check so
+            # a real missing/extra position cannot be hidden by a catalog outage.
+            identity_unresolved = bool(non_ascii_keys)
+            identity_unresolved_keys = set(non_ascii_keys)
+            if non_ascii_keys:
+                # Both sides of a possible displayName/API-symbol pair are
+                # unknown until canonicalization succeeds; do not declare the
+                # API-side order set missing protection merely because the
+                # display-name side could not be mapped.
+                identity_unresolved_keys.update(unmatched_keys)
+            elif unmatched_keys and catalog_count == 0:
+                report["discrepancies"].append({
+                    "level": "WARNING", "code": "POSITION_SYMBOL_CATALOG_UNAVAILABLE",
+                    "detail": "Contract catalog could not be loaded; unmatched ASCII symbols remain subject to strict position identity/quantity reconciliation.",
+                    "catalog_error": catalog_error,
+                    "unmatched_keys": [f"{symbol}:{direction}" for symbol, direction in sorted(unmatched_keys)],
+                })
+            if catalog_count and not identity_unresolved_keys and not unmatched_keys:
+                catalog_status = "OK"
+            report["checks"]["bingx_contract_catalog"] = {
+                "status": catalog_status, "contracts": catalog_count,
+                "source": "single_load_on_identity_mismatch", "error": catalog_error,
+            }
+            if identity_unresolved:
+                report["discrepancies"].append({
+                    "level": "WARNING", "code": "POSITION_SYMBOL_IDENTITY_UNRESOLVED",
+                    "detail": "A display-name identity remains unresolved after the single catalog load; unmatched non-Latin identities were not classified as quantity mismatches.",
+                    "catalog_error": catalog_error,
+                    "unmatched_keys": [f"{symbol}:{direction}" for symbol, direction in sorted(unmatched_keys)],
+                })
+        else:
+            report["checks"]["bingx_contract_catalog"] = {
+                "status": "NOT_NEEDED", "contracts": 0,
+                "source": "no_identity_mismatch",
+            }
         if active is not None and not active_errors and not exchange_errors:
-            for key in sorted(set(local_positions) | set(exchange_positions)):
+            comparison_keys = set(local_positions) | set(exchange_positions)
+            if identity_unresolved:
+                comparison_keys = set(local_positions) & set(exchange_positions)
+            for key in sorted(comparison_keys):
                 local_qty = local_positions.get(key, 0.0)
                 exchange_qty = exchange_positions.get(key, 0.0)
                 tolerance = max(1e-8, exchange_qty * 0.01, local_qty * 0.01)
@@ -455,6 +530,12 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         # This is read-only; ambiguous openOrders data never becomes "no protection".
         for (symbol, direction), exchange_qty in sorted(exchange_positions.items()):
             key = f"{symbol}:{direction}"
+            if (symbol, direction) in identity_unresolved_keys:
+                protection_results[key] = {
+                    "status": "UNKNOWN", "error": "contract_display_name_identity_unresolved",
+                    "exchange_qty": exchange_qty, "source": "account_open_orders_snapshot",
+                }
+                continue
             protection = _protection_from_open_orders_snapshot(protection_snapshot, symbol, direction)
             if not isinstance(protection, dict) or str(protection.get("status", "")).lower() != "ok":
                 detail = str(protection.get("error", "invalid_protection_response")) if isinstance(protection, dict) else "invalid_protection_response"
@@ -500,6 +581,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 status = "WARNING"
                 report["discrepancies"].append({"level": "WARNING", "code": "EXCHANGE_TAKE_PROFIT_NOT_VISIBLE", "symbol": symbol, "direction": direction, "detail": "one verified SL is visible, but no open TP order is visible"})
             protection_results[key] = {"status": status, "sl_orders": sl_info, "tp_order_count": len(tp_orders), "source": "account_open_orders_snapshot"}
+
     protection_check_status = "OK"
     if any(item.get("status") == "UNKNOWN" for item in protection_results.values()):
         protection_check_status = "UNKNOWN"
@@ -595,11 +677,26 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 detail += f"; shape_fingerprint={shape_fingerprint}"
             if shape_summary:
                 detail += f"; response_shape={shape_summary}"
+            response_diagnostics = {
+                key: income.get(key) for key in (
+                    "response_type", "response_code", "response_msg",
+                    "response_keys", "response_data_type",
+                ) if isinstance(income, dict) and income.get(key) is not None
+            }
+            if response_diagnostics:
+                detail += "; api_response=" + json.dumps(
+                    response_diagnostics, ensure_ascii=False, separators=(",", ":"),
+                )[:700]
             income_summaries[symbol] = {
                 "status": "ERROR", "error": detail, "attempts": attempts,
                 "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
+                "response_diagnostics": response_diagnostics,
             }
-            report["discrepancies"].append({"level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE", "symbol": symbol, "detail": f"{detail} (attempts={attempts})"})
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE",
+                "symbol": symbol, "detail": f"{detail} (attempts={attempts})",
+                "response_diagnostics": response_diagnostics,
+            })
             continue
         totals = {"realized_pnl": 0.0, "trading_fees": 0.0, "funding_fees": 0.0, "other_known": 0.0, "records": len(income.get("records", [])), "attempts": attempts}
         for row in income.get("records", []):

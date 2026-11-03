@@ -82,6 +82,18 @@ CACHE = {
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
 
+# Provider aliases that are part of the bot's established market-data contract.
+# Keep these shared by reconciliation and cashflow matching rather than letting
+# the same instrument normalize differently in separate subsystems.
+_KNOWN_CONTRACT_SYMBOL_ALIASES = {
+    "LIT": "LIGHTER-USDT",
+    "LITUSDT": "LIGHTER-USDT",
+    "LIT-USDT": "LIGHTER-USDT",
+    "TRUMPSOL": "TRUMP-USDT",
+    "TRUMPSOLUSDT": "TRUMP-USDT",
+    "TRUMPSOL-USDT": "TRUMP-USDT",
+}
+
 # Live-price requests are used by the tracker and by execution sizing. A bad
 # symbol must never be allowed to fan out into repeated invalid requests that
 # trigger BingX's 109429 temporary restriction. Keep this protection local to
@@ -404,6 +416,93 @@ def to_bx_symbol(symbol: str) -> str | None:
     if not c:
         return None
     return str(c.get("symbol", "")).upper()
+
+
+def canonical_contract_symbol(symbol: Any) -> str:
+    """Return the canonical BingX API symbol using the already-loaded catalog.
+
+    This helper deliberately performs **no network I/O**.  It is intended for
+    joining local journals with exchange position/order rows after the caller
+    has loaded ``contracts()`` once for the current process.  A display name
+    such as ``牛来`` can therefore resolve to ``NIULAI-USDT`` without treating
+    the display name as a second instrument.
+
+    Unknown or ambiguous names are preserved in normalized form.  Guessing a
+    contract from a partial ticker could merge two real instruments and hide a
+    position mismatch, so callers can still report an unresolved identity.
+    """
+    raw = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if not raw:
+        return ""
+    raw = raw.replace("--", "-")
+    if "-" not in raw:
+        if raw.endswith("USDT") and len(raw) > 4:
+            raw = f"{raw[:-4]}-USDT"
+        else:
+            raw = f"{raw}-USDT"
+
+    # This is a distinct market, not the legacy TRUMPSOL spelling used by
+    # BingX for TRUMP. Preserve the explicitly dashed TRUMP-SOL contract.
+    if raw == "TRUMP-SOL-USDT":
+        return raw
+
+    base = raw[:-5] if raw.endswith("-USDT") else raw
+    compact_raw = raw.replace("-", "")
+    compact_base = base.replace("-", "")
+    configured = next((
+        SYMBOL_MAP.get(key) for key in (raw, base, compact_raw, compact_base)
+        if SYMBOL_MAP.get(key)
+    ), None)
+    if configured:
+        mapped = str(configured).strip().upper().replace("_", "-").replace("/", "-")
+        if "-" not in mapped and mapped.endswith("USDT") and len(mapped) > 4:
+            mapped = f"{mapped[:-4]}-USDT"
+        elif "-" not in mapped:
+            mapped = f"{mapped}-USDT"
+        return mapped
+    known = _KNOWN_CONTRACT_SYMBOL_ALIASES.get(raw) or _KNOWN_CONTRACT_SYMBOL_ALIASES.get(compact_raw)
+    if known:
+        return known
+
+    catalog = CACHE.get("data", {}) if isinstance(CACHE, dict) else {}
+    by_name = CACHE.get("by_display_name", {}) if isinstance(CACHE, dict) else {}
+    if not isinstance(catalog, dict):
+        catalog = {}
+    if not isinstance(by_name, dict):
+        by_name = {}
+
+    # Exact API-symbol match wins immediately.
+    if raw in catalog:
+        return raw
+
+    def compact(value: Any) -> str:
+        return str(value or "").strip().upper().replace("-", "").replace("_", "").replace("/", "").replace(" ", "")
+
+    aliases = (raw, base, compact(raw), compact(base), f"{base}USDT", f"{compact(base)}USDT")
+    matches: set[str] = set()
+    for alias in aliases:
+        contract = by_name.get(alias)
+        if isinstance(contract, dict):
+            contract_symbol = str(contract.get("symbol") or "").strip().upper().replace("_", "-").replace("/", "-")
+            if contract_symbol:
+                matches.add(contract_symbol)
+
+    # The display-name cache is useful for exact aliases.  A bounded scan of
+    # the in-memory catalog also handles displayName values with/without USDT
+    # suffixes (including non-Latin names such as 牛来).
+    wanted = {compact(base), compact(raw)}
+    for contract in catalog.values():
+        if not isinstance(contract, dict):
+            continue
+        contract_symbol = str(contract.get("symbol") or "").strip().upper().replace("_", "-").replace("/", "-")
+        display = str(contract.get("displayName") or "").strip().upper()
+        display_compact = compact(display)
+        if contract_symbol and display_compact in wanted:
+            matches.add(contract_symbol)
+
+    if len(matches) == 1:
+        return next(iter(matches))
+    return raw
 
 
 def contract_exists(symbol: str) -> bool:
@@ -900,6 +999,26 @@ def _shape_fingerprint(payload: Any) -> tuple[str, str]:
     return fingerprint, description
 
 
+def _response_envelope_diagnostics(response: Any) -> dict[str, Any]:
+    """Return bounded, non-secret metadata for an unexpected API envelope."""
+    if not isinstance(response, dict):
+        return {
+            "response_type": type(response).__name__,
+            "response_keys": [],
+            "response_code": None,
+            "response_msg": None,
+            "response_data_type": None,
+        }
+    message = response.get("msg")
+    return {
+        "response_type": "dict",
+        "response_keys": sorted(str(key) for key in response.keys())[:40],
+        "response_code": response.get("code"),
+        "response_msg": str(message)[:240] if message not in (None, "") else "",
+        "response_data_type": type(response.get("data")).__name__ if "data" in response else "missing",
+    }
+
+
 def _normalize_history_symbol(symbol: str) -> str | None:
     """Normalize base, dashed, and compact USDT symbols for history endpoints.
 
@@ -972,7 +1091,11 @@ def get_fill_history(
         return {"status": "error", "error": f"request_exception:{exc}", "fills": []}
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         error = resp.get("msg", resp) if isinstance(resp, dict) else resp
-        return {"status": "error", "error": str(error), "code": resp.get("code") if isinstance(resp, dict) else None, "fills": []}
+        return {
+            "status": "error", "error": str(error),
+            "code": resp.get("code") if isinstance(resp, dict) else None,
+            **_response_envelope_diagnostics(resp), "fills": [],
+        }
 
     data = resp.get("data")
     row_keys = (
@@ -984,8 +1107,17 @@ def get_fill_history(
     if rows is None:
         fingerprint, description = _shape_fingerprint(data)
         reason = "fill_history_non_object_row" if total == "non_object_row" else "fill_history_unexpected_data_shape"
-        log.warning("[BINGX] %s fingerprint=%s shape=%s", reason, fingerprint, description)
-        return {"status": "error", "error": reason, "shape_fingerprint": fingerprint, "fills": []}
+        envelope = _response_envelope_diagnostics(resp)
+        log.warning(
+            "[BINGX] %s fingerprint=%s shape=%s response_code=%s response_msg=%s response_keys=%s",
+            reason, fingerprint, description, envelope.get("response_code"),
+            envelope.get("response_msg"), envelope.get("response_keys"),
+        )
+        return {
+            "status": "error", "error": reason,
+            "shape_fingerprint": fingerprint, "shape_summary": description,
+            **envelope, "fills": [],
+        }
 
     def first_number(row: dict, names: tuple[str, ...]) -> float | None:
         for key in names:
@@ -1088,7 +1220,7 @@ def get_income_history(
     limit = min(limit, 1000)
     seen: set[str] = set()
     request_count = 0
-    last_shape_diagnostics: dict[str, str] = {}
+    last_shape_diagnostics: dict[str, Any] = {}
     # Bound recursive time-range splitting so a dense account history cannot
     # turn a single recovery into thousands of signed API requests. Callers
     # doing secondary/background reconciliation may choose a smaller budget;
@@ -1110,6 +1242,7 @@ def get_income_history(
             return None, f"request_exception:{exc}"
         if not isinstance(response, dict) or response.get("code") not in (0, "0"):
             err = response.get("msg", response) if isinstance(response, dict) else response
+            last_shape_diagnostics.update(_response_envelope_diagnostics(response))
             return None, str(err)
         data = response.get("data")
         income_row_keys = (
@@ -1131,10 +1264,17 @@ def get_income_history(
         )
         if rows is None:
             fp, desc = _shape_fingerprint(data)
-            log.warning("[BINGX] income history unexpected shape fingerprint=%s shape=%s", fp, desc)
+            envelope = _response_envelope_diagnostics(response)
+            log.warning(
+                "[BINGX] income history unexpected shape fingerprint=%s shape=%s response_code=%s response_msg=%s response_keys=%s",
+                fp, desc, envelope.get("response_code"), envelope.get("response_msg"), envelope.get("response_keys"),
+            )
             # Keep the accounting result UNKNOWN, but propagate only structural
             # diagnostics (keys/types), never raw account values, to health/alerts.
-            last_shape_diagnostics.update({"shape_fingerprint": fp, "shape_summary": desc, "data_type": type(data).__name__})
+            last_shape_diagnostics.update({
+                "shape_fingerprint": fp, "shape_summary": desc,
+                "data_type": type(data).__name__, **envelope,
+            })
             return None, "income_history_unexpected_data_shape"
         if len(rows) < limit:
             return rows, None

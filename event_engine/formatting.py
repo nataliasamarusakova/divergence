@@ -39,6 +39,22 @@ def format_price(value: Any, *, decimals: int = 8) -> str:
     return format_number(value, decimals=decimals)
 
 
+def format_telegram_symbol(value: Any) -> str:
+    """Render a USDT contract as a compact, copy-friendly Telegram ticker.
+
+    This is presentation-only: exchange/API symbols remain unchanged. It accepts
+    base tickers (OP), compact pairs (OPUSDT), and separated pairs (OP-USDT,
+    OP/USDT, OP_USDT), and avoids duplicating the quote suffix.
+    """
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return "—"
+    if raw.endswith("USDT"):
+        base = raw[:-4].rstrip("-/_")
+        return f"{base}USDT" if base else "USDT"
+    return f"{raw}USDT"
+
+
 def format_percent(value: Any, *, decimals: int = 2, signed: bool = False) -> str:
     d = _decimal(value)
     if d is None:
