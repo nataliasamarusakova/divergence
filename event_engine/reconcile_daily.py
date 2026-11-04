@@ -38,6 +38,12 @@ MAX_INCOME_SYMBOLS = max(0, min(3, int(os.environ.get("RECONCILIATION_MAX_SYMBOL
 INCOME_TIMEOUT_SEC = max(1.0, min(3.0, float(os.environ.get("RECONCILIATION_INCOME_TIMEOUT_SEC", "3"))))
 INCOME_REQUEST_BUDGET = max(1, min(4, int(os.environ.get("RECONCILIATION_INCOME_REQUEST_BUDGET", "4"))))
 INCOME_RETRIES = max(0, min(2, int(os.environ.get("RECONCILIATION_INCOME_RETRIES", "1"))))
+# A mismatch can be caused by a fill that occurred after the tracker poll at the
+# start of the scan. Verify order executions only for mismatched positions and
+# keep the read-only reconciliation bounded.
+MAX_TRACKER_FILL_ORDER_QUERIES = max(0, min(32, int(os.environ.get("RECONCILIATION_FILL_ORDER_QUERY_BUDGET", "24"))))
+TRACKER_FILL_ORDER_TIMEOUT_SEC = max(1.0, min(5.0, float(os.environ.get("RECONCILIATION_FILL_ORDER_TIMEOUT_SEC", "2"))))
+TRACKER_FILL_ORDER_TIME_BUDGET_SEC = max(1.0, min(60.0, float(os.environ.get("RECONCILIATION_FILL_ORDER_TIME_BUDGET_SEC", "20"))))
 
 
 def _timestamp_ms(value: Any) -> int:
@@ -159,6 +165,28 @@ def _load_journal(path: Path) -> tuple[list[dict], list[str]]:
     return records, errors
 
 
+def _is_closed_or_confirmed_gone_trade(trade: dict) -> bool:
+    """Whether an active-state row is no longer a live position exposure.
+
+    The tracker intentionally keeps rows after exchange closure while it retries
+    close journaling, Telegram delivery, or protection cleanup. Those rows are
+    lifecycle work items, not open position quantity. An unresolved entry-order
+    quarantine is deliberately excluded from this shortcut: an entry may still
+    fill after an empty position read.
+    """
+    if not isinstance(trade, dict):
+        return False
+    if trade.get("entry_order_resolution_pending"):
+        return False
+    if any(bool(trade.get(flag)) for flag in (
+        "closed", "protection_cleanup_only", "close_cleanup_pending",
+        "close_notification_pending", "close_journal_pending",
+    )):
+        return True
+    confirmation = trade.get("position_gone_confirmation")
+    return isinstance(confirmation, dict) and str(confirmation.get("status", "")).upper() == "CONFIRMED"
+
+
 def _active_local_positions(active: dict) -> tuple[dict[tuple[str, str], float], list[str]]:
     positions: dict[tuple[str, str], float] = defaultdict(float)
     errors: list[str] = []
@@ -166,7 +194,7 @@ def _active_local_positions(active: dict) -> tuple[dict[tuple[str, str], float],
         if not isinstance(trade, dict):
             errors.append(f"active_trade_not_object:{event_id}")
             continue
-        if bool(trade.get("closed")):
+        if _is_closed_or_confirmed_gone_trade(trade):
             continue
         try:
             qty = abs(float(trade.get("remaining_qty", 0) or 0))
@@ -182,6 +210,157 @@ def _active_local_positions(active: dict) -> tuple[dict[tuple[str, str], float],
             continue
         positions[(symbol, direction)] += qty
     return dict(positions), errors
+
+
+def _post_close_lifecycle_pending(active: dict) -> list[dict]:
+    """Summarize non-open rows retained for durable post-close processing."""
+    pending: list[dict] = []
+    for event_id, trade in active.items():
+        if not isinstance(trade, dict) or trade.get("closed") or trade.get("entry_order_resolution_pending"):
+            continue
+        confirmation = trade.get("position_gone_confirmation")
+        confirmed_gone = isinstance(confirmation, dict) and str(confirmation.get("status", "")).upper() == "CONFIRMED"
+        flags = [name for name in (
+            "close_journal_pending", "close_notification_pending", "close_cleanup_pending",
+            "protection_cleanup_only",
+        ) if bool(trade.get(name))]
+        if not confirmed_gone and not flags:
+            continue
+        pending.append({
+            "event_id": str(event_id),
+            "symbol": str(trade.get("symbol") or ""),
+            "direction": str(trade.get("direction") or ""),
+            "pending_flags": flags,
+            "position_gone_confirmed": confirmed_gone,
+        })
+    return pending
+
+
+def _finite_nonnegative(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def _pending_exit_fill_evidence(
+    active: dict, key: tuple[str, str], expected_delta: float, query_state: dict[str, Any],
+) -> tuple[float, list[dict], bool]:
+    """Find exchange-confirmed exit fills not yet reflected in tracker remaining_qty.
+
+    TP fills are cumulative per leg in tp_filled_qty, so only the positive
+    difference from the last tracker observation is counted. SL/manual exit orders
+    are considered only when the exchange says FILLED. This function never writes
+    active state and never changes the strict mismatch tolerance.
+    """
+    candidates: list[tuple[int, str, str, str, str, float]] = []
+    for event_id, trade in active.items():
+        if not isinstance(trade, dict) or _is_closed_or_confirmed_gone_trade(trade):
+            continue
+        if _canonical_position_symbol(trade.get("symbol")) != key[0]:
+            continue
+        if _direction(trade.get("direction")) != key[1]:
+            continue
+
+        recorded_by_leg = trade.get("tp_filled_qty") if isinstance(trade.get("tp_filled_qty"), dict) else {}
+        tp_orders = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
+        for tp in tp_orders:
+            if not isinstance(tp, dict) or tp.get("order_id") in (None, ""):
+                continue
+            leg = str(tp.get("leg") or "").strip().lower()
+            if not leg:
+                continue
+            try:
+                recorded_qty = float(recorded_by_leg.get(leg, 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(recorded_qty) or recorded_qty < 0.0:
+                continue
+            # Query the earliest target first; in the common TP1 race this both
+            # gives exact evidence and avoids unnecessary API requests for TP2.
+            try:
+                leg_rank = int(leg.replace("tp", "")) if leg.startswith("tp") else 99
+            except ValueError:
+                leg_rank = 99
+            candidates.append((
+                leg_rank, str(event_id), str(trade.get("symbol") or key[0]),
+                str(tp["order_id"]), f"TP:{leg}", recorded_qty,
+            ))
+
+        current_sl = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+        if current_sl.get("order_id") not in (None, ""):
+            candidates.append((
+                100, str(event_id), str(trade.get("symbol") or key[0]),
+                str(current_sl["order_id"]), "SL", 0.0,
+            ))
+        manual_exit_id = trade.get("manual_exit_order_id")
+        if manual_exit_id not in (None, ""):
+            candidates.append((
+                101, str(event_id), str(trade.get("symbol") or key[0]),
+                str(manual_exit_id), "MANUAL_EXIT", 0.0,
+            ))
+        sl_history = trade.get("sl_order_history") if isinstance(trade.get("sl_order_history"), list) else []
+        for item in sl_history:
+            if isinstance(item, dict) and item.get("order_id") not in (None, ""):
+                candidates.append((
+                    102, str(event_id), str(trade.get("symbol") or key[0]),
+                    str(item["order_id"]), "SL_HISTORY", 0.0,
+                ))
+
+    candidates.sort(key=lambda item: item[0])
+    seen_order_ids: set[str] = set()
+    total_pending = 0.0
+    evidence: list[dict] = []
+    budget_exhausted = False
+    evidence_tolerance = max(1e-8, abs(expected_delta) * 1e-8)
+
+    for _rank, event_id, symbol, order_id, source, recorded_qty in candidates:
+        if order_id in seen_order_ids:
+            continue
+        seen_order_ids.add(order_id)
+        if query_state["queries_used"] >= query_state["query_budget"]:
+            budget_exhausted = True
+            break
+        elapsed = time.monotonic() - query_state["started_monotonic"]
+        remaining_budget = query_state["time_budget_sec"] - elapsed
+        # bingx._request clamps every HTTP timeout to at least one second. Do not
+        # start a request when less than that remains, or the advertised elapsed
+        # budget could be exceeded by the transport layer's minimum timeout.
+        if remaining_budget < 1.0:
+            budget_exhausted = True
+            break
+        query_timeout = min(TRACKER_FILL_ORDER_TIMEOUT_SEC, remaining_budget)
+        query_state["queries_used"] += 1
+        try:
+            order = bingx.get_order(symbol, order_id, timeout_sec=query_timeout)
+        except Exception:
+            continue
+        if not isinstance(order, dict) or str(order.get("status", "")).lower() != "ok":
+            continue
+        order_status = str(order.get("order_status") or "").upper()
+        allowed_statuses = {"PARTIALLY_FILLED", "FILLED"} if source.startswith("TP:") else {"FILLED"}
+        if order_status not in allowed_statuses:
+            continue
+        executed_qty = _finite_nonnegative(order.get("executed_qty"))
+        if executed_qty is None:
+            continue
+        pending_qty = max(0.0, executed_qty - recorded_qty) if source.startswith("TP:") else executed_qty
+        if pending_qty <= 1e-12:
+            continue
+        evidence.append({
+            "order_id": order_id, "source": source, "order_status": order_status,
+            "executed_qty": executed_qty,
+            "previously_recorded_qty": recorded_qty if source.startswith("TP:") else 0.0,
+            "unapplied_fill_qty": pending_qty, "event_id": event_id,
+        })
+        total_pending += pending_qty
+        if abs(total_pending - expected_delta) <= evidence_tolerance:
+            break
+        if total_pending > expected_delta + evidence_tolerance:
+            break
+
+    return total_pending, evidence, budget_exhausted
 
 
 def _exchange_positions(rows: list[dict]) -> tuple[dict[tuple[str, str], float], list[str]]:
@@ -300,11 +479,25 @@ def _mark_alert_sent(discrepancies: list[dict], path: Path, now_ms: int) -> None
 
 def _discrepancy_message_detail(item: dict) -> str:
     if item.get("code") == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH":
-        return (
+        detail = (
             f"{item.get('symbol', '?')} {item.get('direction', '?')}: "
             f"local_qty={item.get('local_qty')} exchange_qty={item.get('exchange_qty')} "
             f"delta={item.get('delta_qty')} tolerance={item.get('tolerance_qty')}"
         )
+        if item.get("confirmed_unapplied_fill_qty") is not None:
+            detail += f" confirmed_unapplied_exit_fill_qty={item.get('confirmed_unapplied_fill_qty')}"
+        return detail
+    if item.get("code") == "TRACKER_EXIT_FILL_PENDING":
+        evidence = item.get("fill_evidence") if isinstance(item.get("fill_evidence"), list) else []
+        order_details = "; ".join(
+            f"{row.get('source')}#{row.get('order_id')} qty={row.get('unapplied_fill_qty')}"
+            for row in evidence if isinstance(row, dict)
+        )
+        base = (
+            f"{item.get('symbol', '?')} {item.get('direction', '?')}: "
+            f"confirmed_unapplied_exit_fill_qty={item.get('confirmed_unapplied_fill_qty')}"
+        )
+        return f"{base}; orders={order_details}" if order_details else base
     return str(item.get("detail") or item.get("code") or "unknown")
 
 
@@ -341,14 +534,25 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_UNAVAILABLE", "detail": active_error})
     else:
         local_positions, active_errors = _active_local_positions(active)
+        post_close_pending = _post_close_lifecycle_pending(active)
         report["checks"]["local_active_state"] = {
             "status": "OK" if not active_errors else "WARNING",
             "active_event_records": len(active),
             "active_position_keys": len(local_positions),
+            "post_close_lifecycle_pending_records": len(post_close_pending),
             "parse_errors": active_errors,
         }
         for detail in active_errors:
             report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_INVALID", "detail": detail})
+        if post_close_pending:
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "LOCAL_CLOSE_LIFECYCLE_PENDING",
+                "detail": (
+                    f"{len(post_close_pending)} non-open trade record(s) remain for close journal, "
+                    "notification, or protection-cleanup retries; these rows are excluded from live position totals."
+                ),
+                "records": post_close_pending[:20],
+            })
 
     try:
         exchange_rows = bingx.get_positions(timeout_sec=3.0, retryable=False)
@@ -369,7 +573,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         has_non_ascii_identity = any(
             not str(trade.get("symbol") or "").strip().isascii()
             for trade in (active.values() if isinstance(active, dict) else [])
-            if isinstance(trade, dict) and not bool(trade.get("closed"))
+            if isinstance(trade, dict) and not _is_closed_or_confirmed_gone_trade(trade)
         ) or any(
             not str(row.get("symbol") or "").strip().isascii()
             for row in exchange_rows if isinstance(row, dict)
@@ -447,6 +651,73 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 "status": "NOT_NEEDED", "contracts": 0,
                 "source": "no_identity_mismatch",
             }
+        tracker_fill_query_state = {
+            "queries_used": 0,
+            "query_budget": MAX_TRACKER_FILL_ORDER_QUERIES,
+            "started_monotonic": time.monotonic(),
+            "time_budget_sec": TRACKER_FILL_ORDER_TIME_BUDGET_SEC,
+        }
+        fill_evidence_by_key: dict[tuple[str, str], dict] = {}
+        budget_exhausted_keys: set[tuple[str, str]] = set()
+        if active is not None and not active_errors and not exchange_errors:
+            # Query only keys already discrepant in the first position snapshot.
+            # These reads are bounded by both a request-count and elapsed-time budget.
+            for key in sorted(set(local_positions) | set(exchange_positions)):
+                local_qty = local_positions.get(key, 0.0)
+                exchange_qty = exchange_positions.get(key, 0.0)
+                tolerance = max(1e-8, exchange_qty * 0.01, local_qty * 0.01)
+                expected_exit_delta = local_qty - exchange_qty
+                if abs(expected_exit_delta) <= tolerance or expected_exit_delta <= 0:
+                    continue
+                if MAX_TRACKER_FILL_ORDER_QUERIES <= 0:
+                    continue
+                confirmed_fill_qty, fill_evidence, budget_exhausted = _pending_exit_fill_evidence(
+                    active, key, expected_exit_delta, tracker_fill_query_state,
+                )
+                if budget_exhausted:
+                    budget_exhausted_keys.add(key)
+                if fill_evidence:
+                    fill_evidence_by_key[key] = {
+                        "confirmed_fill_qty": confirmed_fill_qty,
+                        "evidence": fill_evidence,
+                        "budget_exhausted": budget_exhausted,
+                        "expected_delta": expected_exit_delta,
+                    }
+
+        # Order details and position snapshots are separate exchange reads. A fill
+        # may land between them, so a matching order total alone is not enough to
+        # downgrade a CRITICAL mismatch. Take one fresh account-wide position read
+        # after exact fill evidence and require the residual position to agree.
+        exact_fill_candidates = {
+            key: item for key, item in fill_evidence_by_key.items()
+            if abs(item["confirmed_fill_qty"] - item["expected_delta"])
+            <= max(1e-8, abs(item["expected_delta"]) * 1e-8)
+        }
+        fill_refresh_status = "NOT_NEEDED"
+        fill_refresh_error = None
+        if exact_fill_candidates:
+            try:
+                refreshed_rows = bingx.get_positions(timeout_sec=3.0, retryable=False)
+                refreshed_positions, refreshed_errors = _exchange_positions(refreshed_rows)
+                if refreshed_errors:
+                    fill_refresh_status = "ERROR"
+                    fill_refresh_error = ";".join(refreshed_errors[:5])
+                else:
+                    exchange_positions = refreshed_positions
+                    exchange_errors = []
+                    fill_refresh_status = "OK"
+                    report["checks"]["exchange_positions"].update({
+                        "post_fill_refresh": "OK",
+                        "post_fill_refresh_api_rows": len(refreshed_rows),
+                        "active_position_keys": len(exchange_positions),
+                    })
+            except Exception as exc:
+                fill_refresh_status = "ERROR"
+                fill_refresh_error = f"{type(exc).__name__}:{exc}"
+            if fill_refresh_status != "OK":
+                report["checks"]["exchange_positions"]["post_fill_refresh"] = "ERROR"
+                report["checks"]["exchange_positions"]["post_fill_refresh_error"] = fill_refresh_error
+
         if active is not None and not active_errors and not exchange_errors:
             comparison_keys = set(local_positions) | set(exchange_positions)
             if identity_unresolved:
@@ -455,13 +726,55 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 local_qty = local_positions.get(key, 0.0)
                 exchange_qty = exchange_positions.get(key, 0.0)
                 tolerance = max(1e-8, exchange_qty * 0.01, local_qty * 0.01)
-                if abs(local_qty - exchange_qty) > tolerance:
-                    report["discrepancies"].append({
-                        "level": "CRITICAL", "code": "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH",
-                        "symbol": key[0], "direction": key[1], "local_qty": local_qty,
-                        "exchange_qty": exchange_qty, "delta_qty": exchange_qty - local_qty,
-                        "tolerance_qty": tolerance,
-                    })
+                if abs(local_qty - exchange_qty) <= tolerance:
+                    continue
+
+                fill_info = fill_evidence_by_key.get(key)
+                if fill_info:
+                    confirmed_fill_qty = fill_info["confirmed_fill_qty"]
+                    fill_evidence = fill_info["evidence"]
+                    expected_after_fills = max(0.0, local_qty - confirmed_fill_qty)
+                    evidence_tolerance = max(1e-8, abs(expected_after_fills) * 1e-8)
+                    refresh_confirms_residual = (
+                        fill_refresh_status == "OK"
+                        and abs(exchange_qty - expected_after_fills) <= evidence_tolerance
+                    )
+                    if refresh_confirms_residual and key in exact_fill_candidates:
+                        report["discrepancies"].append({
+                            "level": "WARNING", "code": "TRACKER_EXIT_FILL_PENDING",
+                            "symbol": key[0], "direction": key[1],
+                            "local_qty": local_qty, "exchange_qty": exchange_qty,
+                            "confirmed_unapplied_fill_qty": confirmed_fill_qty,
+                            "fill_evidence": fill_evidence,
+                            "detail": "Confirmed order executions explain the full local/exchange delta, and a fresh exchange position read confirms the expected residual quantity. The next tracker pass should persist the fill-adjusted remaining_qty.",
+                        })
+                        continue
+
+                mismatch = {
+                    "level": "CRITICAL", "code": "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH",
+                    "symbol": key[0], "direction": key[1], "local_qty": local_qty,
+                    "exchange_qty": exchange_qty, "delta_qty": exchange_qty - local_qty,
+                    "tolerance_qty": tolerance,
+                }
+                if fill_info:
+                    mismatch["confirmed_unapplied_fill_qty"] = fill_info["confirmed_fill_qty"]
+                    mismatch["fill_evidence"] = fill_info["evidence"]
+                    mismatch["detail"] = "Confirmed order fills do not fully explain the latest exchange position quantity; the unexplained remainder remains CRITICAL."
+                    if fill_refresh_status != "OK":
+                        mismatch["position_refresh_error"] = fill_refresh_error or "post_fill_position_refresh_unavailable"
+                elif key in budget_exhausted_keys:
+                    mismatch["detail"] = "Position mismatch remains CRITICAL; bounded tracker-order verification budget was exhausted before the delta could be explained."
+                report["discrepancies"].append(mismatch)
+
+        report["checks"]["tracker_exit_fill_reconciliation"] = {
+            "status": "NOT_NEEDED" if tracker_fill_query_state["queries_used"] == 0 else "CHECKED",
+            "order_queries_used": tracker_fill_query_state["queries_used"],
+            "order_query_budget": tracker_fill_query_state["query_budget"],
+            "order_query_timeout_sec": TRACKER_FILL_ORDER_TIMEOUT_SEC,
+            "order_query_time_budget_sec": TRACKER_FILL_ORDER_TIME_BUDGET_SEC,
+            "position_refresh_status": fill_refresh_status,
+            "position_refresh_error": fill_refresh_error,
+        }
     except Exception as exc:
         exchange_positions = {}
         report["checks"]["exchange_positions"] = {"status": "ERROR", "error": f"{type(exc).__name__}:{exc}"}

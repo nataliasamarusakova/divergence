@@ -1169,7 +1169,7 @@ def format_tp_hit_message(
     exec_price: float, closed_qty: float, remaining_qty: float, remaining_pct: float,
 ) -> str:
     return (
-        f"💰 <b>{name} ({symbol})</b>\n\n"
+        f"💰 <b>{name} ({format_telegram_symbol(symbol)})</b>\n\n"
         f"Leg: <b>{leg}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
         f"Цена исполнения: <code>{format_price(exec_price)}</code>\n"

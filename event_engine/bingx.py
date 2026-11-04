@@ -834,7 +834,10 @@ def get_open_orders_snapshot(
     return {"status": "ok", "orders": [dict(order) for order in orders], "source": "account_open_orders_snapshot"}
 
 
-def _query_order(symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None) -> dict:
+def _query_order(
+    symbol: str, *, order_id: str | int | None = None, client_order_id: str | None = None,
+    timeout_sec: float | None = None,
+) -> dict:
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
@@ -847,7 +850,10 @@ def _query_order(symbol: str, *, order_id: str | int | None = None, client_order
     else:
         params["clientOrderId"] = str(client_order_id)
 
-    resp = _request("GET", ORDER_PATH, params, signed=True, retryable=False)
+    request_options = {"retryable": False}
+    if timeout_sec is not None:
+        request_options["timeout_sec"] = timeout_sec
+    resp = _request("GET", ORDER_PATH, params, signed=True, **request_options)
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         return {"status": "error", "error": resp.get("msg") if isinstance(resp, dict) else str(resp), "code": resp.get("code") if isinstance(resp, dict) else None}
 
@@ -932,8 +938,8 @@ def _query_order(symbol: str, *, order_id: str | int | None = None, client_order
     }
 
 
-def get_order(symbol: str, order_id: str | int) -> dict:
-    return _query_order(symbol, order_id=order_id)
+def get_order(symbol: str, order_id: str | int, *, timeout_sec: float | None = None) -> dict:
+    return _query_order(symbol, order_id=order_id, timeout_sec=timeout_sec)
 
 
 def get_order_by_client_order_id(symbol: str, client_order_id: str) -> dict:
