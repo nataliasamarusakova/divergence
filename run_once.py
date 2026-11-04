@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.29"
+APP_VERSION = "V10.4.30"
 
 import pandas as pd
 import requests

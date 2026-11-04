@@ -1798,6 +1798,24 @@ def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monke
     assert calls[1]["quantity"] == "0.750"
 
 
+def test_get_order_accepts_explicit_read_timeout(monkeypatch):
+    from event_engine import bingx as bx
+
+    captured = {}
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
+
+    def fake_request(method, path, params, signed=True, **kwargs):
+        captured.update({"method": method, "path": path, "params": params, "signed": signed, **kwargs})
+        return {"code": 0, "data": {"order": {"orderId": "OID-TIMEOUT", "status": "NEW"}}}
+
+    monkeypatch.setattr(bx, "_request", fake_request)
+    out = bx.get_order("TEST", "OID-TIMEOUT", timeout_sec=1.5)
+
+    assert out["status"] == "ok"
+    assert captured["timeout_sec"] == 1.5
+    assert captured["retryable"] is False
+
+
 def test_get_order_by_client_order_id_queries_exchange_with_client_id(monkeypatch):
     from event_engine import bingx as bx
 

@@ -428,8 +428,8 @@ def test_application_version_and_runtime_guards():
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
     workflow = _workflow()
-    assert 'APP_VERSION = "V10.4.29"' in runtime
-    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.29"' in workflow
+    assert 'APP_VERSION = "V10.4.30"' in runtime
+    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.30"' in workflow
     assert 'version=%s' in runtime
     tracker = Path('event_engine/tracker.py').read_text(encoding='utf-8')
     assert 'EARLY_LOSS_CUT_ENABLED = False' in tracker
@@ -449,6 +449,9 @@ def test_release_runs_bounded_read_only_reconciliation_after_engine():
     assert workflow.index("Read-only BingX position and daily ledger reconciliation") < workflow.index("Commit state")
     assert 'RECONCILIATION_MAX_SYMBOLS: "2"' in workflow
     assert 'RECONCILIATION_INCOME_REQUEST_BUDGET: "4"' in workflow
+    assert 'RECONCILIATION_FILL_ORDER_QUERY_BUDGET: "24"' in workflow
+    assert 'RECONCILIATION_FILL_ORDER_TIMEOUT_SEC: "2"' in workflow
+    assert 'RECONCILIATION_FILL_ORDER_TIME_BUDGET_SEC: "20"' in workflow
     assert "python -m event_engine.reconcile_daily" in workflow
     assert "scripts/reconcile_daily.py" not in workflow
     assert "get_positions" in script and "get_open_orders_snapshot" in script and "get_income_history" in script

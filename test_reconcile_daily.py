@@ -429,3 +429,343 @@ def test_catalog_unavailable_does_not_hide_unmatched_ascii_position(tmp_path, mo
     mismatch = [item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
     assert len(mismatch) == 2
     assert {item["symbol"] for item in mismatch} == {"LOCALCOIN-USDT", "OTHERCOIN-USDT"}
+
+
+def test_active_local_positions_excludes_confirmed_closed_lifecycle_records():
+    active = {
+        "LIVE": {"symbol": "BTC", "direction": "SHORT", "remaining_qty": 2.0, "closed": False},
+        "CLEANUP": {"symbol": "ETH", "direction": "SHORT", "remaining_qty": 0.5,
+                    "closed": False, "close_cleanup_pending": True},
+        "NOTIFY": {"symbol": "ADA", "direction": "LONG", "remaining_qty": 13.0,
+                   "closed": False, "close_notification_pending": True},
+        "JOURNAL": {"symbol": "DOT", "direction": "SHORT", "remaining_qty": 7.8,
+                    "closed": False, "close_journal_pending": True},
+        "GONE": {"symbol": "LTC", "direction": "SHORT", "remaining_qty": 0.1,
+                 "closed": False, "position_gone_confirmation": {"status": "CONFIRMED"}},
+        "QUARANTINE": {"symbol": "XRP", "direction": "SHORT", "remaining_qty": 0.0,
+                       "closed": False, "protection_cleanup_only": True},
+    }
+
+    positions, errors = recon._active_local_positions(active)
+
+    assert positions == {("BTC-USDT", "SHORT"): 2.0}
+    assert errors == []
+    assert len(recon._post_close_lifecycle_pending(active)) == 5
+
+
+def test_daily_reconciliation_classifies_exact_unapplied_tp_fill_as_warning(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "initial_qty": 139.0, "closed": False, "tp_filled_qty": {},
+            "tp_orders": [
+                {"leg": "tp1", "order_id": "TP1-HBAR"},
+                {"leg": "tp2", "order_id": "TP2-HBAR"},
+            ],
+            "sl_order": {"order_id": "SL-HBAR"},
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    position_reads = []
+    def read_positions(**kwargs):
+        position_reads.append(kwargs)
+        return [{"symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -104.0}]
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": [
+        {"symbol": "HBAR-USDT", "orderId": "SL-HBAR", "type": "STOP_MARKET", "stopPrice": "0.08",
+         "positionSide": "SHORT", "origQty": "104"},
+        {"symbol": "HBAR-USDT", "orderId": "TP2-HBAR", "type": "TAKE_PROFIT_MARKET",
+         "positionSide": "SHORT", "origQty": "104"},
+    ]})
+    def read_order(symbol, order_id, **kwargs):
+        assert kwargs.get("timeout_sec", 0) <= recon.TRACKER_FILL_ORDER_TIMEOUT_SEC
+        return {
+            "status": "ok", "order_id": order_id,
+            "order_status": "FILLED" if order_id == "TP1-HBAR" else "NEW",
+            "executed_qty": 35.0 if order_id == "TP1-HBAR" else 0.0,
+            "avg_price": 0.06839 if order_id == "TP1-HBAR" else 0.0,
+        }
+    monkeypatch.setattr(recon.bingx, "get_order", read_order)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    pending = [item for item in report["discrepancies"] if item["code"] == "TRACKER_EXIT_FILL_PENDING"]
+    assert len(pending) == 1
+    assert pending[0]["confirmed_unapplied_fill_qty"] == 35.0
+    assert pending[0]["local_qty"] == 139.0
+    assert pending[0]["exchange_qty"] == 104.0
+    assert pending[0]["fill_evidence"][0]["order_id"] == "TP1-HBAR"
+    assert len(position_reads) == 2  # the post-fill evidence must be checked against a fresh position snapshot
+    assert report["checks"]["tracker_exit_fill_reconciliation"]["position_refresh_status"] == "OK"
+    assert report["status"] == "WARNING"
+
+
+def test_daily_reconciliation_keeps_critical_when_confirmed_tp_fill_does_not_explain_delta(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "closed": False, "tp_filled_qty": {},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP1-HBAR"}],
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -104.0,
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": [
+        {"symbol": "HBAR-USDT", "orderId": "SL-HBAR", "type": "STOP_MARKET", "stopPrice": "0.08",
+         "positionSide": "SHORT", "origQty": "104"},
+        {"symbol": "HBAR-USDT", "orderId": "TP-HBAR", "type": "TAKE_PROFIT_MARKET",
+         "positionSide": "SHORT", "origQty": "104"},
+    ]})
+    monkeypatch.setattr(recon.bingx, "get_order", lambda *_a, **_k: {
+        "status": "ok", "order_status": "FILLED", "executed_qty": 25.0,
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    mismatch = [item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["level"] == "CRITICAL"
+    assert mismatch[0]["confirmed_unapplied_fill_qty"] == 25.0
+    assert report["status"] == "CRITICAL"
+
+
+def test_pending_exit_fill_evidence_does_not_start_request_below_transport_minimum(tmp_path, monkeypatch):
+    active = {
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "closed": False, "tp_filled_qty": {},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP1-HBAR"}],
+        },
+    }
+    queried = []
+    monkeypatch.setattr(recon.bingx, "get_order", lambda *a, **k: queried.append((a, k)))
+    monkeypatch.setattr(recon.time, "monotonic", lambda: 100.0)
+    state = {
+        "queries_used": 0,
+        "query_budget": 5,
+        "started_monotonic": 100.0,
+        "time_budget_sec": 0.5,
+    }
+
+    qty, evidence, exhausted = recon._pending_exit_fill_evidence(
+        active, ("HBAR-USDT", "SHORT"), 35.0, state,
+    )
+
+    assert qty == 0.0
+    assert evidence == []
+    assert exhausted is True
+    assert state["queries_used"] == 0
+    assert queried == []
+
+
+def test_daily_reconciliation_keeps_critical_when_fresh_position_read_disagrees_with_fill(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "closed": False, "tp_filled_qty": {},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP1-HBAR"}],
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    position_reads = iter((
+        [{"symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -104.0}],
+        [{"symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -100.0}],
+    ))
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: next(position_reads))
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_order", lambda *_a, **_k: {
+        "status": "ok", "order_status": "FILLED", "executed_qty": 35.0,
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    mismatch = [item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["level"] == "CRITICAL"
+    assert mismatch[0]["confirmed_unapplied_fill_qty"] == 35.0
+    assert mismatch[0]["exchange_qty"] == 100.0
+    assert "latest exchange position" in mismatch[0]["detail"]
+    assert report["checks"]["tracker_exit_fill_reconciliation"]["position_refresh_status"] == "OK"
+
+
+def test_daily_reconciliation_keeps_critical_when_post_fill_position_refresh_fails(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "closed": False, "tp_filled_qty": {},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP1-HBAR"}],
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    position_reads = iter((
+        [{"symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -104.0}],
+        RuntimeError("position endpoint unavailable during refresh"),
+    ))
+
+    def read_positions(**kwargs):
+        value = next(position_reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_order", lambda *_a, **_k: {
+        "status": "ok", "order_status": "FILLED", "executed_qty": 35.0,
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    mismatch = [item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["level"] == "CRITICAL"
+    assert mismatch[0]["position_refresh_error"].startswith("RuntimeError:")
+    assert report["checks"]["tracker_exit_fill_reconciliation"]["position_refresh_status"] == "ERROR"
+    assert report["status"] == "CRITICAL"
+
+
+def test_daily_reconciliation_classifies_filled_break_even_stop_as_pending_exit(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-STRK": {
+            "symbol": "STRK", "direction": "SHORT", "remaining_qty": 174.094,
+            "closed": False, "tp_filled_qty": {"tp1": 58.032},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP1-STRK"}],
+            "sl_order": {"order_id": "BE-SL-STRK"},
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    queried = []
+    def order_lookup(symbol, order_id, **kwargs):
+        queried.append(order_id)
+        if order_id == "TP1-STRK":
+            return {"status": "ok", "order_status": "FILLED", "executed_qty": 58.032}
+        if order_id == "BE-SL-STRK":
+            return {"status": "ok", "order_status": "FILLED", "executed_qty": 174.094}
+        return {"status": "error"}
+    monkeypatch.setattr(recon.bingx, "get_order", order_lookup)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    pending = [item for item in report["discrepancies"] if item["code"] == "TRACKER_EXIT_FILL_PENDING"]
+    assert len(pending) == 1
+    assert pending[0]["confirmed_unapplied_fill_qty"] == 174.094
+    assert [item["source"] for item in pending[0]["fill_evidence"]] == ["SL"]
+    assert queried == ["TP1-STRK", "BE-SL-STRK"]
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+
+
+def test_entry_resolution_quarantine_is_not_mistaken_for_confirmed_close():
+    active = {
+        "ENTRY_PENDING": {
+            "symbol": "XRP", "direction": "SHORT", "remaining_qty": 1.0,
+            "closed": False, "entry_order_resolution_pending": True,
+            "close_cleanup_pending": True,
+        },
+    }
+    positions, errors = recon._active_local_positions(active)
+    assert positions == {("XRP-USDT", "SHORT"): 1.0}
+    assert errors == []
+
+
+def test_daily_reconciliation_keeps_close_lifecycle_visible_without_counting_as_position(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-CLOSED": {
+            "symbol": "LTC", "direction": "SHORT", "remaining_qty": 0.1,
+            "closed": False, "close_cleanup_pending": True,
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["local_active_state"]["active_position_keys"] == 0
+    assert report["checks"]["local_active_state"]["post_close_lifecycle_pending_records"] == 1
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    assert any(item["code"] == "LOCAL_CLOSE_LIFECYCLE_PENDING" for item in report["discrepancies"])
+    assert report["status"] == "WARNING"
+
+
+def test_daily_reconciliation_respects_bounded_tracker_order_query_budget(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-HBAR": {
+            "symbol": "HBAR", "direction": "SHORT", "remaining_qty": 139.0,
+            "closed": False, "tp_filled_qty": {},
+            "tp_orders": [
+                {"leg": "tp2", "order_id": "TP2-HBAR"},
+                {"leg": "tp1", "order_id": "TP1-HBAR"},
+            ],
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_TRACKER_FILL_ORDER_QUERIES", 1)
+    monkeypatch.setattr(recon.bingx, "SYMBOL_MAP", {})
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "HBAR-USDT", "positionSide": "SHORT", "positionAmt": -104.0,
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": [
+        {"symbol": "HBAR-USDT", "orderId": "SL-HBAR", "type": "STOP_MARKET", "stopPrice": "0.08",
+         "positionSide": "SHORT", "origQty": "104"},
+        {"symbol": "HBAR-USDT", "orderId": "TP2-HBAR", "type": "TAKE_PROFIT_MARKET",
+         "positionSide": "SHORT", "origQty": "104"},
+    ]})
+    queried = []
+    def order_lookup(symbol, order_id, **kwargs):
+        queried.append(order_id)
+        return {"status": "ok", "order_status": "NEW", "executed_qty": 0.0}
+    monkeypatch.setattr(recon.bingx, "get_order", order_lookup)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert queried == ["TP1-HBAR"]
+    assert report["checks"]["tracker_exit_fill_reconciliation"]["order_queries_used"] == 1
+    assert any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    mismatch = next(item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH")
+    assert "budget was exhausted" in mismatch["detail"]

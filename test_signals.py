@@ -4233,3 +4233,26 @@ def test_load_active_trades_rejects_invalid_root_type(tmp_path, monkeypatch):
 
     with pytest.raises(tr.ActiveTradeStateError, match="root must be a JSON object"):
         tr._load_active_trades()
+
+
+def test_tp_hit_message_uses_compact_usdt_symbol():
+    from event_engine.tracker import format_tp_hit_message
+
+    message = format_tp_hit_message(
+        name="Hedera", symbol="HBAR", leg="tp1", pnl_pct=4.54,
+        exec_price=0.06839, closed_qty=35.0, remaining_qty=104.0, remaining_pct=74.8,
+    )
+
+    assert "Hedera (HBARUSDT)" in message
+
+
+def test_telegram_signal_formats_contract_ticker_independently_of_provider_name():
+    from types import SimpleNamespace
+    from event_engine.telegram import format_signal
+
+    message = format_signal(
+        {"direction": "SHORT", "symbol": "1000SHIB", "event_type": "X", "event_fact": {}, "timestamps": {}},
+        coinalyze_row=SimpleNamespace(name="1000SHIB"),
+    )
+
+    assert "SHORT - 1000SHIB (1000SHIBUSDT)" in message
