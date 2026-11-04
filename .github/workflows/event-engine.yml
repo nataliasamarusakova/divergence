@@ -26,7 +26,7 @@ jobs:
       COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
       BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-      DIVERGENCE_BUILD_VERSION: "V10.4.29"
+      DIVERGENCE_BUILD_VERSION: "V10.4.30"
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
@@ -374,6 +374,9 @@ jobs:
           RECONCILIATION_INCOME_TIMEOUT_SEC: "3"
           RECONCILIATION_INCOME_REQUEST_BUDGET: "4"
           RECONCILIATION_INCOME_RETRIES: "1"
+          RECONCILIATION_FILL_ORDER_QUERY_BUDGET: "24"
+          RECONCILIATION_FILL_ORDER_TIMEOUT_SEC: "2"
+          RECONCILIATION_FILL_ORDER_TIME_BUDGET_SEC: "20"
         run: |
           python -m event_engine.reconcile_daily
 
