@@ -475,8 +475,7 @@ def test_telegram_symbol_is_compact_usdt_pair_and_does_not_duplicate_suffix():
     assert format_telegram_symbol("") == "—"
 
 
-def test_telegram_send_preserves_multiline_signal_and_adds_copy_button_below(monkeypatch):
-    import json
+def test_telegram_send_preserves_multiline_signal_with_inline_code_ticker(monkeypatch):
     from event_engine import telegram as tg
 
     monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
@@ -498,31 +497,30 @@ def test_telegram_send_preserves_multiline_signal_and_adds_copy_button_below(mon
         return Response()
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
-
     message = (
-        "<b>🔴 SHORT - Lido DAO Token (LDOUSDT)</b>\n\n"
+        "<b>🔴 SHORT - Lido DAO Token (</b><code>LDOUSDT</code><b>)</b>\n\n"
         "Score: <b>80/100</b>\n"
         "Event: <code>BREAKER_BLOCK_BEARISH</code>\n"
         "TF: <b>1h</b> + trigger 15m\n"
         "\n<b>SETUP</b>\nEntry: <code>0.3416</code>\n"
         "\n<b>EXECUTION</b>\nMode: vst"
     )
-    result = tg.send_detailed(message, copy_ticker="LDO-USDT")
+
+    result = tg.send_detailed(message)
 
     assert result["test-chat"]["sent"] is True
     assert len(calls) == 1
     url, payload, timeout = calls[0]
     assert url.endswith("/sendMessage")
     assert timeout == 15
-    assert payload["text"] == message  # exact newlines and blank lines survive transport
+    assert payload["text"] == message
     assert payload["parse_mode"] == "HTML"
-    assert json.loads(payload["reply_markup"]) == {
-        "inline_keyboard": [[{"text": "LDOUSDT", "copy_text": {"text": "LDOUSDT"}}]]
-    }
+    assert "reply_markup" not in payload
+    assert "\n\nScore:" in payload["text"]
+    assert "\n\n<b>SETUP</b>" in payload["text"]
 
 
-def test_closed_trade_message_keeps_multiline_layout_and_copy_button_below(monkeypatch):
-    import json
+def test_closed_trade_message_uses_inline_code_ticker_and_no_keyboard(monkeypatch):
     from event_engine import telegram as tg
     from event_engine.tracker import format_trade_closed_message
 
@@ -552,23 +550,21 @@ def test_closed_trade_message_keeps_multiline_layout_and_copy_button_below(monke
         exit_reason="TAKE_PROFIT_FULL", event_type="CRT_BEARISH",
     )
 
-    result = tg.send_detailed(message, copy_ticker="LTC-USDT")
+    result = tg.send_detailed(message)
 
     assert result["test-chat"]["sent"] is True
     assert len(calls) == 1
     assert calls[0][0].endswith("/sendMessage")
     payload = calls[0][1]
     assert payload["text"] == message
+    assert "<code>LTCUSDT</code>" in payload["text"]
     assert "\n\nНаправление:" in payload["text"]
     assert "\nВход" in payload["text"]
     assert "\nRealized R:R:" in payload["text"]
-    assert json.loads(payload["reply_markup"]) == {
-        "inline_keyboard": [[{"text": "LTCUSDT", "copy_text": {"text": "LTCUSDT"}}]]
-    }
+    assert "reply_markup" not in payload
 
 
-def test_telegram_copy_button_uses_one_standard_send_without_rich_message_api(monkeypatch):
-    import json
+def test_telegram_send_never_attaches_copy_keyboard(monkeypatch):
     from event_engine import telegram as tg
 
     monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
@@ -590,14 +586,12 @@ def test_telegram_copy_button_uses_one_standard_send_without_rich_message_api(mo
         return Response()
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
-
-    result = tg.send_detailed("<b>Litecoin (LTCUSDT)</b>", copy_ticker="LTC")
+    result = tg.send_detailed("<b>Litecoin (</b><code>LTCUSDT</code><b>)</b>")
 
     assert result["test-chat"]["sent"] is True
     assert len(calls) == 1
     assert calls[0][0].endswith("/sendMessage")
-    assert "rich_message" not in calls[0][1]
-    assert json.loads(calls[0][1]["reply_markup"])["inline_keyboard"][0][0]["copy_text"]["text"] == "LTCUSDT"
+    assert "reply_markup" not in calls[0][1]
 
 
 def test_telegram_send_timeout_does_not_retry_or_duplicate_message(monkeypatch):
@@ -613,69 +607,12 @@ def test_telegram_send_timeout_does_not_retry_or_duplicate_message(monkeypatch):
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
 
-    result = tg.send_detailed("<b>SHORT - Lido DAO Token (LDOUSDT)</b>", copy_ticker="LDO")
+    result = tg.send_detailed("<b>SHORT - Lido DAO Token (</b><code>LDOUSDT</code><b>)</b>")
 
     assert result["test-chat"]["sent"] is False
     assert len(calls) == 1
     assert calls[0][0].endswith("/sendMessage")
-
-
-def test_telegram_send_without_copy_ticker_keeps_message_without_keyboard(monkeypatch):
-    from event_engine import telegram as tg
-
-    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
-    calls = []
-
-    class Response:
-        text = ""
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"ok": True, "result": {"message_id": 124}}
-
-    def fake_post(url, *, data, timeout):
-        calls.append((url, data))
-        return Response()
-
-    monkeypatch.setattr(tg.requests, "post", fake_post)
-    assert tg.send_detailed("ordinary notification", copy_ticker="—")["test-chat"]["sent"] is True
-    assert calls[0][0].endswith("/sendMessage")
     assert "reply_markup" not in calls[0][1]
-
-
-def test_pending_open_telegram_notification_passes_contract_ticker_for_copy(monkeypatch):
-    import run_once as ro
-
-    sent = []
-    monkeypatch.setattr(ro, "_load_active_trades", lambda: {
-        "EVT_LDO": {
-            "symbol": "LDO-USDT",
-            "direction": "SHORT",
-            "timeframe": "1h",
-            "event_type": "BREAKER_BLOCK_BEARISH",
-            "score": 80,
-            "setup": {},
-        }
-    })
-    monkeypatch.setattr(ro, "to_bx_symbol", lambda symbol: symbol)
-    monkeypatch.setattr(ro, "format_signal", lambda *args, **kwargs: "open signal")
-    monkeypatch.setattr(
-        ro,
-        "send_tg",
-        lambda message, **kwargs: sent.append((message, kwargs)) or True,
-    )
-    monkeypatch.setattr(ro, "record_action", lambda *_args, **_kwargs: None)
-
-    attempted = ro.send_pending_open_trade_notifications(
-        {("LDO-USDT", "SHORT"): {"positionAmt": "1"}},
-        set(),
-    )
-
-    assert attempted == {"EVT_LDO"}
-    assert sent == [("open signal", {"copy_ticker": "LDO-USDT"})]
 
 
 def test_telegram_signal_header_contains_copy_friendly_usdt_ticker_for_both_directions():
@@ -684,8 +621,8 @@ def test_telegram_signal_header_contains_copy_friendly_usdt_ticker_for_both_dire
     long_message = format_signal({"direction": "LONG", "symbol": "OP", "event_type": "X", "event_fact": {}, "timestamps": {}})
     short_message = format_signal({"direction": "SHORT", "symbol": "OP-USDT", "event_type": "X", "event_fact": {}, "timestamps": {}})
 
-    assert "🟢 LONG - OP (OPUSDT)" in long_message
-    assert "🔴 SHORT - OP-USDT (OPUSDT)" in short_message
+    assert "<b>🟢 LONG - OP (</b><code>OPUSDT</code><b>)</b>" in long_message
+    assert "<b>🔴 SHORT - OP-USDT (</b><code>OPUSDT</code><b>)</b>" in short_message
 
 
 def test_closed_trade_message_shows_compact_ticker_and_open_direction():
@@ -697,7 +634,7 @@ def test_closed_trade_message_shows_compact_ticker_and_open_direction():
         max_drawdown=-6.93, exit_reason="TAKE_PROFIT_FULL", event_type="CRT_BEARISH", timeframe="4h",
     )
 
-    assert "RENDER (RENDERUSDT) — сделка закрыта" in msg
+    assert "<b>RENDER (</b><code>RENDERUSDT</code><b>) — сделка закрыта</b>" in msg
     assert "Направление: <b>SHORT</b>" in msg
 
 
@@ -1830,8 +1767,8 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     attempts = []
 
     monkeypatch.setenv("TG_CHAT_IDS", "A,B")
-    def fake_send_detailed(text, only_chat_ids=None, *, copy_ticker=None):
-        attempts.append((tuple(only_chat_ids or []), copy_ticker))
+    def fake_send_detailed(text, only_chat_ids=None):
+        attempts.append(tuple(only_chat_ids or []))
         if len(attempts) == 1:
             return {"A": {"sent": True}, "B": {"sent": False, "error": "temporary"}}
         return {cid: {"sent": True} for cid in (only_chat_ids or [])}
@@ -1842,13 +1779,13 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     assert tr._queue_notification(
         nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
     ) is False
-    assert attempts[-1] == (("A", "B"), "ABC")
+    assert attempts[-1] == ("A", "B")
 
     # Only the undelivered chat is retried; the successful chat is never duplicated.
     assert tr._queue_notification(
         nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
     ) is True
-    assert attempts[-1] == (("B",), "ABC")
+    assert attempts[-1] == ("B",)
 
 
 def test_be_activation_is_not_sent_to_telegram(monkeypatch, tmp_path):
@@ -1930,8 +1867,8 @@ def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppre
     }), encoding="utf-8")
     delivered = []
 
-    def fake_send(text, *, only_chat_ids=None, copy_ticker=None):
-        delivered.append((text, list(only_chat_ids or []), copy_ticker))
+    def fake_send(text, *, only_chat_ids=None):
+        delivered.append((text, list(only_chat_ids or [])))
         return {chat_id: {"sent": True, "message_id": 101} for chat_id in (only_chat_ids or [])}
 
     monkeypatch.setattr(tr, "send_detailed", fake_send)
@@ -1940,7 +1877,6 @@ def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppre
     saved = json.loads(tr.NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
     assert len(delivered) == 1
     assert delivered[0][0] == "close notification"
-    assert delivered[0][2] is None  # legacy notification has no symbol to copy
     assert saved[legacy_id]["resolved"] is True
     assert saved[legacy_id]["suppressed"] is True
     assert saved[pending_id]["resolved"] is True
@@ -4447,7 +4383,7 @@ def test_tp_hit_message_uses_compact_usdt_symbol():
         exec_price=0.06839, closed_qty=35.0, remaining_qty=104.0, remaining_pct=74.8,
     )
 
-    assert "Hedera (HBARUSDT)" in message
+    assert "<b>💰 Hedera (</b><code>HBARUSDT</code><b>)</b>" in message
 
 
 def test_telegram_signal_formats_contract_ticker_independently_of_provider_name():
@@ -4459,4 +4395,4 @@ def test_telegram_signal_formats_contract_ticker_independently_of_provider_name(
         coinalyze_row=SimpleNamespace(name="1000SHIB"),
     )
 
-    assert "SHORT - 1000SHIB (1000SHIBUSDT)" in message
+    assert "<b>🔴 SHORT - 1000SHIB (</b><code>1000SHIBUSDT</code><b>)</b>" in message

@@ -428,8 +428,8 @@ def test_application_version_and_runtime_guards():
     assert not Path("VERSION").exists()
     runtime = Path("run_once.py").read_text(encoding="utf-8")
     workflow = _workflow()
-    assert 'APP_VERSION = "V10.4.32"' in runtime
-    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.32"' in workflow
+    assert 'APP_VERSION = "V10.4.34"' in runtime
+    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.34"' in workflow
     assert 'version=%s' in runtime
     tracker = Path('event_engine/tracker.py').read_text(encoding='utf-8')
     assert 'EARLY_LOSS_CUT_ENABLED = False' in tracker
