@@ -171,7 +171,12 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
         return bool(item["resolved"])
 
     item["attempts"] = int(item.get("attempts", 0)) + 1
-    results = send_detailed(str(item.get("text", "")), only_chat_ids=pending)
+    copy_ticker = item.get("symbol") if str(item.get("kind", "")).upper() == "TRADE_CLOSE" else None
+    results = send_detailed(
+        str(item.get("text", "")),
+        only_chat_ids=pending,
+        copy_ticker=copy_ticker,
+    )
     now_ms = int(time.time() * 1000)
     for cid in pending:
         state = chat_state.setdefault(cid, {})
