@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import hashlib
 import logging
@@ -171,11 +172,9 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
         return bool(item["resolved"])
 
     item["attempts"] = int(item.get("attempts", 0)) + 1
-    copy_ticker = item.get("symbol") if str(item.get("kind", "")).upper() == "TRADE_CLOSE" else None
     results = send_detailed(
         str(item.get("text", "")),
         only_chat_ids=pending,
-        copy_ticker=copy_ticker,
     )
     now_ms = int(time.time() * 1000)
     for cid in pending:
@@ -1174,7 +1173,7 @@ def format_tp_hit_message(
     exec_price: float, closed_qty: float, remaining_qty: float, remaining_pct: float,
 ) -> str:
     return (
-        f"💰 <b>{name} ({format_telegram_symbol(symbol)})</b>\n\n"
+        f"<b>💰 {html.escape(str(name), quote=False)} (</b><code>{html.escape(format_telegram_symbol(symbol), quote=False)}</code><b>)</b>\n\n"
         f"Leg: <b>{leg}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
         f"Цена исполнения: <code>{format_price(exec_price)}</code>\n"
@@ -1201,9 +1200,10 @@ def format_trade_closed_message(
     direction_text = str(direction or "").strip().upper()
     if direction_text not in {"LONG", "SHORT"}:
         direction_text = "UNKNOWN"
-    display_symbol = format_telegram_symbol(symbol)
+    display_name = html.escape(str(name), quote=False)
+    display_symbol = html.escape(format_telegram_symbol(symbol), quote=False)
     lines = [
-        f"{emoji} <b>{name} ({display_symbol}) — сделка закрыта</b>",
+        f"{emoji} <b>{display_name} (</b><code>{display_symbol}</code><b>) — сделка закрыта</b>",
         "",
         f"Направление: <b>{direction_text}</b>",
         f"Вход <code>{format_price(entry_price)}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",

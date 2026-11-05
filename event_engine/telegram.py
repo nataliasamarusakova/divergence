@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 import os
 from typing import Any, Optional
 
@@ -15,21 +14,6 @@ def _chat_ids() -> list[str]:
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
 
-def _copy_ticker_reply_markup(copy_ticker: Any) -> Optional[str]:
-    """Build a Telegram inline button that copies the contract ticker."""
-    raw_ticker = str(copy_ticker or "").strip()
-    if raw_ticker in {"", "—", "-"}:
-        return None
-    ticker = format_telegram_symbol(raw_ticker)
-    if ticker in {"", "—", "USDT"} or len(ticker) > 256:
-        return None
-    return json.dumps(
-        {"inline_keyboard": [[{"text": ticker, "copy_text": {"text": ticker}}]]},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
 def _response_payload(response: Any) -> dict[str, Any]:
     try:
         payload = response.json()
@@ -41,8 +25,6 @@ def _response_payload(response: Any) -> dict[str, Any]:
 def send_detailed(
     text: str,
     only_chat_ids: Optional[list[str]] = None,
-    *,
-    copy_ticker: Any = None,
 ) -> dict[str, dict[str, Any]]:
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
     ids = only_chat_ids if only_chat_ids is not None else _chat_ids()
@@ -55,19 +37,15 @@ def send_detailed(
     result: dict[str, dict[str, Any]] = {}
     for chat_id in ids:
         try:
-            # Use the standard Bot API sendMessage path only. The former
-            # sendRichMessage path collapsed newline-separated text blocks in
-            # the Telegram client. sendMessage preserves the original multiline
-            # body while the copy_text button is rendered below the message.
+            # Send the original multi-line HTML body unchanged. Contract tickers
+            # are inline <code> entities, which Telegram clients render as
+            # tap-to-copy text. No extra keyboard or copy button is attached.
             message_data: dict[str, Any] = {
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": "true",
             }
-            reply_markup = _copy_ticker_reply_markup(copy_ticker)
-            if reply_markup:
-                message_data["reply_markup"] = reply_markup
 
             response = requests.post(
                 f"{base_url}/sendMessage",
@@ -97,8 +75,8 @@ def send_detailed(
     return result
 
 
-def send(text: str, *, copy_ticker: Any = None) -> bool:
-    result = send_detailed(text, copy_ticker=copy_ticker)
+def send(text: str) -> bool:
+    result = send_detailed(text)
     return bool(result) and all(bool(item.get("sent")) for item in result.values())
 
 
@@ -132,7 +110,7 @@ def format_signal(
     score_str = f"{score:.0f}/100" if score is not None else "—"
 
     lines = [
-        f"<b>{header_prefix} - {esc(name)} ({esc(symbol)})</b>",
+        f"<b>{header_prefix} - {esc(name)} (</b><code>{esc(symbol)}</code><b>)</b>",
         "",
         f"Score: <b>{score_str}</b>",
         f"Event: <code>{esc(event_type)}</code>",
