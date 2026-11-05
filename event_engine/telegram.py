@@ -16,7 +16,7 @@ def _chat_ids() -> list[str]:
 
 
 def _copy_ticker_reply_markup(copy_ticker: Any) -> Optional[str]:
-    """Build a fallback Telegram inline button that copies the contract ticker."""
+    """Build a Telegram inline button that copies the contract ticker."""
     raw_ticker = str(copy_ticker or "").strip()
     if raw_ticker in {"", "—", "-"}:
         return None
@@ -30,53 +30,12 @@ def _copy_ticker_reply_markup(copy_ticker: Any) -> Optional[str]:
     )
 
 
-def _rich_copy_message_html(message: str, copy_ticker: Any) -> Optional[str]:
-    """Put Telegram's native copy button exactly where the ticker appears in line one."""
-    raw_ticker = str(copy_ticker or "").strip()
-    if raw_ticker in {"", "—", "-"}:
-        return None
-    ticker = format_telegram_symbol(raw_ticker)
-    if ticker in {"", "—", "USDT"} or len(ticker) > 256:
-        return None
-
-    first_line_end = message.find("\n")
-    first_line = message if first_line_end < 0 else message[:first_line_end]
-    remainder = "" if first_line_end < 0 else message[first_line_end:]
-    escaped_text = html.escape(ticker, quote=False)
-    escaped_attribute = html.escape(ticker, quote=True)
-    needle = f"({escaped_text})"
-    ticker_index = first_line.rfind(needle)
-    if ticker_index < 0:
-        return None
-    last_open_tag = first_line.rfind("<b>", 0, ticker_index)
-    last_close_tag = first_line.rfind("</b>", 0, ticker_index)
-    if last_open_tag < 0 or last_open_tag < last_close_tag:
-        return None
-    if first_line.find("</b>", ticker_index + len(needle)) < 0:
-        return None
-
-    left = first_line[:ticker_index] + "(</b>"
-    right = "<b>)" + first_line[ticker_index + len(needle):]
-    button = (
-        f'<tg-button type="copy_text" text="{escaped_attribute}">'
-        f"{escaped_text}</tg-button>"
-    )
-    return left + button + right + remainder
-
-
 def _response_payload(response: Any) -> dict[str, Any]:
     try:
         payload = response.json()
     except (AttributeError, ValueError):
         payload = {"ok": False, "description": str(getattr(response, "text", ""))[:500]}
     return payload if isinstance(payload, dict) else {"ok": False, "description": "invalid Telegram API response"}
-
-
-def _is_rich_message_rejection(response: Any, payload: dict[str, Any]) -> bool:
-    """Fallback only on explicit client/API rejection, never on a network timeout."""
-    status_code = getattr(response, "status_code", None)
-    error_code = payload.get("error_code")
-    return status_code in {400, 404} or error_code in {400, 404}
 
 
 def send_detailed(
@@ -96,53 +55,32 @@ def send_detailed(
     result: dict[str, dict[str, Any]] = {}
     for chat_id in ids:
         try:
-            rich_html = _rich_copy_message_html(text, copy_ticker)
-            if rich_html:
-                response = requests.post(
-                    f"{base_url}/sendRichMessage",
-                    data={
-                        "chat_id": chat_id,
-                        "rich_message": json.dumps({"html": rich_html}, ensure_ascii=False),
-                    },
-                    timeout=15,
-                )
-                payload = _response_payload(response)
-                if not payload.get("ok") and _is_rich_message_rejection(response, payload):
-                    # The API explicitly rejected the rich request, so it did not
-                    # create a message. Fall back to sendMessage with a copy button
-                    # below the text. Do not do this after transport errors/timeouts.
-                    response = requests.post(
-                        f"{base_url}/sendMessage",
-                        data={
-                            "chat_id": chat_id,
-                            "text": text,
-                            "parse_mode": "HTML",
-                            "disable_web_page_preview": "true",
-                            "reply_markup": _copy_ticker_reply_markup(copy_ticker),
-                        },
-                        timeout=15,
-                    )
-                    payload = _response_payload(response)
-            else:
-                fallback_markup = _copy_ticker_reply_markup(copy_ticker)
-                message_data = {
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                }
-                if fallback_markup:
-                    message_data["reply_markup"] = fallback_markup
-                response = requests.post(
-                    f"{base_url}/sendMessage",
-                    data=message_data,
-                    timeout=15,
-                )
-                payload = _response_payload(response)
+            # Use the standard Bot API sendMessage path only. The former
+            # sendRichMessage path collapsed newline-separated text blocks in
+            # the Telegram client. sendMessage preserves the original multiline
+            # body while the copy_text button is rendered below the message.
+            message_data: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            }
+            reply_markup = _copy_ticker_reply_markup(copy_ticker)
+            if reply_markup:
+                message_data["reply_markup"] = reply_markup
 
+            response = requests.post(
+                f"{base_url}/sendMessage",
+                data=message_data,
+                timeout=15,
+            )
             response.raise_for_status()
+            payload = _response_payload(response)
             if payload.get("ok"):
-                result[str(chat_id)] = {"sent": True, "message_id": ((payload.get("result") or {}).get("message_id"))}
+                result[str(chat_id)] = {
+                    "sent": True,
+                    "message_id": ((payload.get("result") or {}).get("message_id")),
+                }
             else:
                 error = str(payload.get("description", "unknown Telegram API error"))
                 print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
@@ -155,6 +93,7 @@ def send_detailed(
             error = str(exc)
             print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {error}")
             result[str(chat_id)] = {"sent": False, "error": error}
+
     return result
 
 
