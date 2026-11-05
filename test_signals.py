@@ -475,7 +475,7 @@ def test_telegram_symbol_is_compact_usdt_pair_and_does_not_duplicate_suffix():
     assert format_telegram_symbol("") == "—"
 
 
-def test_telegram_send_places_copy_button_inline_on_normalized_ticker(monkeypatch):
+def test_telegram_send_preserves_multiline_signal_and_adds_copy_button_below(monkeypatch):
     import json
     from event_engine import telegram as tg
 
@@ -499,20 +499,29 @@ def test_telegram_send_places_copy_button_inline_on_normalized_ticker(monkeypatc
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
 
-    result = tg.send_detailed("<b>SHORT - Lido DAO Token (LDOUSDT)</b>", copy_ticker="LDO-USDT")
+    message = (
+        "<b>🔴 SHORT - Lido DAO Token (LDOUSDT)</b>\n\n"
+        "Score: <b>80/100</b>\n"
+        "Event: <code>BREAKER_BLOCK_BEARISH</code>\n"
+        "TF: <b>1h</b> + trigger 15m\n"
+        "\n<b>SETUP</b>\nEntry: <code>0.3416</code>\n"
+        "\n<b>EXECUTION</b>\nMode: vst"
+    )
+    result = tg.send_detailed(message, copy_ticker="LDO-USDT")
 
     assert result["test-chat"]["sent"] is True
     assert len(calls) == 1
     url, payload, timeout = calls[0]
-    assert url.endswith("/sendRichMessage")
+    assert url.endswith("/sendMessage")
     assert timeout == 15
-    rich_message = json.loads(payload["rich_message"])
-    assert rich_message == {
-        "html": '<b>SHORT - Lido DAO Token (</b><tg-button type="copy_text" text="LDOUSDT">LDOUSDT</tg-button><b>)</b>'
+    assert payload["text"] == message  # exact newlines and blank lines survive transport
+    assert payload["parse_mode"] == "HTML"
+    assert json.loads(payload["reply_markup"]) == {
+        "inline_keyboard": [[{"text": "LDOUSDT", "copy_text": {"text": "LDOUSDT"}}]]
     }
 
 
-def test_closed_trade_header_contains_inline_copy_button_for_usdt_ticker(monkeypatch):
+def test_closed_trade_message_keeps_multiline_layout_and_copy_button_below(monkeypatch):
     import json
     from event_engine import telegram as tg
     from event_engine.tracker import format_trade_closed_message
@@ -547,14 +556,18 @@ def test_closed_trade_header_contains_inline_copy_button_for_usdt_ticker(monkeyp
 
     assert result["test-chat"]["sent"] is True
     assert len(calls) == 1
-    assert calls[0][0].endswith("/sendRichMessage")
-    rich_html = json.loads(calls[0][1]["rich_message"])["html"]
-    assert '<tg-button type="copy_text" text="LTCUSDT">LTCUSDT</tg-button>' in rich_html
-    assert "Litecoin (</b>" in rich_html
-    assert "— сделка закрыта</b>" in rich_html
+    assert calls[0][0].endswith("/sendMessage")
+    payload = calls[0][1]
+    assert payload["text"] == message
+    assert "\n\nНаправление:" in payload["text"]
+    assert "\nВход" in payload["text"]
+    assert "\nRealized R:R:" in payload["text"]
+    assert json.loads(payload["reply_markup"]) == {
+        "inline_keyboard": [[{"text": "LTCUSDT", "copy_text": {"text": "LTCUSDT"}}]]
+    }
 
 
-def test_telegram_rich_copy_rejection_falls_back_to_send_message_button(monkeypatch):
+def test_telegram_copy_button_uses_one_standard_send_without_rich_message_api(monkeypatch):
     import json
     from event_engine import telegram as tg
 
@@ -563,38 +576,31 @@ def test_telegram_rich_copy_rejection_falls_back_to_send_message_button(monkeypa
     calls = []
 
     class Response:
-        def __init__(self, payload, status_code=200):
-            self._payload = payload
-            self.status_code = status_code
-            self.text = ""
+        status_code = 200
+        text = ""
 
         def raise_for_status(self):
-            if self.status_code >= 400:
-                raise tg.requests.HTTPError(f"HTTP {self.status_code}")
+            return None
 
         def json(self):
-            return self._payload
+            return {"ok": True, "result": {"message_id": 124}}
 
     def fake_post(url, *, data, timeout):
         calls.append((url, data))
-        if url.endswith("/sendRichMessage"):
-            return Response({"ok": False, "error_code": 400, "description": "rich message rejected"})
-        return Response({"ok": True, "result": {"message_id": 124}})
+        return Response()
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
 
-    result = tg.send_detailed("<b>Litecoin (LTCUSDT) — сделка закрыта</b>", copy_ticker="LTC")
+    result = tg.send_detailed("<b>Litecoin (LTCUSDT)</b>", copy_ticker="LTC")
 
     assert result["test-chat"]["sent"] is True
-    assert len(calls) == 2
-    assert calls[0][0].endswith("/sendRichMessage")
-    assert calls[1][0].endswith("/sendMessage")
-    assert json.loads(calls[1][1]["reply_markup"]) == {
-        "inline_keyboard": [[{"text": "LTCUSDT", "copy_text": {"text": "LTCUSDT"}}]]
-    }
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/sendMessage")
+    assert "rich_message" not in calls[0][1]
+    assert json.loads(calls[0][1]["reply_markup"])["inline_keyboard"][0][0]["copy_text"]["text"] == "LTCUSDT"
 
 
-def test_telegram_rich_copy_timeout_does_not_trigger_duplicate_fallback(monkeypatch):
+def test_telegram_send_timeout_does_not_retry_or_duplicate_message(monkeypatch):
     from event_engine import telegram as tg
 
     monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
@@ -602,7 +608,7 @@ def test_telegram_rich_copy_timeout_does_not_trigger_duplicate_fallback(monkeypa
     calls = []
 
     def fake_post(url, *, data, timeout):
-        calls.append(url)
+        calls.append((url, data))
         raise tg.requests.Timeout("simulated send timeout")
 
     monkeypatch.setattr(tg.requests, "post", fake_post)
@@ -611,7 +617,7 @@ def test_telegram_rich_copy_timeout_does_not_trigger_duplicate_fallback(monkeypa
 
     assert result["test-chat"]["sent"] is False
     assert len(calls) == 1
-    assert calls[0].endswith("/sendRichMessage")
+    assert calls[0][0].endswith("/sendMessage")
 
 
 def test_telegram_send_without_copy_ticker_keeps_message_without_keyboard(monkeypatch):
