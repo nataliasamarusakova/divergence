@@ -475,6 +475,203 @@ def test_telegram_symbol_is_compact_usdt_pair_and_does_not_duplicate_suffix():
     assert format_telegram_symbol("") == "—"
 
 
+def test_telegram_send_places_copy_button_inline_on_normalized_ticker(monkeypatch):
+    import json
+    from event_engine import telegram as tg
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 123}}
+
+    def fake_post(url, *, data, timeout):
+        calls.append((url, data, timeout))
+        return Response()
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+
+    result = tg.send_detailed("<b>SHORT - Lido DAO Token (LDOUSDT)</b>", copy_ticker="LDO-USDT")
+
+    assert result["test-chat"]["sent"] is True
+    assert len(calls) == 1
+    url, payload, timeout = calls[0]
+    assert url.endswith("/sendRichMessage")
+    assert timeout == 15
+    rich_message = json.loads(payload["rich_message"])
+    assert rich_message == {
+        "html": '<b>SHORT - Lido DAO Token (</b><tg-button type="copy_text" text="LDOUSDT">LDOUSDT</tg-button><b>)</b>'
+    }
+
+
+def test_closed_trade_header_contains_inline_copy_button_for_usdt_ticker(monkeypatch):
+    import json
+    from event_engine import telegram as tg
+    from event_engine.tracker import format_trade_closed_message
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 125}}
+
+    def fake_post(url, *, data, timeout):
+        calls.append((url, data))
+        return Response()
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    message = format_trade_closed_message(
+        name="Litecoin", symbol="LTC-USDT", direction="SHORT", entry_price=100.0,
+        exit_price=95.0, pnl_pct=5.0, realized_rr=1.0, planned_rr=1.2,
+        duration_min=60.0, peak_pnl=5.0, max_drawdown=-1.0,
+        exit_reason="TAKE_PROFIT_FULL", event_type="CRT_BEARISH",
+    )
+
+    result = tg.send_detailed(message, copy_ticker="LTC-USDT")
+
+    assert result["test-chat"]["sent"] is True
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/sendRichMessage")
+    rich_html = json.loads(calls[0][1]["rich_message"])["html"]
+    assert '<tg-button type="copy_text" text="LTCUSDT">LTCUSDT</tg-button>' in rich_html
+    assert "Litecoin (</b>" in rich_html
+    assert "— сделка закрыта</b>" in rich_html
+
+
+def test_telegram_rich_copy_rejection_falls_back_to_send_message_button(monkeypatch):
+    import json
+    from event_engine import telegram as tg
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+    calls = []
+
+    class Response:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+            self.text = ""
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise tg.requests.HTTPError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, *, data, timeout):
+        calls.append((url, data))
+        if url.endswith("/sendRichMessage"):
+            return Response({"ok": False, "error_code": 400, "description": "rich message rejected"})
+        return Response({"ok": True, "result": {"message_id": 124}})
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+
+    result = tg.send_detailed("<b>Litecoin (LTCUSDT) — сделка закрыта</b>", copy_ticker="LTC")
+
+    assert result["test-chat"]["sent"] is True
+    assert len(calls) == 2
+    assert calls[0][0].endswith("/sendRichMessage")
+    assert calls[1][0].endswith("/sendMessage")
+    assert json.loads(calls[1][1]["reply_markup"]) == {
+        "inline_keyboard": [[{"text": "LTCUSDT", "copy_text": {"text": "LTCUSDT"}}]]
+    }
+
+
+def test_telegram_rich_copy_timeout_does_not_trigger_duplicate_fallback(monkeypatch):
+    from event_engine import telegram as tg
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+    calls = []
+
+    def fake_post(url, *, data, timeout):
+        calls.append(url)
+        raise tg.requests.Timeout("simulated send timeout")
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+
+    result = tg.send_detailed("<b>SHORT - Lido DAO Token (LDOUSDT)</b>", copy_ticker="LDO")
+
+    assert result["test-chat"]["sent"] is False
+    assert len(calls) == 1
+    assert calls[0].endswith("/sendRichMessage")
+
+
+def test_telegram_send_without_copy_ticker_keeps_message_without_keyboard(monkeypatch):
+    from event_engine import telegram as tg
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+    calls = []
+
+    class Response:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 124}}
+
+    def fake_post(url, *, data, timeout):
+        calls.append((url, data))
+        return Response()
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    assert tg.send_detailed("ordinary notification", copy_ticker="—")["test-chat"]["sent"] is True
+    assert calls[0][0].endswith("/sendMessage")
+    assert "reply_markup" not in calls[0][1]
+
+
+def test_pending_open_telegram_notification_passes_contract_ticker_for_copy(monkeypatch):
+    import run_once as ro
+
+    sent = []
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {
+        "EVT_LDO": {
+            "symbol": "LDO-USDT",
+            "direction": "SHORT",
+            "timeframe": "1h",
+            "event_type": "BREAKER_BLOCK_BEARISH",
+            "score": 80,
+            "setup": {},
+        }
+    })
+    monkeypatch.setattr(ro, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(ro, "format_signal", lambda *args, **kwargs: "open signal")
+    monkeypatch.setattr(
+        ro,
+        "send_tg",
+        lambda message, **kwargs: sent.append((message, kwargs)) or True,
+    )
+    monkeypatch.setattr(ro, "record_action", lambda *_args, **_kwargs: None)
+
+    attempted = ro.send_pending_open_trade_notifications(
+        {("LDO-USDT", "SHORT"): {"positionAmt": "1"}},
+        set(),
+    )
+
+    assert attempted == {"EVT_LDO"}
+    assert sent == [("open signal", {"copy_ticker": "LDO-USDT"})]
+
+
 def test_telegram_signal_header_contains_copy_friendly_usdt_ticker_for_both_directions():
     from event_engine.telegram import format_signal
 
@@ -1627,8 +1824,8 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     attempts = []
 
     monkeypatch.setenv("TG_CHAT_IDS", "A,B")
-    def fake_send_detailed(text, only_chat_ids=None):
-        attempts.append(tuple(only_chat_ids or []))
+    def fake_send_detailed(text, only_chat_ids=None, *, copy_ticker=None):
+        attempts.append((tuple(only_chat_ids or []), copy_ticker))
         if len(attempts) == 1:
             return {"A": {"sent": True}, "B": {"sent": False, "error": "temporary"}}
         return {cid: {"sent": True} for cid in (only_chat_ids or [])}
@@ -1639,13 +1836,13 @@ def test_telegram_exit_notification_is_persistent_and_retries_per_chat(monkeypat
     assert tr._queue_notification(
         nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
     ) is False
-    assert attempts[-1] == ("A", "B")
+    assert attempts[-1] == (("A", "B"), "ABC")
 
     # Only the undelivered chat is retried; the successful chat is never duplicated.
     assert tr._queue_notification(
         nid, event_id="EVT_TEST", kind="TRADE_CLOSE", symbol="ABC", direction="LONG", text="close"
     ) is True
-    assert attempts[-1] == ("B",)
+    assert attempts[-1] == (("B",), "ABC")
 
 
 def test_be_activation_is_not_sent_to_telegram(monkeypatch, tmp_path):
@@ -1727,8 +1924,8 @@ def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppre
     }), encoding="utf-8")
     delivered = []
 
-    def fake_send(text, *, only_chat_ids=None):
-        delivered.append((text, list(only_chat_ids or [])))
+    def fake_send(text, *, only_chat_ids=None, copy_ticker=None):
+        delivered.append((text, list(only_chat_ids or []), copy_ticker))
         return {chat_id: {"sent": True, "message_id": 101} for chat_id in (only_chat_ids or [])}
 
     monkeypatch.setattr(tr, "send_detailed", fake_send)
@@ -1737,6 +1934,7 @@ def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppre
     saved = json.loads(tr.NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
     assert len(delivered) == 1
     assert delivered[0][0] == "close notification"
+    assert delivered[0][2] is None  # legacy notification has no symbol to copy
     assert saved[legacy_id]["resolved"] is True
     assert saved[legacy_id]["suppressed"] is True
     assert saved[pending_id]["resolved"] is True

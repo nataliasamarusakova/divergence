@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.30"
+APP_VERSION = "V10.4.31"
 
 import pandas as pd
 import requests
@@ -2073,7 +2073,7 @@ def send_pending_open_trade_notifications(
         msg = format_signal(event, setup=setup, execution=execution, score=trade.get("score"))
         attempted.add(event_id)
         try:
-            sent = bool(send_tg(msg))
+            sent = bool(send_tg(msg, copy_ticker=symbol))
         except Exception as exc:
             sent = False
             log.error("[TELEGRAM] Pending-open retry exception for %s %s (%s): %s", direction, symbol, event_id, exc)
@@ -6556,7 +6556,7 @@ def main() -> None:
         sent = False
         if is_real_execution and not telegram_already_sent and event_id not in telegram_attempted_this_cycle:
             try:
-                sent = bool(send_tg(msg))
+                sent = bool(send_tg(msg, copy_ticker=symbol))
             except Exception as exc:
                 sent = False
                 log.error("[TELEGRAM] Exception while sending %s %s (%s): %s", direction, symbol, event_id, exc)
