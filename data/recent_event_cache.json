@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793995779736,
+  "updated_ts": 1793995942821,
   "events": [
     {
       "event_id": "EVT_B041216AF90AE7B3",
@@ -1976,6 +1976,58 @@
         "atr": 0.002806185121000963,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_BFCD7DE624E16CD1",
+      "symbol": "BIRB",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1793987999999,
+        "pivot_2_ts": 1793995199999,
+        "detected_at_ts": 1793995199999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.11195,
+        "range_high": 0.11195,
+        "range_low": 0.09304,
+        "manipulation_depth_atr": 0.4161545753067601,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_26D87DD6EFDB5EAC",
+      "symbol": "BIRB",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "REGULAR_BEARISH_FR_OIW_Z",
+      "timestamps": {
+        "pivot_1_ts": 1793793599999,
+        "pivot_2_ts": 1793966399999,
+        "detected_at_ts": 1793995199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.0972,
+        "p1_price": 0.09826,
+        "p2_price": 0.12349,
+        "p1_indicator": 0.28993290711297914,
+        "p2_indicator": -0.14074057829962008,
+        "bars_between": 12,
+        "price_delta_atr": 3.2261417181484027,
+        "price_delta_pct": 25.67677590067169,
+        "volume_ratio_20": 2.8659742685182463,
+        "volume_confirmation_enabled": true,
+        "vwap": 0.09513746937235242,
+        "vwap_distance_pct": null,
+        "engine": "DIVERGENCE",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
