@@ -1005,6 +1005,22 @@ def _shape_fingerprint(payload: Any) -> tuple[str, str]:
     return fingerprint, description
 
 
+def is_income_history_null_data_shape(response: Any) -> bool:
+    """True only for BingX's successful envelope with an unexpected null data body.
+
+    Do not use this recovery path for authentication, permission, rate-limit, or
+    transport failures: those require their own handling and another signed
+    account-wide request can make rate limiting worse.
+    """
+    return (
+        isinstance(response, dict)
+        and response.get("status") == "error"
+        and response.get("error") == "income_history_unexpected_data_shape"
+        and response.get("response_code") in (0, "0")
+        and response.get("response_data_type") == "NoneType"
+    )
+
+
 def _response_envelope_diagnostics(response: Any) -> dict[str, Any]:
     """Return bounded, non-secret metadata for an unexpected API envelope."""
     if not isinstance(response, dict):
@@ -1200,7 +1216,7 @@ def get_fill_history(
 
 
 def get_income_history(
-    symbol: str,
+    symbol: str | None,
     start_ts: int,
     end_ts: int,
     *,
@@ -1214,8 +1230,11 @@ def get_income_history(
     is required: a truncated response or an unknown row shape is an error, never
     treated as a zero cost. The API retains only a bounded recent history.
     """
-    bx = _normalize_history_symbol(symbol)
-    if not bx:
+    # BingX documents `symbol` as optional for user income history. A missing
+    # symbol requests account-wide rows; callers must then filter by each row's
+    # actual symbol before attributing any amount to a contract.
+    bx = _normalize_history_symbol(symbol) if symbol not in (None, "") else None
+    if symbol not in (None, "") and not bx:
         return {"status": "error", "error": "invalid_or_unknown_income_symbol", "records": [], "complete": False}
     try:
         start_ts, end_ts, limit = int(start_ts), int(end_ts), int(limit)
@@ -1241,7 +1260,9 @@ def get_income_history(
         if request_count >= max_range_requests:
             return None, "income_history_query_budget_exhausted"
         request_count += 1
-        params = {"symbol": bx, "startTime": lo, "endTime": hi, "limit": limit}
+        params = {"startTime": lo, "endTime": hi, "limit": limit}
+        if bx:
+            params["symbol"] = bx
         try:
             response = _request("GET", INCOME_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
         except Exception as exc:
@@ -1353,9 +1374,55 @@ def get_income_history(
     records.sort(key=lambda item: (item["time"], item["record_id"]))
     return {
         "status": "ok", "records": records, "complete": True,
-        "symbol": bx, "start_ts": start_ts, "end_ts": end_ts,
+        "symbol": bx, "query_scope": "SYMBOL" if bx else "ACCOUNT_WIDE",
+        "start_ts": start_ts, "end_ts": end_ts,
         "returned": len(records), "source": "BINGX_USER_INCOME", "query_count": request_count,
     }
+
+
+def filter_income_history_by_symbol(response: dict[str, Any], symbol: str) -> dict[str, Any]:
+    """Strictly filter a complete account-wide income response to one contract.
+
+    Transfers without a contract symbol are irrelevant to position PnL and are
+    skipped. Every other row must identify its own symbol; unknown rows make the
+    result incomplete rather than being guessed into the requested contract.
+    """
+    if not isinstance(response, dict) or response.get("status") != "ok" or response.get("complete") is not True:
+        return {"status": "error", "error": "account_wide_income_response_incomplete", "records": [], "complete": False}
+    target = canonical_contract_symbol(symbol)
+    if not target or not target.isascii():
+        return {"status": "error", "error": "invalid_or_unresolved_income_symbol", "records": [], "complete": False}
+    rows = response.get("records")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return {"status": "error", "error": "account_wide_income_records_invalid", "records": [], "complete": False}
+    filtered: list[dict] = []
+    for row in rows:
+        kind = str(row.get("income_type") or "").upper()
+        row_symbol_raw = row.get("symbol")
+        if not row_symbol_raw:
+            if kind == "TRANSFER":
+                continue
+            return {
+                "status": "error", "error": "account_wide_income_row_missing_symbol",
+                "records": [], "complete": False,
+            }
+        row_symbol = canonical_contract_symbol(str(row_symbol_raw))
+        if not row_symbol or not row_symbol.isascii():
+            return {
+                "status": "error", "error": "account_wide_income_row_symbol_unresolved",
+                "records": [], "complete": False,
+            }
+        if row_symbol == target:
+            filtered.append(row)
+    result = dict(response)
+    result.update({
+        "records": filtered,
+        "symbol": target,
+        "query_scope": "ACCOUNT_WIDE_FILTERED_BY_ROW_SYMBOL",
+        "returned": len(filtered),
+        "account_wide_returned": len(rows),
+    })
+    return result
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
     bx = to_bx_symbol(symbol)

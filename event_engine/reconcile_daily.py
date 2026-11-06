@@ -498,6 +498,25 @@ def _discrepancy_message_detail(item: dict) -> str:
             f"confirmed_unapplied_exit_fill_qty={item.get('confirmed_unapplied_fill_qty')}"
         )
         return f"{base}; orders={order_details}" if order_details else base
+    if item.get("code") == "DAILY_INCOME_QUERY_INCOMPLETE":
+        return (
+            f"{item.get('symbol', '?')}: {item.get('detail') or 'income history incomplete'}"
+        )
+    if item.get("code") == "DATA_ERROR_CLOSES_UNRESOLVED":
+        trades = item.get("trades") if isinstance(item.get("trades"), list) else []
+        summaries = []
+        for trade in trades[:5]:
+            if not isinstance(trade, dict):
+                continue
+            recovery = trade.get("fill_history_recovery") if isinstance(trade.get("fill_history_recovery"), dict) else {}
+            symbol = trade.get("symbol") or "?"
+            direction = trade.get("direction") or "?"
+            event_id = trade.get("event_id") or "?"
+            reason = trade.get("exit_reason") or "DATA_ERROR"
+            last_error = recovery.get("last_error") or trade.get("data_error") or trade.get("error_code") or "recovery_not_attempted"
+            summaries.append(f"{symbol} {direction} event={event_id} reason={reason} recovery={str(last_error)[:180]}")
+        base = f"{item.get('count', len(trades))} unresolved DATA_ERROR close(s)"
+        return base + ("; " + " | ".join(summaries) if summaries else "")
     return str(item.get("detail") or item.get("code") or "unknown")
 
 
@@ -923,19 +942,35 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         if day_start <= stamp <= now_ms:
             today_records.append(record)
     record_counts = Counter(str(row.get("record_type") or "UNKNOWN") for row in today_records)
-    today_data_errors = [
-        {"event_id": row.get("event_id"), "symbol": row.get("symbol"), "closed_ts": row.get("closed_ts"), "data_error": row.get("data_error"), "error_code": row.get("error_code")}
-        for row in today_records
-        if row.get("record_type") == "TRADE_CLOSE" and (
-            str(row.get("exit_reason") or "").upper() == "DATA_ERROR"
-            or bool(row.get("data_error"))
-        )
-    ]
-    if today_data_errors:
+    unresolved_data_errors = []
+    for row in journal:
+        if row.get("record_type") != "TRADE_CLOSE":
+            continue
+        if str(row.get("exit_reason") or "").upper() != "DATA_ERROR" and not bool(row.get("data_error")):
+            continue
+        recovery = row.get("fill_history_recovery") if isinstance(row.get("fill_history_recovery"), dict) else {}
+        unresolved_data_errors.append({
+            "event_id": row.get("event_id"),
+            "symbol": row.get("symbol"),
+            "direction": row.get("direction"),
+            "closed_ts": row.get("closed_ts"),
+            "exit_reason": row.get("exit_reason"),
+            "data_error": row.get("data_error"),
+            "error_code": row.get("error_code"),
+            "exit_order_ids": row.get("exit_order_ids", []),
+            "entry_order_id": row.get("entry_order_id"),
+            "fill_history_recovery": {
+                "status": recovery.get("status", "NOT_ATTEMPTED"),
+                "attempts": recovery.get("attempts", 0),
+                "last_error": recovery.get("last_error"),
+                "next_retry_ts": recovery.get("next_retry_ts"),
+            },
+        })
+    if unresolved_data_errors:
         report["discrepancies"].append({
-            "level": "CRITICAL", "code": "DATA_ERROR_CLOSES_IN_UTC_DAY",
-            "count": len(today_data_errors), "trades": today_data_errors[:25],
-            "detail": "Close outcome or net-cost attribution remains unconfirmed for this UTC day.",
+            "level": "CRITICAL", "code": "DATA_ERROR_CLOSES_UNRESOLVED",
+            "count": len(unresolved_data_errors), "trades": unresolved_data_errors[:25],
+            "detail": "One or more historical trade closes still lack a fill-confirmed exit outcome. This remains CRITICAL across UTC days until fill recovery succeeds; missing fees/funding alone do not trigger it.",
         })
     confirmed_daily_by_symbol: dict[str, dict[str, float]] = defaultdict(lambda: {"net": 0.0, "gross": 0.0, "fees": 0.0, "funding": 0.0, "trades": 0.0})
     for record in today_records:
@@ -964,6 +999,8 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     for sym, _ in local_positions:
         candidate_symbols[sym] += 1
     income_summaries: dict[str, dict] = {}
+    account_wide_income: dict[str, Any] | None = None
+    account_wide_income_attempted = False
     for symbol, _count in candidate_symbols.most_common(MAX_INCOME_SYMBOLS):
         income: dict[str, Any] = {"status": "error", "error": "income_query_not_attempted", "complete": False, "records": []}
         attempts = 0
@@ -982,35 +1019,79 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 # One bounded retry helps with brief API latency spikes without
                 # turning read-only reconciliation into an unbounded request loop.
                 time.sleep(min(0.25 * (attempt + 1), 0.5))
+        # Some BingX VST responses return code=0 with data=null when the
+        # symbol-filtered user/income query has no symbol-scoped payload. The
+        # API supports an account-wide query without `symbol`; try it once per
+        # reconciliation run, then strictly filter by each row's actual symbol.
+        # A null/invalid account-wide response remains UNKNOWN, never zero.
         if not isinstance(income, dict) or income.get("status") != "ok" or income.get("complete") is not True:
-            detail = str(income.get("error", "incomplete_income_response")) if isinstance(income, dict) else "invalid_income_response"
-            shape_fingerprint = income.get("shape_fingerprint") if isinstance(income, dict) else None
-            shape_summary = income.get("shape_summary") if isinstance(income, dict) else None
-            if shape_fingerprint:
-                detail += f"; shape_fingerprint={shape_fingerprint}"
-            if shape_summary:
-                detail += f"; response_shape={shape_summary}"
-            response_diagnostics = {
-                key: income.get(key) for key in (
-                    "response_type", "response_code", "response_msg",
-                    "response_keys", "response_data_type",
-                ) if isinstance(income, dict) and income.get(key) is not None
-            }
-            if response_diagnostics:
-                detail += "; api_response=" + json.dumps(
-                    response_diagnostics, ensure_ascii=False, separators=(",", ":"),
-                )[:700]
-            income_summaries[symbol] = {
-                "status": "ERROR", "error": detail, "attempts": attempts,
-                "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
-                "response_diagnostics": response_diagnostics,
-            }
-            report["discrepancies"].append({
-                "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE",
-                "symbol": symbol, "detail": f"{detail} (attempts={attempts})",
-                "response_diagnostics": response_diagnostics,
-            })
-            continue
+            if bingx.is_income_history_null_data_shape(income):
+                if not account_wide_income_attempted:
+                    account_wide_income_attempted = True
+                    try:
+                        account_wide_income = bingx.get_income_history(
+                            None, day_start, max(day_start + 1, now_ms), limit=1000,
+                            timeout_sec=INCOME_TIMEOUT_SEC,
+                            max_range_requests=INCOME_REQUEST_BUDGET,
+                        )
+                    except Exception as exc:
+                        account_wide_income = {
+                            "status": "error", "complete": False,
+                            "error": f"account_wide_income_exception:{type(exc).__name__}:{exc}",
+                            "records": [],
+                        }
+                if isinstance(account_wide_income, dict) and account_wide_income.get("status") == "ok" and account_wide_income.get("complete") is True:
+                    income = bingx.filter_income_history_by_symbol(account_wide_income, symbol)
+                elif isinstance(account_wide_income, dict):
+                    fallback_error = account_wide_income.get("error", "account_wide_income_incomplete")
+                    fallback_diagnostics = {
+                        key: account_wide_income.get(key) for key in (
+                            "response_type", "response_code", "response_msg",
+                            "response_keys", "response_data_type", "shape_fingerprint",
+                        ) if account_wide_income.get(key) is not None
+                    }
+                    if isinstance(income, dict):
+                        income = dict(income)
+                        income["account_wide_fallback_error"] = str(fallback_error)
+                        income["account_wide_fallback_diagnostics"] = fallback_diagnostics
+            if isinstance(income, dict) and income.get("status") == "ok" and income.get("complete") is True:
+                pass
+            else:
+                detail = str(income.get("error", "incomplete_income_response")) if isinstance(income, dict) else "invalid_income_response"
+                shape_fingerprint = income.get("shape_fingerprint") if isinstance(income, dict) else None
+                shape_summary = income.get("shape_summary") if isinstance(income, dict) else None
+                if shape_fingerprint:
+                    detail += f"; shape_fingerprint={shape_fingerprint}"
+                if shape_summary:
+                    detail += f"; response_shape={shape_summary}"
+                response_diagnostics = {
+                    key: income.get(key) for key in (
+                        "response_type", "response_code", "response_msg",
+                        "response_keys", "response_data_type",
+                    ) if isinstance(income, dict) and income.get(key) is not None
+                }
+                if response_diagnostics:
+                    detail += "; api_response=" + json.dumps(
+                        response_diagnostics, ensure_ascii=False, separators=(",", ":"),
+                    )[:700]
+                if isinstance(income, dict) and income.get("account_wide_fallback_error"):
+                    detail += f"; account_wide_fallback={income.get('account_wide_fallback_error')}"
+                    fallback_diagnostics = income.get("account_wide_fallback_diagnostics")
+                    if isinstance(fallback_diagnostics, dict) and fallback_diagnostics:
+                        detail += "; account_wide_api_response=" + json.dumps(
+                            fallback_diagnostics, ensure_ascii=False, separators=(",", ":"),
+                        )[:500]
+                income_summaries[symbol] = {
+                    "status": "ERROR", "error": detail, "attempts": attempts,
+                    "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
+                    "response_diagnostics": response_diagnostics,
+                }
+                report["discrepancies"].append({
+                    "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE",
+                    "symbol": symbol, "detail": f"{detail} (attempts={attempts})",
+                    "response_diagnostics": response_diagnostics,
+                })
+                continue
         totals = {"realized_pnl": 0.0, "trading_fees": 0.0, "funding_fees": 0.0, "other_known": 0.0, "records": len(income.get("records", [])), "attempts": attempts}
         for row in income.get("records", []):
             if not isinstance(row, dict) or str(row.get("asset") or "").upper() != "USDT":
@@ -1032,7 +1113,11 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 totals["other_known"] += amount
         income_net = sum(totals[key] for key in ("realized_pnl", "trading_fees", "funding_fees", "other_known"))
         totals["aggregate_net"] = income_net
-        totals["source_scope"] = "ACCOUNT_SYMBOL_DAILY_AGGREGATE_NOT_PER_POSITION"
+        totals["source_scope"] = (
+            "ACCOUNT_WIDE_FILTERED_BY_SYMBOL_DAILY_AGGREGATE_NOT_PER_POSITION"
+            if income.get("query_scope") == "ACCOUNT_WIDE_FILTERED_BY_ROW_SYMBOL"
+            else "ACCOUNT_SYMBOL_DAILY_AGGREGATE_NOT_PER_POSITION"
+        )
         income_summaries[symbol] = {"status": "OK", **totals}
         local_confirmed = confirmed_daily_by_symbol.get(symbol)
         if local_confirmed is not None:

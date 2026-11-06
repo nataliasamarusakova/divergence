@@ -17,6 +17,8 @@ from event_engine.bingx import (
     get_order_by_client_order_id,
     get_fill_history,
     get_income_history,
+    filter_income_history_by_symbol,
+    is_income_history_null_data_shape,
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
@@ -54,6 +56,8 @@ def _format_exchange_response_diagnostics(response: Any) -> str:
         parts.append(f"response_code={response.get('response_code')}")
     if response.get("response_data_type") is not None:
         parts.append(f"response_data_type={response.get('response_data_type')}")
+    if response.get("account_wide_fallback_error") not in (None, ""):
+        parts.append(f"account_wide_fallback_error={str(response.get('account_wide_fallback_error'))[:240]}")
     if response.get("response_msg") not in (None, ""):
         message = str(response.get("response_msg")).replace("\n", " ").replace("\r", " ")[:240]
         parts.append(f"response_msg={message}")
@@ -564,107 +568,138 @@ def _fill_id(value: Any) -> str:
     return str(value).strip() if value not in (None, "") else ""
 
 
-def _fetch_trade_fill_history(record: dict, opened_record: dict | None, now_ms: int) -> tuple[list[dict], str | None]:
-    """Fetch paginated actual fills for one known trade, with bounded time windows."""
+def _fetch_trade_fill_history(
+    record: dict, opened_record: dict | None, now_ms: int, *,
+    max_requests: int = 24, max_pages_per_order: int = 10,
+) -> tuple[list[dict], str | None]:
+    """Fetch fills only by exact journaled order IDs, with a strict request budget.
+
+    This avoids scanning up to 90 days of unrelated fills for a single close.
+    A result is usable only when every known order's pagination is complete.
+    """
     opened = opened_record if isinstance(opened_record, dict) else {}
     execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
     result_open = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    protection = result_open.get("protection") if isinstance(result_open.get("protection"), dict) else {}
     symbol = str(record.get("symbol") or opened.get("symbol") or "").strip()
     if not symbol:
         return [], "missing_symbol"
+
+    entry_order_id = _fill_id(record.get("entry_order_id") or execution.get("order_id") or execution.get("orderId")
+                              or result_open.get("order_id") or result_open.get("orderId"))
+    if not entry_order_id:
+        return [], "missing_entry_order_id_for_reconstruction"
+
+    order_ids: set[str] = {entry_order_id}
+    sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
+    for value in (record.get("sl_order_id"), record.get("filled_sl_order_id"),
+                  sl_result.get("order_id"), sl_result.get("orderId")):
+        if _fill_id(value):
+            order_ids.add(_fill_id(value))
+    for source in (record, opened):
+        history = source.get("sl_order_history") if isinstance(source.get("sl_order_history"), list) else []
+        for item in history:
+            if isinstance(item, dict):
+                value = _fill_id(item.get("order_id") or item.get("orderId"))
+                if value:
+                    order_ids.add(value)
+    tp_orders = protection.get("tp_orders") if isinstance(protection.get("tp_orders"), list) else []
+    for item in tp_orders:
+        if isinstance(item, dict):
+            value = _fill_id(item.get("order_id") or item.get("orderId"))
+            if value:
+                order_ids.add(value)
+    for key in ("tp_order_ids", "close_order_ids", "exit_order_ids", "filled_order_ids"):
+        values = record.get(key)
+        if isinstance(values, list):
+            order_ids.update(_fill_id(value) for value in values if _fill_id(value))
+    for key in ("order_id", "orderId", "orderID", "close_order_id", "exit_order_id",
+                "manual_exit_order_id", "filled_sl_order_id"):
+        value = _fill_id(record.get(key))
+        if value:
+            order_ids.add(value)
+
+    # The close reconstruction itself requires at least one known exit order ID.
+    exit_ids = order_ids - {entry_order_id}
+    if not exit_ids:
+        return [], "missing_direct_exit_order_ids_for_reconstruction"
+
     close_ts = int(_safe_float(record.get("closed_ts") or record.get("ts"), now_ms))
     entry_ts = int(_safe_float(
-        result_open.get("fill_ts_ms") or result_open.get("fillTime") or opened.get("entry_ts_ms")
-        or opened.get("ts") or (opened.get("signal") or {}).get("detected_at_ts"), 0.0
+        result_open.get("fill_ts_ms") or result_open.get("fillTime")
+        or opened.get("entry_ts_ms") or opened.get("ts")
+        or (opened.get("signal") or {}).get("detected_at_ts"), 0.0
     ))
     if close_ts <= 0:
         close_ts = now_ms
     if entry_ts <= 0:
-        # A bounded fallback is allowed to query history, but final reconstruction
-        # still requires the exact complete close volume and close-time consistency.
-        entry_ts = max(1, close_ts - 7 * 24 * 60 * 60 * 1000)
+        return [], "missing_entry_timestamp_for_order_fill_query"
     start_ts = max(1, entry_ts - 60_000)
     end_ts = max(start_ts + 1, close_ts + 120_000)
     if end_ts - start_ts > 90 * 24 * 60 * 60 * 1000:
         return [], "trade_history_window_exceeds_90_days"
 
-    event_id = str(record.get("event_id") or "<unknown>")
-    log.info(
-        "[TRACKER_RECOVERY] Fill-history scan START event=%s symbol=%s window=%s..%s span_hours=%.2f timeout=5.0s",
-        event_id, symbol, start_ts, end_ts, (end_ts - start_ts) / 3_600_000.0,
-    )
-
-    # The documented endpoint paginates with pageIndex/pageSize (max 1000).
-    # Small windows prevent a large response or undocumented range limit from
-    # silently truncating fills for long-lived trades.
-    chunk_ms = 24 * 60 * 60 * 1000
-    all_fills: list[dict] = []
-    seen_ids: set[str] = set()
-    cursor = start_ts
+    fills_by_id: dict[str, dict] = {}
+    request_count = 0
     last_request_monotonic = 0.0
-    while cursor < end_ts:
-        chunk_end = min(end_ts, cursor + chunk_ms - 1)
+    for order_id in sorted(order_ids):
         page_index = 1
-        while page_index <= 10:
+        while page_index <= max_pages_per_order:
+            if request_count >= max(1, int(max_requests)):
+                return [], "fill_history_order_query_budget_exhausted"
             wait = 0.22 - (time.monotonic() - last_request_monotonic)
             if last_request_monotonic > 0 and wait > 0:
                 time.sleep(wait)
+            request_count += 1
             request_started = time.monotonic()
             log.info(
-                "[TRACKER_RECOVERY] Fill-history request START event=%s symbol=%s chunk=%s..%s page=%d page_size=1000 timeout=5.0s",
-                event_id, symbol, cursor, chunk_end, page_index,
+                "[TRACKER_RECOVERY] Fill-history request START event=%s symbol=%s order_id=%s page=%d request=%d/%d timeout=5.0s",
+                str(record.get("event_id") or "<unknown>"), symbol, order_id, page_index, request_count, max_requests,
             )
             try:
                 response = get_fill_history(
-                    symbol, cursor, chunk_end, page_index=page_index,
-                    page_size=1000, currency="USDT", timeout_sec=5.0,
+                    symbol, start_ts, end_ts, order_id=order_id,
+                    page_index=page_index, page_size=1000, currency="USDT", timeout_sec=5.0,
                 )
             except Exception as exc:
-                request_elapsed = time.monotonic() - request_started
-                log.warning(
-                    "[TRACKER_RECOVERY] Fill-history request ERROR event=%s symbol=%s page=%d elapsed=%.2fs error=%s",
-                    event_id, symbol, page_index, request_elapsed, exc,
-                )
-                return [], f"fill_history_exception:{exc}"
-            request_elapsed = time.monotonic() - request_started
+                return [], f"fill_history_exception_for_order:{order_id}:{exc}"
             last_request_monotonic = time.monotonic()
+            request_elapsed = last_request_monotonic - request_started
             if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
-                response_error = str(response.get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
+                error = str(response.get("error", "fill_history_unavailable")) if isinstance(response, dict) else "fill_history_invalid_response"
                 diagnostic = _format_exchange_response_diagnostics(response)
                 if diagnostic:
-                    response_error = f"{response_error}; {diagnostic}"
+                    error = f"{error}; {diagnostic}"
                 log.warning(
-                    "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=ERROR error=%s",
-                    event_id, symbol, page_index, request_elapsed, response_error,
+                    "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s order_id=%s page=%d elapsed=%.2fs status=ERROR error=%s",
+                    str(record.get("event_id") or "<unknown>"), symbol, order_id, page_index, request_elapsed, error,
                 )
-                return [], response_error
+                return [], f"fill_history_failed_for_order:{order_id}:{error}"
             rows = response.get("fills")
             if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-                log.warning(
-                    "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=INVALID_PAYLOAD",
-                    event_id, symbol, page_index, request_elapsed,
-                )
-                return [], "fill_history_invalid_fills_payload"
+                return [], f"fill_history_invalid_rows_for_order:{order_id}"
             log.info(
-                "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s page=%d elapsed=%.2fs status=OK rows=%d",
-                event_id, symbol, page_index, request_elapsed, len(rows),
+                "[TRACKER_RECOVERY] Fill-history request END event=%s symbol=%s order_id=%s page=%d elapsed=%.2fs status=OK rows=%d has_more=%s",
+                str(record.get("event_id") or "<unknown>"), symbol, order_id, page_index, request_elapsed, len(rows), response.get("has_more") is True,
             )
             for row in rows:
-                # De-duplicate repeated IDs across page/time-boundary responses.
-                identity = _fill_id(row.get("trade_id"))
+                row_order_id = _fill_id(row.get("order_id") or row.get("orderId"))
+                if row_order_id != order_id:
+                    return [], f"fill_history_order_id_mismatch:{order_id}:{row_order_id or 'MISSING'}"
+                identity = _fill_id(row.get("trade_id") or row.get("tradeId"))
                 if not identity:
-                    identity = "|".join(str(row.get(key) or "") for key in ("order_id", "symbol", "side", "time", "price", "qty"))
-                if identity in seen_ids:
-                    continue
-                seen_ids.add(identity)
-                all_fills.append(row)
-            if len(rows) < 1000:
+                    return [], f"fill_history_missing_trade_id_for_order:{order_id}"
+                previous = fills_by_id.get(identity)
+                normalized = dict(row, order_id=order_id, trade_id=identity)
+                if previous is not None and previous != normalized:
+                    return [], f"duplicate_fill_id_conflict:{identity}"
+                fills_by_id[identity] = normalized
+            if response.get("has_more") is not True:
                 break
             page_index += 1
-        if page_index > 10:
-            return [], "fill_history_page_limit_exceeded"
-        cursor = chunk_end + 1
-    return all_fills, None
+        else:
+            return [], f"fill_history_page_limit_exceeded_for_order:{order_id}"
+    return list(fills_by_id.values()), None
 
 
 def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: list[dict]) -> tuple[dict | None, str | None]:
@@ -689,8 +724,19 @@ def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: l
     if not entry_order_id:
         return None, "missing_entry_order_id_for_reconstruction"
     sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
-    sl_ids = {_fill_id(record.get("sl_order_id")), _fill_id(sl_result.get("order_id") or sl_result.get("orderId"))}
+    sl_ids = {
+        _fill_id(record.get("sl_order_id")),
+        _fill_id(record.get("filled_sl_order_id")),
+        _fill_id(sl_result.get("order_id") or sl_result.get("orderId")),
+    }
     sl_ids.discard("")
+    for source in (record, opened):
+        history = source.get("sl_order_history") if isinstance(source.get("sl_order_history"), list) else []
+        for item in history:
+            if isinstance(item, dict):
+                order_id = _fill_id(item.get("order_id") or item.get("orderId"))
+                if order_id:
+                    sl_ids.add(order_id)
     tp_ids = {_fill_id(x) for x in record.get("tp_order_ids", []) if _fill_id(x)}
     if not tp_ids:
         tp_orders = protection.get("tp_orders") if isinstance(protection.get("tp_orders"), list) else []
@@ -2135,6 +2181,67 @@ def _load_exchange_fill_evidence(
     return list(fills_by_id.values()), None
 
 
+def _get_income_history_for_symbol(
+    symbol: str, start_ts: int, end_ts: int, *, timeout_sec: float = 5.0,
+    max_range_requests: int = 64,
+) -> dict[str, Any]:
+    """Query symbol-scoped income, then try one strictly-filtered account-wide fallback.
+
+    BingX can respond to the symbol-scoped endpoint with code=0/data=null. Since
+    the API also supports omitting `symbol`, a bounded account-wide query is a
+    valid recovery attempt. It is accepted only after every relevant row has an
+    explicit, resolvable symbol; null or ambiguous responses remain incomplete.
+    """
+    try:
+        primary = get_income_history(
+            symbol, start_ts, end_ts, limit=1000,
+            timeout_sec=timeout_sec, max_range_requests=max_range_requests,
+        )
+    except Exception as exc:
+        primary = {
+            "status": "error", "complete": False, "records": [],
+            "error": f"income_history_exception:{type(exc).__name__}:{exc}",
+        }
+    if isinstance(primary, dict) and primary.get("status") == "ok" and primary.get("complete") is True:
+        return primary
+    if not is_income_history_null_data_shape(primary):
+        return primary if isinstance(primary, dict) else {
+            "status": "error", "complete": False, "records": [],
+            "error": "income_history_invalid_response",
+        }
+
+    try:
+        account_wide = get_income_history(
+            None, start_ts, end_ts, limit=1000,
+            timeout_sec=min(timeout_sec, 3.0), max_range_requests=min(max_range_requests, 8),
+        )
+    except Exception as exc:
+        account_wide = {
+            "status": "error", "complete": False, "records": [],
+            "error": f"account_wide_income_exception:{type(exc).__name__}:{exc}",
+        }
+    if isinstance(account_wide, dict) and account_wide.get("status") == "ok" and account_wide.get("complete") is True:
+        filtered = filter_income_history_by_symbol(account_wide, symbol)
+        if filtered.get("status") == "ok" and filtered.get("complete") is True:
+            filtered["fallback_from_symbol_query"] = primary.get("error")
+            return filtered
+        return {
+            **filtered,
+            "account_wide_filter_error": filtered.get("error"),
+            "primary_symbol_query_error": primary.get("error"),
+        }
+    result = dict(primary)
+    fallback_error = account_wide.get("error", "account_wide_income_incomplete") if isinstance(account_wide, dict) else "invalid_account_wide_income_response"
+    result["account_wide_fallback_error"] = str(fallback_error)
+    result["error"] = f"{result.get('error', 'income_history_incomplete')}; account_wide_fallback={fallback_error}"
+    result["account_wide_fallback_diagnostics"] = {
+        key: account_wide.get(key) for key in (
+            "response_code", "response_msg", "response_keys", "response_data_type", "shape_fingerprint",
+        ) if isinstance(account_wide, dict) and account_wide.get(key) is not None
+    }
+    return result
+
+
 def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6) -> int:
     """Reconcile cashflows only when ledger trade IDs link to exact exchange fills.
 
@@ -2340,10 +2447,9 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
             log.warning("[TRACKER_CASHFLOW] Trade=%s remains unattributed: %s", event_id, fill_error)
             continue
 
-        try:
-            response = get_income_history(symbol, query_start, query_end, limit=1000, timeout_sec=5.0)
-        except Exception as exc:
-            response = {"status": "error", "error": f"income_history_exception:{exc}", "complete": False, "records": []}
+        response = _get_income_history_for_symbol(
+            symbol, query_start, query_end, timeout_sec=5.0, max_range_requests=64,
+        )
         records = response.get("records") if isinstance(response, dict) else None
         error = None
         if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok" or response.get("complete") is not True:
@@ -3127,6 +3233,7 @@ def update_active_trades() -> None:
                         "stop_slippage_pct": stop_slippage_pct,
                         "filled_sl_order_id": filled_sl_id,
                         "manual_exit_order_id": trade.get("manual_exit_order_id"),
+                        "sl_order_history": list(trade.get("sl_order_history", [])) if isinstance(trade.get("sl_order_history"), list) else [],
                         "exit_order_ids": sorted({
                             str(x) for x in (
                                 [filled_sl_id, trade.get("manual_exit_order_id")]
