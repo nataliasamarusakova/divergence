@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from event_engine import reconcile_daily as recon
+import pytest
 
 
 def _stub_snapshot(**kwargs):
@@ -145,7 +146,7 @@ def test_unknown_net_attribution_is_not_misclassified_as_failed_close(tmp_path, 
         "status": "ok", "complete": True, "records": [],
     })
     report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
-    assert not any(item["code"] == "DATA_ERROR_CLOSES_IN_UTC_DAY" for item in report["discrepancies"])
+    assert not any(item["code"] == "DATA_ERROR_CLOSES_UNRESOLVED" for item in report["discrepancies"])
     assert report["status"] != "CRITICAL"
 
 
@@ -282,12 +283,16 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     }) + "\n", encoding="utf-8")
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
     monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {"status": "ok", "orders": []})
-    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
-        "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
-        "records": [], "shape_fingerprint": "ABC123", "shape_summary": "dict:fields=incomeHistory:dict",
-        "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
-        "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
-    })
+    income_calls = []
+    def income_unavailable(symbol, *args, **kwargs):
+        income_calls.append(symbol)
+        return {
+            "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
+            "records": [], "shape_fingerprint": "ABC123", "shape_summary": "dict:fields=incomeHistory:dict",
+            "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
+            "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
+        }
+    monkeypatch.setattr(recon.bingx, "get_income_history", income_unavailable)
     alerts = []
     monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
     monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "V10.4.25")
@@ -299,6 +304,9 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     assert "response_data_type\":\"NoneType" in warning["detail"]
     assert warning["response_diagnostics"]["response_code"] == 0
     assert warning["response_diagnostics"]["response_keys"] == ["code", "data", "msg"]
+    assert income_calls == ["BTC-USDT", "BTC-USDT", None]
+    assert "BTC-USDT" in recon._discrepancy_message_detail(warning)
+    assert "account_wide_income_unexpected_data_shape" in warning["detail"] or "income_history_unexpected_data_shape" in warning["detail"]
     assert report["build_version"] == "V10.4.25"
     assert "Build: <code>V10.4.25</code>" in alerts[0]
 
@@ -769,3 +777,107 @@ def test_daily_reconciliation_respects_bounded_tracker_order_query_budget(tmp_pa
     assert any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
     mismatch = next(item for item in report["discrepancies"] if item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH")
     assert "budget was exhausted" in mismatch["detail"]
+
+
+def test_daily_income_does_not_fallback_for_nonzero_code_even_when_data_is_null(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-BTC", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    calls = []
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        return {"status": "error", "complete": False, "records": [],
+                "error": "100410", "response_code": 100410, "response_data_type": "NoneType"}
+    monkeypatch.setattr(recon.bingx, "get_income_history", income)
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+    assert calls == ["BTC-USDT"]
+    summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert summary["status"] != "OK"
+    assert any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in report["discrepancies"])
+
+
+def test_daily_income_uses_one_account_wide_fallback_and_filters_by_real_symbol(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-BTC", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    calls = []
+
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        if symbol is not None:
+            return {
+                "status": "error", "complete": False, "records": [],
+                "error": "income_history_unexpected_data_shape",
+                "response_data_type": "NoneType", "response_code": 0,
+                "response_keys": ["code", "data", "msg"],
+            }
+        return {
+            "status": "ok", "complete": True, "symbol": None,
+            "query_scope": "ACCOUNT_WIDE", "records": [
+                {"symbol": "BTC-USDT", "asset": "USDT", "income_type": "TRADING_FEE", "amount": -0.12, "time": now_ms},
+                {"symbol": "ETH-USDT", "asset": "USDT", "income_type": "TRADING_FEE", "amount": -5.0, "time": now_ms},
+                {"symbol": "", "asset": "USDT", "income_type": "TRANSFER", "amount": 100.0, "time": now_ms},
+            ],
+        }
+
+    monkeypatch.setattr(recon.bingx, "get_income_history", income)
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    assert calls == ["BTC-USDT", None]
+    summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert summary["status"] == "OK"
+    assert summary["trading_fees"] == pytest.approx(-0.12)
+    assert summary["source_scope"].startswith("ACCOUNT_WIDE_FILTERED_BY_SYMBOL")
+    assert not any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in report["discrepancies"])
+
+
+def test_unresolved_data_error_from_previous_utc_day_remains_critical_with_recovery_detail(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = int(datetime(2026, 11, 6, 11, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    previous_day_close = int(datetime(2026, 11, 5, 19, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_CLOSE", "event_id": "EVT-VIRTUAL", "symbol": "VIRTUAL",
+        "direction": "SHORT", "closed_ts": previous_day_close, "exit_reason": "DATA_ERROR",
+        "data_error": "close_fill_not_confirmed", "exit_order_ids": ["SL-REPLACED"],
+        "fill_history_recovery": {
+            "status": "PENDING", "attempts": 4,
+            "last_error": "incomplete_close_fills:4.235/16.94", "next_retry_ts": now_ms + 1000,
+        },
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    item = next(x for x in report["discrepancies"] if x["code"] == "DATA_ERROR_CLOSES_UNRESOLVED")
+    assert item["count"] == 1
+    assert item["trades"][0]["symbol"] == "VIRTUAL"
+    assert item["trades"][0]["fill_history_recovery"]["last_error"].startswith("incomplete_close_fills")
+    detail = recon._discrepancy_message_detail(item)
+    assert "VIRTUAL SHORT" in detail
+    assert "EVT-VIRTUAL" in detail
+    assert "incomplete_close_fills" in detail
+    assert report["status"] == "CRITICAL"

@@ -65,7 +65,10 @@ def test_recovery_logs_duration_and_individual_fill_requests(tmp_path, monkeypat
         {"trade_id": "C1", "order_id": "CLOSE-1", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 101.0, "qty": 1.0, "time": 1_700_000_059_000, "realized_pnl": 1.0, "fee": -0.01},
     ]
     monkeypatch.setattr(tracker, "TRADES_PATH", journal)
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {
+        "status": "ok", "fills": [row for row in fills if row["order_id"] == str(kwargs.get("order_id") or "")],
+        "has_more": False,
+    })
 
     with caplog.at_level(logging.INFO, logger="event_engine.tracker"):
         recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)

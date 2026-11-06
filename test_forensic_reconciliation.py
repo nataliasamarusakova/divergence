@@ -213,7 +213,9 @@ def test_successful_recovery_persists_pnl_provenance_and_cost_uncertainty(tmp_pa
     query_kwargs = []
     def fake_fill_history(*args, **kwargs):
         query_kwargs.append(dict(kwargs))
-        return {"status": "ok", "fills": fills}
+        order_id = str(kwargs.get("order_id") or "")
+        rows = [row for row in fills if row["order_id"] == order_id]
+        return {"status": "ok", "fills": rows, "has_more": False}
     monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
 
     recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
@@ -236,7 +238,10 @@ def test_incomplete_data_error_fills_remain_unresolved_with_retry_metadata(tmp_p
     opened, closed, fills = _close_fixture(incomplete=True)
     journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
     monkeypatch.setattr(tracker, "TRADES_PATH", journal)
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+    def fake_fill_history(*args, **kwargs):
+        order_id = str(kwargs.get("order_id") or "")
+        return {"status": "ok", "fills": [row for row in fills if row["order_id"] == order_id], "has_more": False}
+    monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
 
     recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert recovered == 0
@@ -257,7 +262,10 @@ def test_recovery_preserves_unparseable_forensic_rows(tmp_path, monkeypatch):
     damaged = '{"malformed": not-json}\n'
     journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n" + damaged, encoding="utf-8")
     monkeypatch.setattr(tracker, "TRADES_PATH", journal)
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *args, **kwargs: {"status": "ok", "fills": fills})
+    def fake_fill_history(*args, **kwargs):
+        order_id = str(kwargs.get("order_id") or "")
+        return {"status": "ok", "fills": [row for row in fills if row["order_id"] == order_id], "has_more": False}
+    monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
 
     tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert journal.read_text(encoding="utf-8").splitlines()[-1] == damaged.rstrip("\n")
@@ -418,3 +426,32 @@ def test_fill_history_uses_total_to_distinguish_full_final_page(monkeypatch):
     monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"fill_orders": rows, "total": 1001}})
     result = bingx.get_fill_history("BTC", 1_699_999_999_000, 1_700_000_001_000, page_index=1, page_size=1000)
     assert result["has_more"] is True
+
+
+def test_data_error_reconstruction_recognizes_replaced_break_even_sl_from_journaled_history():
+    from event_engine.tracker import _rebuild_data_error_close
+
+    opened, closed, _ = _close_fixture()
+    opened["result"]["protection"] = {
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1-OWN"}],
+        "sl_result": {"order_id": "SL-ORIGINAL"},
+    }
+    closed.update({
+        "tp_order_ids": ["TP1-OWN"],
+        "sl_order_history": [{"order_id": "SL-BREAK-EVEN", "stop_price": 100.0}],
+        "exit_order_ids": ["TP1-OWN", "SL-ORIGINAL", "SL-BREAK-EVEN"],
+        "be_activated": True,
+    })
+    fills = [
+        {"trade_id": "entry-1", "order_id": "ENTRY-1", "symbol": "BTC-USDT", "side": "BUY", "position_side": "LONG", "price": 100.0, "qty": 3.0, "time": opened["ts"] + 1000, "realized_pnl": 0.0, "fee": -0.03, "fee_asset": "USDT"},
+        {"trade_id": "tp1-1", "order_id": "TP1-OWN", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 104.0, "qty": 1.0, "time": closed["closed_ts"] - 10_000, "realized_pnl": 4.0, "fee": -0.01, "fee_asset": "USDT"},
+        {"trade_id": "sl-be-1", "order_id": "SL-BREAK-EVEN", "symbol": "BTC-USDT", "side": "SELL", "position_side": "LONG", "price": 100.0, "qty": 2.0, "time": closed["closed_ts"] - 1_000, "realized_pnl": 0.0, "fee": -0.02, "fee_asset": "USDT"},
+    ]
+
+    rebuilt, error = _rebuild_data_error_close(closed, opened, fills)
+
+    assert error is None
+    assert rebuilt is not None
+    assert rebuilt["exit_reason"] == "BREAK_EVEN"
+    assert rebuilt["exit_price"] == pytest.approx(100.0)
+    assert rebuilt["total_close_fill_qty"] == pytest.approx(3.0)

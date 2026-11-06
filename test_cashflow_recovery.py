@@ -595,12 +595,16 @@ def test_income_history_unknown_shape_returns_safe_diagnostics_not_zero(monkeypa
 def test_fill_recovery_error_preserves_bounded_exchange_envelope_diagnostics(monkeypatch):
     from event_engine import tracker
 
-    monkeypatch.setattr(tracker, "get_fill_history", lambda *a, **k: {
-        "status": "error", "error": "fill_history_unexpected_data_shape",
-        "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
-        "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
-        "shape_summary": "NoneType", "shape_fingerprint": "ABC123",
-    })
+    queried_order_ids = []
+    def failed_fill_query(*a, **kwargs):
+        queried_order_ids.append(kwargs.get("order_id"))
+        return {
+            "status": "error", "error": "fill_history_unexpected_data_shape",
+            "response_type": "dict", "response_code": 0, "response_msg": "unexpected response",
+            "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
+            "shape_summary": "NoneType", "shape_fingerprint": "ABC123",
+        }
+    monkeypatch.setattr(tracker, "get_fill_history", failed_fill_query)
     close_ts = 1_700_000_100_000
     opened = {
         "symbol": "BTC", "direction": "LONG", "ts": close_ts - 60_000,
@@ -615,8 +619,122 @@ def test_fill_recovery_error_preserves_bounded_exchange_envelope_diagnostics(mon
     fills, error = tracker._fetch_trade_fill_history(closed, opened, close_ts + 1000)
 
     assert fills == []
+    # The first exact order query fails closed; no broad symbol/time scan follows.
+    assert queried_order_ids == ["ENTRY-1"]
     assert "fill_history_unexpected_data_shape" in error
     assert "response_code=0" in error
     assert "response_data_type=NoneType" in error
     assert "response_keys=code,data,msg" in error
     assert "shape_fingerprint=ABC123" in error
+
+
+def test_income_history_supports_account_wide_query_without_symbol(monkeypatch):
+    from event_engine import bingx
+
+    captured = {}
+    def fake_request(method, path, params=None, **kwargs):
+        captured.update(method=method, path=path, params=dict(params or {}), kwargs=kwargs)
+        return {"code": 0, "data": [
+            {"tranId": "BTC-FEE", "symbol": "BTC-USDT", "incomeType": "TRADING_FEE", "income": "-0.12", "asset": "USDT", "time": 1_700_000_001_000},
+            {"tranId": "ETH-FEE", "symbol": "ETH-USDT", "incomeType": "TRADING_FEE", "income": "-0.50", "asset": "USDT", "time": 1_700_000_002_000},
+            {"tranId": "TRANSFER-1", "incomeType": "TRANSFER", "income": "10", "asset": "USDT", "time": 1_700_000_003_000},
+        ]}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+
+    result = bingx.get_income_history(None, 1_700_000_000_000, 1_700_000_004_000)
+
+    assert result["status"] == "ok" and result["complete"] is True
+    assert result["query_scope"] == "ACCOUNT_WIDE"
+    assert "symbol" not in captured["params"]
+    filtered = bingx.filter_income_history_by_symbol(result, "BTC")
+    assert filtered["status"] == "ok" and filtered["complete"] is True
+    assert [row["record_id"] for row in filtered["records"]] == ["BTC-FEE"]
+
+
+def test_account_wide_income_filter_rejects_unidentifiable_non_transfer_rows(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": [
+        {"tranId": "UNKNOWN", "incomeType": "TRADING_FEE", "income": "-0.12", "asset": "USDT", "time": 1_700_000_001_000},
+    ]})
+    result = bingx.get_income_history(None, 1_700_000_000_000, 1_700_000_004_000)
+    filtered = bingx.filter_income_history_by_symbol(result, "BTC")
+    assert filtered["status"] == "error"
+    assert filtered["complete"] is False
+    assert filtered["error"] == "account_wide_income_row_missing_symbol"
+
+
+def test_tracker_income_recovery_uses_account_wide_fallback_after_symbol_data_null(monkeypatch):
+    from event_engine import tracker
+
+    calls = []
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        if symbol is not None:
+            return {
+                "status": "error", "complete": False, "records": [],
+                "error": "income_history_unexpected_data_shape",
+                "response_data_type": "NoneType", "response_code": 0,
+            }
+        return {
+            "status": "ok", "complete": True, "records": [
+                {"symbol": "BTC-USDT", "record_id": "BTC-FEE", "income_type": "TRADING_FEE", "amount": -0.12, "asset": "USDT", "time": 1_700_000_001_000},
+                {"symbol": "ETH-USDT", "record_id": "ETH-FEE", "income_type": "TRADING_FEE", "amount": -9.99, "asset": "USDT", "time": 1_700_000_001_000},
+                {"symbol": "", "record_id": "TRANSFER", "income_type": "TRANSFER", "amount": 10.0, "asset": "USDT", "time": 1_700_000_001_000},
+            ],
+        }
+
+    monkeypatch.setattr(tracker, "get_income_history", income)
+    response = tracker._get_income_history_for_symbol(
+        "BTC", 1_700_000_000_000, 1_700_000_002_000, timeout_sec=2.0,
+    )
+
+    assert calls == ["BTC", None]
+    assert response["status"] == "ok" and response["complete"] is True
+    assert response["query_scope"] == "ACCOUNT_WIDE_FILTERED_BY_ROW_SYMBOL"
+    assert [row["record_id"] for row in response["records"]] == ["BTC-FEE"]
+
+
+def test_tracker_income_fallback_does_not_run_on_ordinary_timeout(monkeypatch):
+    from event_engine import tracker
+
+    calls = []
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        return {"status": "error", "complete": False, "records": [], "error": "request_exception:timeout"}
+
+    monkeypatch.setattr(tracker, "get_income_history", income)
+    response = tracker._get_income_history_for_symbol(
+        "BTC", 1_700_000_000_000, 1_700_000_002_000,
+    )
+
+    assert calls == ["BTC"]
+    assert response["error"] == "request_exception:timeout"
+
+def test_tracker_income_fallback_does_not_run_on_nonzero_code_even_when_data_is_null(monkeypatch):
+    from event_engine import tracker
+
+    calls = []
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        return {"status": "error", "complete": False, "records": [],
+                "error": "100410", "response_code": 100410, "response_data_type": "NoneType"}
+    monkeypatch.setattr(tracker, "get_income_history", income)
+    response = tracker._get_income_history_for_symbol("BTC", 1_700_000_000_000, 1_700_000_002_000)
+    assert calls == ["BTC"]
+    assert response["response_code"] == 100410
+
+
+def test_tracker_income_fallback_requires_code_zero_and_expected_shape_error(monkeypatch):
+    from event_engine import tracker
+
+    calls = []
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        return {"status": "error", "complete": False, "records": [],
+                "error": "income_history_unexpected_data_shape",
+                "response_code": 100410, "response_data_type": "NoneType"}
+    monkeypatch.setattr(tracker, "get_income_history", income)
+    tracker._get_income_history_for_symbol("BTC", 1_700_000_000_000, 1_700_000_002_000)
+    assert calls == ["BTC"]
+
