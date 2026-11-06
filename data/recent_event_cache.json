@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1793948806517,
+  "updated_ts": 1793949104206,
   "events": [
     {
       "event_id": "EVT_BC3BBB55B5079CD5",
@@ -1291,6 +1291,57 @@
         "mss_level": 0.04639,
         "broken_ts": 1793804399999,
         "bos_ts": 1793761199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_DF1EE1E0C30BBA13",
+      "symbol": "ICNT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1793948399999,
+        "pivot_2_ts": 1793948399999,
+        "detected_at_ts": 1793948399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.2497,
+        "bb_width": 0.0337350322365324,
+        "kc_width": 0.026549006516273732,
+        "squeeze_duration_bars": 4,
+        "compression_ratio": 1.2706702307618878,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.23400950325813685,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_86C05E839B323CFF",
+      "symbol": "ICNT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1793919599999,
+        "pivot_2_ts": 1793948399999,
+        "detected_at_ts": 1793948399999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.2255,
+        "zone_high": 0.2255,
+        "zone_low": 0.2219,
+        "bos_level": 0.23,
+        "ob_ts": 1793941199999,
+        "displacement_atr": 2.2863559420872117,
+        "volume_ratio": 2.855706088755769,
+        "body_fraction": 0.8506224066390046,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
