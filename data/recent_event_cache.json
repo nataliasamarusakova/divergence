@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794033127141,
+  "updated_ts": 1794033417299,
   "events": [
     {
       "event_id": "EVT_68372EFF9798724A",
@@ -1142,6 +1142,83 @@
         "displacement_atr": 0.9732281325068122,
         "volume_ratio": 1.8240984571831784,
         "body_fraction": 0.809963099630996,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_9DC7A1B8DB0D5A91",
+      "symbol": "ESPORTS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1794031199999,
+        "pivot_2_ts": 1794031199999,
+        "detected_at_ts": 1794031199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.011275,
+        "bb_width": 0.001178508124708124,
+        "kc_width": 0.001166528570254264,
+        "squeeze_duration_bars": 59,
+        "compression_ratio": 1.0102694051044536,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.010890514285127132,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_25A3AAA34A27DE5C",
+      "symbol": "ESPORTS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1794031199999,
+        "pivot_2_ts": 1794031199999,
+        "detected_at_ts": 1794031199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.011275,
+        "compression_ratio": 0.9811369933151891,
+        "ma_spread_atr": 0.5955615551329165,
+        "compression_threshold": 0.6070116193667902,
+        "breakout_atr": 1.2866157603367707,
+        "volume_ratio": 2.003932094721247,
+        "requires_retest": true,
+        "trigger_level": 0.010803,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4F1DFDC624E1FA19",
+      "symbol": "ESPORTS",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1794013199999,
+        "pivot_2_ts": 1794031199999,
+        "detected_at_ts": 1794031199999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.010552,
+        "zone_high": 0.010552,
+        "zone_low": 0.01025,
+        "bos_level": 0.010803,
+        "ob_ts": 1794016799999,
+        "displacement_atr": 2.0852988488509094,
+        "volume_ratio": 2.003932094721247,
+        "body_fraction": 0.8803222094361336,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
