@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794022917551,
+  "updated_ts": 1794023262124,
   "events": [
     {
       "event_id": "EVT_5C7F9B1C8E309F8E",
@@ -53,7 +53,11 @@
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 3.248816264222892,
+        "htf_slope50": 0.025356248940684,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -110,7 +114,11 @@
         "volume_ratio": 1.2062568136952891,
         "body_fraction": 0.6501766784452291,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.01883375141642609,
+        "htf_slope50": 0.0010631957640828416,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -164,7 +172,11 @@
         "volume_ratio": 1.4441316349466853,
         "body_fraction": 0.5738636363636342,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 1.2564675133857623,
+        "htf_slope50": -0.015465055980229847,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -315,7 +327,11 @@
         "range_low": 0.10741,
         "manipulation_depth_atr": 0.2913769393639111,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.1001262631774397,
+        "htf_slope50": 0.002357579652504785,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -340,36 +356,6 @@
         "atr": 2.7514497913251232,
         "volume_profile_method": "ohlcv_typical_price_proxy",
         "engine": "VOLUME_PROFILE_DIVERGENCE",
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_010EEF58C1F66583",
-      "symbol": "QNT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "BREAKER_BLOCK_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1793779199999,
-        "pivot_2_ts": 1794020399999,
-        "detected_at_ts": 1794020399999
-      },
-      "event_fact": {
-        "engine": "BREAKER_BLOCK",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 193.26,
-        "zone_high": 195.94,
-        "zone_low": 193.26,
-        "breaker_from": "BULLISH_OB",
-        "liquidity_sweep_ts": 1793851199999,
-        "liquidity_sweep_level": 206.84,
-        "mss_ts": 1793894399999,
-        "mss_pivot_ts": 1793825999999,
-        "mss_level": 201.18,
-        "broken_ts": 1793894399999,
-        "bos_ts": 1793797199999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
