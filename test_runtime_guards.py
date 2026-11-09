@@ -1638,7 +1638,7 @@ def test_emergency_close_retry_after_verified_cancel_uses_new_client_order_id(mo
     assert out["status"] == "closed"
     assert len(calls) == 2
     assert calls[0]["clientOrderId"] != calls[1]["clientOrderId"]
-    assert lookup_calls == [calls[0]["clientOrderId"]]
+    assert lookup_calls == [calls[0]["clientOrderId"], calls[1]["clientOrderId"]]
 
 
 def test_emergency_close_acknowledged_fill_with_stale_position_refuses_duplicate(monkeypatch):
@@ -1757,17 +1757,23 @@ def test_emergency_close_filled_order_recloses_only_stable_smaller_residual_with
     assert calls[1]["quantity"] == "0.750"
 
 
-def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monkeypatch):
+def test_emergency_close_partial_fill_is_canceled_before_residual_retry(monkeypatch):
     from event_engine import bingx as bx
 
+    # Initial position, five stable post-cancel residual snapshots, fresh retry
+    # position, then two explicit not_found reads after the residual close.
     states = iter([
         {"status": "found", "positionAmt": "1.250", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
+        {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
         {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
         {"status": "found", "positionAmt": "0.750", "avgPrice": "100"},
         {"status": "not_found", "positionAmt": "0"},
         {"status": "not_found", "positionAmt": "0"},
     ])
-    calls = []
+    calls, lookups, cancels = [], [], []
     monkeypatch.setattr(bx, "to_bx_symbol", lambda symbol: "TEST-USDT")
     monkeypatch.setattr(bx, "get_contract", lambda symbol: {"quantityPrecision": 3})
     monkeypatch.setattr(bx, "get_position_mode", lambda: {"status": "ok", "mode": "HEDGE", "dualSidePosition": True})
@@ -1776,19 +1782,30 @@ def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monke
 
     def fake_request(method, path, params):
         calls.append(dict(params))
-        if len(calls) == 1:
-            return {"code": -1, "msg": "read timed out"}
-        return {"code": 0, "msg": "OK", "data": {"order": {"orderId": "CLOSE3", "avgPrice": "99.0"}}}
+        return {"code": 0, "msg": "OK", "data": {"order": {
+            "orderId": f"CLOSE{len(calls)}", "avgPrice": "99.0",
+        }}}
+
+    def fake_lookup(symbol, client_id):
+        lookups.append(client_id)
+        if len(lookups) == 1:
+            return {
+                "status": "ok", "order_id": "PART1", "order_status": "PARTIALLY_FILLED",
+                "executed_qty": 0.500, "avg_price": 99.0, "client_order_id": client_id,
+            }
+        if len(lookups) == 2:
+            return {
+                "status": "ok", "order_id": "PART1", "order_status": "CANCELED",
+                "executed_qty": 0.500, "avg_price": 99.0, "client_order_id": client_id,
+            }
+        return {
+            "status": "ok", "order_id": "CLOSE2", "order_status": "FILLED",
+            "executed_qty": 0.750, "avg_price": 99.0, "client_order_id": client_id,
+        }
 
     monkeypatch.setattr(bx, "_request", fake_request)
-    monkeypatch.setattr(
-        bx,
-        "get_order_by_client_order_id",
-        lambda symbol, client_id: {
-            "status": "ok", "order_id": "PART1", "order_status": "PARTIALLY_FILLED",
-            "executed_qty": 0.500, "avg_price": 99.0, "client_order_id": client_id,
-        },
-    )
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", fake_lookup)
+    monkeypatch.setattr(bx, "cancel_order", lambda symbol, order_id: cancels.append(str(order_id)) or {"code": 0})
 
     out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="PARTIAL")
 
@@ -1796,6 +1813,8 @@ def test_emergency_close_partial_fill_uses_new_order_for_verified_residual(monke
     assert len(calls) == 2
     assert calls[0]["clientOrderId"] != calls[1]["clientOrderId"]
     assert calls[1]["quantity"] == "0.750"
+    assert cancels == ["PART1"]
+    assert lookups[0] == lookups[1] == calls[0]["clientOrderId"]
 
 
 def test_get_order_accepts_explicit_read_timeout(monkeypatch):

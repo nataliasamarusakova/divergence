@@ -68,7 +68,7 @@ def test_emergency_close_does_not_report_closed_when_post_close_read_errors(monk
     result = bingx.emergency_close_position("BTC", "LONG", 0.25, reason_token="TEST_POST_VERIFY")
     assert result["status"] == "unknown"
     assert result["escalation_required"] is True
-    assert "verification" in result["error"] or "state is unknown" in result["error"]
+    assert "order" in result["error"] or "verification" in result["error"] or "state is unknown" in result["error"]
 
 
 def test_emergency_close_requires_two_explicit_not_found_reads(monkeypatch):

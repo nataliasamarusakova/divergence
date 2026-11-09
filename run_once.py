@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.36"
+APP_VERSION = "V10.4.38"
 
 import pandas as pd
 import requests
@@ -51,6 +51,7 @@ from event_engine.bingx import (
     has_open_position,
     emergency_close_position,
     get_position_directional,
+    get_order,
     _current_close_price,
     _audit_exact_single_sl,
 )
@@ -3109,7 +3110,11 @@ def _sl_order_to_tracker(sl_orders: list[dict]) -> dict:
 def _find_active_trade_for_position(bx_symbol: str, direction: str, active_trades: dict) -> dict | None:
     want_dir = str(direction).upper()
     for trade in active_trades.values():
-        if trade.get("closed", False) or trade.get("entry_order_resolution_pending"):
+        if (
+            trade.get("closed", False)
+            or trade.get("entry_order_resolution_pending")
+            or trade.get("protection_cleanup_only")
+        ):
             continue
         t_bx = to_bx_symbol(trade.get("symbol", ""))
         t_dir = str(trade.get("direction", "")).upper()
@@ -3215,6 +3220,221 @@ def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction
         "sl_orders": sl_orders, "tp_orders": tp_orders,
         "source": "account_open_orders_snapshot",
     }
+
+
+def _missing_tp_order_state(
+    symbol: str,
+    matched_trade: dict | None,
+    missing_legs: set[str],
+) -> dict[str, Any]:
+    """Check whether a locally missing TP leg has actually filled on BingX.
+
+    Reconciliation runs after the tracker pass, so a TP can fill in the small
+    interval between those two steps. Re-creating an order whose original order
+    has already filled can over-close a position. Unknown order state therefore
+    defers repair; only an explicitly canceled/expired/rejected order with zero
+    execution is considered safe to replace.
+    """
+    if not missing_legs:
+        return {"status": "not_needed", "orders": []}
+    if not isinstance(matched_trade, dict):
+        # An orphan position has no historical local TP order IDs to query.
+        # Its already-open protection was inspected separately; there is no
+        # prior local TP order that this helper could accidentally duplicate.
+        return {"status": "safe_to_replace", "reason": "orphan_without_local_tp_ids", "orders": []}
+
+    tracked = matched_trade.get("tp_orders")
+    tracked = tracked if isinstance(tracked, list) else []
+    recorded_by_leg = matched_trade.get("tp_filled_qty")
+    recorded_by_leg = recorded_by_leg if isinstance(recorded_by_leg, dict) else {}
+    results: list[dict[str, Any]] = []
+
+    for leg in sorted(missing_legs):
+        tp = next((
+            item for item in tracked
+            if isinstance(item, dict)
+            and str(item.get("leg") or "").strip().lower() == leg
+            and item.get("order_id") not in (None, "")
+        ), None)
+        if tp is None:
+            return {
+                "status": "unknown", "reason": f"missing_tracked_order_id:{leg}",
+                "orders": results,
+            }
+
+        order_id = str(tp["order_id"])
+        try:
+            order = get_order(symbol, order_id, timeout_sec=5.0)
+        except Exception as exc:
+            return {
+                "status": "unknown", "reason": f"order_query_exception:{leg}:{type(exc).__name__}:{exc}",
+                "orders": results,
+            }
+        if not isinstance(order, dict) or str(order.get("status", "")).lower() != "ok":
+            return {
+                "status": "unknown", "reason": f"order_state_unavailable:{leg}",
+                "orders": results + [{"leg": leg, "order_id": order_id, "response": order}],
+            }
+
+        order_status = str(order.get("order_status") or "").upper()
+        try:
+            executed_qty = float(order.get("executed_qty"))
+            recorded_qty = float(recorded_by_leg.get(leg, 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            executed_qty = float("nan")
+            recorded_qty = 0.0
+        if not math.isfinite(executed_qty) or executed_qty < 0 or not math.isfinite(recorded_qty) or recorded_qty < 0:
+            return {
+                "status": "unknown", "reason": f"invalid_execution_quantity:{leg}",
+                "orders": results + [{"leg": leg, "order_id": order_id, "order_status": order_status}],
+            }
+
+        item = {
+            "leg": leg, "order_id": order_id, "order_status": order_status,
+            "executed_qty": executed_qty, "recorded_filled_qty": recorded_qty,
+        }
+        results.append(item)
+
+        terminal_status = order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        if executed_qty > recorded_qty + 1e-12:
+            return {
+                "status": "fill_pending_tracker", "reason": f"confirmed_or_possible_tp_fill:{leg}",
+                "orders": results,
+            }
+        if order_status in {"FILLED", "PARTIALLY_FILLED"}:
+            # FILLED and still-active PARTIALLY_FILLED orders are not replaceable.
+            # The tracker must first book their cumulative execution or the
+            # exchange must confirm a terminal state.
+            return {
+                "status": "fill_pending_tracker" if order_status == "FILLED" else "unknown",
+                "reason": f"tp_order_not_terminal:{leg}:{order_status}",
+                "orders": results,
+            }
+        if not terminal_status:
+            return {
+                "status": "unknown", "reason": f"non_replaceable_tp_state:{leg}:{order_status or 'MISSING'}",
+                "orders": results,
+            }
+
+        if executed_qty <= 1e-12:
+            # Confirmed terminal zero-fill: the full target can be recreated.
+            continue
+
+        # A terminal TP can still contain a partial fill. Once the tracker has
+        # applied the cumulative fill, only the exact unfilled original quantity
+        # may be recreated. Never redistribute the full position across targets.
+        raw_original_qty = order.get("orig_qty")
+        if raw_original_qty in (None, "", 0, 0.0):
+            raw_original_qty = tp.get("qty")
+        try:
+            original_qty = float(raw_original_qty)
+        except (TypeError, ValueError, OverflowError):
+            original_qty = float("nan")
+        if not math.isfinite(original_qty) or original_qty <= 0 or executed_qty > original_qty + max(1e-10, original_qty * 1e-8):
+            return {
+                "status": "unknown", "reason": f"terminal_tp_original_quantity_unavailable_or_invalid:{leg}",
+                "orders": results,
+            }
+        replacement_qty = max(0.0, original_qty - executed_qty)
+        if replacement_qty <= max(1e-10, original_qty * 1e-8):
+            # The leg is fully executed even if the exchange's terminal status
+            # was not FILLED. Let the tracker mark the milestone; do not recreate.
+            return {
+                "status": "fill_pending_tracker", "reason": f"terminal_tp_fully_executed:{leg}",
+                "orders": results,
+            }
+        item["replacement_qty"] = replacement_qty
+        item["original_qty"] = original_qty
+        item["remaining_execution_qty"] = replacement_qty
+        results[-1] = item
+
+    return {"status": "safe_to_replace", "orders": results}
+
+
+def _stable_live_protection_audit(
+    symbol: str,
+    direction: str,
+    *,
+    stop_loss_pct: float,
+    expected_sl_price: float | None = None,
+    timeout_sec: float = 5.0,
+) -> dict[str, Any]:
+    """Re-read position around a fresh open-orders snapshot before repair/close.
+
+    A confirmed missing SL is actionable only when the position quantity stayed
+    stable across the protection read. API errors or a changing position state
+    are UNKNOWN, never evidence that protection is absent.
+    """
+    for attempt in range(2):
+        try:
+            before = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "unknown", "reason": f"position_query_exception:{type(exc).__name__}:{exc}"}
+
+        before_status = str(before.get("status") or "").lower() if isinstance(before, dict) else "unknown"
+        if before_status == "not_found":
+            return {"status": "not_found", "reason": "position_not_found_before_protection_read"}
+        if before_status != "found":
+            return {"status": "unknown", "reason": f"position_state_{before_status or 'unknown'}"}
+
+        qty_before = abs(_safe_float(before.get("positionAmt"), 0.0))
+        avg_before = _safe_float(before.get("avgPrice") or before.get("entryPrice"), 0.0)
+        if not math.isfinite(qty_before) or qty_before <= 0 or not math.isfinite(avg_before) or avg_before <= 0:
+            return {"status": "unknown", "reason": "invalid_live_position_quantity_or_entry_price"}
+
+        try:
+            protection = get_open_protection_directional(
+                symbol, direction, timeout_sec=timeout_sec, retryable=False,
+            )
+        except Exception as exc:
+            return {"status": "unknown", "reason": f"open_orders_query_exception:{type(exc).__name__}:{exc}"}
+        if not isinstance(protection, dict) or str(protection.get("status", "")).lower() != "ok":
+            return {
+                "status": "unknown", "reason": "open_orders_state_unavailable",
+                "protection_error": protection.get("error") if isinstance(protection, dict) else "invalid_response",
+            }
+
+        try:
+            after = get_position_directional(symbol, direction)
+        except Exception as exc:
+            return {"status": "unknown", "reason": f"position_confirm_query_exception:{type(exc).__name__}:{exc}"}
+        after_status = str(after.get("status") or "").lower() if isinstance(after, dict) else "unknown"
+        if after_status == "not_found":
+            return {"status": "not_found", "reason": "position_not_found_after_protection_read"}
+        if after_status != "found":
+            return {"status": "unknown", "reason": f"position_confirm_state_{after_status or 'unknown'}"}
+
+        qty_after = abs(_safe_float(after.get("positionAmt"), 0.0))
+        avg_after = _safe_float(after.get("avgPrice") or after.get("entryPrice"), 0.0)
+        tolerance = max(1e-8, max(qty_before, qty_after) * 1e-6)
+        avg_tolerance = max(1e-12, max(avg_before, avg_after) * 1e-6)
+        if (
+            qty_after <= 0 or not math.isfinite(qty_after)
+            or avg_after <= 0 or not math.isfinite(avg_after)
+            or abs(qty_after - qty_before) > tolerance
+            or abs(avg_after - avg_before) > avg_tolerance
+        ):
+            if attempt == 0:
+                continue
+            return {"status": "unknown", "reason": "position_changed_during_protection_audit"}
+
+        target_sl_price = expected_sl_price
+        if target_sl_price is None:
+            target_sl_price = (
+                avg_after * (1.0 - stop_loss_pct / 100.0)
+                if direction == "LONG"
+                else avg_after * (1.0 + stop_loss_pct / 100.0)
+            )
+        sl_valid, audit = _audit_exact_single_sl(
+            protection, direction=direction, avg_price=avg_after,
+            expected_price=target_sl_price, expected_qty=qty_after,
+        )
+        return {
+            "status": "ok", "live_qty": qty_after, "avg_price": avg_after,
+            "protection": protection, "sl_valid": bool(sl_valid), "sl_audit": audit,
+        }
+
+    return {"status": "unknown", "reason": "protection_audit_not_stable"}
 
 
 def reconcile_all_open_positions() -> None:
@@ -3605,14 +3825,20 @@ def reconcile_all_open_positions() -> None:
             sl_pct = float(FIXED_STOP_LOSS_PCT)
 
         tp_levels = []
-        if matched_trade and isinstance(matched_trade.get("effective_tp_levels"), list) and matched_trade.get("effective_tp_levels"):
-            # Preserve the exact original protection profile, including squeeze and normal
-            # TP distances and micro-position single-TP mode. Never silently rewrite a
-            # matched trade during restart repair.
-            for level in matched_trade.get("effective_tp_levels", []):
+        tp_quantity_metadata_incomplete = False
+        tp_target_levels = matched_trade.get("effective_tp_levels", []) if matched_trade else []
+        if matched_trade and isinstance(tp_target_levels, list) and tp_target_levels:
+            # Preserve the exact original profile and each leg's remaining target
+            # quantity. This matters when a TP was partially filled and then
+            # CANCELED: the replacement must cover only original_qty - executed_qty.
+            tracked_tp_orders = matched_trade.get("tp_orders", [])
+            tracked_tp_orders = tracked_tp_orders if isinstance(tracked_tp_orders, list) else []
+            recorded_fills = matched_trade.get("tp_filled_qty", {})
+            recorded_fills = recorded_fills if isinstance(recorded_fills, dict) else {}
+            for level in tp_target_levels:
                 if not isinstance(level, dict):
                     continue
-                leg = str(level.get("leg", ""))
+                leg = str(level.get("leg", "")).strip().lower()
                 if not leg or leg in hit_legs:
                     continue
                 try:
@@ -3620,8 +3846,60 @@ def reconcile_all_open_positions() -> None:
                     fraction = float(level.get("close_fraction", 0))
                 except (TypeError, ValueError):
                     continue
-                if pnl_pct > 0 and fraction > 0:
+                if pnl_pct <= 0 or fraction <= 0:
+                    continue
+
+                raw_target_qty = level.get("qty")
+                if raw_target_qty in (None, "", 0, 0.0):
+                    tracked_order = next((
+                        item for item in tracked_tp_orders
+                        if isinstance(item, dict)
+                        and str(item.get("leg") or "").strip().lower() == leg
+                    ), None)
+                    raw_target_qty = tracked_order.get("qty") if isinstance(tracked_order, dict) else None
+                try:
+                    target_qty = float(raw_target_qty) if raw_target_qty not in (None, "") else None
+                    filled_qty = float(recorded_fills.get(leg, 0.0) or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    target_qty, filled_qty = None, float("nan")
+                if not math.isfinite(filled_qty) or filled_qty < 0:
+                    tp_quantity_metadata_incomplete = True
+                    continue
+                if target_qty is not None and (not math.isfinite(target_qty) or target_qty <= 0):
+                    tp_quantity_metadata_incomplete = True
+                    continue
+                if target_qty is not None:
+                    remaining_target_qty = max(0.0, target_qty - filled_qty)
+                    quantity_tolerance = max(1e-10, target_qty * 1e-8)
+                    if remaining_target_qty <= quantity_tolerance:
+                        # A target exhausted by execution must be marked as hit by
+                        # the tracker; it must never be recreated as a full leg.
+                        tp_quantity_metadata_incomplete = True
+                        continue
+                    tp_levels.append({
+                        "leg": leg, "pnl_pct": pnl_pct,
+                        "close_fraction": fraction, "qty": remaining_target_qty,
+                    })
+                else:
+                    if filled_qty > 1e-12:
+                        tp_quantity_metadata_incomplete = True
                     tp_levels.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
+
+            has_explicit_qty = ["qty" in level for level in tp_levels]
+            if has_explicit_qty and any(has_explicit_qty) and not all(has_explicit_qty):
+                tp_quantity_metadata_incomplete = True
+
+        if tp_quantity_metadata_incomplete:
+            record_action({
+                "record_type": "PROTECTION_REPAIR_DEFERRED_TP_QUANTITY_UNKNOWN",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "position_qty": qty,
+                "reason": "tracked_target_qty_or_applied_fill_qty_is_incomplete",
+                "repair_attempted": False,
+                "ts": int(time.time() * 1000),
+            })
+            continue
 
         if not tp_levels:
             if _is_squeeze_event(str((matched_trade or {}).get("event_type", ""))):
@@ -3657,6 +3935,80 @@ def reconcile_all_open_positions() -> None:
             ):
                 preserved_orphan_sl_price = candidate_sl_price
         desired_repair_sl_price = avg_price if be_activated else preserved_orphan_sl_price
+
+        # The tracker runs immediately before reconciliation, but a TP can fill
+        # between those two passes. Never re-create a locally missing TP until
+        # its original exchange order is proven canceled with zero execution.
+        missing_tp_legs = remaining_expected_legs - recheck_known_legs
+        missing_tp_state = _missing_tp_order_state(
+            bx_symbol, matched_trade, missing_tp_legs,
+        )
+        if missing_tp_state.get("status") not in {"not_needed", "safe_to_replace"}:
+            record_action({
+                "record_type": "PROTECTION_REPAIR_DEFERRED_TP_STATE",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "position_qty": qty, "missing_tp_legs": sorted(missing_tp_legs),
+                "tp_order_state": missing_tp_state,
+                "repair_attempted": False,
+                "ts": int(time.time() * 1000),
+            })
+            continue
+
+        # Refresh quantity and open protection together before modifying orders.
+        # The earlier account snapshot/recheck may have become stale after a TP
+        # fill. Unknown or unstable exchange state is not authorization to repair.
+        fresh_live = _stable_live_protection_audit(
+            bx_symbol, direction, stop_loss_pct=sl_pct,
+            expected_sl_price=desired_repair_sl_price,
+            timeout_sec=recon_timeout,
+        )
+        if fresh_live.get("status") != "ok":
+            record_action({
+                "record_type": "PROTECTION_REPAIR_DEFERRED_LIVE_STATE",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "reason": fresh_live.get("reason", fresh_live.get("status")),
+                "live_state": fresh_live, "repair_attempted": False,
+                "ts": int(time.time() * 1000),
+            })
+            continue
+
+        qty = float(fresh_live["live_qty"])
+        avg_price = float(fresh_live["avg_price"])
+        if tp_levels and all("qty" in level for level in tp_levels):
+            planned_remaining_tp_qty = sum(float(level["qty"]) for level in tp_levels)
+            tp_qty_tolerance = max(1e-8, qty * 1e-6)
+            if abs(planned_remaining_tp_qty - qty) > tp_qty_tolerance:
+                record_action({
+                    "record_type": "PROTECTION_REPAIR_DEFERRED_TP_QUANTITY_MISMATCH",
+                    "event_id": (matched_trade or {}).get("event_id"),
+                    "symbol": bx_symbol, "direction": direction,
+                    "position_qty": qty,
+                    "planned_remaining_tp_qty": planned_remaining_tp_qty,
+                    "difference_qty": qty - planned_remaining_tp_qty,
+                    "repair_attempted": False,
+                    "ts": int(time.time() * 1000),
+                })
+                continue
+        recheck = fresh_live["protection"]
+        recheck_sl = list(recheck.get("sl_orders", []))
+        recheck_tp = list(recheck.get("tp_orders", []))
+        recheck_tracker_probe = _tp_orders_to_tracker(
+            recheck_tp, direction=direction, avg_price=avg_price,
+            effective_levels=effective_levels if isinstance(effective_levels, list) else None,
+        )
+        recheck_known_legs = {str(x.get("leg", "")).lower() for x in recheck_tracker_probe if x.get("leg")}
+        if fresh_live.get("sl_valid") and remaining_expected_legs.issubset(recheck_known_legs):
+            record_action({
+                "record_type": "PROTECTION_REPAIR_SKIPPED_FRESH_STATE_COMPLETE",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction,
+                "position_qty": qty, "sl_audit": fresh_live.get("sl_audit"),
+                "tp_legs": sorted(recheck_known_legs),
+                "ts": int(time.time() * 1000),
+            })
+            continue
 
         res = ensure_directional_protection(
             symbol=bx_symbol,
@@ -3746,31 +4098,55 @@ def reconcile_all_open_positions() -> None:
             })
             # Only close after a successful exchange query proves that no single
             # correct residual SL exists. Reconfirm current position quantity.
-            try:
-                live_position = get_position_directional(bx_symbol, direction)
-            except Exception as exc:
-                live_position = {"status": "error", "error": str(exc)}
-            live_qty = abs(_safe_float(live_position.get("positionAmt"), 0.0)) if live_position.get("status") == "found" else 0.0
-            if live_qty > 0:
-                emergency_result = emergency_close_position(
-                    bx_symbol, direction, live_qty,
-                    reason_token=f"RECONSL:{str((matched_trade or {}).get('event_id') or bx_symbol).replace('EVT_', '')}",
-                )
-                record_action({
-                    "record_type": "PROTECTION_EMERGENCY_CLOSE_RESULT",
-                    "event_id": (matched_trade or {}).get("event_id"),
-                    "symbol": bx_symbol, "direction": direction, "position_qty": live_qty,
-                    "reason": "NO_VERIFIED_SINGLE_SL_AFTER_REPAIR", "result": emergency_result,
-                    "ts": int(time.time() * 1000),
-                })
-            else:
+            # A TP can execute while repair is in flight, and BingX may resize
+            # the remaining SL automatically. Re-audit with a stable fresh
+            # position/orders snapshot before sending a MARKET close.
+            final_live = _stable_live_protection_audit(
+                bx_symbol, direction, stop_loss_pct=sl_pct,
+                expected_sl_price=expected_sl_price,
+                timeout_sec=recon_timeout,
+            )
+            if final_live.get("status") != "ok":
                 record_action({
                     "record_type": "PROTECTION_EMERGENCY_CLOSE_SKIPPED",
                     "event_id": (matched_trade or {}).get("event_id"),
                     "symbol": bx_symbol, "direction": direction,
-                    "reason": "POSITION_NO_LONGER_FOUND_OR_STATE_UNKNOWN", "live_position_status": live_position.get("status"),
+                    "reason": "FRESH_POSITION_OR_PROTECTION_STATE_UNKNOWN_OR_NOT_FOUND",
+                    "final_live_audit": final_live,
+                    "emergency_close_attempted": False,
                     "ts": int(time.time() * 1000),
                 })
+                continue
+
+            if final_live.get("sl_valid"):
+                record_action({
+                    "record_type": "PROTECTION_EMERGENCY_CLOSE_SKIPPED",
+                    "event_id": (matched_trade or {}).get("event_id"),
+                    "symbol": bx_symbol, "direction": direction,
+                    "position_qty": final_live.get("live_qty"),
+                    "reason": "FRESH_LIVE_SL_VALID_AFTER_POSITION_CHANGE",
+                    "final_live_audit": final_live,
+                    "emergency_close_attempted": False,
+                    "ts": int(time.time() * 1000),
+                })
+                continue
+
+            live_qty = float(final_live["live_qty"])
+            emergency_result = emergency_close_position(
+                bx_symbol, direction, live_qty,
+                reason_token=f"RECONSL:{str((matched_trade or {}).get('event_id') or bx_symbol).replace('EVT_', '')}",
+                require_live_position=True,
+                require_unprotected_position=True,
+                expected_sl_price=expected_sl_price,
+            )
+            record_action({
+                "record_type": "PROTECTION_EMERGENCY_CLOSE_RESULT",
+                "event_id": (matched_trade or {}).get("event_id"),
+                "symbol": bx_symbol, "direction": direction, "position_qty": live_qty,
+                "reason": "FRESH_AUDIT_CONFIRMED_NO_VALID_SL", "result": emergency_result,
+                "final_live_audit": final_live,
+                "ts": int(time.time() * 1000),
+            })
             continue
 
         if missing_returned_tp_ids:
@@ -4692,16 +5068,20 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
 
     except (TypeError, ValueError) as exc:
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"SETUPFAIL:{trade_id}", require_live_position=True)
+        rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
+        rolled_back = str(rollback.get("status", "")).lower() == "closed"
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
-            "position": {**position, "positionAmt": actual_qty},
+            "position": ({**position, "positionAmt": 0.0} if rolled_back else {**position, "positionAmt": actual_qty}),
             "open_result": opened,
             "execution_quality": execution_quality,
             "error": str(exc),
             "emergency_close": rollback,
-            "rolled_back": rollback.get("status") == "closed",
+            "rolled_back": rolled_back,
+            "rollback_state_unknown": not rolled_back,
+            "protection_cleanup": rollback_cleanup,
         }
 
     try:
@@ -4737,7 +5117,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     symbol, direction, actual_qty, reason_token=f"SRPOSTFAIL:{trade_id}",
                     require_live_position=True,
                 )
-                flattened = rollback.get("status") == "closed"
+                flattened = str(rollback.get("status", "")).lower() == "closed"
+                rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
                 return {
                     "status": "SR_ROOM_POST_FILL_REJECTED",
                     "mode": EXECUTION_MODE,
@@ -4749,6 +5130,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     "sr_room": post_fill_sr,
                     "emergency_close": rollback,
                     "rolled_back": flattened,
+                    "rollback_state_unknown": not flattened,
+                    "protection_cleanup": rollback_cleanup,
                 }
 
         # Opposing zones after TP1 do not alter the target ladder. The entry gate
@@ -4756,16 +5139,20 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         # research/management context without changing the planned targets.
     except Exception as exc:
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}", require_live_position=True)
+        rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
+        rolled_back = str(rollback.get("status", "")).lower() == "closed"
         return {
             "status": "PROTECTION_SETUP_INVALID",
             "mode": EXECUTION_MODE,
             "order_id": order_id,
-            "position": {**position, "positionAmt": actual_qty},
+            "position": ({**position, "positionAmt": 0.0} if rolled_back else {**position, "positionAmt": actual_qty}),
             "open_result": opened,
             "execution_quality": execution_quality,
             "error": str(exc),
             "emergency_close": rollback,
-            "rolled_back": rollback.get("status") == "closed",
+            "rolled_back": rolled_back,
+            "rollback_state_unknown": not rolled_back,
+            "protection_cleanup": rollback_cleanup,
         }
 
     protection = install_protection(
@@ -4893,6 +5280,14 @@ def _trigger_freshness_status(
     if age > max(0.0, limit):
         return "TRIGGER_STALE", age
     return None, age
+
+
+def _divergence_shadow_execution_allowed(
+    *, execution_enabled: bool, is_divergence: bool, shadow_only: bool,
+    trigger_freshness_status: str | None,
+) -> bool:
+    """Shadow entries must obey the same trigger-freshness gate as live entries."""
+    return bool(execution_enabled and is_divergence and shadow_only and not trigger_freshness_status)
 
 
 def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> bool:
@@ -6166,7 +6561,12 @@ def main() -> None:
             max_delay_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
             required=REQUIRE_TRIGGER,
         )
-        if EXECUTION_ENABLED and _is_divergence_event(ev) and DIVERGENCE_SHADOW_ONLY:
+        if _divergence_shadow_execution_allowed(
+            execution_enabled=EXECUTION_ENABLED,
+            is_divergence=_is_divergence_event(ev),
+            shadow_only=DIVERGENCE_SHADOW_ONLY,
+            trigger_freshness_status=trigger_freshness_status,
+        ):
             shadow_ts = int(pd.Timestamp.utcnow().timestamp() * 1000)
             trigger_entry = _safe_float(trigger_meta.get("trigger_price"), 0.0) or float(price)
             try:

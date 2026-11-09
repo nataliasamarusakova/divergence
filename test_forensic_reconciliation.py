@@ -455,3 +455,37 @@ def test_data_error_reconstruction_recognizes_replaced_break_even_sl_from_journa
     assert rebuilt["exit_reason"] == "BREAK_EVEN"
     assert rebuilt["exit_price"] == pytest.approx(100.0)
     assert rebuilt["total_close_fill_qty"] == pytest.approx(3.0)
+
+
+def test_fill_history_accepts_observed_fill_history_orders_gateway_key(monkeypatch):
+    """Regression for the exact top-level key present in the v13 recovery logs."""
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "PUMP-USDT")
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "fill_history_orders": [{
+                "tradeId": "FILL-1", "orderId": "ORDER-1", "symbol": "PUMP-USDT",
+                "side": "BUY", "positionSide": "SHORT", "tradePrice": "0.004091",
+                "volume": "1261", "tradeTime": 1_793_890_936,
+                "realizedPnl": "0.123", "fee": "-0.002", "feeAsset": "USDT",
+            }],
+            "total": 1,
+        },
+    })
+
+    result = bingx.get_fill_history(
+        "PUMP", 1_793_890_000_000, 1_793_891_000_000,
+        order_id="ORDER-1", currency="USDT",
+    )
+
+    assert result["status"] == "ok"
+    assert result["returned"] == 1
+    assert result["has_more"] is False
+    assert result["fills"][0]["order_id"] == "ORDER-1"
+    assert result["fills"][0]["price"] == pytest.approx(0.004091)
+    assert result["fills"][0]["qty"] == pytest.approx(1261.0)
+    assert result["fills"][0]["fee"] == pytest.approx(-0.002)
+    assert result["fills"][0]["fee_asset"] == "USDT"

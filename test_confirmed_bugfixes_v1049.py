@@ -144,11 +144,17 @@ def test_orphan_live_sl_is_passed_to_repair_instead_of_default_7pct(monkeypatch,
     ]
     open_order_reads = iter([
         {"status": "ok", "sl_orders": [sl], "tp_orders": []},
+        # Fresh position/protection audit before repair.
+        {"status": "ok", "sl_orders": [sl], "tp_orders": []},
+        # Post-repair verification.
         {"status": "ok", "sl_orders": [repaired_sl], "tp_orders": repaired_tps},
     ])
     calls = []
     registered = []
     monkeypatch.setattr(ro, "get_positions", lambda **_kwargs: [position])
+    monkeypatch.setattr(ro, "get_position_directional", lambda *_a, **_k: {
+        "status": "found", "positionAmt": "1.0", "avgPrice": "100.0", "entryPrice": "100.0",
+    })
     monkeypatch.setattr(ro, "get_open_orders_snapshot", lambda **_kwargs: {"status": "ok", "orders": [sl]})
     monkeypatch.setattr(ro, "get_open_protection_directional", lambda *_a, **_k: next(open_order_reads))
     monkeypatch.setattr(ro, "_load_active_trades", lambda: {})

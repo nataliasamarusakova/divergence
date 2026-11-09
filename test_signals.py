@@ -2594,6 +2594,10 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
         return {"code": 0, "msg": "OK", "data": {"order": {"orderId": "CLOSE1", "clientOrderId": params["clientOrderId"], "avgPrice": "99.5"}}}
 
     monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda symbol, client_id: {
+        "status": "ok", "order_id": "CLOSE1", "client_order_id": client_id,
+        "order_status": "FILLED", "executed_qty": 1.25, "avg_price": 99.5,
+    })
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 
     out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="UNIT")
@@ -2607,7 +2611,7 @@ def test_emergency_close_flattens_remaining_directional_position(monkeypatch):
     assert out["execution_price"] == pytest.approx(99.5)
 
 
-def test_emergency_close_reports_unflattened_after_two_attempts(monkeypatch):
+def test_emergency_close_refuses_second_market_when_position_snapshot_stays_unchanged(monkeypatch):
     import event_engine.bingx as bx
 
     state = {"qty": 1.25}
@@ -2629,14 +2633,19 @@ def test_emergency_close_reports_unflattened_after_two_attempts(monkeypatch):
         return {"code": 0, "msg": "OK", "data": {"order": {"orderId": f"CLOSE{len(calls)}"}}}
 
     monkeypatch.setattr(bx, "_request", fake_request)
+    monkeypatch.setattr(bx, "get_order_by_client_order_id", lambda symbol, client_id: {
+        "status": "ok", "order_id": "CLOSE1", "client_order_id": client_id,
+        "order_status": "FILLED", "executed_qty": 1.25, "avg_price": 99.5,
+    })
     monkeypatch.setattr(bx.time, "sleep", lambda *_: None)
 
     out = bx.emergency_close_position("TEST", "LONG", 1.25, reason_token="UNIT")
-    assert out["status"] == "UNFLATTENED"
-    assert out["attempts"] == 2
+    assert out["status"] == "unknown"
+    assert out["escalation_required"] is True
+    assert out["client_order_id"]
+    assert len(calls) == 1
     assert out["remaining_qty"] == 1.25
     assert out["escalation_required"] is True
-    assert len(calls) == 2
 
 
 def test_conditional_protection_payloads_do_not_send_client_order_id(monkeypatch):
@@ -4396,3 +4405,85 @@ def test_telegram_signal_formats_contract_ticker_independently_of_provider_name(
     )
 
     assert "<b>🔴 SHORT - 1000SHIB (</b><code>1000SHIBUSDT</code><b>)</b>" in message
+
+
+@pytest.mark.parametrize("failure_mode", ["invalid_risk", "tp_setup", "post_fill_sr"])
+def test_post_fill_rollback_unknown_persists_cleanup_quarantine(monkeypatch, failure_mode):
+    """Every post-fill rejection must durably block re-entry if its close is unconfirmed."""
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 3.0)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", failure_mode == "post_fill_sr")
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "enforce" if failure_mode == "post_fill_sr" else "off")
+    monkeypatch.setattr(ro, "AJAY_SR_REQUIRE_DATA", True)
+    monkeypatch.setattr(ro, "MARKET_DATA_SOURCE", "binance")
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: {"test": True})
+
+    if failure_mode == "post_fill_sr":
+        calls = {"count": 0}
+
+        def _sr_result(*args, **kwargs):
+            calls["count"] += 1
+            return {"reject": calls["count"] > 1, "reject_reason": "post_fill_test_reject"}
+
+        monkeypatch.setattr(ro, "evaluate_sr_room", _sr_result)
+    elif failure_mode == "tp_setup":
+        monkeypatch.setattr(ro, "build_tp_levels", lambda *a, **k: (_ for _ in ()).throw(ValueError("synthetic TP setup failure")))
+
+    risk_pct = 0.0 if failure_mode == "invalid_risk" else 1.0
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: {
+        "status": "opened", "order_id": "O-POSTFILL", "order_reference_price": 100.0,
+        "leverage": 10,
+    })
+    monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **k: {
+        "status": "found", "positionAmt": "1", "avgPrice": "100", "entryPrice": "100",
+    })
+    monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: {
+        "status": "unknown", "error": "synthetic close outcome unknown",
+    })
+    finalize_calls = []
+    monkeypatch.setattr(ro, "_finalize_rollback_protection_cleanup", lambda *a, **k: (
+        finalize_calls.append((a, k)) or {"status": "pending", "pending_cleanup_id": "ROLLBACK_TEST"}
+    ))
+    monkeypatch.setattr(ro, "install_protection", lambda **k: pytest.fail("protection must not be installed after rejected setup"))
+    monkeypatch.setattr(ro, "record_action", lambda *a, **k: None)
+
+    result = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": risk_pct, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        f"EVT_POSTFILL_{failure_mode.upper()}",
+    )
+
+    assert result["status"] in {"PROTECTION_SETUP_INVALID", "SR_ROOM_POST_FILL_REJECTED"}
+    assert result["rolled_back"] is False
+    assert result["rollback_state_unknown"] is True
+    assert result["position"]["positionAmt"] == pytest.approx(1.0)
+    assert result["protection_cleanup"]["status"] == "pending"
+    assert len(finalize_calls) == 1
+
+
+def test_divergence_shadow_execution_obeys_pre_order_trigger_freshness():
+    import run_once as ro
+
+    common = {
+        "execution_enabled": True,
+        "is_divergence": True,
+        "shadow_only": True,
+    }
+    assert ro._divergence_shadow_execution_allowed(
+        **common, trigger_freshness_status=None
+    ) is True
+    for status in ("TRIGGER_STALE", "TRIGGER_TIMESTAMP_UNKNOWN", "TRIGGER_TIMESTAMP_IN_FUTURE"):
+        assert ro._divergence_shadow_execution_allowed(
+            **common, trigger_freshness_status=status
+        ) is False
+    assert ro._divergence_shadow_execution_allowed(
+        execution_enabled=False, is_divergence=True, shadow_only=True,
+        trigger_freshness_status=None,
+    ) is False
+    assert ro._divergence_shadow_execution_allowed(
+        execution_enabled=True, is_divergence=False, shadow_only=True,
+        trigger_freshness_status=None,
+    ) is False
