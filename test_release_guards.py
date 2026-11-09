@@ -424,12 +424,25 @@ def test_long_btc_regime_gate_fails_closed_only_for_long_and_handles_btc_self():
     assert run_once._long_btc_regime_veto_reason("LONG", {"btc_regime": "SELF", "trend_4h": "BEAR"}, enabled=True)
 
 def test_application_version_and_runtime_guards():
-    # APP_VERSION is the single application-version source of truth.
-    assert not Path("VERSION").exists()
+    # VERSION is the only application-version source of truth. Future release
+    # bumps change this file only; runtime, reconciliation and CI consume it.
+    import re
+    from event_engine.version import APP_VERSION
+
+    version_file = Path("VERSION")
+    version = version_file.read_text(encoding="utf-8").strip()
+    assert re.fullmatch(r"divergence-v\d+\.\d+", version)
+    assert APP_VERSION == version
+
     runtime = Path("run_once.py").read_text(encoding="utf-8")
     workflow = _workflow()
-    assert 'APP_VERSION = "V10.4.38"' in runtime
-    assert 'DIVERGENCE_BUILD_VERSION: "V10.4.38"' in workflow
+    pine_workflow = Path(".github/workflows/pine-sr-diagnostic.yml").read_text(encoding="utf-8")
+    reconciliation = Path("event_engine/reconcile_daily.py").read_text(encoding="utf-8")
+    assert "from event_engine.version import APP_VERSION" in runtime
+    assert "from event_engine.version import APP_VERSION" in reconciliation
+    assert "Validate canonical Divergence version" in workflow
+    assert "Validate canonical Divergence version" in pine_workflow
+    assert "DIVERGENCE_BUILD_VERSION" not in workflow
     assert 'version=%s' in runtime
     tracker = Path('event_engine/tracker.py').read_text(encoding='utf-8')
     assert 'EARLY_LOSS_CUT_ENABLED = False' in tracker

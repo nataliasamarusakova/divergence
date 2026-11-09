@@ -1841,6 +1841,66 @@ def test_legacy_be_activation_notification_is_suppressed_on_retry(monkeypatch, t
     assert saved[legacy_id]["suppressed"] is True
 
 
+def test_legacy_be_suppression_persistence_failure_does_not_abort_position_tracking(monkeypatch, tmp_path):
+    import event_engine.tracker as tr
+
+    tr.NOTIFICATIONS_PATH = tmp_path / "notifications.json"
+    tr.ACTIVE_TRADES_PATH = tmp_path / "active_trades.json"
+    tr.TRADES_PATH = tmp_path / "trades.jsonl"
+    legacy_id = tr._notification_id("EVT_OLD_BE", "BE_ACTIVATED")
+    original_outbox = json.dumps({
+        legacy_id: {
+            "notification_id": legacy_id,
+            "event_id": "EVT_OLD_BE",
+            "kind": "BE_ACTIVATED",
+            "resolved": False,
+            "chats": {"A": {"sent": False, "attempts": 0}},
+            "text": "legacy BE message",
+        }
+    }).encode("utf-8")
+    tr.NOTIFICATIONS_PATH.write_bytes(original_outbox)
+    tr.ACTIVE_TRADES_PATH.write_text(json.dumps({
+        "EVT_OPEN": {
+            "trade_id": "TR_OPEN",
+            "event_id": "EVT_OPEN",
+            "symbol": "TEST",
+            "direction": "LONG",
+            "entry_price": 100.0,
+            "initial_qty": 1.0,
+            "remaining_qty": 1.0,
+            "entry_ts": 1_700_000_000_000,
+            "hit_legs": [],
+            "tp_filled_qty": {},
+            "be_activated": False,
+            "sl_order": {"order_id": "SL1", "stop_price": 93.0},
+            "tp_orders": [],
+            "closed": False,
+        }
+    }), encoding="utf-8")
+
+    def fail_notification_save(_data):
+        raise OSError("simulated read-only outbox")
+
+    position_reads = []
+    monkeypatch.setattr(tr, "_save_notifications", fail_notification_save)
+    monkeypatch.setattr(tr, "_recover_data_error_trade_closes", lambda: None)
+    monkeypatch.setattr(tr, "_recover_trade_cashflows", lambda **kwargs: None)
+    monkeypatch.setattr(tr, "get_position_directional", lambda symbol, direction: (
+        position_reads.append((symbol, direction)) or
+        {"status": "found", "positionAmt": "1.0", "avgPrice": "100.0"}
+    ))
+    monkeypatch.setattr(tr, "get_live_price", lambda _symbol: 100.0)
+    monkeypatch.setattr(tr, "fetch_klines", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(tr, "_update_live_pnl_extrema", lambda *_args, **_kwargs: None)
+
+    tr.update_active_trades()
+
+    assert position_reads == [("TEST", "LONG")]
+    assert tr.NOTIFICATIONS_PATH.read_bytes() == original_outbox
+    saved_trades = json.loads(tr.ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
+    assert saved_trades["EVT_OPEN"]["current_position_qty"] == 1.0
+
+
 def test_retry_pending_notifications_preserves_sent_state_after_legacy_be_suppression(monkeypatch, tmp_path):
     import event_engine.tracker as tr
 

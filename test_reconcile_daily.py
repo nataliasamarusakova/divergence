@@ -295,7 +295,9 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     monkeypatch.setattr(recon.bingx, "get_income_history", income_unavailable)
     alerts = []
     monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
-    monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "V10.4.25")
+    # A stale environment override must never split the displayed build version
+    # from the canonical VERSION file.
+    monkeypatch.setenv("DIVERGENCE_BUILD_VERSION", "obsolete-build")
 
     report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=True)
     warning = next(item for item in report["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
@@ -307,8 +309,8 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     assert income_calls == ["BTC-USDT", "BTC-USDT", None]
     assert "BTC-USDT" in recon._discrepancy_message_detail(warning)
     assert "account_wide_income_unexpected_data_shape" in warning["detail"] or "income_history_unexpected_data_shape" in warning["detail"]
-    assert report["build_version"] == "V10.4.25"
-    assert "Build: <code>V10.4.25</code>" in alerts[0]
+    assert report["build_version"] == recon.APP_VERSION
+    assert f"Build: <code>{recon.APP_VERSION}</code>" in alerts[0]
 
 
 def test_trump_legacy_exchange_symbol_is_canonicalized_without_merging_sol():

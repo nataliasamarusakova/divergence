@@ -570,15 +570,56 @@ def _coinalyze_test_row(symbol="BTC"):
     )
 
 
-def test_coinalyze_page_failure_raises_with_partial_rows(monkeypatch):
+def test_coinalyze_load_page_waits_for_dom_and_table_not_networkidle():
+    import event_engine.coinalyze as coinalyze
+
+    calls = {"goto": None, "selector": None, "wait_load_state": 0}
+
+    class _Page:
+        def goto(self, url, *, wait_until, timeout):
+            calls["goto"] = (url, wait_until, timeout)
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+        def content(self):
+            return "<html><table><tbody><tr><td>AAA</td></tr></tbody></table></html>"
+
+        def wait_for_selector(self, selector, *, timeout):
+            calls["selector"] = (selector, timeout)
+
+        def query_selector_all(self, _selector):
+            return [object()]
+
+        def query_selector(self, _selector):
+            return None
+
+        def evaluate(self, _script):
+            pass
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            calls["wait_load_state"] += 1
+            raise AssertionError("networkidle must not be awaited")
+
+    html = coinalyze._load_page(_Page(), "https://coinalyze.test/page")
+
+    assert "tbody" in html
+    assert calls["goto"] == (
+        "https://coinalyze.test/page",
+        "domcontentloaded",
+        coinalyze.PAGE_NAVIGATION_TIMEOUT_MS,
+    )
+    assert calls["selector"] == ("tbody tr", coinalyze.PAGE_TABLE_TIMEOUT_MS)
+    assert calls["wait_load_state"] == 0
+
+
+def test_coinalyze_initial_page_retries_once_then_succeeds(monkeypatch):
     import playwright.sync_api as sync_api
     import event_engine.coinalyze as coinalyze
 
-    row1 = _coinalyze_test_row("AAA")
+    row = _coinalyze_test_row("AAA")
     browser = type("Browser", (), {"close": lambda self: None})()
     page = type("Page", (), {"query_selector": lambda self, selector: None})()
-    state = {"failed": True}
-    htmls = {"p1": "HTML1", "p2": "HTML2"}
 
     class _PlaywrightContext:
         def __enter__(self):
@@ -586,26 +627,62 @@ def test_coinalyze_page_failure_raises_with_partial_rows(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
-    monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
-    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: ["p1", "p2"])
-    monkeypatch.setattr(coinalyze, "parse_table", lambda html: [row1] if html == "HTML1" else [_coinalyze_test_row("BBB")])
+    attempts = {coinalyze.COINALYZE_URL: 0}
 
     def fake_load(_page, url):
-        if url == coinalyze.COINALYZE_URL:
-            return htmls["p1"]
-        if url == "p2" and state["failed"]:
-            raise RuntimeError("page 2 transient failure")
-        return htmls[url]
+        attempts[url] = attempts.get(url, 0) + 1
+        if url == coinalyze.COINALYZE_URL and attempts[url] == 1:
+            raise RuntimeError("transient initial navigation failure")
+        return "HTML1"
 
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
+    monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
+    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: [coinalyze.COINALYZE_URL])
+    monkeypatch.setattr(coinalyze, "parse_table", lambda _html: [row])
     monkeypatch.setattr(coinalyze, "_load_page", fake_load)
+    monkeypatch.setattr(coinalyze.time, "sleep", lambda _seconds: None)
 
-    try:
+    rows = coinalyze.fetch_data()
+
+    assert [item.symbol for item in rows] == ["AAA"]
+    assert attempts[coinalyze.COINALYZE_URL] == 2
+
+
+def test_coinalyze_page_failure_raises_with_partial_rows_after_retry(monkeypatch):
+    import playwright.sync_api as sync_api
+    import event_engine.coinalyze as coinalyze
+
+    row1 = _coinalyze_test_row("AAA")
+    browser = type("Browser", (), {"close": lambda self: None})()
+    page = type("Page", (), {"query_selector": lambda self, selector: None})()
+
+    class _PlaywrightContext:
+        def __enter__(self):
+            return object()
+        def __exit__(self, *args):
+            return False
+
+    attempts = {coinalyze.COINALYZE_URL: 0, "p2": 0}
+
+    def fake_load(_page, url):
+        attempts[url] = attempts.get(url, 0) + 1
+        if url == "p2":
+            raise RuntimeError("persistent page 2 failure")
+        return "HTML1"
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
+    monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
+    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: [coinalyze.COINALYZE_URL, "p2"])
+    monkeypatch.setattr(coinalyze, "parse_table", lambda _html: [row1])
+    monkeypatch.setattr(coinalyze, "_load_page", fake_load)
+    monkeypatch.setattr(coinalyze.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(coinalyze.CoinalyzeIncompleteDataError, match="1 page") as exc_info:
         coinalyze.fetch_data()
-        assert False, "expected incomplete pagination error"
-    except coinalyze.CoinalyzeIncompleteDataError as exc:
-        assert [row.symbol for row in exc.rows] == ["AAA"]
-        assert "1 page" in str(exc)
+
+    assert [row.symbol for row in exc_info.value.rows] == ["AAA"]
+    assert attempts[coinalyze.COINALYZE_URL] == 1
+    assert attempts["p2"] == coinalyze.PAGE_LOAD_MAX_ATTEMPTS == 2
 
 
 def test_coinalyze_page_retry_then_all_pages_succeed(monkeypatch):
@@ -621,22 +698,28 @@ def test_coinalyze_page_retry_then_all_pages_succeed(monkeypatch):
         def __exit__(self, *args):
             return False
 
+    attempts = {coinalyze.COINALYZE_URL: 0, "p2": 0}
+
+    def fake_load(_page, url):
+        attempts[url] = attempts.get(url, 0) + 1
+        if url == "p2" and attempts[url] == 1:
+            raise RuntimeError("transient page 2 failure")
+        return "p1" if url == coinalyze.COINALYZE_URL else "p2"
+
     monkeypatch.setattr(sync_api, "sync_playwright", lambda: _PlaywrightContext())
     monkeypatch.setattr(coinalyze, "_setup_browser_context", lambda _p: (browser, page))
-    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: ["p1", "p2"])
-    monkeypatch.setattr(
-        coinalyze,
-        "_load_page",
-        lambda _page, url: "p1" if url == coinalyze.COINALYZE_URL else url,
-    )
+    monkeypatch.setattr(coinalyze, "get_page_urls", lambda _html: [coinalyze.COINALYZE_URL, "p2"])
+    monkeypatch.setattr(coinalyze, "_load_page", fake_load)
     monkeypatch.setattr(
         coinalyze,
         "parse_table",
         lambda html: [_coinalyze_test_row("AAA")] if html == "p1" else [_coinalyze_test_row("BBB")],
     )
+    monkeypatch.setattr(coinalyze.time, "sleep", lambda _seconds: None)
 
     rows = coinalyze.fetch_data()
     assert [row.symbol for row in rows] == ["AAA", "BBB"]
+    assert attempts == {coinalyze.COINALYZE_URL: 1, "p2": 2}
 
 
 def test_incomplete_coinalyze_rows_cannot_enter_new_entry_universe():

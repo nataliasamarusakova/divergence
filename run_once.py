@@ -10,7 +10,7 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
 
-APP_VERSION = "V10.4.38"
+from event_engine.version import APP_VERSION
 
 import pandas as pd
 import requests
