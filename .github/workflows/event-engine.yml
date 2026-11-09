@@ -26,7 +26,6 @@ jobs:
       COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
       BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-      DIVERGENCE_BUILD_VERSION: "V10.4.38"
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
@@ -208,6 +207,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Validate canonical Divergence version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from event_engine.version import APP_VERSION
+          if not re.fullmatch(r"divergence-v\d+\.\d+", APP_VERSION):
+              raise SystemExit(f"Invalid VERSION value: {APP_VERSION!r}")
+          print(f"[VERSION] {APP_VERSION}")
+          PY
 
       - name: Cache dependencies and browsers
         id: cache-dependencies

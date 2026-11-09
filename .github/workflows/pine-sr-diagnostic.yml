@@ -50,6 +50,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate canonical Divergence version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from event_engine.version import APP_VERSION
+          if not re.fullmatch(r"divergence-v\d+\.\d+", APP_VERSION):
+              raise SystemExit(f"Invalid VERSION value: {APP_VERSION!r}")
+          print(f"[VERSION] {APP_VERSION}")
+          PY
+
       - name: Install requests
         run: python -m pip install --disable-pip-version-check requests
 
