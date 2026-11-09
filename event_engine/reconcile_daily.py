@@ -339,7 +339,9 @@ def _pending_exit_fill_evidence(
         if not isinstance(order, dict) or str(order.get("status", "")).lower() != "ok":
             continue
         order_status = str(order.get("order_status") or "").upper()
-        allowed_statuses = {"PARTIALLY_FILLED", "FILLED"} if source.startswith("TP:") else {"FILLED"}
+        allowed_statuses = {
+            "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED",
+        } if source.startswith("TP:") else {"FILLED"}
         if order_status not in allowed_statuses:
             continue
         executed_qty = _finite_nonnegative(order.get("executed_qty"))

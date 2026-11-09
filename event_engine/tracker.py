@@ -77,6 +77,10 @@ class ActiveTradeStateError(RuntimeError):
     """Raised when persisted position state cannot be trusted safely."""
 
 
+class NotificationStateError(RuntimeError):
+    """Raised when the durable notification outbox cannot be trusted safely."""
+
+
 DATA = Path("data")
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
@@ -140,14 +144,31 @@ def _durable_replace_text(path: Path, payload: str) -> None:
 
 
 def _load_notifications() -> dict[str, dict]:
+    """Load the durable Telegram outbox without silently discarding pending events.
+
+    A malformed/unreadable outbox is not equivalent to an empty outbox. Returning
+    ``{}`` here allowed the next enqueue to overwrite unresolved notifications.
+    Callers that can continue trading catch NotificationStateError and leave the
+    original file untouched for operator recovery.
+    """
     if not NOTIFICATIONS_PATH.exists():
         return {}
     try:
         data = json.loads(NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
     except Exception as exc:
-        log.error("[TELEGRAM] Notification state read failed: %s", exc)
-        return {}
+        raise NotificationStateError(
+            f"notification state is unreadable: {NOTIFICATIONS_PATH}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise NotificationStateError(
+            f"notification state root must be a JSON object, got {type(data).__name__}"
+        )
+    malformed = [str(key) for key, value in data.items() if not isinstance(value, dict)]
+    if malformed:
+        raise NotificationStateError(
+            "notification state contains non-object records: " + ", ".join(malformed[:10])
+        )
+    return data
 
 
 def _save_notifications(data: dict[str, dict]) -> None:
@@ -160,6 +181,12 @@ def _notification_id(event_id: str, kind: str, leg: str | None = None) -> str:
     return "TG_" + hashlib.sha256(raw).hexdigest()[:24].upper()
 
 
+def _configured_telegram_chat_ids() -> list[str]:
+    """Return the currently configured, de-duplicated Telegram recipient IDs."""
+    raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TG_CHAT_ID") or ""
+    return list(dict.fromkeys(x.strip() for x in raw.replace(";", ",").split(",") if x.strip()))
+
+
 def _deliver_notification(notification_id: str, record: dict) -> bool:
     notifications = _load_notifications()
     item = notifications.get(notification_id)
@@ -167,9 +194,16 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
         return False
     item.setdefault("attempts", 0)
     item.setdefault("created_ts", int(time.time() * 1000))
-    item.setdefault("chats", {})
+    if not isinstance(item.get("chats"), dict):
+        item["chats"] = {}
     chat_state = item["chats"]
-    pending = [cid for cid, state in chat_state.items() if not bool(state.get("sent"))]
+    # A notification may have been queued while Telegram credentials/recipients
+    # were absent. Add recipients configured since the original enqueue so that
+    # durable unresolved events do not remain undeliverable forever. Existing
+    # sent states are preserved and are never resent to those chats.
+    for cid in _configured_telegram_chat_ids():
+        chat_state.setdefault(cid, {"sent": False, "attempts": 0, "last_error": None})
+    pending = [cid for cid, state in chat_state.items() if isinstance(state, dict) and not bool(state.get("sent"))]
     if not pending:
         item["resolved"] = bool(chat_state) and all(bool(state.get("sent")) for state in chat_state.values())
         _save_notifications(notifications)
@@ -200,8 +234,7 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
 def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbol: str, direction: str, text: str, leg: str | None = None) -> bool:
     notifications = _load_notifications()
     item = notifications.get(notification_id)
-    raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TG_CHAT_ID") or ""
-    current_chat_ids = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    current_chat_ids = _configured_telegram_chat_ids()
     if not isinstance(item, dict):
         chat_ids = current_chat_ids
         item = {
@@ -220,7 +253,10 @@ def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbo
         notifications[notification_id] = item
         _save_notifications(notifications)
     else:
-        chats = item.setdefault("chats", {})
+        chats = item.get("chats")
+        if not isinstance(chats, dict):
+            chats = {}
+            item["chats"] = chats
         for cid in current_chat_ids:
             chats.setdefault(cid, {"sent": False, "attempts": 0, "last_error": None})
         item["resolved"] = False if any(not bool(v.get("sent")) for v in chats.values()) else bool(chats)
@@ -230,7 +266,13 @@ def _queue_notification(notification_id: str, *, event_id: str, kind: str, symbo
 
 
 def _retry_pending_notifications() -> None:
-    notifications = _load_notifications()
+    try:
+        notifications = _load_notifications()
+    except NotificationStateError as exc:
+        # Notification failure must not abort position/SL management, but the
+        # corrupt outbox must remain untouched rather than being replaced by {}.
+        log.critical("[TELEGRAM] Pending outbox cannot be read; delivery is paused: %s", exc)
+        return
     changed = False
 
     # Apply legacy suppressions before delivery. _deliver_notification reloads and
@@ -1046,7 +1088,15 @@ def update_active_trade_protection(
     want_direction = str(direction).upper()
 
     for trade in trades.values():
-        if trade.get("closed", False):
+        # Cleanup/quarantine rows are durable symbol-side locks, not live trade
+        # records. A later exchange fill can appear while one of these sentinels
+        # is pending; reconciliation must adopt that position into a real tracker
+        # record instead of attaching its TP/SL metadata to the sentinel.
+        if (
+            trade.get("closed", False)
+            or trade.get("protection_cleanup_only")
+            or trade.get("entry_order_resolution_pending")
+        ):
             continue
         trade_bx = to_bx_symbol(trade.get("symbol", "")) or _normalized_symbol(trade.get("symbol", ""))
         trade_direction = str(trade.get("direction", "")).upper()
@@ -2627,7 +2677,11 @@ def update_active_trades() -> None:
             # The close journal is already durable; do not re-run position/fill/
             # candle queries just because queue persistence for Telegram failed.
             nid = _notification_id(str(event_id), "TRADE_CLOSE")
-            notifications = _load_notifications()
+            try:
+                notifications = _load_notifications()
+            except NotificationStateError as exc:
+                log.critical("[TELEGRAM] Cannot inspect close-notification outbox for %s: %s", event_id, exc)
+                notifications = {}
             queued = notifications.get(nid)
             notification_is_durable = (
                 isinstance(queued, dict)
@@ -2652,7 +2706,11 @@ def update_active_trades() -> None:
                         )
                     except Exception as exc:
                         log.warning("[TELEGRAM] Could not restore close notification queue for %s: %s", event_id, exc)
-                    notifications = _load_notifications()
+                    try:
+                        notifications = _load_notifications()
+                    except NotificationStateError as exc:
+                        log.critical("[TELEGRAM] Close-notification outbox remains unreadable for %s: %s", event_id, exc)
+                        notifications = {}
                     queued = notifications.get(nid)
                     notification_is_durable = (
                         isinstance(queued, dict)
@@ -2948,16 +3006,56 @@ def update_active_trades() -> None:
                 if order_info.get("status") == "error":
                     continue
 
-                order_status = str(order_info.get("order_status", "")).upper()
-                if order_status not in {"PARTIALLY_FILLED", "FILLED"}:
+                order_status = str(order_info.get("order_status", "")).strip().upper()
+                if order_status not in {
+                    "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED",
+                }:
                     continue
 
-                executed_qty = max(0.0, _safe_float(order_info.get("executed_qty", 0.0)))
+                # BingX may report a partially executed TP as terminal CANCELED
+                # after the unfilled remainder was canceled. Its cumulative fill
+                # remains real and must be booked exactly once. Missing or malformed
+                # executedQty is UNKNOWN; never coerce it to zero for terminal orders.
+                raw_executed_qty = order_info.get("executed_qty")
+                try:
+                    executed_qty = float(raw_executed_qty) if raw_executed_qty is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    executed_qty = None
+                if executed_qty is None or not math.isfinite(executed_qty) or executed_qty < 0:
+                    log.warning(
+                        "[TRACKER_TP] %s %s %s has no trustworthy executedQty; deferring terminal order reconciliation",
+                        symbol, direction, leg,
+                    )
+                    continue
+
                 previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
                 delta_qty = max(0.0, executed_qty - previous_qty)
+                original_qty = max(
+                    0.0,
+                    _safe_float(order_info.get("orig_qty"), 0.0)
+                    or _safe_float(tp.get("qty"), 0.0),
+                )
+                qty_tolerance = max(1e-10, original_qty * 1e-8)
+                terminal_status = order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+                if order_status == "FILLED" and executed_qty <= 1e-12:
+                    log.warning(
+                        "[TRACKER_TP] %s %s %s is marked FILLED with zero executedQty; deferring inconsistent exchange state",
+                        symbol, direction, leg,
+                    )
+                    continue
+                if original_qty > 0 and executed_qty > original_qty + max(1e-10, original_qty * 1e-8):
+                    log.error(
+                        "[TRACKER_TP] %s %s %s executedQty %.12g exceeds original TP quantity %.12g; deferring inconsistent exchange state",
+                        symbol, direction, leg, executed_qty, original_qty,
+                    )
+                    continue
+                leg_fully_executed = (
+                    order_status == "FILLED"
+                    or (terminal_status and original_qty > 0 and executed_qty >= original_qty - qty_tolerance)
+                )
 
                 if delta_qty <= 0:
-                    if order_status == "FILLED":
+                    if leg_fully_executed:
                         hit_legs.add(leg)
                     continue
 
@@ -2985,7 +3083,7 @@ def update_active_trades() -> None:
                 trade["realized_pnl_weighted_sum"] = realized_weighted
                 trade["last_tp_exec_price"] = exec_price
 
-                if order_status == "FILLED" and leg not in hit_legs:
+                if leg_fully_executed and leg not in hit_legs:
                     hit_legs.add(leg)
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 

@@ -14,6 +14,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from decimal import (
     Decimal,
+    InvalidOperation,
     ROUND_DOWN,
     ROUND_FLOOR,
 )
@@ -1121,6 +1122,10 @@ def get_fill_history(
 
     data = resp.get("data")
     row_keys = (
+        # Observed BingX gateway response in production journals. Keep these
+        # endpoint-specific names explicit: arbitrary list keys must still fail
+        # closed rather than being mistaken for fill rows.
+        "fill_history_orders", "fillHistoryOrders",
         "fill_orders", "fillOrders", "fills", "list", "orders", "rows", "records",
         "tradeFills", "trade_fills", "fillList", "fill_list", "result", "data",
         "resultData", "response",
@@ -1918,6 +1923,8 @@ def emergency_close_position(
     reason_token: str | None = None,
     *,
     require_live_position: bool = False,
+    require_unprotected_position: bool = False,
+    expected_sl_price: float | None = None,
 ) -> dict:
     """Fail-safe close used when a freshly opened position cannot be protected.
 
@@ -1931,6 +1938,12 @@ def emergency_close_position(
     proof that the position was closed: the position endpoint may be lagging.
     The function returns UNKNOWN and submits no close order until the directional
     position becomes visible, allowing the caller to retain quarantine.
+
+    ``require_unprotected_position`` is reserved for protection reconciliation.
+    Immediately before a MARKET POST, the function re-reads open protection and
+    the directional position. A valid SL for the stable live quantity aborts the
+    close; an unavailable/unstable read also aborts it. The caller must provide
+    the expected SL price so the guard verifies the exact intended protection.
     """
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1949,6 +1962,13 @@ def emergency_close_position(
     contract = get_contract(symbol)
     if not bx_symbol or not contract:
         return {"status": "error", "error": "contract_not_found"}
+    if require_unprotected_position:
+        try:
+            expected_sl_price = float(expected_sl_price)
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "error", "error": "expected_sl_price_required_for_unprotected_close_guard"}
+        if not math.isfinite(expected_sl_price) or expected_sl_price <= 0:
+            return {"status": "error", "error": "invalid_expected_sl_price_for_unprotected_close_guard"}
     try:
         precision = int(contract.get("quantityPrecision") or 0)
         requested_qty = abs(float(qty)) if qty is not None else 0.0
@@ -2035,6 +2055,116 @@ def emergency_close_position(
             "poll_count": len(errors),
         }
 
+    def _resolve_close_order_terminal(order_info: dict) -> tuple[dict | None, str | None]:
+        """Cancel and re-query any active close order before another MARKET POST.
+
+        A PARTIALLY_FILLED MARKET order is still live until BingX confirms a
+        terminal state. Seeing a smaller position snapshot alone is not enough
+        to mint a new clientOrderId: the original order could continue filling.
+        """
+        latest = dict(order_info) if isinstance(order_info, dict) else {}
+        status = str(latest.get("order_status") or "").strip().upper()
+        terminal_states = {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        active_states = {"NEW", "PENDING", "PARTIALLY_FILLED"}
+        if status in terminal_states:
+            return latest, None
+        if status not in active_states:
+            return None, f"close_order_status_not_resolvable:{status or 'UNKNOWN'}"
+
+        order_id = str(latest.get("order_id") or "").strip()
+        if not order_id:
+            return None, "active_close_order_missing_order_id"
+
+        last_error = None
+        for cancel_attempt in range(3):
+            try:
+                cancel_order(symbol, order_id)
+            except Exception as exc:
+                last_error = f"cancel_exception:{type(exc).__name__}:{exc}"
+            time.sleep(0.2 * (cancel_attempt + 1))
+            try:
+                refreshed = get_order_by_client_order_id(symbol, client_order_id)
+            except Exception as exc:
+                refreshed = {"status": "error", "error": f"order_recheck_exception:{type(exc).__name__}:{exc}"}
+            if not isinstance(refreshed, dict) or str(refreshed.get("status", "")).lower() != "ok":
+                last_error = str(refreshed.get("error") or "close_order_recheck_failed") if isinstance(refreshed, dict) else "invalid_close_order_recheck"
+                continue
+            refreshed_status = str(refreshed.get("order_status") or "").strip().upper()
+            if refreshed_status in terminal_states:
+                return refreshed, None
+            if refreshed_status not in active_states:
+                return None, f"close_order_entered_unknown_state:{refreshed_status or 'UNKNOWN'}"
+            latest = refreshed
+            order_id = str(refreshed.get("order_id") or order_id).strip()
+
+        return None, f"close_order_cancel_unconfirmed:{last_error or status}"
+
+    def _classify_terminal_close(
+        order_info: dict, *, pre_order_qty: float, attempt: int,
+    ) -> dict:
+        """Return closed/retry/unknown only from a terminal order + position evidence."""
+        order_status = str(order_info.get("order_status") or "").strip().upper()
+        raw_executed = order_info.get("executed_qty")
+        try:
+            executed_qty = float(raw_executed) if raw_executed is not None else None
+        except (TypeError, ValueError, OverflowError):
+            executed_qty = None
+        if executed_qty is None or not math.isfinite(executed_qty) or executed_qty < 0:
+            return {"status": "unknown", "error": "terminal_close_order_missing_trustworthy_executed_qty"}
+
+        cancel_terminal = order_status in {"CANCELED", "CANCELLED", "EXPIRED"}
+        if order_status == "FILLED" and executed_qty <= 1e-12:
+            return {
+                "status": "unknown",
+                "error": "filled_close_order_has_zero_executed_qty",
+            }
+        if cancel_terminal and executed_qty <= 1e-12:
+            return {"status": "retry", "reason": "terminal_zero_fill"}
+        if order_status != "FILLED" and not (cancel_terminal and executed_qty > 0):
+            return {
+                "status": "unknown",
+                "error": f"close_order_terminal_state_not_retryable:{order_status or 'UNKNOWN'}",
+            }
+
+        post_fill = _poll_after_filled_close()
+        if post_fill.get("status") == "closed":
+            return {
+                "status": "closed", "verification": post_fill.get("verification"),
+                "position_poll_count": post_fill.get("poll_count"),
+            }
+        if post_fill.get("status") != "found":
+            return {
+                "status": "unknown",
+                "error": "terminal_close_order_but_position_verification_unknown",
+                "position_poll_error": post_fill.get("error"),
+            }
+
+        residual_qty = float(post_fill.get("remaining_qty") or 0.0)
+        qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
+        if (
+            post_fill.get("stable") is True
+            and math.isfinite(residual_qty)
+            and residual_qty > 0
+            and residual_qty < pre_order_qty - qty_tolerance
+            and attempt + 1 < 2
+        ):
+            return {
+                "status": "retry", "reason": "confirmed_stable_residual",
+                "remaining_qty": residual_qty,
+            }
+        return {
+            "status": "unknown",
+            "error": (
+                "terminal close order left an unverified or unchanged residual; refusing another MARKET "
+                f"(status={order_status}; executed_qty={executed_qty}; residual_qty={residual_qty}; "
+                f"stable={post_fill.get('stable')}; observed_qty={post_fill.get('observed_quantities', [])})"
+            ),
+            "remaining_qty": residual_qty,
+            "position_poll_count": post_fill.get("poll_count"),
+            "position_poll_stable": post_fill.get("stable"),
+            "position_poll_quantities": post_fill.get("observed_quantities", []),
+        }
+
     for attempt in range(2):
         try:
             live = get_position_directional(symbol, direction)
@@ -2066,13 +2196,85 @@ def emergency_close_position(
 
         try:
             live_qty = abs(float(live.get("positionAmt", 0) or 0))
+            live_avg = float(live.get("avgPrice") or live.get("entryPrice") or 0)
         except (TypeError, ValueError, OverflowError):
-            live_qty = 0.0
+            live_qty, live_avg = 0.0, 0.0
         if not math.isfinite(live_qty) or live_qty <= 0:
             return {
                 "status": "unknown", "error": "live position quantity is not confirmed; refusing emergency close POST",
                 "symbol": bx_symbol, "direction": direction, "attempts": attempt, "escalation_required": True,
             }
+
+        if require_unprotected_position:
+            try:
+                live_protection = get_open_protection_directional(
+                    symbol, direction, timeout_sec=5.0, retryable=False,
+                )
+            except Exception as exc:
+                return {
+                    "status": "unknown", "error": f"protection recheck failed before emergency close: {exc}",
+                    "symbol": bx_symbol, "direction": direction, "close_order_submitted": False,
+                    "escalation_required": True,
+                }
+            if not isinstance(live_protection, dict) or str(live_protection.get("status", "")).lower() != "ok":
+                return {
+                    "status": "unknown", "error": "protection state unavailable before emergency close",
+                    "symbol": bx_symbol, "direction": direction, "close_order_submitted": False,
+                    "protection_response": live_protection if isinstance(live_protection, dict) else None,
+                    "escalation_required": True,
+                }
+            try:
+                confirmed_live = get_position_directional(symbol, direction)
+            except Exception as exc:
+                return {
+                    "status": "unknown", "error": f"position recheck failed before emergency close: {exc}",
+                    "symbol": bx_symbol, "direction": direction, "close_order_submitted": False,
+                    "escalation_required": True,
+                }
+            confirmed_status = str(confirmed_live.get("status", "")).lower() if isinstance(confirmed_live, dict) else "unknown"
+            if confirmed_status != "found":
+                return {
+                    "status": "unknown", "error": f"position state {confirmed_status} during final protection guard",
+                    "symbol": bx_symbol, "direction": direction, "close_order_submitted": False,
+                    "escalation_required": True,
+                }
+            try:
+                confirmed_qty = abs(float(confirmed_live.get("positionAmt", 0) or 0))
+                confirmed_avg = float(confirmed_live.get("avgPrice") or confirmed_live.get("entryPrice") or 0)
+            except (TypeError, ValueError, OverflowError):
+                confirmed_qty, confirmed_avg = 0.0, 0.0
+            qty_tolerance = max(1e-8, max(live_qty, confirmed_qty) * 1e-6)
+            avg_tolerance = max(1e-12, max(live_avg, confirmed_avg) * 1e-6)
+            if (
+                not math.isfinite(confirmed_qty) or confirmed_qty <= 0
+                or not math.isfinite(live_avg) or live_avg <= 0
+                or not math.isfinite(confirmed_avg) or confirmed_avg <= 0
+                or abs(confirmed_qty - live_qty) > qty_tolerance
+                or abs(confirmed_avg - live_avg) > avg_tolerance
+            ):
+                if attempt == 0:
+                    continue
+                return {
+                    "status": "unknown", "error": "position changed during final protection guard; refusing MARKET close",
+                    "symbol": bx_symbol, "direction": direction,
+                    "observed_qty_before": live_qty, "observed_qty_after": confirmed_qty,
+                    "observed_avg_before": live_avg, "observed_avg_after": confirmed_avg,
+                    "close_order_submitted": False, "escalation_required": True,
+                }
+            sl_valid, sl_audit = _audit_exact_single_sl(
+                live_protection, direction=direction, avg_price=confirmed_avg,
+                expected_price=expected_sl_price, expected_qty=confirmed_qty,
+            )
+            if sl_valid:
+                return {
+                    "status": "protected", "symbol": bx_symbol, "direction": direction,
+                    "remaining_qty": confirmed_qty, "close_order_submitted": False,
+                    "verification": "fresh_position_and_open_orders_confirm_valid_sl",
+                    "protection_audit": sl_audit,
+                }
+            live = confirmed_live
+            live_qty = confirmed_qty
+
         close_qty = _round_qty(live_qty, precision)
         if close_qty <= 0:
             return {"status": "unknown", "error": "emergency close quantity rounds to zero", "symbol": bx_symbol, "escalation_required": True}
@@ -2101,136 +2303,53 @@ def emergency_close_position(
                 queried = {"status": "error", "error": str(exc)}
 
             if queried.get("status") == "ok":
-                order_status = str(queried.get("order_status", "")).upper()
-                executed_qty = float(queried.get("executed_qty", 0) or 0)
-                if order_status in {"FILLED", "PARTIALLY_FILLED"} or executed_qty > 0:
-                    log.warning(
-                        "[EMERGENCY_CLOSE] %s found after transport error with status=%s executed_qty=%s; verifying residual before any new POST.",
-                        client_order_id, order_status, executed_qty,
-                    )
-                    time.sleep(0.25)
-                    try:
-                        after_recovery = get_position_directional(symbol, direction)
-                    except Exception as exc:
-                        return {
-                            "status": "unknown",
-                            "error": f"emergency close order outcome found but residual verification failed: {exc}",
-                            "symbol": bx_symbol, "direction": direction,
-                            "client_order_id": client_order_id, "escalation_required": True,
-                        }
-                    after_status = str(after_recovery.get("status", "")).lower()
-                    if after_status == "not_found":
-                        after_recovery = _confirm_absence(after_recovery)
-                        after_status = str(after_recovery.get("status", "")).lower()
-                        if after_status == "not_found":
-                            return {
-                                "status": "closed", "symbol": bx_symbol, "direction": direction,
-                                "client_order_id": client_order_id,
-                                "order_id": queried.get("order_id"),
-                                "execution_price": queried.get("avg_price") or None,
-                                "idempotency": "order_queried_after_transport_error",
-                                "verification": "two_not_found_reads",
-                            }
-                    if after_status != "found":
-                        return {
-                            "status": "unknown",
-                            "error": f"close order outcome found but live position state is unknown: {after_recovery.get('error', after_status or 'unknown')}",
-                            "symbol": bx_symbol, "direction": direction,
-                            "client_order_id": client_order_id, "escalation_required": True,
-                        }
-                    residual_qty = abs(float(after_recovery.get("positionAmt", 0) or 0))
-                    if not math.isfinite(residual_qty) or residual_qty <= 0:
-                        return {
-                            "status": "unknown", "error": "position read reported found with invalid residual quantity",
-                            "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id,
-                            "escalation_required": True,
-                        }
-                    if order_status == "FILLED":
-                        post_fill = _poll_after_filled_close()
-                        if post_fill.get("status") == "closed":
-                            return {
-                                "status": "closed", "symbol": bx_symbol, "direction": direction,
-                                "client_order_id": client_order_id, "order_id": queried.get("order_id"),
-                                "execution_price": queried.get("avg_price") or None,
-                                "idempotency": "order_queried_after_transport_error",
-                                "verification": post_fill.get("verification"),
-                                "position_poll_count": post_fill.get("poll_count"),
-                            }
-                        if post_fill.get("status") == "found":
-                            residual_qty = float(post_fill.get("remaining_qty") or 0.0)
-                            qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
-                            # A stable residual smaller than the pre-order position
-                            # is a newly confirmed remaining quantity. Retry only
-                            # once, with a fresh clientOrderId and a fresh position
-                            # read at the top of the loop. An unchanged/stale view
-                            # is escalated without another MARKET POST.
-                            if (post_fill.get("stable") is True and residual_qty < live_qty - qty_tolerance
-                                    and attempt + 1 < 2):
-                                digest = hashlib.sha256(
-                                    f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:FILLED_RESIDUAL:{attempt}".upper().encode()
-                                ).hexdigest().upper()[:24]
-                                client_order_id = f"EVTCLOSE{digest}"
-                                continue
-                            return {
-                                "status": "unknown",
-                                "error": (
-                                    "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate "
-                                    f"(residual_qty={residual_qty}; polls={post_fill.get('poll_count')}; "
-                                    f"stable={post_fill.get('stable')}; observed_qty={post_fill.get('observed_quantities', [])})"
-                                ),
-                                "symbol": bx_symbol, "direction": direction,
-                                "client_order_id": client_order_id,
-                                "remaining_qty": residual_qty, "position_poll_count": post_fill.get("poll_count"),
-                                "position_poll_stable": post_fill.get("stable"),
-                                "position_poll_quantities": post_fill.get("observed_quantities", []),
-                                "escalation_required": True,
-                            }
-                        return {
-                            "status": "unknown",
-                            "error": "MARKET close order outcome confirmed FILLED but position verification stayed unknown after bounded polls",
-                            "symbol": bx_symbol, "direction": direction,
-                            "client_order_id": client_order_id,
-                            "position_poll_count": post_fill.get("poll_count"),
-                            "position_poll_error": post_fill.get("error"),
-                            "escalation_required": True,
-                        }
-                    # A verified partial fill justifies one fresh order for the
-                    # exact residual quantity. Never reuse the filled order id.
+                terminal_order, terminal_error = _resolve_close_order_terminal(queried)
+                if terminal_order is None:
+                    return {
+                        "status": "unknown",
+                        "error": terminal_error or "close_order_terminal_state_unconfirmed_after_transport_error",
+                        "symbol": bx_symbol, "direction": direction,
+                        "client_order_id": client_order_id, "escalation_required": True,
+                    }
+                outcome = _classify_terminal_close(
+                    terminal_order, pre_order_qty=live_qty, attempt=attempt,
+                )
+                if outcome.get("status") == "closed":
+                    return {
+                        "status": "closed", "symbol": bx_symbol, "direction": direction,
+                        "client_order_id": client_order_id,
+                        "order_id": terminal_order.get("order_id"),
+                        "execution_price": terminal_order.get("avg_price") or None,
+                        "idempotency": "order_queried_after_transport_error",
+                        "verification": outcome.get("verification"),
+                        "position_poll_count": outcome.get("position_poll_count"),
+                    }
+                if outcome.get("status") == "retry":
                     digest = hashlib.sha256(
-                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RESIDUAL:{attempt}".upper().encode()
-                    ).hexdigest().upper()[:24]
-                    client_order_id = f"EVTCLOSE{digest}"
-                    requested_qty = residual_qty
-                    continue
-
-                if order_status in {"CANCELED", "EXPIRED"}:
-                    digest = hashlib.sha256(
-                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:RETRY:{attempt}".upper().encode()
+                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:TRANSPORT_RECOVERY:{attempt}:{outcome.get('reason')}".upper().encode()
                     ).hexdigest().upper()[:24]
                     client_order_id = f"EVTCLOSE{digest}"
                     continue
-
                 return {
-                    "status": "unknown",
-                    "error": f"MARKET close order pending after transport error: status={order_status or 'unknown'}; refusing blind duplicate",
+                    "status": "unknown", "error": outcome.get("error", "close_order_recovery_unresolved"),
                     "symbol": bx_symbol, "direction": direction,
                     "client_order_id": client_order_id,
+                    "remaining_qty": outcome.get("remaining_qty"),
+                    "position_poll_count": outcome.get("position_poll_count"),
+                    "position_poll_stable": outcome.get("position_poll_stable"),
+                    "position_poll_quantities": outcome.get("position_poll_quantities", []),
                     "escalation_required": True,
                 }
 
             if queried.get("status") == "absent":
                 # A proven-absent order may be safely retried with the SAME
-                # clientOrderId. If the first POST was actually accepted but
-                # the query is only lagging, BingX's unique clientOrderId
-                # prevents creation of a second order.
+                # clientOrderId. If the first POST was accepted but the query
+                # lags, the exchange's idempotency key prevents a second order.
                 if attempt + 1 < 2:
                     time.sleep(0.25)
                     continue
                 continue
 
-            # If the order lookup itself is unavailable, do not manufacture a
-            # new MARKET order. The original clientOrderId remains the canonical
-            # recovery key for the next reconciliation cycle.
             return {
                 "status": "unknown",
                 "error": f"MARKET close transport outcome unknown; order lookup failed: {queried.get('error', 'unknown')}",
@@ -2239,153 +2358,65 @@ def emergency_close_position(
                 "escalation_required": True,
             }
 
+        # A successful HTTP acknowledgement is not proof of execution. Query the
+        # exchange order first; never infer a successful close from a temporarily
+        # absent position while the MARKET order may still be NEW or partial.
         time.sleep(0.25)
-        execution_price = None
-        actual_order_id = None
-        if isinstance(response, dict):
-            data = response.get("data") or {}
-            order = data.get("order") if isinstance(data, dict) else {}
-            if isinstance(order, dict):
-                actual_order_id = order.get("orderId") or order.get("orderID") or data.get("orderId")
-                for key in ("avgPrice", "avg_price", "executedAvgPrice"):
-                    try:
-                        candidate = float(order.get(key))
-                    except (TypeError, ValueError):
-                        continue
-                    if candidate > 0:
-                        execution_price = candidate
-                        break
-        try:
-            after = get_position_directional(symbol, direction)
-        except Exception as exc:
-            return {"status": "unknown", "error": f"emergency close submitted but verification failed: {exc}", "symbol": bx_symbol, "client_order_id": client_order_id}
-        after_status = str(after.get("status", "")).lower()
-        if after_status == "not_found":
-            after = _confirm_absence(after)
-            after_status = str(after.get("status", "")).lower()
-            if after_status == "not_found":
-                return {
-                    "status": "closed", "symbol": bx_symbol, "direction": direction,
-                    "client_order_id": client_order_id, "order_id": str(actual_order_id) if actual_order_id not in (None, "") else None,
-                    "execution_price": execution_price,
-                    "verification": "two_not_found_reads",
-                }
-        if after_status != "found":
-            return {
-                "status": "unknown",
-                "error": f"emergency close submitted but position state is unknown: {after.get('error', after_status or 'unknown')}",
-                "symbol": bx_symbol, "direction": direction,
-                "client_order_id": client_order_id, "escalation_required": True,
-            }
-        try:
-            after_qty = abs(float(after.get("positionAmt", 0) or 0))
-        except (TypeError, ValueError, OverflowError):
-            after_qty = 0.0
-        if not math.isfinite(after_qty) or after_qty <= 0:
-            return {
-                "status": "unknown", "error": "position state found but residual quantity is invalid after close",
-                "symbol": bx_symbol, "direction": direction, "client_order_id": client_order_id,
-                "escalation_required": True,
-            }
-
-        # An HTTP-successful MARKET close can still race the position endpoint: the
-        # order may already be FILLED while the live position view has not caught up.
-        # Never infer "partial" solely from a stale position snapshot. Verify the
-        # acknowledged order by its clientOrderId before issuing any second MARKET.
         try:
             verified_order = get_order_by_client_order_id(symbol, client_order_id)
         except Exception as exc:
             verified_order = {"status": "error", "error": str(exc)}
 
         if verified_order.get("status") != "ok":
-            # The original POST was acknowledged, but the order lookup endpoint
-            # is unavailable. A single bounded retry with the SAME clientOrderId
-            # is safe: it cannot create a second independent order identity.
-            # Never mint a fresh ID while the original outcome is unverified.
+            # Reusing the same clientOrderId is idempotent. Do not mint a new ID
+            # while the accepted order's state is unknown.
             if attempt + 1 < 2:
                 time.sleep(0.25)
                 continue
-            continue
-
-        verified_status = str(verified_order.get("order_status", "")).upper()
-        verified_executed_qty = float(verified_order.get("executed_qty", 0) or 0)
-        residual_qty = after_qty
-
-        if verified_status == "FILLED" and residual_qty > 0:
-            post_fill = _poll_after_filled_close()
-            if post_fill.get("status") == "closed":
-                return {
-                    "status": "closed", "symbol": bx_symbol, "direction": direction,
-                    "client_order_id": client_order_id,
-                    "order_id": str(actual_order_id) if actual_order_id not in (None, "") else str(verified_order.get("order_id") or "") or None,
-                    "execution_price": execution_price or verified_order.get("avg_price") or None,
-                    "verification": post_fill.get("verification"),
-                    "position_poll_count": post_fill.get("poll_count"),
-                }
-            if post_fill.get("status") == "found":
-                residual_qty = float(post_fill.get("remaining_qty") or 0.0)
-                qty_tolerance = max(1e-9, 0.5 * (10.0 ** (-max(0, precision))))
-                if (post_fill.get("stable") is True and residual_qty < live_qty - qty_tolerance
-                        and attempt + 1 < 2):
-                    digest = hashlib.sha256(
-                        f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:FILLED_RESIDUAL:{attempt}".upper().encode()
-                    ).hexdigest().upper()[:24]
-                    client_order_id = f"EVTCLOSE{digest}"
-                    continue
-                return {
-                    "status": "unknown",
-                    "error": (
-                        "MARKET close order is FILLED but position view still shows residual; refusing blind duplicate "
-                        f"(residual_qty={residual_qty}; polls={post_fill.get('poll_count')}; "
-                        f"stable={post_fill.get('stable')}; observed_qty={post_fill.get('observed_quantities', [])})"
-                    ),
-                    "symbol": bx_symbol,
-                    "direction": direction,
-                    "client_order_id": client_order_id,
-                    "remaining_qty": residual_qty,
-                    "executed_qty": verified_executed_qty,
-                    "position_poll_count": post_fill.get("poll_count"),
-                    "position_poll_stable": post_fill.get("stable"),
-                    "position_poll_quantities": post_fill.get("observed_quantities", []),
-                    "escalation_required": True,
-                }
             return {
                 "status": "unknown",
-                "error": "MARKET close order FILLED but position verification stayed unknown after bounded polls",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "executed_qty": verified_executed_qty,
-                "position_poll_count": post_fill.get("poll_count"),
-                "position_poll_error": post_fill.get("error"),
-                "escalation_required": True,
+                "error": f"emergency close acknowledged but order state is unknown: {verified_order.get('error', 'unknown')}",
+                "symbol": bx_symbol, "direction": direction,
+                "client_order_id": client_order_id, "escalation_required": True,
             }
 
-        if verified_status in {"CANCELED", "EXPIRED"}:
+        terminal_order, terminal_error = _resolve_close_order_terminal(verified_order)
+        if terminal_order is None:
+            return {
+                "status": "unknown",
+                "error": terminal_error or "close_order_terminal_state_unconfirmed_after_ack",
+                "symbol": bx_symbol, "direction": direction,
+                "client_order_id": client_order_id, "escalation_required": True,
+            }
+
+        outcome = _classify_terminal_close(
+            terminal_order, pre_order_qty=live_qty, attempt=attempt,
+        )
+        if outcome.get("status") == "closed":
+            return {
+                "status": "closed", "symbol": bx_symbol, "direction": direction,
+                "client_order_id": client_order_id,
+                "order_id": terminal_order.get("order_id"),
+                "execution_price": terminal_order.get("avg_price") or None,
+                "verification": outcome.get("verification"),
+                "position_poll_count": outcome.get("position_poll_count"),
+            }
+        if outcome.get("status") == "retry":
             digest = hashlib.sha256(
-                f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:ACK_CANCEL_RETRY:{attempt}".upper().encode()
+                f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:ACK_RESIDUAL:{attempt}:{outcome.get('reason')}".upper().encode()
             ).hexdigest().upper()[:24]
             client_order_id = f"EVTCLOSE{digest}"
             continue
-
-        if verified_status not in {"PARTIALLY_FILLED", "FILLED"} or verified_executed_qty <= 0:
-            return {
-                "status": "unknown",
-                "error": f"MARKET close acknowledged but order status={verified_status or 'unknown'} with residual position; refusing blind duplicate",
-                "symbol": bx_symbol,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "remaining_qty": residual_qty,
-                "escalation_required": True,
-            }
-
-        # Verified partial fill: a second close is justified for the exact live
-        # residual, but it must use a fresh clientOrderId because the first ID
-        # already belongs to the exchange order.
-        digest = hashlib.sha256(
-            f"{reason_token or 'EMERGENCY'}:{bx_symbol}:{direction}:SUCCESS_RESIDUAL:{attempt}".upper().encode()
-        ).hexdigest().upper()[:24]
-        client_order_id = f"EVTCLOSE{digest}"
+        return {
+            "status": "unknown", "error": outcome.get("error", "emergency_close_unresolved"),
+            "symbol": bx_symbol, "direction": direction,
+            "client_order_id": client_order_id,
+            "remaining_qty": outcome.get("remaining_qty"),
+            "position_poll_count": outcome.get("position_poll_count"),
+            "position_poll_stable": outcome.get("position_poll_stable"),
+            "position_poll_quantities": outcome.get("position_poll_quantities", []),
+            "escalation_required": True,
+        }
 
     # Two verified close attempts are the automatic safety limit. Do one final
     # read-only position check and surface an explicit unresolved state rather
@@ -2695,15 +2726,13 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
 
 
 def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float, precision: int, min_qty: float) -> list[dict]:
-    """Select at most two TP legs using actual filled quantity constraints.
+    """Select an executable TP profile without changing persisted leg identity.
 
-    New strategy profiles already contain TP1 and terminal TP2. If a legacy or
-    custom caller supplies three levels, keep its first and final target and drop
-    the obsolete middle milestone; the final target is relabelled TP2. If the
-    position cannot support both legs, use the nearest target (TP1) for the
-    entire position. This avoids leaving micro-positions with an unreachable
-    terminal target. Feasibility is tested with the same allocator used for
-    real TP orders.
+    Explicit quantities are used during reconciliation after partial fills. In
+    that mode every leg quantity must be present, valid and sum to the current
+    live position; otherwise protection repair fails closed. For new positions
+    without explicit quantities, retain the historical fraction-based allocator
+    and its micro-position fallback to the nearest target.
     """
     if not tp_levels_norm or position_qty <= 0:
         return []
@@ -2712,31 +2741,46 @@ def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float,
         precision_i = int(precision)
         min_qty_f = max(float(min_qty or 0.0), 0.0)
         position = float(position_qty)
-        if not math.isfinite(position) or position <= 0:
+        if not math.isfinite(position) or position <= 0 or not math.isfinite(min_qty_f):
             return []
-        if not math.isfinite(min_qty_f):
-            min_qty_f = 0.0
     except (TypeError, ValueError, ArithmeticError):
         return []
 
     available_levels = [dict(x) for x in tp_levels_norm if isinstance(x, dict)]
     if not available_levels:
         return []
+
+    has_fixed_qty = ["qty" in level for level in available_levels]
+    if any(has_fixed_qty):
+        # Do not drop/relabel a persisted leg or redistribute its remaining
+        # quantity: that would change TP semantics after a partial execution.
+        if not all(has_fixed_qty) or len(available_levels) > 2:
+            return []
+        try:
+            _allocate_tp_quantities(
+                position_qty=position,
+                precision=precision_i,
+                min_qty=min_qty_f,
+                fractions=[x["close_fraction"] for x in available_levels],
+                fixed_quantities=[x["qty"] for x in available_levels],
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return []
+        return available_levels
+
     if len(available_levels) > 2:
         # Keep the early partial and final target, remove the former middle TP.
         final_level = dict(available_levels[-1])
         final_level["leg"] = "tp2"
         available_levels = [available_levels[0], final_level]
 
-    # Try the largest executable profile first. The allocator is the single
-    # source of truth for whether the selected fractions can be represented by
-    # the actual filled quantity, precision, and minimum executable quantity.
+    # Try the largest executable profile first. If a new small position cannot
+    # support both legs, place the nearest target for its full quantity. Preserve
+    # the actual label of an explicitly single remaining target (e.g. TP2 after
+    # TP1 has already been hit during restart reconciliation).
     for candidate_count in range(len(available_levels), 0, -1):
         if candidate_count == 1:
-            # A single executable order must realize the nearest profit target,
-            # not the farthest target intended for the remaining partial size.
             candidate = [dict(available_levels[0])]
-            candidate[0]["leg"] = "tp1"
             candidate[0]["close_fraction"] = 1.0
         else:
             candidate = [dict(x) for x in available_levels[:candidate_count]]
@@ -2754,7 +2798,10 @@ def _select_supported_tp_levels(tp_levels_norm: list[dict], position_qty: float,
     return []
 
 
-def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
+def _allocate_tp_quantities(
+    position_qty: float, precision: int, min_qty: float, fractions: list[float],
+    fixed_quantities: list[float] | None = None,
+) -> list[float]:
     if position_qty <= 0:
         raise ValueError("position_qty must be > 0")
     if not fractions or any(f <= 0 for f in fractions):
@@ -2764,8 +2811,26 @@ def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float,
     pos = Decimal(str(position_qty))
     min_q = Decimal(str(max(min_qty, 0.0)))
     min_leg = max(step, min_q)
-    k = len(fractions)
 
+    if fixed_quantities is not None:
+        if len(fixed_quantities) != len(fractions):
+            raise ValueError("fixed TP quantities must match TP legs")
+        fixed: list[Decimal] = []
+        for raw_qty in fixed_quantities:
+            try:
+                value = Decimal(str(raw_qty))
+            except (InvalidOperation, TypeError, ValueError):
+                raise ValueError("invalid fixed TP quantity")
+            if not value.is_finite() or value < min_leg:
+                raise ValueError("fixed TP quantity is non-finite or below exchange minimum")
+            if value != value.quantize(step, rounding=ROUND_DOWN):
+                raise ValueError("fixed TP quantity exceeds exchange quantity precision")
+            fixed.append(value)
+        if sum(fixed) != pos:
+            raise ValueError("fixed TP quantities do not equal current position quantity")
+        return [float(value) for value in fixed]
+
+    k = len(fractions)
     if pos < min_leg * k:
         raise ValueError(f"position_qty={position_qty} cannot support {k} TP legs with min_leg={min_leg}")
 
@@ -2799,16 +2864,27 @@ def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float,
 def _normalize_tp_levels(tp_levels: list) -> list[dict]:
     normalized = []
     for tp in (tp_levels or []):
+        if not isinstance(tp, dict):
+            continue
         leg = str(tp.get("leg", f"tp{len(normalized) + 1}"))
         try:
             pnl_pct = float(tp.get("pnl_pct", 0))
             fraction = float(tp.get("close_fraction", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
 
         if not math.isfinite(pnl_pct) or not math.isfinite(fraction) or pnl_pct <= 0 or fraction <= 0:
             continue
-        normalized.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
+        row = {"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction}
+        if "qty" in tp:
+            try:
+                fixed_qty = float(tp.get("qty"))
+            except (TypeError, ValueError, OverflowError):
+                return []
+            if not math.isfinite(fixed_qty) or fixed_qty <= 0:
+                return []
+            row["qty"] = fixed_qty
+        normalized.append(row)
 
     if not normalized:
         normalized = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
@@ -2817,7 +2893,6 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
     for x in normalized:
         x["close_fraction"] /= total
     return normalized
-
 
 def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, price_precision: int, trade_id: str | None = None) -> bool:
     order_type = str(order.get("type", "")).upper()
@@ -3608,6 +3683,10 @@ def ensure_directional_protection(
             precision=precision,
             min_qty=min_qty,
             fractions=[x["close_fraction"] for x in tp_levels_norm],
+            fixed_quantities=(
+                [x["qty"] for x in tp_levels_norm]
+                if all("qty" in x for x in tp_levels_norm) else None
+            ),
         )
     except ValueError as exc:
         return {

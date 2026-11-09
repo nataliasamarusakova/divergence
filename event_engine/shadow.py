@@ -10,6 +10,10 @@ from typing import Any
 from event_engine.json_safe import json_safe
 
 
+class ShadowStateError(RuntimeError):
+    """Raised when the persisted paper-trade snapshot cannot be trusted."""
+
+
 def _load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -27,13 +31,28 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _load_state(path: Path) -> dict[str, dict]:
+    """Load paper state without silently converting corruption into an empty book.
+
+    Returning ``{}`` on a malformed snapshot allowed the next successful update
+    to overwrite all prior shadow trades. The caller may skip this research-only
+    update, but the source file must remain untouched for recovery.
+    """
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        raise ShadowStateError(f"shadow state is unreadable: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ShadowStateError(
+            f"shadow state root must be a JSON object, got {type(data).__name__}"
+        )
+    malformed = [str(key) for key, value in data.items() if not isinstance(value, dict)]
+    if malformed:
+        raise ShadowStateError(
+            "shadow state contains non-object records: " + ", ".join(malformed[:10])
+        )
+    return data
 
 
 def _save_state(path: Path, state: dict[str, dict]) -> None:
