@@ -287,7 +287,17 @@ def _retry_pending_notifications() -> None:
             notifications[nid] = item
             changed = True
     if changed:
-        _save_notifications(notifications)
+        try:
+            _save_notifications(notifications)
+        except Exception as exc:
+            # Outbox persistence is independent from position management. Keep
+            # the original durable file untouched and retry this suppression on
+            # the next cycle instead of aborting TP/SL tracking for open trades.
+            log.critical(
+                "[TELEGRAM] Could not persist legacy notification suppression; "
+                "position tracking will continue and suppression will be retried: %s",
+                exc,
+            )
 
     pending_ids = [
         nid for nid, item in notifications.items()

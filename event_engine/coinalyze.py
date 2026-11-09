@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,10 @@ COINALYZE_URL = os.environ.get("COINALYZE_URL", "https://coinalyze.net/").strip(
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "").strip()
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "").strip()
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
+PAGE_NAVIGATION_TIMEOUT_MS = 30_000
+PAGE_TABLE_TIMEOUT_MS = 20_000
+PAGE_LOAD_MAX_ATTEMPTS = 2
+PAGE_LOAD_RETRY_DELAY_SECONDS = 2.0
 DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "").strip()
 
 
@@ -271,19 +276,21 @@ def _setup_browser_context(p):
 
 
 def _load_page(page, url: str) -> str:
-    page.goto(url, wait_until="networkidle", timeout=60_000)
+    # Coinalyze may keep background requests open indefinitely. The table, not
+    # global network idleness, is the readiness condition required by the parser.
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=PAGE_NAVIGATION_TIMEOUT_MS,
+    )
     page.wait_for_timeout(3_000)
 
     content = page.content()
     if "Attention Required" in content:
         log.warning("[COINALYZE] Cloudflare challenge detected, waiting...")
         page.wait_for_timeout(10_000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=30_000)
-        except Exception:
-            pass
 
-    page.wait_for_selector("tbody tr", timeout=25_000)
+    page.wait_for_selector("tbody tr", timeout=PAGE_TABLE_TIMEOUT_MS)
     prev = len(page.query_selector_all("tbody tr"))
 
     for attempt in range(15):
@@ -300,17 +307,40 @@ def _load_page(page, url: str) -> str:
             break
         prev = cur
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=10_000)
-    except Exception:
-        pass
-
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
 
     final_count = len(page.query_selector_all("tbody tr"))
     log.info("[COINALYZE] Page rows=%d (pagination=%s)", final_count, bool(page.query_selector(".pagination")))
     return page.content()
+
+
+def _load_page_with_retry(page, url: str) -> str:
+    """Load one Coinalyze page with one bounded retry on transient failures."""
+    for attempt in range(1, PAGE_LOAD_MAX_ATTEMPTS + 1):
+        try:
+            return _load_page(page, url)
+        except Exception as exc:
+            if attempt >= PAGE_LOAD_MAX_ATTEMPTS:
+                log.error(
+                    "[COINALYZE] Page load failed after %d attempts for %s: %s",
+                    attempt,
+                    url,
+                    exc,
+                )
+                raise
+            log.warning(
+                "[COINALYZE] Page load attempt %d/%d failed for %s: %s; retrying in %.1fs",
+                attempt,
+                PAGE_LOAD_MAX_ATTEMPTS,
+                url,
+                exc,
+                PAGE_LOAD_RETRY_DELAY_SECONDS,
+            )
+            time.sleep(PAGE_LOAD_RETRY_DELAY_SECONDS)
+
+    # The loop always returns or raises; this guards future changes to attempts.
+    raise RuntimeError(f"[COINALYZE] Page load exhausted retries: {url}")
 
 
 def click_next_page(page, current_page_num: int) -> bool:
@@ -480,7 +510,7 @@ def fetch_data() -> list[CoinalyzeRow]:
     with sync_playwright() as p:
         browser, page = _setup_browser_context(p)
         try:
-            html = _load_page(page, COINALYZE_URL)
+            html = _load_page_with_retry(page, COINALYZE_URL)
             if DEBUG_HTML_FILE:
                 try:
                     with open(DEBUG_HTML_FILE, "w", encoding="utf-8") as f:
@@ -507,7 +537,7 @@ def fetch_data() -> list[CoinalyzeRow]:
             if len(page_urls) > 1:
                 for i, url in enumerate(page_urls[1:], start=2):
                     try:
-                        html = _load_page(page, url)
+                        html = _load_page_with_retry(page, url)
                         rows = parse_table(html)
                         added = 0
                         for row in rows:

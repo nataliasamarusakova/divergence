@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from event_engine import bingx  # noqa: E402
+from event_engine.version import APP_VERSION  # noqa: E402
 from event_engine.telegram import send_detailed  # noqa: E402
 
 DATA_DIR = Path(os.environ.get("DIVERGENCE_DATA_DIR", ROOT / "data"))
@@ -538,7 +539,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     report: dict[str, Any] = {
         "record_type": "DAILY_RECONCILIATION",
         "ts": now_ms,
-        "build_version": str(os.environ.get("DIVERGENCE_BUILD_VERSION", "UNKNOWN")),
+        "build_version": APP_VERSION,
         "utc_day": utc_now.date().isoformat(),
         "mode": "READ_ONLY",
         "status": "OK",
