@@ -34,11 +34,17 @@ ACTIVE_TRADES_PATH = DATA_DIR / "active_trades.json"
 TRADES_PATH = DATA_DIR / "trades.jsonl"
 HEALTH_PATH = DATA_DIR / "health.jsonl"
 ALERT_STATE_PATH = DATA_DIR / "reconciliation_alert_state.json"
+RUNTIME_STATE_MARKER_PATH = DATA_DIR / "runtime_state_initialized.json"
+INCOME_PENDING_STATE_PATH = DATA_DIR / "reconciliation_income_pending.json"
 ALERT_REPEAT_SUPPRESSION_SEC = max(0.0, min(24 * 3600.0, float(os.environ.get("RECONCILIATION_ALERT_REPEAT_SUPPRESSION_SEC", "3600"))))
 MAX_INCOME_SYMBOLS = max(0, min(3, int(os.environ.get("RECONCILIATION_MAX_SYMBOLS", "2"))))
 INCOME_TIMEOUT_SEC = max(1.0, min(3.0, float(os.environ.get("RECONCILIATION_INCOME_TIMEOUT_SEC", "3"))))
 INCOME_REQUEST_BUDGET = max(1, min(4, int(os.environ.get("RECONCILIATION_INCOME_REQUEST_BUDGET", "4"))))
 INCOME_RETRIES = max(0, min(2, int(os.environ.get("RECONCILIATION_INCOME_RETRIES", "1"))))
+INCOME_NULL_GRACE_SEC = max(
+    0.0,
+    min(6 * 3600.0, float(os.environ.get("RECONCILIATION_INCOME_NULL_GRACE_SEC", "1800"))),
+)
 # A mismatch can be caused by a fill that occurred after the tracker poll at the
 # start of the scan. Verify order executions only for mismatched positions and
 # keep the read-only reconciliation bounded.
@@ -164,6 +170,175 @@ def _load_journal(path: Path) -> tuple[list[dict], list[str]]:
             continue
         records.append(obj)
     return records, errors
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Durably replace a small reconciliation state file without clobbering on failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Directory fsync is not supported by every filesystem.
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_json_state(path: Path, value: dict) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    )
+
+
+def _has_prior_runtime_state_evidence(
+    *, active_path: Path, trades_path: Path, health_path: Path,
+) -> bool:
+    """Detect evidence that the local trading state was previously initialized.
+
+    A missing pair of files is bootstrap-safe only on a genuinely clean start.
+    Existing state files, archived trade journals, or a previous successful
+    reconciliation prove that silently recreating an empty active state could
+    hide a later state loss.
+    """
+    if active_path.exists() or trades_path.exists():
+        return True
+    archive_dir = trades_path.parent / "archive"
+    if archive_dir.exists() and any(archive_dir.glob("trades-*.jsonl.gz")):
+        return True
+    if not health_path.exists():
+        return False
+    try:
+        with health_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    # A damaged runtime history is not evidence of a clean
+                    # first start. Do not bootstrap empty state over ambiguity.
+                    return True
+                if not isinstance(row, dict) or row.get("record_type") != "DAILY_RECONCILIATION":
+                    continue
+                checks = row.get("checks") if isinstance(row.get("checks"), dict) else {}
+                local = checks.get("local_active_state") if isinstance(checks.get("local_active_state"), dict) else {}
+                journal = checks.get("trade_journal") if isinstance(checks.get("trade_journal"), dict) else {}
+                # UNKNOWN means the file had not yet been created. OK/WARNING
+                # means a real local file was read and therefore existed.
+                if str(local.get("status", "")).upper() in {"OK", "WARNING"}:
+                    return True
+                if str(journal.get("status", "")).upper() == "OK":
+                    return True
+    except OSError:
+        # An unreadable history file is not proof of a clean first start.
+        return True
+    return False
+
+
+def _ensure_runtime_state_initialized(
+    *, active_path: Path, trades_path: Path, health_path: Path,
+    marker_path: Path, active: dict | None, active_error: str | None,
+    exchange_positions: dict[tuple[str, str], float], exchange_errors: list[str],
+    now_ms: int,
+) -> tuple[dict | None, str | None, dict]:
+    """Initialize only a confirmed flat, first-run account; never heal state loss."""
+    if marker_path.exists():
+        marker, marker_error = _load_json_object(marker_path)
+        if marker_error or not isinstance(marker, dict) or marker.get("version") != 1 or marker.get("initialized") is not True:
+            return active, active_error, {
+                "status": "ERROR", "error": marker_error or "runtime_state_marker_schema_invalid",
+            }
+        return active, active_error, {"status": "OK", "source": "persistent_marker"}
+
+    prior_evidence = _has_prior_runtime_state_evidence(
+        active_path=active_path, trades_path=trades_path, health_path=health_path,
+    )
+    reason = "legacy_state_or_history_present"
+    status = "MARKED_EXISTING_STATE"
+    if not prior_evidence:
+        if exchange_errors:
+            # A failed/ambiguous exchange response cannot establish that the
+            # account is flat. Leave the marker absent so a later clean snapshot
+            # can complete first-run initialization.
+            return active, active_error, {
+                "status": "UNKNOWN", "reason": "exchange_snapshot_not_clean",
+            }
+        if exchange_positions:
+            # Live exchange exposure with no local files is not a clean start.
+            # Persist this fact so a later flat snapshot cannot silently erase it.
+            reason = "exchange_exposure_present_without_local_state"
+            status = "EXPOSURE_WITHOUT_LOCAL_STATE"
+        else:
+            try:
+                if not active_path.exists() and not trades_path.exists():
+                    _atomic_write_text(active_path, "{}\n")
+                    _atomic_write_text(trades_path, "")
+                    active = {}
+                    active_error = None
+                    reason = "confirmed_empty_exchange_snapshot"
+                    status = "BOOTSTRAPPED_EMPTY_ACCOUNT"
+                else:
+                    # A partial file set is evidence of a previously initialized
+                    # state and must not be completed with invented empty data.
+                    reason = "partial_local_state_present"
+                    status = "PARTIAL_STATE_NOT_BOOTSTRAPPED"
+            except OSError as exc:
+                return active, active_error, {
+                    "status": "ERROR", "error": f"runtime_state_bootstrap_failed:{type(exc).__name__}:{exc}",
+                }
+
+    marker = {
+        "version": 1,
+        "initialized": True,
+        "initialized_at_ts_ms": int(now_ms),
+        "reason": reason,
+    }
+    try:
+        _write_json_state(marker_path, marker)
+    except OSError as exc:
+        return active, active_error, {
+            "status": "ERROR", "error": f"runtime_state_marker_write_failed:{type(exc).__name__}:{exc}",
+        }
+    return active, active_error, {"status": status, **marker}
+
+
+def _load_income_pending_state(path: Path) -> tuple[dict[str, dict], str | None, bool]:
+    """Load persisted null-income grace timestamps without repairing corruption."""
+    if not path.exists():
+        return {}, None, False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, f"income_pending_state_read_error:{type(exc).__name__}:{exc}", True
+    if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("pending"), dict):
+        return {}, "income_pending_state_schema_invalid", True
+    pending: dict[str, dict] = {}
+    for key, item in value["pending"].items():
+        if not isinstance(key, str) or not isinstance(item, dict):
+            return {}, "income_pending_state_entry_invalid", True
+        since = item.get("since_ts_ms")
+        if isinstance(since, bool) or not isinstance(since, int) or since <= 0:
+            return {}, f"income_pending_state_timestamp_invalid:{key}", True
+        pending[key] = dict(item)
+    return pending, None, True
+
+
+def _save_income_pending_state(path: Path, pending: dict[str, dict]) -> None:
+    _write_json_state(path, {"version": 1, "pending": pending})
 
 
 def _is_closed_or_confirmed_gone_trade(trade: dict) -> bool:
@@ -530,9 +705,13 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         data_dir = Path(data_dir)
         active_path, trades_path, health_path = data_dir / "active_trades.json", data_dir / "trades.jsonl", data_dir / "health.jsonl"
         alert_state_path = data_dir / "reconciliation_alert_state.json"
+        runtime_marker_path = data_dir / "runtime_state_initialized.json"
+        income_pending_path = data_dir / "reconciliation_income_pending.json"
     else:
         active_path, trades_path, health_path = ACTIVE_TRADES_PATH, TRADES_PATH, HEALTH_PATH
         alert_state_path = ALERT_STATE_PATH
+        runtime_marker_path = RUNTIME_STATE_MARKER_PATH
+        income_pending_path = INCOME_PENDING_STATE_PATH
     now_ms = int(now_ms or time.time() * 1000)
     utc_now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     day_start = int(utc_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -545,36 +724,15 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         "status": "OK",
         "checks": {},
         "discrepancies": [],
-        "notes": ["Daily income totals are account+symbol aggregates and are not per-position attribution."],
+        "notes": [
+            "Daily income totals are account+symbol aggregates and are not per-position attribution.",
+            "READ_ONLY means no exchange orders or positions are modified; local reconciliation metadata may be persisted.",
+        ],
     }
 
     active, active_error = _load_json_object(active_path)
     local_positions: dict[tuple[str, str], float] = {}
     active_errors: list[str] = []
-    if active is None:
-        report["checks"]["local_active_state"] = {"status": "UNKNOWN", "error": active_error}
-        report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_UNAVAILABLE", "detail": active_error})
-    else:
-        local_positions, active_errors = _active_local_positions(active)
-        post_close_pending = _post_close_lifecycle_pending(active)
-        report["checks"]["local_active_state"] = {
-            "status": "OK" if not active_errors else "WARNING",
-            "active_event_records": len(active),
-            "active_position_keys": len(local_positions),
-            "post_close_lifecycle_pending_records": len(post_close_pending),
-            "parse_errors": active_errors,
-        }
-        for detail in active_errors:
-            report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_INVALID", "detail": detail})
-        if post_close_pending:
-            report["discrepancies"].append({
-                "level": "WARNING", "code": "LOCAL_CLOSE_LIFECYCLE_PENDING",
-                "detail": (
-                    f"{len(post_close_pending)} non-open trade record(s) remain for close journal, "
-                    "notification, or protection-cleanup retries; these rows are excluded from live position totals."
-                ),
-                "records": post_close_pending[:20],
-            })
 
     try:
         exchange_rows = bingx.get_positions(timeout_sec=3.0, retryable=False)
@@ -587,6 +745,50 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         }
         for detail in exchange_errors:
             report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_ROW_UNIDENTIFIABLE", "detail": detail})
+        active, active_error, runtime_state_check = _ensure_runtime_state_initialized(
+            active_path=active_path,
+            trades_path=trades_path,
+            health_path=health_path,
+            marker_path=runtime_marker_path,
+            active=active,
+            active_error=active_error,
+            exchange_positions=exchange_positions,
+            exchange_errors=exchange_errors,
+            now_ms=now_ms,
+        )
+        report["checks"]["runtime_state_initialization"] = runtime_state_check
+        if runtime_state_check.get("status") == "ERROR":
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "RUNTIME_STATE_INITIALIZATION_UNAVAILABLE",
+                "detail": str(runtime_state_check.get("error") or "runtime_state_initialization_failed"),
+            })
+        if active is None:
+            report["checks"]["local_active_state"] = {"status": "UNKNOWN", "error": active_error}
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "LOCAL_ACTIVE_STATE_UNAVAILABLE",
+                "detail": active_error or "active_state_unavailable",
+            })
+        else:
+            local_positions, active_errors = _active_local_positions(active)
+            post_close_pending = _post_close_lifecycle_pending(active)
+            report["checks"]["local_active_state"] = {
+                "status": "OK" if not active_errors else "WARNING",
+                "active_event_records": len(active),
+                "active_position_keys": len(local_positions),
+                "post_close_lifecycle_pending_records": len(post_close_pending),
+                "parse_errors": active_errors,
+            }
+            for detail in active_errors:
+                report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_INVALID", "detail": detail})
+            if post_close_pending:
+                report["discrepancies"].append({
+                    "level": "WARNING", "code": "LOCAL_CLOSE_LIFECYCLE_PENDING",
+                    "detail": (
+                        f"{len(post_close_pending)} non-open trade record(s) remain for close journal, "
+                        "notification, or protection-cleanup retries; these rows are excluded from live position totals."
+                    ),
+                    "records": post_close_pending[:20],
+                })
         catalog_status = "NOT_NEEDED"
         catalog_count = 0
         catalog_error = None
@@ -801,6 +1003,25 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         exchange_positions = {}
         report["checks"]["exchange_positions"] = {"status": "ERROR", "error": f"{type(exc).__name__}:{exc}"}
         report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_QUERY_FAILED", "detail": str(exc)})
+        report["checks"]["runtime_state_initialization"] = {
+            "status": "UNKNOWN", "reason": "exchange_snapshot_failed_no_bootstrap_attempted",
+        }
+        if active is None:
+            report["checks"]["local_active_state"] = {"status": "UNKNOWN", "error": active_error or "file_missing"}
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "LOCAL_ACTIVE_STATE_UNAVAILABLE",
+                "detail": active_error or "active_state_unavailable",
+            })
+        else:
+            local_positions, active_errors = _active_local_positions(active)
+            report["checks"]["local_active_state"] = {
+                "status": "OK" if not active_errors else "WARNING",
+                "active_event_records": len(active),
+                "active_position_keys": len(local_positions),
+                "parse_errors": active_errors,
+            }
+            for detail in active_errors:
+                report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_INVALID", "detail": detail})
 
     # Fetch one account-wide snapshot. Querying openOrders once per position can
     # trip BingX's endpoint trigger-frequency breaker, and symbol-by-symbol retries
@@ -1004,6 +1225,26 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     income_summaries: dict[str, dict] = {}
     account_wide_income: dict[str, Any] | None = None
     account_wide_income_attempted = False
+    income_pending, income_pending_error, income_pending_file_exists = _load_income_pending_state(income_pending_path)
+    income_pending_dirty = False
+    pending_income_symbols: set[str] = set()
+    expired_income_symbols: set[str] = set()
+    if income_pending_error:
+        report["checks"]["daily_income_pending_state"] = {
+            "status": "ERROR", "error": income_pending_error,
+        }
+        report["discrepancies"].append({
+            "level": "WARNING", "code": "DAILY_INCOME_PENDING_STATE_UNAVAILABLE",
+            "detail": income_pending_error,
+        })
+    income_pending_key_prefix = f"{utc_now.date().isoformat()}|"
+    # Bound persistent metadata. Expired UTC-day entries are no longer queried
+    # by this daily report; prior reports remain in health.jsonl.
+    if income_pending_error is None:
+        stale_keys = [key for key in income_pending if not key.startswith(income_pending_key_prefix)]
+        for key in stale_keys:
+            del income_pending[key]
+            income_pending_dirty = True
     for symbol, _count in candidate_symbols.most_common(MAX_INCOME_SYMBOLS):
         income: dict[str, Any] = {"status": "error", "error": "income_query_not_attempted", "complete": False, "records": []}
         attempts = 0
@@ -1084,10 +1325,44 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                         detail += "; account_wide_api_response=" + json.dumps(
                             fallback_diagnostics, ensure_ascii=False, separators=(",", ":"),
                         )[:500]
+                pending_key = f"{utc_now.date().isoformat()}|{symbol}"
+                is_transient_null = bingx.is_income_history_null_data_shape(income)
+                if is_transient_null and income_pending_error is None:
+                    pending_entry = income_pending.get(pending_key)
+                    if pending_entry is None:
+                        pending_entry = {
+                            "since_ts_ms": int(now_ms),
+                            "first_error": "income_history_unexpected_data_shape",
+                        }
+                        income_pending[pending_key] = pending_entry
+                        income_pending_dirty = True
+                    since_ts_ms = int(pending_entry["since_ts_ms"])
+                    age_sec = max(0.0, (now_ms - since_ts_ms) / 1000.0)
+                    if age_sec < INCOME_NULL_GRACE_SEC:
+                        pending_income_symbols.add(symbol)
+                        income_summaries[symbol] = {
+                            "status": "PENDING",
+                            "error": detail,
+                            "attempts": attempts,
+                            "pending_since_ts_ms": since_ts_ms,
+                            "pending_age_sec": round(age_sec, 3),
+                            "grace_sec": INCOME_NULL_GRACE_SEC,
+                            "accounting_value": "UNKNOWN_NOT_ZERO",
+                            "shape_fingerprint": shape_fingerprint,
+                            "response_diagnostics": response_diagnostics,
+                        }
+                        continue
+                    expired_income_symbols.add(symbol)
+                    detail += f"; null_data_pending_for_sec={int(age_sec)}; grace_sec={int(INCOME_NULL_GRACE_SEC)}"
+                else:
+                    if income_pending_error is None and pending_key in income_pending:
+                        del income_pending[pending_key]
+                        income_pending_dirty = True
                 income_summaries[symbol] = {
                     "status": "ERROR", "error": detail, "attempts": attempts,
                     "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
                     "response_diagnostics": response_diagnostics,
+                    "accounting_value": "UNKNOWN_NOT_ZERO",
                 }
                 report["discrepancies"].append({
                     "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE",
@@ -1095,6 +1370,10 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     "response_diagnostics": response_diagnostics,
                 })
                 continue
+        pending_key = f"{utc_now.date().isoformat()}|{symbol}"
+        if income_pending_error is None and pending_key in income_pending:
+            del income_pending[pending_key]
+            income_pending_dirty = True
         totals = {"realized_pnl": 0.0, "trading_fees": 0.0, "funding_fees": 0.0, "other_known": 0.0, "records": len(income.get("records", [])), "attempts": attempts}
         for row in income.get("records", []):
             if not isinstance(row, dict) or str(row.get("asset") or "").upper() != "USDT":
@@ -1137,8 +1416,44 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     "bot_confirmed_trade_totals": local_confirmed, "component_deltas": component_deltas,
                     "detail": "Warning only: account aggregate may include non-bot/manual trades and other open positions.",
                 })
+    income_pending_write_error = None
+    if income_pending_error is None and (income_pending_dirty or not income_pending_file_exists):
+        try:
+            _save_income_pending_state(income_pending_path, income_pending)
+        except OSError as exc:
+            income_pending_write_error = f"income_pending_state_write_error:{type(exc).__name__}:{exc}"
+            report["discrepancies"].append({
+                "level": "WARNING", "code": "DAILY_INCOME_PENDING_STATE_UNAVAILABLE",
+                "detail": income_pending_write_error,
+            })
+            for symbol in sorted(pending_income_symbols):
+                summary = income_summaries.get(symbol)
+                if isinstance(summary, dict) and summary.get("status") == "PENDING":
+                    summary["status"] = "ERROR"
+                    summary["accounting_value"] = "UNKNOWN_NOT_ZERO"
+                    summary["error"] = f"{summary.get('error')}; grace_state_not_persisted"
+                    report["discrepancies"].append({
+                        "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE",
+                        "symbol": symbol,
+                        "detail": f"{summary['error']} (pending grace state could not be persisted)",
+                    })
+    if income_pending_error is None and income_pending_write_error is None:
+        pending_state_status = (
+            "WARNING" if expired_income_symbols else "PENDING" if pending_income_symbols else "OK"
+        )
+        report["checks"]["daily_income_pending_state"] = {
+            "status": pending_state_status,
+            "pending_symbols": sorted(pending_income_symbols),
+            "expired_symbols": sorted(expired_income_symbols),
+            "grace_sec": INCOME_NULL_GRACE_SEC,
+            "note": "Successful-envelope null data remains UNKNOWN, never zero. Transient null responses are pending during the bounded grace period; persistent null responses remain warnings.",
+        }
     report["checks"]["daily_exchange_income_aggregates"] = {
-        "status": "OK" if all(x.get("status") == "OK" for x in income_summaries.values()) else ("UNKNOWN" if not income_summaries else "WARNING"),
+        "status": (
+            "WARNING" if any(x.get("status") == "ERROR" for x in income_summaries.values())
+            else "PENDING" if any(x.get("status") == "PENDING" for x in income_summaries.values())
+            else "OK" if income_summaries else "NOT_NEEDED"
+        ),
         "symbols_checked": income_summaries,
         "scope": "account+symbol aggregate; never used to attribute per-position net PnL",
     }
@@ -1162,7 +1477,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
             for item in report["discrepancies"][:12]:
                 detail = _discrepancy_message_detail(item)
                 lines.append(f"• <b>{item.get('level')}</b> {item.get('code')}: <code>{str(detail)[:350]}</code>")
-            lines.append("Read-only check; it does not place/cancel orders or block a later run.")
+            lines.append("Exchange read-only check; persists local reconciliation metadata only. It does not place/cancel orders or block a later run.")
             try:
                 delivery = send_detailed("\n".join(lines))
                 delivered = bool(delivery) and all(
