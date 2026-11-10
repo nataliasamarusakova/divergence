@@ -72,6 +72,109 @@ def test_missing_active_state_is_unknown_not_interpreted_as_empty(tmp_path, monk
     assert any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
 
 
+def test_clean_first_run_bootstraps_empty_local_state_only_after_confirmed_flat_exchange(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["status"] == "OK"
+    assert report["checks"]["runtime_state_initialization"]["status"] == "BOOTSTRAPPED_EMPTY_ACCOUNT"
+    assert report["checks"]["local_active_state"]["status"] == "OK"
+    assert report["checks"]["trade_journal"]["status"] == "OK"
+    assert json.loads((data / "active_trades.json").read_text(encoding="utf-8")) == {}
+    assert (data / "trades.jsonl").read_text(encoding="utf-8") == ""
+    marker = json.loads((data / "runtime_state_initialized.json").read_text(encoding="utf-8"))
+    assert marker["initialized"] is True
+    assert marker["reason"] == "confirmed_empty_exchange_snapshot"
+    assert not any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
+
+
+def test_runtime_state_loss_after_initialization_is_not_silently_bootstrapped(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "runtime_state_initialized.json").write_text(json.dumps({
+        "version": 1, "initialized": True, "initialized_at_ts_ms": _now_ms(),
+        "reason": "confirmed_empty_exchange_snapshot",
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["local_active_state"]["status"] == "UNKNOWN"
+    assert any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
+    assert not (data / "active_trades.json").exists()
+
+
+def test_clean_state_is_not_bootstrapped_when_exchange_snapshot_has_live_exposure(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "ETH-USDT", "positionSide": "SHORT", "positionAmt": "0.5",
+    }])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: _stub_snapshot())
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["runtime_state_initialization"]["status"] == "EXPOSURE_WITHOUT_LOCAL_STATE"
+    assert report["checks"]["local_active_state"]["status"] == "UNKNOWN"
+    assert any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
+    assert not (data / "active_trades.json").exists()
+    assert not (data / "trades.jsonl").exists()
+
+
+def test_runtime_state_is_not_bootstrapped_when_exchange_snapshot_fails(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("exchange unavailable")))
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["runtime_state_initialization"]["status"] == "UNKNOWN"
+    assert report["checks"]["local_active_state"]["status"] == "UNKNOWN"
+    assert not (data / "active_trades.json").exists()
+    assert not (data / "trades.jsonl").exists()
+
+
+def test_missing_state_with_prior_successful_reconciliation_evidence_is_state_loss(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    previous = {
+        "record_type": "DAILY_RECONCILIATION",
+        "checks": {
+            "local_active_state": {"status": "OK", "active_event_records": 0},
+            "trade_journal": {"status": "OK", "records": 0},
+        },
+    }
+    (data / "health.jsonl").write_text(json.dumps(previous) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["runtime_state_initialization"]["status"] == "MARKED_EXISTING_STATE"
+    assert report["checks"]["local_active_state"]["status"] == "UNKNOWN"
+    assert any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
+    assert not (data / "active_trades.json").exists()
+    assert not (data / "trades.jsonl").exists()
+
+
+def test_corrupt_health_history_prevents_empty_state_bootstrap(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "health.jsonl").write_text('{truncated-json\n', encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert report["checks"]["runtime_state_initialization"]["status"] == "MARKED_EXISTING_STATE"
+    assert report["checks"]["local_active_state"]["status"] == "UNKNOWN"
+    assert any(item["code"] == "LOCAL_ACTIVE_STATE_UNAVAILABLE" for item in report["discrepancies"])
+    assert not (data / "active_trades.json").exists()
+    assert not (data / "trades.jsonl").exists()
+
+
 def test_daily_reconciliation_rejects_stop_order_without_positive_trigger_price(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
@@ -293,6 +396,7 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
             "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
         }
     monkeypatch.setattr(recon.bingx, "get_income_history", income_unavailable)
+    monkeypatch.setattr(recon, "INCOME_NULL_GRACE_SEC", 0.0)
     alerts = []
     monkeypatch.setattr(recon, "send_detailed", lambda text: alerts.append(text) or {"test": {"sent": True}})
     # A stale environment override must never split the displayed build version
@@ -311,6 +415,119 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     assert "account_wide_income_unexpected_data_shape" in warning["detail"] or "income_history_unexpected_data_shape" in warning["detail"]
     assert report["build_version"] == recon.APP_VERSION
     assert f"Build: <code>{recon.APP_VERSION}</code>" in alerts[0]
+
+
+def test_income_null_data_is_pending_during_grace_and_warns_only_after_expiry(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-INCOME-PENDING", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon, "INCOME_NULL_GRACE_SEC", 1800.0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    null_data = {
+        "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
+        "records": [], "shape_fingerprint": "NULL123", "shape_summary": "NoneType",
+        "response_type": "dict", "response_code": 0, "response_msg": "",
+        "response_keys": ["code", "data", "msg"], "response_data_type": "NoneType",
+    }
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: dict(null_data))
+
+    first = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+    first_summary = first["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert first_summary["status"] == "PENDING"
+    assert first_summary["accounting_value"] == "UNKNOWN_NOT_ZERO"
+    assert first["checks"]["daily_exchange_income_aggregates"]["status"] == "PENDING"
+    assert not any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in first["discrepancies"])
+    state_path = data / "reconciliation_income_pending.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pending"]["2026-10-27|BTC-USDT"]["since_ts_ms"] == now_ms
+
+    second = recon.run_reconciliation(now_ms=now_ms + 10 * 60_000, data_dir=data, notify=False)
+    second_summary = second["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert second_summary["status"] == "PENDING"
+    assert second_summary["pending_since_ts_ms"] == now_ms
+    assert not any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in second["discrepancies"])
+
+    expired = recon.run_reconciliation(now_ms=now_ms + 1800 * 1000, data_dir=data, notify=False)
+    expired_summary = expired["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert expired_summary["status"] == "ERROR"
+    assert expired_summary["accounting_value"] == "UNKNOWN_NOT_ZERO"
+    warning = next(item for item in expired["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
+    assert "null_data_pending_for_sec=1800" in warning["detail"]
+    assert expired["checks"]["daily_income_pending_state"]["status"] == "WARNING"
+    assert expired["checks"]["daily_income_pending_state"]["expired_symbols"] == ["BTC-USDT"]
+
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [], "query_scope": "SYMBOL",
+    })
+    recovered = recon.run_reconciliation(now_ms=now_ms + 1900 * 1000, data_dir=data, notify=False)
+    recovered_summary = recovered["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert recovered_summary["status"] == "OK"
+    assert not any(item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE" for item in recovered["discrepancies"])
+    assert json.loads(state_path.read_text(encoding="utf-8"))["pending"] == {}
+
+
+def test_income_null_pending_state_write_failure_does_not_silence_warning(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-INCOME-WRITE-FAIL", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon, "INCOME_NULL_GRACE_SEC", 1800.0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
+        "records": [], "response_code": 0, "response_data_type": "NoneType",
+        "response_keys": ["code", "data", "msg"],
+    })
+    monkeypatch.setattr(recon, "_save_income_pending_state", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    codes = [item["code"] for item in report["discrepancies"]]
+    assert "DAILY_INCOME_PENDING_STATE_UNAVAILABLE" in codes
+    assert "DAILY_INCOME_QUERY_INCOMPLETE" in codes
+    summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
+    assert summary["status"] == "ERROR"
+    assert summary["accounting_value"] == "UNKNOWN_NOT_ZERO"
+    assert not any(item["status"] == "PENDING" for item in report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"].values())
+
+
+def test_corrupt_income_pending_state_fails_closed_without_overwrite(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-INCOME-CORRUPT", "symbol": "BTC",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    pending_path = data / "reconciliation_income_pending.json"
+    original = b'{"version":99,"pending":{}}'
+    pending_path.write_bytes(original)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "error", "error": "income_history_unexpected_data_shape", "complete": False,
+        "records": [], "response_code": 0, "response_data_type": "NoneType",
+        "response_keys": ["code", "data", "msg"],
+    })
+
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    codes = {item["code"] for item in report["discrepancies"]}
+    assert "DAILY_INCOME_PENDING_STATE_UNAVAILABLE" in codes
+    assert "DAILY_INCOME_QUERY_INCOMPLETE" in codes
+    assert pending_path.read_bytes() == original
 
 
 def test_trump_legacy_exchange_symbol_is_canonicalized_without_merging_sol():

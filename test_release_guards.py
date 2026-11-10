@@ -462,6 +462,7 @@ def test_release_runs_bounded_read_only_reconciliation_after_engine():
     assert workflow.index("Read-only BingX position and daily ledger reconciliation") < workflow.index("Commit state")
     assert 'RECONCILIATION_MAX_SYMBOLS: "2"' in workflow
     assert 'RECONCILIATION_INCOME_REQUEST_BUDGET: "4"' in workflow
+    assert 'RECONCILIATION_INCOME_NULL_GRACE_SEC: "1800"' in workflow
     assert 'RECONCILIATION_FILL_ORDER_QUERY_BUDGET: "24"' in workflow
     assert 'RECONCILIATION_FILL_ORDER_TIMEOUT_SEC: "2"' in workflow
     assert 'RECONCILIATION_FILL_ORDER_TIME_BUDGET_SEC: "20"' in workflow
