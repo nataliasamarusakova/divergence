@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794379302403,
+  "updated_ts": 1794379626390,
   "events": [
     {
       "event_id": "EVT_7B7F2A1E0D387EAF",
@@ -27,7 +27,11 @@
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.06483335460204177,
+        "htf_slope50": 0.00018860382084513738,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -57,7 +61,11 @@
         "broken_ts": 1794329999999,
         "bos_ts": 1793984399999,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 1.407405233744462,
+        "htf_slope50": -0.00367612595157496,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -455,35 +463,6 @@
       }
     },
     {
-      "event_id": "EVT_F9AAC9C8CB1EB398",
-      "symbol": "ERA",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "DONCHIAN_RETEST_BREAKOUT",
-      "timestamps": {
-        "pivot_1_ts": 1794376799999,
-        "pivot_2_ts": 1794376799999,
-        "detected_at_ts": 1794376799999
-      },
-      "event_fact": {
-        "detection_close_price": 0.08714,
-        "donchian_high": 0.0863,
-        "donchian_low": 0.07211,
-        "breakout_atr": 0.2922133267483344,
-        "volume_ratio": 2.9487501700052188,
-        "adx": 42.24495977365565,
-        "ema200": 0.07319428977766124,
-        "compressed_recent": false,
-        "bb_width": 0.16037551452609042,
-        "trigger_level": 0.0863,
-        "requires_retest": true,
-        "engine": "DONCHIAN_RETEST",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_BD3B40DFBE71C7C9",
       "symbol": "ERA",
       "timeframe": "1h",
@@ -507,7 +486,60 @@
         "volume_ratio": 2.9487501700052188,
         "body_fraction": 0.6428571428571416,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.07306003118889963,
+        "htf_slope50": 0.001466371339013381,
+        "context_timeframe": "4h",
+        "trend_filter": {
+          "version": "trend-v1-2026-10-04",
+          "enabled": true,
+          "mode": "shadow",
+          "symbol": "ERA",
+          "event_direction": "LONG",
+          "event_type": "ORDER_BLOCK_BULLISH",
+          "decision_ts": 1794379499999,
+          "trend_decision": "ALIGNED",
+          "trend_reject_reason": null,
+          "trend_4h": "BULL",
+          "trend_1h": "LONG",
+          "trend_persistence": "PERSISTENT",
+          "trend_4h_bars": 400,
+          "trend_1h_bars": 400,
+          "trend_4h_bar_close_ts": 1794369599999,
+          "trend_1h_bar_close_ts": 1794376799999,
+          "trend_persistence_1h_return_pct": 8.80259707828693,
+          "trend_persistence_4h_return_pct": 4.311199207135774,
+          "btc_regime": "BULLISH",
+          "btc_bar_close_ts": 1794376799999,
+          "btc_chg_1h_pct": 0.2610470101705336,
+          "btc_chg_4h_pct": 0.4383395561693064,
+          "btc_context_veto": false,
+          "require_persistence": false,
+          "min_bars_1h": 400,
+          "min_bars_4h": 400,
+          "persistence_lookback_1h": 6,
+          "persistence_lookback_4h": 3,
+          "slope_lookback_4h": 6,
+          "btc_bars": 10,
+          "trend_4h_close": 0.0842,
+          "trend_4h_ema50": 0.07306003118889963,
+          "trend_4h_ema200": 0.07052763525177916,
+          "trend_4h_ema50_slope_pct": 2.130070842252918,
+          "trend_4h_slope_lookback": 6,
+          "trend_1h_close": 0.08714,
+          "trend_1h_ema20": 0.07962646812603152,
+          "trend_1h_ema50": 0.07683895206792896,
+          "trend_1h_ema200": 0.07319428977766124,
+          "trend_1h_ema50_slope_pct": 2.0999391559040292
+        },
+        "entry_quality_gate_enabled": true,
+        "entry_quality_mode": "shadow",
+        "entry_quality_allowed": true,
+        "entry_quality_reasons": [],
+        "score": 90.0,
+        "score_gate_threshold": 60.0,
+        "score_gate_passed": true
       }
     },
     {
