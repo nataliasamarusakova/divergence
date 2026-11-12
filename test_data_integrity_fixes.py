@@ -359,3 +359,99 @@ def test_active_trade_notification_and_shadow_snapshots_fsync_before_replace(tmp
     assert json.loads(active_path.read_text(encoding="utf-8"))["EVT1"]["qty"] == 1.0
     assert json.loads(notifications_path.read_text(encoding="utf-8"))["TG1"]["resolved"] is True
     assert json.loads(shadow_path.read_text(encoding="utf-8"))["EVT1"]["status"] == "ACTIVE"
+
+
+@pytest.mark.parametrize("filename, recorder, cache_name", [
+    ("oi_history.json", "_record_oi_snapshots", "_OI_HIST_CACHE"),
+    ("funding_history.json", "_record_funding_snapshots", "_FUNDING_HIST_CACHE"),
+])
+def test_corrupt_market_history_is_preserved_and_not_overwritten(tmp_path, monkeypatch, filename, recorder, cache_name):
+    from types import SimpleNamespace
+    import run_once as ro
+
+    history_path = tmp_path / filename
+    original = b'{"BTC": {"123": 1.25}, broken'
+    history_path.write_bytes(original)
+    if filename == "oi_history.json":
+        monkeypatch.setattr(ro, "OI_HISTORY", history_path)
+        rows = [SimpleNamespace(symbol="ETH", oi=99.0)]
+    else:
+        monkeypatch.setattr(ro, "FUNDING_HISTORY", history_path)
+        rows = [SimpleNamespace(symbol="ETH", fr_oiw=0.001)]
+    monkeypatch.setattr(ro, cache_name, {"ts": 0.0, "data": {}, "path": "", "error": None})
+
+    assert getattr(ro, recorder)(rows, 1_700_000_000_000) == 0
+    assert history_path.read_bytes() == original
+    loaded = ro._load_oi_history() if filename == "oi_history.json" else ro._load_funding_history()
+    assert loaded == {}
+    assert history_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("state_value", [[], {"cooldown_until_ms": "not-a-timestamp"}, {"cooldown_until_ms": -1}])
+def test_corrupt_kline_cooldown_fails_closed_and_preserves_original(tmp_path, monkeypatch, state_value):
+    import run_once as ro
+
+    path = tmp_path / "kline_rate_limit.json"
+    original = json.dumps(state_value).encode("utf-8")
+    path.write_bytes(original)
+    monkeypatch.setattr(ro, "KLINE_RATE_LIMIT_STATE", path)
+    ro._KLINE_RATE_LIMIT_CACHE.update(path="", cooldown_until_ms=0, loaded_ts=0.0)
+
+    state = ro._load_kline_rate_limit_state()
+    now_ms = int(__import__("time").time() * 1000)
+    assert state["cooldown_until_ms"] >= now_ms + 60_000
+    assert state["code"] == "CORRUPT_PERSISTED_STATE"
+    backups = list(tmp_path.glob("kline_rate_limit.json.corrupt.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert json.loads(path.read_text(encoding="utf-8"))["cooldown_until_ms"] == state["cooldown_until_ms"]
+
+
+@pytest.mark.parametrize("filename, loader, cache_name", [
+    ("binance_market_rate_limit.json", "_load_binance_rate_limit_state", "_BINANCE_RATE_LIMIT_CACHE"),
+    ("bingx_kline_rate_limit.json", "_load_kline_rate_limit_state", "_KLINE_RATE_LIMIT_CACHE"),
+])
+def test_corrupt_market_data_cooldown_is_quarantined_and_replaced(tmp_path, monkeypatch, filename, loader, cache_name):
+    import run_once as ro
+
+    path = tmp_path / filename
+    original = b"not-json"
+    path.write_bytes(original)
+    attr = "BINANCE_RATE_LIMIT_STATE" if "binance" in filename else "KLINE_RATE_LIMIT_STATE"
+    monkeypatch.setattr(ro, attr, path)
+    getattr(ro, cache_name).update(path="", cooldown_until_ms=0, loaded_ts=0.0)
+
+    state = getattr(ro, loader)()
+    now_ms = int(__import__("time").time() * 1000)
+    minimum = 60_000 if "binance" in filename else 60_000
+    assert state["cooldown_until_ms"] >= now_ms + minimum - 2_000
+    backup = list(tmp_path.glob(filename + ".corrupt.*"))
+    assert len(backup) == 1 and backup[0].read_bytes() == original
+    assert json.loads(path.read_text(encoding="utf-8"))["code"] == "CORRUPT_PERSISTED_STATE"
+
+
+def test_coinalyze_semantics_rejects_non_finite_optional_raw_metric():
+    from event_engine.coinalyze import _validate_row_semantics
+
+    with pytest.raises(ValueError, match="Non-finite value.*price_chg24"):
+        _validate_row_semantics("BTC", {
+            "price": 100.0,
+            "volume24": 1_000_000.0,
+            "oi": 500_000.0,
+            "price_chg24": float("inf"),
+        })
+
+
+def test_failed_cooldown_rewrite_restores_corrupt_source_for_next_run(tmp_path, monkeypatch):
+    import run_once as ro
+
+    path = tmp_path / "kline_rate_limit.json"
+    original = b"broken-cooldown-json"
+    path.write_bytes(original)
+    monkeypatch.setattr(ro, "KLINE_RATE_LIMIT_STATE", path)
+    monkeypatch.setattr(ro, "_save_json_atomic", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+    ro._KLINE_RATE_LIMIT_CACHE.update(path="", cooldown_until_ms=0, loaded_ts=0.0)
+
+    state = ro._load_kline_rate_limit_state()
+    assert state["cooldown_until_ms"] > int(__import__("time").time() * 1000)
+    assert path.read_bytes() == original

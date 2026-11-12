@@ -4547,3 +4547,24 @@ def test_divergence_shadow_execution_obeys_pre_order_trigger_freshness():
         execution_enabled=True, is_divergence=False, shadow_only=True,
         trigger_freshness_status=None,
     ) is False
+
+
+def test_execute_new_position_blocks_non_finite_cross_exchange_reference(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "MARKET_DATA_SOURCE", "binance")
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: float("nan"))
+    monkeypatch.setattr(ro, "open_market", lambda *a, **k: pytest.fail("BingX order must not be sent"))
+    actions = []
+    monkeypatch.setattr(ro, "record_action", lambda row: actions.append(row))
+
+    out = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
+        "EVT_CROSS_NAN",
+    )
+
+    assert out["status"] == "CROSS_EXCHANGE_PRICE_UNAVAILABLE"
+    assert actions[-1]["reason"] == "INVALID_REFERENCE_PRICE"

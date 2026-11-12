@@ -183,3 +183,13 @@ def test_binance_price_refreshes_exchange_info_once_after_http_400(monkeypatch):
     assert calls[0]["symbol"] == "OLDUSDT"
     assert calls[1]["symbol"] == "NEWUSDT"
     assert refreshes == [{"force": True}]
+
+
+@pytest.mark.parametrize("raw_price", ["NaN", "Infinity", "-Infinity", "0", "-1", "bad"])
+def test_binance_fetch_price_rejects_non_finite_and_non_positive_values(monkeypatch, raw_price):
+    client = bx.BinanceMarketClient()
+    monkeypatch.setattr(client, "resolve_symbol", lambda symbol: "BTCUSDT")
+    monkeypatch.setattr(client, "_request_json", lambda *args, **kwargs: {"symbol": "BTCUSDT", "price": raw_price})
+
+    with pytest.raises(bx.BinanceHTTPError, match="invalid ticker price"):
+        client.fetch_price("BTCUSDT")

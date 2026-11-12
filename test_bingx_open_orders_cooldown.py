@@ -101,3 +101,38 @@ def test_engine_reconciliation_does_not_fan_out_after_account_snapshot_100410(mo
     assert len(actions) == len(positions)
     assert all(row["record_type"] == "PROTECTION_STATE_UNKNOWN" for row in actions)
     assert all("cooldown active" in row["error"] for row in actions)
+
+
+def test_corrupt_open_orders_cooldown_is_quarantined_and_fails_closed(tmp_path, monkeypatch):
+    now_ms = int(time.time() * 1000)
+    path = tmp_path / "bingx_open_orders_cooldown.json"
+    original = b'{"cooldown_until_ms": "broken"}'
+    path.write_bytes(original)
+    monkeypatch.setattr(bx, "OPEN_ORDERS_COOLDOWN_STATE_PATH", path)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_UNTIL_MS", 0)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_REASON", "")
+
+    result = bx._read_open_orders_cooldown(now_ms=now_ms)
+    assert result is not None
+    until_ms, reason = result
+    assert until_ms >= now_ms + 60_000
+    assert "corrupt cooldown state" in reason
+    backups = list(tmp_path.glob("bingx_open_orders_cooldown.json.corrupt.*"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+    assert json.loads(path.read_text(encoding="utf-8"))["cooldown_until_ms"] == until_ms
+
+
+def test_failed_open_orders_cooldown_rewrite_restores_corrupt_source(tmp_path, monkeypatch):
+    now_ms = int(time.time() * 1000)
+    path = tmp_path / "bingx_open_orders_cooldown.json"
+    original = b"broken-cooldown-json"
+    path.write_bytes(original)
+    monkeypatch.setattr(bx, "OPEN_ORDERS_COOLDOWN_STATE_PATH", path)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_UNTIL_MS", 0)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_REASON", "")
+    monkeypatch.setattr(bx, "_persist_open_orders_cooldown", lambda *args, **kwargs: False)
+
+    result = bx._read_open_orders_cooldown(now_ms=now_ms)
+    assert result is not None
+    assert result[0] > now_ms
+    assert path.read_bytes() == original

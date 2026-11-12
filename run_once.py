@@ -1055,16 +1055,53 @@ def _persist_terminal_filtered_event_cache(events: list[dict], terminal_ids: set
 
 OI_HISTORY = DATA / "oi_history.json"
 FUNDING_HISTORY = DATA / "funding_history.json"
-_OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": ""}
+_OI_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": "", "error": None}
 _OI_HIST_CACHE_TTL = 30.0
 _OI_HIST_MAX_BUCKETS = 500
-_FUNDING_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": ""}
+_FUNDING_HIST_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}, "path": "", "error": None}
 _FUNDING_HIST_CACHE_TTL = 30.0
 _FUNDING_HIST_MAX_BUCKETS = 500
 
 
+def _read_bucket_history(
+    path: Path, *, label: str, positive_values: bool,
+) -> tuple[dict[str, dict[str, float]], str | None]:
+    """Read a complete, schema-valid numeric history without hiding corruption.
+
+    An unreadable history is returned as unavailable, never as an empty book that
+    a later snapshot could overwrite. The caller keeps the source file untouched.
+    """
+    if not path.exists():
+        return {}, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return {}, f"{type(exc).__name__}:{exc}"
+    if not isinstance(raw, dict):
+        return {}, f"invalid_root_type:{type(raw).__name__}"
+
+    validated: dict[str, dict[str, float]] = {}
+    for symbol, buckets in raw.items():
+        if not isinstance(symbol, str) or not symbol or not isinstance(buckets, dict):
+            return {}, f"invalid_symbol_record:{symbol!r}"
+        normalized: dict[str, float] = {}
+        for bucket, value in buckets.items():
+            try:
+                bucket_int = int(bucket)
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return {}, f"invalid_bucket_value:{symbol}:{bucket!r}:{value!r}"
+            if bucket_int <= 0 or str(bucket_int) != str(bucket):
+                return {}, f"invalid_bucket_key:{symbol}:{bucket!r}"
+            if not math.isfinite(numeric) or (positive_values and numeric <= 0):
+                return {}, f"invalid_numeric_history_value:{symbol}:{bucket}:{value!r}"
+            normalized[str(bucket_int)] = numeric
+        validated[symbol] = normalized
+    return validated, None
+
+
 def _load_oi_history() -> dict[str, dict[str, float]]:
-    """Cached view of the accumulated OI snapshot history (audit fix B2)."""
+    """Cached view of accumulated OI history; corruption disables OI history safely."""
     now = time.monotonic()
     cache_path = str(OI_HISTORY.resolve())
     if (
@@ -1073,26 +1110,22 @@ def _load_oi_history() -> dict[str, dict[str, float]]:
         and "data" in _OI_HIST_CACHE
     ):
         return _OI_HIST_CACHE["data"]
-    raw = _load_json(OI_HISTORY, {})
-    data = raw if isinstance(raw, dict) else {}
-    _OI_HIST_CACHE["ts"] = now
-    _OI_HIST_CACHE["path"] = cache_path
-    _OI_HIST_CACHE["data"] = data
+    data, error = _read_bucket_history(OI_HISTORY, label="OI", positive_values=True)
+    if error:
+        log.error("[OI_HISTORY] Persisted history is unreadable; preserving source and disabling OI-history features: %s", error)
+    _OI_HIST_CACHE.update(ts=now, path=cache_path, data=data, error=error)
     return data
 
 
 def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
-    """Persist per-symbol OI snapshots keyed by the current 1h bucket.
-
-    Snapshots are written only while their bucket is active, so a stored value
-    always predates the bucket close. Divergence detectors can therefore map
-    bucket -> OI without look-ahead. Returns the number of symbols updated.
-    """
+    """Persist per-symbol OI snapshots without replacing an untrusted history."""
     if not rows:
         return 0
-    history = _load_json(OI_HISTORY, {})
-    if not isinstance(history, dict):
-        history = {}
+    history, error = _read_bucket_history(OI_HISTORY, label="OI", positive_values=True)
+    if error:
+        log.error("[OI_HISTORY] Snapshot write skipped; corrupt history preserved: %s", error)
+        _OI_HIST_CACHE.update(ts=time.monotonic(), path=str(OI_HISTORY.resolve()), data={}, error=error)
+        return 0
     bucket = str(int(now_ms // 3_600_000))
     updated = 0
     for r in rows:
@@ -1104,32 +1137,25 @@ def _record_oi_snapshots(rows: list[Any], now_ms: int) -> int:
             oi = float(oi)
         except (TypeError, ValueError, OverflowError):
             continue
-        # JSON has no standard NaN/Infinity values. Reject non-finite snapshots
-        # before persistence so readers never ingest implementation-specific JSON.
         if not math.isfinite(oi) or oi <= 0:
             continue
         rec = history.setdefault(symbol, {})
-        if not isinstance(rec, dict):
-            rec = history[symbol] = {}
         rec[bucket] = oi
         if len(rec) > _OI_HIST_MAX_BUCKETS:
-            for key in sorted(rec, key=lambda k: int(k))[: len(rec) - _OI_HIST_MAX_BUCKETS]:
+            for key in sorted(rec, key=int)[: len(rec) - _OI_HIST_MAX_BUCKETS]:
                 del rec[key]
         updated += 1
 
     if updated:
         _save_json_atomic(OI_HISTORY, history)
-        # Keep the in-memory cache coherent with the just-persisted snapshot.
-        # Invalidating the timestamp alone can still leave callers with stale
-        # data during the same monotonic tick if they read immediately.
-        _OI_HIST_CACHE["data"] = history
-        _OI_HIST_CACHE["ts"] = time.monotonic()
-    _OI_HIST_CACHE["path"] = str(OI_HISTORY.resolve())
+        _OI_HIST_CACHE.update(ts=time.monotonic(), path=str(OI_HISTORY.resolve()), data=history, error=None)
+    else:
+        _OI_HIST_CACHE.update(path=str(OI_HISTORY.resolve()), error=None)
     return updated
 
 
 def _load_funding_history() -> dict[str, dict[str, float]]:
-    """Cached funding-rate snapshots keyed by symbol and 1h bucket."""
+    """Cached view of funding history; corruption disables funding history safely."""
     now = time.monotonic()
     cache_path = str(FUNDING_HISTORY.resolve())
     if (
@@ -1138,21 +1164,22 @@ def _load_funding_history() -> dict[str, dict[str, float]]:
         and "data" in _FUNDING_HIST_CACHE
     ):
         return _FUNDING_HIST_CACHE["data"]
-    raw = _load_json(FUNDING_HISTORY, {})
-    data = raw if isinstance(raw, dict) else {}
-    _FUNDING_HIST_CACHE["ts"] = now
-    _FUNDING_HIST_CACHE["path"] = cache_path
-    _FUNDING_HIST_CACHE["data"] = data
+    data, error = _read_bucket_history(FUNDING_HISTORY, label="FUNDING", positive_values=False)
+    if error:
+        log.error("[FUNDING_HISTORY] Persisted history is unreadable; preserving source and disabling funding-history features: %s", error)
+    _FUNDING_HIST_CACHE.update(ts=now, path=cache_path, data=data, error=error)
     return data
 
 
 def _record_funding_snapshots(rows: list[Any], now_ms: int) -> int:
-    """Persist the latest available OI-weighted funding rate per 1h bucket."""
+    """Persist the latest OI-weighted funding rate without replacing corrupt history."""
     if not rows:
         return 0
-    history = _load_json(FUNDING_HISTORY, {})
-    if not isinstance(history, dict):
-        history = {}
+    history, error = _read_bucket_history(FUNDING_HISTORY, label="FUNDING", positive_values=False)
+    if error:
+        log.error("[FUNDING_HISTORY] Snapshot write skipped; corrupt history preserved: %s", error)
+        _FUNDING_HIST_CACHE.update(ts=time.monotonic(), path=str(FUNDING_HISTORY.resolve()), data={}, error=error)
+        return 0
     bucket = str(int(now_ms // 3_600_000))
     updated = 0
     for row in rows:
@@ -1162,25 +1189,22 @@ def _record_funding_snapshots(rows: list[Any], now_ms: int) -> int:
             continue
         try:
             fr = float(raw_fr)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if not (-float("inf") < fr < float("inf")):
+        if not math.isfinite(fr):
             continue
         rec = history.setdefault(symbol, {})
-        if not isinstance(rec, dict):
-            rec = history[symbol] = {}
         rec[bucket] = fr
         if len(rec) > _FUNDING_HIST_MAX_BUCKETS:
-            for key in sorted(rec, key=lambda k: int(k))[: len(rec) - _FUNDING_HIST_MAX_BUCKETS]:
+            for key in sorted(rec, key=int)[: len(rec) - _FUNDING_HIST_MAX_BUCKETS]:
                 del rec[key]
         updated += 1
     if updated:
         _save_json_atomic(FUNDING_HISTORY, history)
-        _FUNDING_HIST_CACHE["data"] = history
-        _FUNDING_HIST_CACHE["ts"] = time.monotonic()
-    _FUNDING_HIST_CACHE["path"] = str(FUNDING_HISTORY.resolve())
+        _FUNDING_HIST_CACHE.update(ts=time.monotonic(), path=str(FUNDING_HISTORY.resolve()), data=history, error=None)
+    else:
+        _FUNDING_HIST_CACHE.update(path=str(FUNDING_HISTORY.resolve()), error=None)
     return updated
-
 
 def _acquire_scan_slot(min_interval: float) -> None:
     """Process-local pacing for BingX kline scans.
@@ -1199,19 +1223,66 @@ def _acquire_scan_slot(min_interval: float) -> None:
             time.sleep(wait)
     _acquire_scan_slot._last_call = time.monotonic()
 
+def _load_persisted_rate_limit_state(path: Path, *, label: str, fallback_sec: float) -> dict[str, Any]:
+    """Load a cooldown; quarantine corrupt state and fail closed for a fallback window."""
+    if not path.exists():
+        return {"cooldown_until_ms": 0, "code": None, "reason": ""}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"invalid_root_type:{type(raw).__name__}")
+        if "cooldown_until_ms" not in raw:
+            raise ValueError("missing_cooldown_until_ms")
+        raw_until = raw.get("cooldown_until_ms", 0)
+        if isinstance(raw_until, bool):
+            raise ValueError("invalid_cooldown_timestamp:boolean")
+        until = int(raw_until or 0)
+        if until < 0 or (raw_until not in (None, "", 0, "0") and str(until) != str(raw_until)):
+            raise ValueError(f"invalid_cooldown_timestamp:{raw_until!r}")
+        return {"cooldown_until_ms": until, "code": raw.get("code"), "reason": str(raw.get("reason") or "")}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError) as exc:
+        now_ms = int(time.time() * 1000)
+        deadline = now_ms + int(max(60.0, fallback_sec) * 1000)
+        backup = path.with_name(f"{path.name}.corrupt.{time.time_ns()}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, backup)
+            quarantined = True
+        except OSError as quarantine_exc:
+            quarantined = False
+            log.critical("[%s] Corrupt cooldown could not be quarantined; using in-memory fail-closed window: %s", label, quarantine_exc)
+        state = {
+            "cooldown_until_ms": deadline,
+            "saved_at_ms": now_ms,
+            "code": "CORRUPT_PERSISTED_STATE",
+            "reason": f"corrupt cooldown fallback applied: {type(exc).__name__}: {exc}",
+        }
+        if quarantined:
+            try:
+                _save_json_atomic(path, state)
+            except OSError as persist_exc:
+                log.critical("[%s] Could not persist fail-closed cooldown; this process will still block until %d: %s", label, deadline, persist_exc)
+                try:
+                    os.replace(backup, path)
+                except OSError as restore_exc:
+                    log.critical("[%s] Could not restore corrupt cooldown after failed persistence; backup remains at %s: %s", label, backup, restore_exc)
+            else:
+                log.error("[%s] Corrupt cooldown quarantined at %s; conservative cooldown active until %d", label, backup, deadline)
+        return state
+
+
 def _load_kline_rate_limit_state() -> dict[str, Any]:
     """Load the persisted BingX Kline cooldown shared across workflow runs."""
     cache_path = str(KLINE_RATE_LIMIT_STATE.resolve())
     now = time.monotonic()
     if _KLINE_RATE_LIMIT_CACHE.get("path") == cache_path and now - float(_KLINE_RATE_LIMIT_CACHE.get("loaded_ts", 0.0)) < 5.0:
         return dict(_KLINE_RATE_LIMIT_CACHE)
-    raw = _load_json(KLINE_RATE_LIMIT_STATE, {})
-    state = raw if isinstance(raw, dict) else {}
     try:
-        cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
+        fallback_sec = float(os.environ.get("BINGX_KLINE_RATE_LIMIT_FALLBACK_SEC", "900"))
     except (TypeError, ValueError):
-        cooldown_until_ms = 0
-    _KLINE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, cooldown_until_ms), loaded_ts=now)
+        fallback_sec = 900.0
+    state = _load_persisted_rate_limit_state(KLINE_RATE_LIMIT_STATE, label="BINGX_KLINE", fallback_sec=fallback_sec)
+    _KLINE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, int(state["cooldown_until_ms"])), code=state.get("code"), reason=state.get("reason", ""), loaded_ts=now)
     return dict(_KLINE_RATE_LIMIT_CACHE)
 
 
@@ -1258,13 +1329,8 @@ def _load_binance_rate_limit_state() -> dict[str, Any]:
     now = time.monotonic()
     if _BINANCE_RATE_LIMIT_CACHE.get("path") == cache_path and now - float(_BINANCE_RATE_LIMIT_CACHE.get("loaded_ts", 0.0)) < 5.0:
         return dict(_BINANCE_RATE_LIMIT_CACHE)
-    raw = _load_json(BINANCE_RATE_LIMIT_STATE, {})
-    state = raw if isinstance(raw, dict) else {}
-    try:
-        cooldown_until_ms = int(state.get("cooldown_until_ms", 0) or 0)
-    except (TypeError, ValueError):
-        cooldown_until_ms = 0
-    _BINANCE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, cooldown_until_ms), loaded_ts=now)
+    state = _load_persisted_rate_limit_state(BINANCE_RATE_LIMIT_STATE, label="BINANCE_MARKET", fallback_sec=60.0)
+    _BINANCE_RATE_LIMIT_CACHE.update(path=cache_path, cooldown_until_ms=max(0, int(state["cooldown_until_ms"])), code=state.get("code"), reason=state.get("reason", ""), loaded_ts=now)
     return dict(_BINANCE_RATE_LIMIT_CACHE)
 
 
@@ -4603,7 +4669,18 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "order_id": None,
                 "error": price_error,
             }
-        if live_reference is None or float(live_reference) <= 0 or binance_live_price <= 0:
+        try:
+            bingx_reference_price = float(live_reference)
+            binance_reference_price = float(binance_live_price)
+        except (TypeError, ValueError, OverflowError):
+            bingx_reference_price = float("nan")
+            binance_reference_price = float("nan")
+        if (
+            not math.isfinite(bingx_reference_price)
+            or not math.isfinite(binance_reference_price)
+            or bingx_reference_price <= 0
+            or binance_reference_price <= 0
+        ):
             price_error = f"invalid BingX/Binance reference prices: bingx={live_reference}, binance={binance_live_price}"
             quality = {
                 "binance_live_price": _safe_float(binance_live_price, 0.0) or None,
@@ -4628,7 +4705,22 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "error": price_error,
                 "execution_quality": quality,
             }
-        cross_exchange_drift_pct = abs(float(live_reference) - float(binance_live_price)) / float(binance_live_price) * 100.0
+        cross_exchange_drift_pct = abs(bingx_reference_price - binance_reference_price) / binance_reference_price * 100.0
+        if not math.isfinite(cross_exchange_drift_pct):
+            price_error = (
+                "non-finite cross-exchange drift: "
+                f"bingx={bingx_reference_price}, binance={binance_reference_price}"
+            )
+            record_action({
+                "record_type": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "event_id": event_id, "symbol": symbol, "direction": direction,
+                "reason": "NON_FINITE_CROSS_EXCHANGE_DRIFT", "error": price_error,
+                "ts": int(time.time() * 1000),
+            })
+            return {
+                "status": "CROSS_EXCHANGE_PRICE_UNAVAILABLE",
+                "mode": EXECUTION_MODE, "order_id": None, "error": price_error,
+            }
         execution_quality_guard = {
             "binance_live_price": float(binance_live_price),
             "bingx_live_price": float(live_reference),
