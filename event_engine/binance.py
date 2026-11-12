@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -297,9 +298,9 @@ class BinanceMarketClient:
             raise BinanceHTTPError(f"[BINANCE] ticker response for {resolved} is not an object")
         try:
             price = float(payload.get("price"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             price = 0.0
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise BinanceHTTPError(f"[BINANCE] invalid ticker price for {resolved}: {payload}")
         return price
 

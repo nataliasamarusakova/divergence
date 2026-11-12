@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
@@ -214,21 +215,17 @@ def _get_val(tds: list[Any], header_map: dict[str, int], field_name: str) -> flo
 
 
 def _validate_row_semantics(symbol: str, raw: dict[str, float | None]) -> None:
-    finite_fields = {
-        "price", "volume24", "oi", "oi_chg24_pct", "oi_chg4h_pct", "oi_vol_ratio",
-        "oi_mktcap_ratio", "fr_oiw", "pfr_oiw", "liq_short24", "liq_long24",
-        "ls_accounts", "btc_corr7d", "cvd24", "lls24",
-    }
-
-    for field in finite_fields:
-        value = raw.get(field)
+    # Every extracted Coinalyze cell is numeric telemetry. Validate all mapped
+    # values, not only fields currently used by entry filters: optional columns
+    # are retained in ``raw`` for later analytics and must not carry NaN/Infinity.
+    for field, value in raw.items():
         if value is None:
             continue
         try:
             value_float = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"Invalid numeric value for {symbol} field={field}: {value!r}")
-        if not (float("-inf") < value_float < float("inf")):
+        if not math.isfinite(value_float):
             raise ValueError(f"Non-finite value for {symbol} field={field}: {value!r}")
 
     if raw.get("price") is not None and raw["price"] <= 0:

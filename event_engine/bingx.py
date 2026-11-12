@@ -188,22 +188,51 @@ def _parse_open_orders_unblock_ms(message: object) -> int | None:
 
 
 def _read_open_orders_cooldown(now_ms: int | None = None) -> tuple[int, str] | None:
-    """Load the openOrders cooldown across workflow processes; never query while active."""
+    """Load the openOrders cooldown; corrupt persistent state fails closed."""
     global _OPEN_ORDERS_COOLDOWN_UNTIL_MS, _OPEN_ORDERS_COOLDOWN_REASON
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     until_ms = int(_OPEN_ORDERS_COOLDOWN_UNTIL_MS or 0)
     reason = _OPEN_ORDERS_COOLDOWN_REASON
-    try:
-        if OPEN_ORDERS_COOLDOWN_STATE_PATH.exists():
-            state = json.loads(OPEN_ORDERS_COOLDOWN_STATE_PATH.read_text(encoding="utf-8"))
-            if isinstance(state, dict) and state.get("base_url", BASE_URL) == BASE_URL:
-                stored_until = int(state.get("cooldown_until_ms", 0) or 0)
+    path = OPEN_ORDERS_COOLDOWN_STATE_PATH
+    if path.exists():
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError(f"invalid_root_type:{type(state).__name__}")
+            if state.get("base_url", BASE_URL) == BASE_URL:
+                if "cooldown_until_ms" not in state:
+                    raise ValueError("missing_cooldown_until_ms")
+                raw_until = state.get("cooldown_until_ms", 0)
+                if isinstance(raw_until, bool):
+                    raise ValueError("invalid_cooldown_timestamp:boolean")
+                stored_until = int(raw_until or 0)
+                if stored_until < 0 or (raw_until not in (None, "", 0, "0") and str(stored_until) != str(raw_until)):
+                    raise ValueError(f"invalid_cooldown_timestamp:{raw_until!r}")
                 if stored_until > until_ms:
                     until_ms = stored_until
                     reason = str(state.get("reason") or reason or "BingX code 100410")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        # Cooldown persistence is best-effort; the in-process deadline still applies.
-        pass
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError) as exc:
+            fallback_ms = now_ms + int(max(60.0, OPEN_ORDERS_COOLDOWN_FALLBACK_SEC) * 1000)
+            backup = path.with_name(f"{path.name}.corrupt.{time.time_ns()}")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, backup)
+                quarantined = True
+            except OSError as quarantine_exc:
+                quarantined = False
+                log.critical("[BINGX] Corrupt openOrders cooldown could not be quarantined; fail-closed cooldown is process-local: %s", quarantine_exc)
+            until_ms = max(until_ms, fallback_ms)
+            reason = f"corrupt cooldown state; conservative fallback: {type(exc).__name__}: {exc}"
+            _OPEN_ORDERS_COOLDOWN_UNTIL_MS = until_ms
+            _OPEN_ORDERS_COOLDOWN_REASON = reason
+            if quarantined:
+                if _persist_open_orders_cooldown(until_ms, reason):
+                    log.error("[BINGX] Corrupt openOrders cooldown quarantined at %s; endpoint blocked until %d", backup, until_ms)
+                else:
+                    try:
+                        os.replace(backup, path)
+                    except OSError as restore_exc:
+                        log.critical("[BINGX] Could not restore corrupt cooldown after failed persistence; backup remains at %s: %s", backup, restore_exc)
     if until_ms > now_ms:
         _OPEN_ORDERS_COOLDOWN_UNTIL_MS = until_ms
         _OPEN_ORDERS_COOLDOWN_REASON = reason
@@ -212,15 +241,15 @@ def _read_open_orders_cooldown(now_ms: int | None = None) -> tuple[int, str] | N
         _OPEN_ORDERS_COOLDOWN_UNTIL_MS = 0
         _OPEN_ORDERS_COOLDOWN_REASON = ""
         try:
-            state = json.loads(OPEN_ORDERS_COOLDOWN_STATE_PATH.read_text(encoding="utf-8")) if OPEN_ORDERS_COOLDOWN_STATE_PATH.exists() else {}
+            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
             if not isinstance(state, dict) or state.get("base_url", BASE_URL) == BASE_URL:
-                OPEN_ORDERS_COOLDOWN_STATE_PATH.unlink(missing_ok=True)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                path.unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
             pass
     return None
 
 
-def _persist_open_orders_cooldown(until_ms: int, reason: str) -> None:
+def _persist_open_orders_cooldown(until_ms: int, reason: str) -> bool:
     """Persist a rate-limit deadline atomically so the next workflow run respects it."""
     global _OPEN_ORDERS_COOLDOWN_UNTIL_MS, _OPEN_ORDERS_COOLDOWN_REASON
     _OPEN_ORDERS_COOLDOWN_UNTIL_MS = max(int(until_ms), int(_OPEN_ORDERS_COOLDOWN_UNTIL_MS or 0))
@@ -248,8 +277,10 @@ def _persist_open_orders_cooldown(until_ms: int, reason: str) -> None:
                 os.close(directory_fd)
         except OSError:
             pass
+        return True
     except OSError as exc:
         log.warning("[BINGX] Could not persist openOrders rate-limit cooldown: %s", exc)
+        return False
 
 
 def _clear_open_orders_cooldown() -> None:
