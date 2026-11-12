@@ -238,6 +238,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run regression test suite before market execution
+        # The job has production Telegram secrets for the live engine. Explicitly
+        # clear them for pytest so a regression test can never page the operator.
+        env:
+          TG_BOT_TOKEN: ""
+          TG_CHAT_IDS: ""
+          TG_CHAT_ID: ""
         run: |
           python -m pytest -q
 
