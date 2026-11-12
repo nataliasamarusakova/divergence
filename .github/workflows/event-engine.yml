@@ -237,6 +237,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run regression test suite before market execution
+        run: |
+          python -m pytest -q
+
       - name: Install Playwright Chromium
         if: steps.cache-dependencies.outputs.cache-hit != 'true'
         run: |
