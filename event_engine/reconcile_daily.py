@@ -523,6 +523,11 @@ def _pending_exit_fill_evidence(
         executed_qty = _finite_nonnegative(order.get("executed_qty"))
         if executed_qty is None:
             continue
+        try:
+            avg_price = float(order.get("avg_price"))
+        except (TypeError, ValueError, OverflowError):
+            avg_price = 0.0
+        avg_price_available = math.isfinite(avg_price) and avg_price > 0.0
         pending_qty = max(0.0, executed_qty - recorded_qty) if source.startswith("TP:") else executed_qty
         if pending_qty <= 1e-12:
             continue
@@ -531,6 +536,7 @@ def _pending_exit_fill_evidence(
             "executed_qty": executed_qty,
             "previously_recorded_qty": recorded_qty if source.startswith("TP:") else 0.0,
             "unapplied_fill_qty": pending_qty, "event_id": event_id,
+            "avg_price_available": avg_price_available,
         })
         total_pending += pending_qty
         if abs(total_pending - expected_delta) <= evidence_tolerance:
@@ -668,7 +674,8 @@ def _discrepancy_message_detail(item: dict) -> str:
     if item.get("code") == "TRACKER_EXIT_FILL_PENDING":
         evidence = item.get("fill_evidence") if isinstance(item.get("fill_evidence"), list) else []
         order_details = "; ".join(
-            f"{row.get('source')}#{row.get('order_id')} qty={row.get('unapplied_fill_qty')}"
+            f"{row.get('source')}#{row.get('order_id')} qty={row.get('unapplied_fill_qty')} "
+            f"avgPrice={'present' if row.get('avg_price_available') else 'missing'}"
             for row in evidence if isinstance(row, dict)
         )
         base = (

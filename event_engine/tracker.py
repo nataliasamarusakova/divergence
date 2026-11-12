@@ -1894,6 +1894,66 @@ def _vwap_actual_fill_rows(
     return vwap if math.isfinite(vwap) and vwap > 0 else None
 
 
+def _get_order_vwap_from_actual_fills(
+    symbol: str,
+    direction: str,
+    order_id: str,
+    entry_ts: int,
+    executed_qty: float,
+    raw_order: dict | None = None,
+) -> tuple[float | None, str]:
+    """Recover a missing order avgPrice only from exact, complete actual fills.
+
+    This helper is used for a TP's first unapplied fill. It deliberately does not
+    infer an incremental VWAP when some quantity from the same order was already
+    booked: cumulative fill history cannot safely price only the new delta without
+    persisted per-fill identities/notional.
+    """
+    if not order_id or not math.isfinite(executed_qty) or executed_qty <= 0:
+        return None, "invalid_order_or_executed_qty"
+    now_ms = int(time.time() * 1000)
+    normalized_entry_ts = int(_safe_float(entry_ts, 0.0))
+    if normalized_entry_ts and normalized_entry_ts < 100_000_000_000:
+        normalized_entry_ts *= 1000
+    start_ts = max(
+        now_ms - 6 * 24 * 60 * 60 * 1000,
+        normalized_entry_ts - 60_000 if normalized_entry_ts > 0 else 1,
+    )
+    end_ts = now_ms + 60_000
+
+    if isinstance(raw_order, dict):
+        embedded = next((
+            raw_order.get(key)
+            for key in ("fills", "fill_orders", "fillOrders", "trade_list", "tradeList")
+            if isinstance(raw_order.get(key), list)
+        ), None)
+        if embedded is not None:
+            price = _vwap_actual_fill_rows(
+                embedded, str(order_id), direction, start_ts, end_ts, executed_qty,
+            )
+            if price is not None:
+                return price, "ORDER_EMBEDDED_FILLS"
+
+    try:
+        response = get_fill_history(
+            symbol, start_ts, end_ts, order_id=str(order_id),
+            page_index=1, page_size=1000, timeout_sec=5.0,
+        )
+    except Exception as exc:
+        return None, f"fill_history_exception:{type(exc).__name__}"
+    if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+        detail = response.get("error", "invalid_response") if isinstance(response, dict) else "invalid_response"
+        return None, f"fill_history_unavailable:{str(detail)[:120]}"
+    if response.get("has_more") is True:
+        return None, "fill_history_truncated"
+    price = _vwap_actual_fill_rows(
+        response.get("fills"), str(order_id), direction, start_ts, end_ts, executed_qty,
+    )
+    if price is None:
+        return None, "fill_history_rows_not_exact_complete_match"
+    return price, "FILL_HISTORY_VWAP"
+
+
 def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, str | None]:
     """Recover actual stop execution price, never the trigger price.
 
@@ -1920,9 +1980,18 @@ def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, s
     for order_id in dict.fromkeys(candidates):
         try:
             info = get_order(symbol, order_id)
-        except Exception:
-            info = {}
+        except Exception as exc:
+            log.warning(
+                "[TRACKER_SL] order lookup failed for %s order=%s: %s",
+                symbol, order_id, exc,
+            )
+            continue
         if not isinstance(info, dict) or str(info.get("status", "")).lower() != "ok":
+            detail = info.get("error", "invalid_order_response") if isinstance(info, dict) else "invalid_order_response"
+            log.warning(
+                "[TRACKER_SL] order lookup unavailable for %s order=%s: %s",
+                symbol, order_id, str(detail)[:180],
+            )
             continue
         status = str(info.get("order_status", "")).upper()
         # Triggered/active/partially-filled orders are not final exits. Their actual
@@ -1950,13 +2019,23 @@ def _get_filled_sl_from_trade(symbol: str, trade: dict) -> tuple[float | None, s
         except Exception:
             continue
         if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+            detail = response.get("error", "invalid_response") if isinstance(response, dict) else "invalid_response"
+            log.warning(
+                "[TRACKER_SL] exact fill history unavailable for %s order=%s: %s",
+                symbol, order_id, str(detail)[:180],
+            )
             continue
         if response.get("has_more") is True:
+            log.warning("[TRACKER_SL] fill history is truncated for %s order=%s", symbol, order_id)
             continue
         fills = response.get("fills")
         px = _vwap_actual_fill_rows(fills, order_id, direction, start_ts, end_ts, executed_qty or None)
         if px is not None:
             return px, order_id
+        log.warning(
+            "[TRACKER_SL] fill history rows do not exactly match executed order %s for %s",
+            order_id, symbol,
+        )
     return None, None
 
 
@@ -3010,10 +3089,25 @@ def update_active_trades() -> None:
 
                 try:
                     order_info = get_order(symbol, order_id)
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "[TRACKER_TP] order lookup failed for %s %s %s order=%s: %s",
+                        symbol, direction, leg, order_id, exc,
+                    )
                     continue
 
+                if not isinstance(order_info, dict):
+                    log.warning(
+                        "[TRACKER_TP] order lookup returned a non-object for %s %s %s order=%s",
+                        symbol, direction, leg, order_id,
+                    )
+                    continue
                 if order_info.get("status") == "error":
+                    log.warning(
+                        "[TRACKER_TP] order lookup unavailable for %s %s %s order=%s: %s",
+                        symbol, direction, leg, order_id,
+                        str(order_info.get("error") or "unknown")[:180],
+                    )
                     continue
 
                 order_status = str(order_info.get("order_status", "")).strip().upper()
@@ -3070,8 +3164,25 @@ def update_active_trades() -> None:
                     continue
 
                 exec_price = _safe_float(order_info.get("avg_price"), 0.0)
+                price_source = "ORDER_AVG_PRICE"
                 if exec_price <= 0:
-                    log.warning("[TRACKER_TP] %s %s %s has no actual avgPrice; deferring realized PnL", symbol, direction, leg)
+                    # For a first fill, recover the actual VWAP from exact order
+                    # fill rows. Do not promote trigger/stop prices to executions.
+                    # For a later cumulative fill, no incremental VWAP is safe
+                    # without previously persisted per-fill notional/identities.
+                    if previous_qty <= 1e-12:
+                        exec_price, price_source = _get_order_vwap_from_actual_fills(
+                            symbol, direction, str(order_id), entry_ts, executed_qty,
+                            order_info.get("raw_order") if isinstance(order_info.get("raw_order"), dict) else None,
+                        )
+                    else:
+                        price_source = "incremental_fill_vwap_unavailable"
+                if exec_price is None or not math.isfinite(exec_price) or exec_price <= 0:
+                    log.warning(
+                        "[TRACKER_TP] %s %s %s has no safe actual execution price; "
+                        "deferring realized PnL and quantity update (source=%s executed_qty=%.12g previous_qty=%.12g)",
+                        symbol, direction, leg, price_source, executed_qty, previous_qty,
+                    )
                     continue
                 pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
                 if pnl_tp is None:
@@ -3092,6 +3203,7 @@ def update_active_trades() -> None:
                 trade["realized_pnl_qty"] = realized_qty
                 trade["realized_pnl_weighted_sum"] = realized_weighted
                 trade["last_tp_exec_price"] = exec_price
+                trade["last_tp_exec_price_source"] = price_source
 
                 if leg_fully_executed and leg not in hit_legs:
                     hit_legs.add(leg)
