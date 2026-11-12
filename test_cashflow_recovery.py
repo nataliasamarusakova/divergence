@@ -738,3 +738,53 @@ def test_tracker_income_fallback_requires_code_zero_and_expected_shape_error(mon
     tracker._get_income_history_for_symbol("BTC", 1_700_000_000_000, 1_700_000_002_000)
     assert calls == ["BTC"]
 
+
+
+def test_tp_fill_history_recovers_exact_vwap_when_order_avg_price_is_missing(monkeypatch):
+    from event_engine import tracker
+    import time
+
+    now_ms = int(time.time() * 1000)
+    calls = []
+
+    def fake_fill_history(symbol, start_ts, end_ts, **kwargs):
+        calls.append((symbol, start_ts, end_ts, kwargs))
+        return {
+            "status": "ok", "has_more": False,
+            "fills": [
+                {"order_id": "TP-42", "trade_id": "F-1", "position_side": "SHORT",
+                 "price": 0.35, "qty": 2.0, "time": now_ms - 1000},
+                {"order_id": "TP-42", "trade_id": "F-2", "position_side": "SHORT",
+                 "price": 0.34, "qty": 3.0, "time": now_ms - 500},
+            ],
+        }
+
+    monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
+    price, source = tracker._get_order_vwap_from_actual_fills(
+        "APT", "SHORT", "TP-42", now_ms - 60_000, 5.0,
+    )
+
+    assert price == pytest.approx((0.35 * 2 + 0.34 * 3) / 5)
+    assert source == "FILL_HISTORY_VWAP"
+    assert len(calls) == 1
+    assert calls[0][3]["order_id"] == "TP-42"
+
+
+def test_tp_fill_history_refuses_incomplete_or_wrong_quantity_evidence(monkeypatch):
+    from event_engine import tracker
+    import time
+
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *a, **k: {
+        "status": "ok", "has_more": False,
+        "fills": [{
+            "order_id": "TP-42", "trade_id": "F-1", "position_side": "SHORT",
+            "price": 0.35, "qty": 4.0, "time": now_ms - 1000,
+        }],
+    })
+
+    price, source = tracker._get_order_vwap_from_actual_fills(
+        "APT", "SHORT", "TP-42", now_ms - 60_000, 5.0,
+    )
+    assert price is None
+    assert source == "fill_history_rows_not_exact_complete_match"

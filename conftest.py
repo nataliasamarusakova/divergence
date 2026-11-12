@@ -13,6 +13,16 @@ import pytest
 def isolate_production_entry_gates(monkeypatch, tmp_path):
     import run_once as ro
     import event_engine.tracker as tracker
+    import event_engine.reconcile_daily as reconciliation
+
+    # Pytest runs in the same GitHub Actions job as the VST engine. Never let
+    # job-level secrets or an accidentally unmocked notification path send a
+    # real Telegram message from a test.
+    for name in ("TG_BOT_TOKEN", "TG_CHAT_IDS", "TG_CHAT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(ro, "send_tg", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(tracker, "send_detailed", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(reconciliation, "send_detailed", lambda *_args, **_kwargs: {})
 
     # Keep runtime-state writes inside pytest's temporary directory. Rollback
     # safety logic intentionally persists unresolved cleanup records, and tests

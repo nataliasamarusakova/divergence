@@ -729,6 +729,8 @@ def test_daily_reconciliation_classifies_exact_unapplied_tp_fill_as_warning(tmp_
     assert pending[0]["local_qty"] == 139.0
     assert pending[0]["exchange_qty"] == 104.0
     assert pending[0]["fill_evidence"][0]["order_id"] == "TP1-HBAR"
+    assert pending[0]["fill_evidence"][0]["avg_price_available"] is True
+    assert "avgPrice=present" in recon._discrepancy_message_detail(pending[0])
     assert len(position_reads) == 2  # the post-fill evidence must be checked against a fresh position snapshot
     assert report["checks"]["tracker_exit_fill_reconciliation"]["position_refresh_status"] == "OK"
     assert report["status"] == "WARNING"

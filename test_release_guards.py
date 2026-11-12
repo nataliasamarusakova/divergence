@@ -489,3 +489,23 @@ def test_early_loss_cut_is_hard_disabled_even_if_environment_requests_true():
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "False"
     assert "hard-disabled in this release" in proc.stderr
+
+
+def test_pytest_notification_paths_are_isolated_from_workflow_secrets(monkeypatch):
+    """The CI job has production Telegram secrets; pytest must never page them."""
+    import os
+    import run_once
+    from event_engine import tracker, reconcile_daily
+
+    assert not os.environ.get("TG_BOT_TOKEN")
+    assert not os.environ.get("TG_CHAT_IDS")
+    assert not os.environ.get("TG_CHAT_ID")
+    assert run_once.send_tg("test-only") is False
+    assert tracker.send_detailed("test-only") == {}
+    assert reconcile_daily.send_detailed("test-only") == {}
+
+    workflow = _workflow()
+    test_step = workflow.split("- name: Run regression test suite before market execution", 1)[1].split("- name:", 1)[0]
+    assert 'TG_BOT_TOKEN: ""' in test_step
+    assert 'TG_CHAT_IDS: ""' in test_step
+    assert 'TG_CHAT_ID: ""' in test_step

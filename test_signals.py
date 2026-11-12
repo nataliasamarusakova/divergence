@@ -3012,6 +3012,12 @@ def test_execute_new_position_rolls_back_excessive_entry_drift(monkeypatch):
         "status": "found", "positionAmt": "1", "avgPrice": "104", "entryPrice": "104",
     })
     monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: {"status": "closed"})
+    # This test covers the drift rollback decision, not live exchange cleanup.
+    # A real BingX read for the synthetic TEST symbol used to enqueue a false
+    # position_state_not_confirmed Telegram alert during CI.
+    monkeypatch.setattr(ro, "cleanup_directional_protection_after_close", lambda *a, **k: {
+        "status": "cleaned", "cancelled_order_ids": [], "remaining_order_ids": [],
+    })
     out = ro.execute_new_position(
         "TEST", "LONG", 100.0,
         {"risk_pct": 1.0, "signal_price": 100.0, "event_type": "REGULAR_BULLISH_RSI"},
