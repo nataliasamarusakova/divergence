@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794491246500,
+  "updated_ts": 1794491954558,
   "events": [
     {
       "event_id": "EVT_3151F4EFE4DAAAA0",
@@ -2363,6 +2363,147 @@
         "mss_level": 0.2441,
         "broken_ts": 1794369599999,
         "bos_ts": 1793649599999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_76AB80704418FCAD",
+      "symbol": "MAGMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1794484799999,
+        "pivot_2_ts": 1794484799999,
+        "detected_at_ts": 1794484799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.25683,
+        "donchian_high": 0.31296,
+        "donchian_low": 0.25836,
+        "breakout_atr": 0.10657351634107304,
+        "volume_ratio": 12.271466803647865,
+        "adx": 47.03652044602053,
+        "ema200": 0.28502057116128093,
+        "compressed_recent": true,
+        "bb_width": 0.14690833962137112,
+        "trigger_level": 0.25836,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_3839840993B8FAD7",
+      "symbol": "MAGMA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1794455999999,
+        "pivot_2_ts": 1794484799999,
+        "detected_at_ts": 1794484799999
+      },
+      "event_fact": {
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.28309,
+        "zone_high": 0.31296,
+        "zone_low": 0.28309,
+        "bos_level": 0.2634,
+        "ob_ts": 1794481199999,
+        "displacement_atr": 3.7760459613396464,
+        "volume_ratio": 12.271466803647865,
+        "body_fraction": 0.8172772501130707,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_060311077CA8317E",
+      "symbol": "MAGMA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1794149999999,
+        "pivot_2_ts": 1794484799999,
+        "detected_at_ts": 1794484799999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.25475,
+        "zone_high": 0.25475,
+        "zone_low": 0.24812,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1794301199999,
+        "liquidity_sweep_level": 0.22748,
+        "mss_ts": 1794391199999,
+        "mss_pivot_ts": 1794272399999,
+        "mss_level": 0.24476,
+        "broken_ts": 1794391199999,
+        "bos_ts": 1794157199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_1AC955B0E08CF712",
+      "symbol": "MAGMA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1794149999999,
+        "pivot_2_ts": 1794488399999,
+        "detected_at_ts": 1794488399999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.25475,
+        "zone_high": 0.25475,
+        "zone_low": 0.24812,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1794301199999,
+        "liquidity_sweep_level": 0.22748,
+        "mss_ts": 1794391199999,
+        "mss_pivot_ts": 1794272399999,
+        "mss_level": 0.24476,
+        "broken_ts": 1794391199999,
+        "bos_ts": 1794157199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_B8C59A56B71F6681",
+      "symbol": "MAGMA",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1794484799999,
+        "pivot_2_ts": 1794484799999,
+        "detected_at_ts": 1794484799999
+      },
+      "event_fact": {
+        "ema_fast": 0.26021809031863136,
+        "ema_slow": 0.28817833443969276,
+        "ema200": 0.30203646693042846,
+        "body_atr": 0.9895822810288479,
+        "volume_ratio": 9.692331895236045,
+        "trigger_level": 0.26021809031863136,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
