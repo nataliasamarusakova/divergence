@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794612756104,
+  "updated_ts": 1794613030508,
   "events": [
     {
       "event_id": "EVT_69E01741F9400F02",
@@ -725,6 +725,30 @@
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_ABF44FE582A5C54F",
+      "symbol": "POL",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1794610799999,
+        "pivot_2_ts": 1794610799999,
+        "detected_at_ts": 1794610799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.08435,
+        "bb_width": 0.0034065695354696945,
+        "kc_width": 0.003171612310912564,
+        "squeeze_duration_bars": 3,
+        "compression_ratio": 1.0740813193809071,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.08484369384454372,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
