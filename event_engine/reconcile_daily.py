@@ -671,6 +671,26 @@ def _discrepancy_message_detail(item: dict) -> str:
         if item.get("confirmed_unapplied_fill_qty") is not None:
             detail += f" confirmed_unapplied_exit_fill_qty={item.get('confirmed_unapplied_fill_qty')}"
         return detail
+    if item.get("code") in {
+        "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE",
+        "EXCHANGE_POSITION_EMPTY_SNAPSHOT_UNCONFIRMED",
+    }:
+        positions = item.get("unconfirmed_positions")
+        if not isinstance(positions, list):
+            positions = item.get("local_positions") if isinstance(item.get("local_positions"), list) else []
+        samples = []
+        for row in positions[:4]:
+            if isinstance(row, dict):
+                samples.append(f"{row.get('symbol', '?')} {row.get('direction', '?')} qty={row.get('local_qty', '?')}")
+        count = item.get("unconfirmed_position_count", item.get("local_position_count", len(positions)))
+        detail = f"{count} local position(s), exchange snapshot UNKNOWN after empty response; "
+        if samples:
+            detail += ", ".join(samples)
+        if count and len(positions) > len(samples):
+            detail += f"; +{len(positions) - len(samples)} more"
+        return detail
+    if item.get("code") == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED":
+        return str(item.get("detail") or "An empty position snapshot was recovered by a second read")
     if item.get("code") == "TRACKER_EXIT_FILL_PENDING":
         evidence = item.get("fill_evidence") if isinstance(item.get("fill_evidence"), list) else []
         order_details = "; ".join(
@@ -740,15 +760,23 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     active, active_error = _load_json_object(active_path)
     local_positions: dict[tuple[str, str], float] = {}
     active_errors: list[str] = []
+    exchange_errors: list[str] = []
 
+    exchange_snapshot_diagnostics: dict[str, Any] = {}
+    empty_snapshot_recheck_status = "NOT_NEEDED"
+    empty_snapshot_recheck_error: str | None = None
+    empty_snapshot_with_local_positions = False
     try:
-        exchange_rows = bingx.get_positions(timeout_sec=3.0, retryable=False)
+        exchange_rows = bingx.get_positions(
+            timeout_sec=3.0, retryable=False, diagnostics=exchange_snapshot_diagnostics,
+        )
         exchange_positions, exchange_errors = _exchange_positions(exchange_rows)
         report["checks"]["exchange_positions"] = {
             "status": "OK" if not exchange_errors else "WARNING",
             "active_position_keys": len(exchange_positions),
             "api_rows": len(exchange_rows),
             "parse_errors": exchange_errors,
+            "response_diagnostics": dict(exchange_snapshot_diagnostics),
         }
         for detail in exchange_errors:
             report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_ROW_UNIDENTIFIABLE", "detail": detail})
@@ -796,6 +824,74 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     ),
                     "records": post_close_pending[:20],
                 })
+
+        # A single successful-but-empty account response must not be treated as
+        # proof that every previously tracked position disappeared. Confirm the
+        # empty snapshot once when local state still contains live positions.
+        # This is read-only and bounded to one additional request.
+        if active is not None and not active_errors and local_positions and not exchange_positions and not exchange_errors:
+            first_diagnostics = dict(exchange_snapshot_diagnostics)
+            second_diagnostics: dict[str, Any] = {}
+            time.sleep(0.5)
+            try:
+                second_rows = bingx.get_positions(
+                    timeout_sec=3.0, retryable=False, diagnostics=second_diagnostics,
+                )
+                second_positions, second_errors = _exchange_positions(second_rows)
+                if second_errors:
+                    empty_snapshot_recheck_status = "ERROR"
+                    empty_snapshot_recheck_error = ";".join(second_errors[:5])
+                elif second_positions:
+                    exchange_rows = second_rows
+                    exchange_positions = second_positions
+                    exchange_errors = []
+                    empty_snapshot_recheck_status = "RECOVERED_NONEMPTY"
+                    report["discrepancies"].append({
+                        "level": "WARNING", "code": "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED",
+                        "first_snapshot_api_rows": first_diagnostics.get("api_rows", 0),
+                        "second_snapshot_api_rows": len(second_rows),
+                        "second_active_position_keys": len(second_positions),
+                        "detail": (
+                            "The first open-position response contained no active positions while local active state was non-empty; "
+                            "a second independent read returned active positions and is used for reconciliation."
+                        ),
+                    })
+                else:
+                    empty_snapshot_recheck_status = "EMPTY_CONFIRMED"
+                    empty_snapshot_with_local_positions = True
+                    empty_snapshot_recheck_error = None
+            except Exception as exc:
+                empty_snapshot_recheck_status = "ERROR"
+                empty_snapshot_recheck_error = f"{type(exc).__name__}:{exc}"
+
+            report["checks"]["exchange_positions"].update({
+                "status": "OK" if empty_snapshot_recheck_status == "RECOVERED_NONEMPTY" else "UNKNOWN",
+                "active_position_keys": len(exchange_positions),
+                "api_rows": len(exchange_rows),
+                "empty_snapshot_recheck": empty_snapshot_recheck_status,
+                "empty_snapshot_recheck_error": empty_snapshot_recheck_error,
+                "first_snapshot_diagnostics": first_diagnostics,
+                "second_snapshot_diagnostics": second_diagnostics,
+                "parse_errors": exchange_errors,
+            })
+            if empty_snapshot_recheck_status == "ERROR":
+                report["discrepancies"].append({
+                    "level": "CRITICAL",
+                    "code": "EXCHANGE_POSITION_EMPTY_SNAPSHOT_UNCONFIRMED",
+                    "local_position_count": len(local_positions),
+                    "local_positions": [
+                        {"symbol": symbol, "direction": direction, "local_qty": qty}
+                        for (symbol, direction), qty in sorted(local_positions.items())
+                    ],
+                    "first_snapshot_http_status": first_diagnostics.get("http_status"),
+                    "first_snapshot_response_code": first_diagnostics.get("response_code"),
+                    "first_snapshot_data_type": first_diagnostics.get("response_data_type"),
+                    "second_snapshot_error": empty_snapshot_recheck_error,
+                    "detail": (
+                        "The first BingX position response was empty while local active state was non-empty, "
+                        "and the confirming read failed. Exchange quantities and protection remain UNKNOWN."
+                    ),
+                })
         catalog_status = "NOT_NEEDED"
         catalog_count = 0
         catalog_error = None
@@ -814,7 +910,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         # while resolving display-name aliases (for example 牛来 → NIULAI-USDT)
         # in the separate reconciliation process.  The catalog is fetched at
         # most once and then shared by position and protection normalization.
-        if active is not None and not active_errors and not exchange_errors and (
+        if active is not None and not active_errors and not exchange_errors and not empty_snapshot_with_local_positions and empty_snapshot_recheck_status != "ERROR" and (
             has_non_ascii_identity
             or (local_positions and exchange_positions and set(local_positions) != set(exchange_positions))
         ):
@@ -890,8 +986,10 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         }
         fill_evidence_by_key: dict[tuple[str, str], dict] = {}
         budget_exhausted_keys: set[tuple[str, str]] = set()
-        if active is not None and not active_errors and not exchange_errors:
-            # Query only keys already discrepant in the first position snapshot.
+        if active is not None and not active_errors and not exchange_errors and empty_snapshot_recheck_status != "ERROR":
+            # Query only keys already discrepant in the position snapshot. When
+            # two reads confirm an empty account snapshot, exact FILLED orders may
+            # still explain individual local positions awaiting tracker application.
             # These reads are bounded by both a request-count and elapsed-time budget.
             for key in sorted(set(local_positions) | set(exchange_positions)):
                 local_qty = local_positions.get(key, 0.0)
@@ -942,6 +1040,29 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                         "post_fill_refresh_api_rows": len(refreshed_rows),
                         "active_position_keys": len(exchange_positions),
                     })
+                    # The post-fill read is newer than the two empty reads. If it
+                    # now contains live positions, use that recovered snapshot for
+                    # every remaining comparison instead of keeping the whole
+                    # account in the stale empty-snapshot UNKNOWN branch.
+                    if empty_snapshot_with_local_positions and exchange_positions:
+                        empty_snapshot_with_local_positions = False
+                        empty_snapshot_recheck_status = "RECOVERED_NONEMPTY_POST_FILL"
+                        report["checks"]["exchange_positions"].update({
+                            "status": "OK",
+                            "empty_snapshot_recheck": empty_snapshot_recheck_status,
+                        })
+                        report["discrepancies"].append({
+                            "level": "WARNING", "code": "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED",
+                            "first_snapshot_api_rows": 0,
+                            "second_snapshot_api_rows": 0,
+                            "second_active_position_keys": 0,
+                            "post_fill_refresh_api_rows": len(refreshed_rows),
+                            "post_fill_refresh_active_position_keys": len(exchange_positions),
+                            "detail": (
+                                "The first two BingX position reads were empty while local active state was non-empty; "
+                                "the later post-fill refresh returned active positions and is used as the latest snapshot."
+                            ),
+                        })
             except Exception as exc:
                 fill_refresh_status = "ERROR"
                 fill_refresh_error = f"{type(exc).__name__}:{exc}"
@@ -949,15 +1070,16 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 report["checks"]["exchange_positions"]["post_fill_refresh"] = "ERROR"
                 report["checks"]["exchange_positions"]["post_fill_refresh_error"] = fill_refresh_error
 
-        if active is not None and not active_errors and not exchange_errors:
+        if active is not None and not active_errors and not exchange_errors and empty_snapshot_recheck_status != "ERROR":
             comparison_keys = set(local_positions) | set(exchange_positions)
             if identity_unresolved:
                 comparison_keys = set(local_positions) & set(exchange_positions)
+            unconfirmed_empty_snapshot_positions = []
             for key in sorted(comparison_keys):
                 local_qty = local_positions.get(key, 0.0)
                 exchange_qty = exchange_positions.get(key, 0.0)
                 tolerance = max(1e-8, exchange_qty * 0.01, local_qty * 0.01)
-                if abs(local_qty - exchange_qty) <= tolerance:
+                if not empty_snapshot_with_local_positions and abs(local_qty - exchange_qty) <= tolerance:
                     continue
 
                 fill_info = fill_evidence_by_key.get(key)
@@ -974,12 +1096,33 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                         report["discrepancies"].append({
                             "level": "WARNING", "code": "TRACKER_EXIT_FILL_PENDING",
                             "symbol": key[0], "direction": key[1],
-                            "local_qty": local_qty, "exchange_qty": exchange_qty,
+                            "local_qty": local_qty,
+                            "exchange_qty": None if empty_snapshot_with_local_positions else exchange_qty,
                             "confirmed_unapplied_fill_qty": confirmed_fill_qty,
                             "fill_evidence": fill_evidence,
-                            "detail": "Confirmed order executions explain the full local/exchange delta, and a fresh exchange position read confirms the expected residual quantity. The next tracker pass should persist the fill-adjusted remaining_qty.",
+                            "detail": (
+                                "Confirmed order executions explain the full local position quantity, and a fresh exchange position read confirms the expected residual. "
+                                "The next tracker pass should persist the fill-adjusted remaining_qty."
+                                if expected_after_fills > 1e-12 else
+                                "Confirmed order executions explain the full local position quantity and a fresh exchange read remains empty. "
+                                "The next tracker pass should finalize the close lifecycle and protection cleanup."
+                            ),
                         })
                         continue
+
+                if empty_snapshot_with_local_positions:
+                    unconfirmed_item = {
+                        "symbol": key[0], "direction": key[1], "local_qty": local_qty,
+                        "fill_evidence": fill_info["evidence"] if fill_info else [],
+                        "confirmed_fill_qty": fill_info["confirmed_fill_qty"] if fill_info else 0.0,
+                        "order_query_budget_exhausted": key in budget_exhausted_keys,
+                        "reason": (
+                            "confirmed_fills_do_not_match_full_local_quantity" if fill_info
+                            else "no_exact_exit_fill_evidence"
+                        ),
+                    }
+                    unconfirmed_empty_snapshot_positions.append(unconfirmed_item)
+                    continue
 
                 mismatch = {
                     "level": "CRITICAL", "code": "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH",
@@ -997,8 +1140,31 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     mismatch["detail"] = "Position mismatch remains CRITICAL; bounded tracker-order verification budget was exhausted before the delta could be explained."
                 report["discrepancies"].append(mismatch)
 
+            if unconfirmed_empty_snapshot_positions:
+                report["discrepancies"].append({
+                    "level": "CRITICAL",
+                    "code": "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE",
+                    "local_position_count": len(local_positions),
+                    "unconfirmed_position_count": len(unconfirmed_empty_snapshot_positions),
+                    "unconfirmed_positions": unconfirmed_empty_snapshot_positions,
+                    "first_snapshot_http_status": report["checks"]["exchange_positions"].get("first_snapshot_diagnostics", {}).get("http_status"),
+                    "first_snapshot_response_code": report["checks"]["exchange_positions"].get("first_snapshot_diagnostics", {}).get("response_code"),
+                    "second_snapshot_http_status": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("http_status"),
+                    "second_snapshot_response_code": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("response_code"),
+                    "detail": (
+                        "Two independent successful BingX position reads returned no active positions while local active state remained non-empty. "
+                        "Exact complete exit fills are classified separately; every other local position remains UNKNOWN, not exchange_qty=0."
+                    ),
+                })
+
         report["checks"]["tracker_exit_fill_reconciliation"] = {
-            "status": "NOT_NEEDED" if tracker_fill_query_state["queries_used"] == 0 else "CHECKED",
+            "status": (
+                "SKIPPED_UNCONFIRMED_EMPTY_POSITION_SNAPSHOT"
+                if empty_snapshot_recheck_status == "ERROR"
+                else "CHECKED_CONFIRMED_EMPTY_POSITION_SNAPSHOT" if empty_snapshot_with_local_positions and tracker_fill_query_state["queries_used"] > 0
+                else "NO_ORDER_EVIDENCE_ON_CONFIRMED_EMPTY_POSITION_SNAPSHOT" if empty_snapshot_with_local_positions
+                else "NOT_NEEDED" if tracker_fill_query_state["queries_used"] == 0 else "CHECKED"
+            ),
             "order_queries_used": tracker_fill_query_state["queries_used"],
             "order_query_budget": tracker_fill_query_state["query_budget"],
             "order_query_timeout_sec": TRACKER_FILL_ORDER_TIMEOUT_SEC,
@@ -1008,7 +1174,10 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         }
     except Exception as exc:
         exchange_positions = {}
-        report["checks"]["exchange_positions"] = {"status": "ERROR", "error": f"{type(exc).__name__}:{exc}"}
+        report["checks"]["exchange_positions"] = {
+            "status": "ERROR", "error": f"{type(exc).__name__}:{exc}",
+            "response_diagnostics": dict(exchange_snapshot_diagnostics),
+        }
         report["discrepancies"].append({"level": "CRITICAL", "code": "EXCHANGE_POSITION_QUERY_FAILED", "detail": str(exc)})
         report["checks"]["runtime_state_initialization"] = {
             "status": "UNKNOWN", "reason": "exchange_snapshot_failed_no_bootstrap_attempted",
@@ -1029,6 +1198,9 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
             }
             for detail in active_errors:
                 report["discrepancies"].append({"level": "WARNING", "code": "LOCAL_ACTIVE_STATE_INVALID", "detail": detail})
+        if local_positions:
+            empty_snapshot_recheck_status = "ERROR"
+            empty_snapshot_recheck_error = "initial_position_query_failed"
 
     # Fetch one account-wide snapshot. Querying openOrders once per position can
     # trip BingX's endpoint trigger-frequency breaker, and symbol-by-symbol retries
@@ -1039,7 +1211,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     protection_snapshot_error: str | None = None
     protection_snapshot_rate_limited = False
     protection_retry_after_ms = None
-    if exchange_positions:
+    if exchange_positions or local_positions or exchange_errors:
         try:
             candidate_snapshot = bingx.get_open_orders_snapshot(timeout_sec=3.0, retryable=False)
         except Exception as exc:
@@ -1063,7 +1235,8 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
 
     if protection_snapshot_error is not None:
         affected_positions = []
-        for (symbol, direction), exchange_qty in sorted(exchange_positions.items()):
+        protection_scope = exchange_positions if exchange_positions else local_positions
+        for (symbol, direction), exchange_qty in sorted(protection_scope.items()):
             key = f"{symbol}:{direction}"
             affected_positions.append(key)
             protection_results[key] = {
@@ -1088,6 +1261,43 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
             "position_count": len(affected_positions), "positions": affected_positions,
             "rate_limited": protection_snapshot_rate_limited, "detail": detail,
         })
+    elif (local_positions and not exchange_positions) or empty_snapshot_with_local_positions or empty_snapshot_recheck_status == "ERROR" or exchange_errors:
+        # An openOrders collection can show that protective orders remain visible,
+        # but it cannot prove that the corresponding position still exists. Keep
+        # position/protection state UNKNOWN instead of reporting a false OK.
+        for (symbol, direction), local_qty in sorted(local_positions.items()):
+            key = f"{symbol}:{direction}"
+            observed = _protection_from_open_orders_snapshot(protection_snapshot, symbol, direction)
+            if observed.get("status") == "ok":
+                sl_orders = observed.get("sl_orders", [])
+                tp_orders = observed.get("tp_orders", [])
+                visible_sl = [
+                    {
+                        "order_id": str(order.get("orderId") or order.get("orderID") or order.get("clientOrderId") or "") or None,
+                        "type": str(order.get("type") or "").upper(),
+                        "quantity": _finite_nonnegative(order.get("origQty") or order.get("quantity")) or 0.0,
+                    }
+                    for order in sl_orders if isinstance(order, dict)
+                ]
+                protection_results[key] = {
+                    "status": "UNKNOWN",
+                    "reason": "position_snapshot_empty_with_local_active_state",
+                    "local_qty": local_qty,
+                    "visible_sl_orders": visible_sl,
+                    "visible_tp_order_count": len(tp_orders),
+                    "source": "account_open_orders_snapshot_local_state_only",
+                }
+            else:
+                protection_results[key] = {
+                    "status": "UNKNOWN", "error": observed.get("error", "open_orders_snapshot_unavailable"),
+                    "local_qty": local_qty,
+                    "source": "account_open_orders_snapshot_local_state_only",
+                }
+        if exchange_errors and not protection_results:
+            protection_results["UNIDENTIFIED_EXCHANGE_POSITIONS"] = {
+                "status": "UNKNOWN", "error": ";".join(exchange_errors[:5]),
+                "source": "exchange_position_rows_unidentifiable",
+            }
     else:
         # Confirm that each visible exchange position has one identifiable SL.
         # This is read-only; ambiguous openOrders data never becomes "no protection".
@@ -1153,11 +1363,15 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     report["checks"]["exchange_protection"] = {
         "status": protection_check_status,
         "positions_checked": len(protection_results), "by_position": protection_results,
-        "source": "account_open_orders_snapshot" if exchange_positions else "not_needed_no_open_positions",
+        "source": (
+            "account_open_orders_snapshot" if exchange_positions
+            else "account_open_orders_snapshot_local_state_only" if local_positions
+            else "not_needed_no_open_positions"
+        ),
         "error": protection_snapshot_error,
         "rate_limited": protection_snapshot_rate_limited,
         "retry_after_ms": protection_retry_after_ms,
-        "note": "Requires exactly one identifiable STOP/STOP_MARKET SL with a finite positive trigger price, expected directional side, and approximate live quantity; uses one account-wide read-only snapshot and never modifies orders.",
+        "note": "Requires exactly one identifiable STOP/STOP_MARKET SL with a finite positive trigger price, expected directional side, and approximate live quantity. When the position snapshot is empty but local active state exists, open orders are inspected for visibility only and protection remains UNKNOWN; orders alone do not prove a live position. Uses one account-wide read-only snapshot and never modifies orders.",
     }
 
     journal, journal_errors = _load_journal(trades_path)

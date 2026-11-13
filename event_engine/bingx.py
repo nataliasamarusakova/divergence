@@ -19,7 +19,7 @@ from decimal import (
     ROUND_FLOOR,
 )
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -303,12 +303,19 @@ def _request(
     *,
     timeout_sec: float | None = None,
     retryable: bool = True,
+    response_metadata: dict[str, Any] | None = None,
 ):
     is_open_orders = method.upper() == "GET" and path == OPEN_ORDERS_PATH
     if is_open_orders:
         cooldown = _read_open_orders_cooldown()
         if cooldown is not None:
             until_ms, reason = cooldown
+            if isinstance(response_metadata, dict):
+                response_metadata.clear()
+                response_metadata.update({
+                    "http_status": None, "endpoint": path, "method": method.upper(),
+                    "transport": "local_cooldown", "local_cooldown": True,
+                })
             return {
                 "code": 100410,
                 "msg": f"The endpoint trigger frequency limit rule is currently in the disabled period and will be unblocked after {until_ms}",
@@ -337,6 +344,8 @@ def _request(
         if signed:
             _apply_request_timestamp(request_params)
 
+        request_started = time.monotonic()
+        response = None
         try:
             response = session.request(
                 method=method,
@@ -345,8 +354,32 @@ def _request(
                 headers=headers,
                 timeout=request_timeout,
             )
+            if isinstance(response_metadata, dict):
+                response_metadata.clear()
+                response_metadata.update({
+                    "http_status": int(response.status_code),
+                    "endpoint": path,
+                    "method": method.upper(),
+                    "request_host": urlparse(BASE_URL).netloc,
+                    "response_content_type": str(response.headers.get("Content-Type") or "")[:120],
+                })
             payload = response.json()
+            if isinstance(response_metadata, dict):
+                response_metadata["request_elapsed_ms"] = int((time.monotonic() - request_started) * 1000)
         except Exception as exc:
+            if isinstance(response_metadata, dict):
+                if response is not None:
+                    response_metadata["http_status"] = getattr(response, "status_code", None)
+                    headers_obj = getattr(response, "headers", {})
+                    response_metadata["response_content_type"] = str(headers_obj.get("Content-Type") or "")[:120]
+                else:
+                    response_metadata["http_status"] = None
+                response_metadata.update({
+                    "endpoint": path,
+                    "method": method.upper(), "request_host": urlparse(BASE_URL).netloc,
+                    "request_elapsed_ms": int((time.monotonic() - request_started) * 1000),
+                    "transport_error": f"{type(exc).__name__}:{str(exc)[:180]}",
+                })
             return {"code": -1, "msg": str(exc)}
 
         try:
@@ -761,7 +794,17 @@ def _normalize_orders_list(resp: dict) -> list[dict]:
     )
 
 
-def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
+def get_positions(
+    *, timeout_sec: float | None = None, retryable: bool = True,
+    diagnostics: dict[str, Any] | None = None,
+) -> list[dict]:
+    """Fetch open positions and optionally expose a sanitized response envelope.
+
+    An explicit empty collection is still a valid API response. Callers that
+    compare it with an established non-empty local state must independently
+    confirm that snapshot before treating all local positions as absent.
+    """
+    request_metadata: dict[str, Any] = diagnostics if isinstance(diagnostics, dict) else {}
     resp = _request(
         "GET",
         POSITION_PATH,
@@ -769,7 +812,29 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         signed=True,
         timeout_sec=timeout_sec,
         retryable=retryable,
+        response_metadata=request_metadata,
     )
+    if isinstance(diagnostics, dict):
+        request_metadata = dict(diagnostics)
+        data = resp.get("data") if isinstance(resp, dict) else None
+        diagnostics.clear()
+        diagnostics.update(request_metadata)
+        diagnostics.update({
+            "response_type": type(resp).__name__,
+            "response_code": resp.get("code") if isinstance(resp, dict) else None,
+            "response_msg": str(resp.get("msg") or "")[:240] if isinstance(resp, dict) else "",
+            "response_keys": sorted(str(key) for key in resp.keys())[:40] if isinstance(resp, dict) else [],
+            "response_data_type": type(data).__name__ if isinstance(resp, dict) and "data" in resp else "missing",
+            "response_data_is_explicit": isinstance(resp, dict) and "data" in resp,
+        })
+    http_status = request_metadata.get("http_status")
+    if http_status is not None:
+        try:
+            status_code = int(http_status)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError(f"[BINGX] get_positions has invalid HTTP status metadata: {http_status!r}")
+        if not 200 <= status_code < 300:
+            raise RuntimeError(f"[BINGX] get_positions failed: HTTP status={status_code}")
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         code = resp.get("code") if isinstance(resp, dict) else "invalid_response"
         msg = resp.get("msg") if isinstance(resp, dict) else repr(resp)
@@ -792,6 +857,13 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
                 raise ValueError(f"get_positions: row {index} has non-finite positionAmt")
             if abs(qty) > 0 and str(row.get("positionSide") or "").upper() not in {"LONG", "SHORT", "BOTH"}:
                 raise ValueError(f"get_positions: active row {index} has no valid positionSide")
+        if isinstance(diagnostics, dict):
+            diagnostics["api_rows"] = len(rows)
+            diagnostics["active_position_rows"] = sum(
+                1 for row in rows
+                if abs(_safe_float(row.get("positionAmt"), 0.0)) > 1e-12
+            )
+            diagnostics["collection_shape"] = "list" if isinstance(data, list) else type(data).__name__
         return rows
     except ValueError as exc:
         raise RuntimeError(f"[BINGX] get_positions response is ambiguous: {exc}") from exc
