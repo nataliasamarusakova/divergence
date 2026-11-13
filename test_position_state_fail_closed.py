@@ -186,3 +186,80 @@ def test_account_wide_open_orders_rejects_rows_missing_type_or_symbol(monkeypatc
     result = bingx.get_open_orders_snapshot()
     assert result["status"] == "error"
     assert "missing type or symbol" in result["error"]
+
+
+def test_get_positions_exposes_sanitized_empty_snapshot_diagnostics(monkeypatch):
+    from event_engine import bingx
+
+    def fake_request(*args, **kwargs):
+        metadata = kwargs.get("response_metadata")
+        if isinstance(metadata, dict):
+            metadata.update({
+                "http_status": 200, "endpoint": bingx.POSITION_PATH,
+                "method": "GET", "request_host": "open-api-vst.bingx.com",
+            })
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    diagnostics = {}
+    assert bingx.get_positions(retryable=False, diagnostics=diagnostics) == []
+    assert diagnostics["http_status"] == 200
+    assert diagnostics["response_code"] == 0
+    assert diagnostics["response_data_type"] == "list"
+    assert diagnostics["api_rows"] == 0
+    assert diagnostics["active_position_rows"] == 0
+    assert diagnostics["request_host"] == "open-api-vst.bingx.com"
+
+
+def test_get_positions_rejects_non_2xx_even_if_body_looks_like_empty_success(monkeypatch):
+    import pytest
+    from event_engine import bingx
+
+    def fake_request(*args, **kwargs):
+        metadata = kwargs.get("response_metadata")
+        if isinstance(metadata, dict):
+            metadata.update({"http_status": 502, "request_host": "open-api-vst.bingx.com"})
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    diagnostics = {}
+    with pytest.raises(RuntimeError, match="HTTP status=502"):
+        bingx.get_positions(retryable=False, diagnostics=diagnostics)
+    assert diagnostics["http_status"] == 502
+    assert diagnostics["response_data_type"] == "list"
+
+
+def test_get_positions_captures_http_status_even_when_caller_does_not_request_diagnostics(monkeypatch):
+    import pytest
+    from event_engine import bingx
+
+    def fake_request(*args, **kwargs):
+        metadata = kwargs.get("response_metadata")
+        if isinstance(metadata, dict):
+            metadata.update({"http_status": 502, "request_host": "open-api-vst.bingx.com"})
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    with pytest.raises(RuntimeError, match="HTTP status=502"):
+        bingx.get_positions(retryable=False)
+
+
+def test_positions_request_diagnostic_preserves_http_status_when_json_parse_fails(monkeypatch):
+    from event_engine import bingx
+
+    class _Response:
+        status_code = 502
+        headers = {"Content-Type": "text/html"}
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr(bingx.FAST_SESSION, "request", lambda **kwargs: _Response())
+    metadata = {}
+    result = bingx._request(
+        "GET", bingx.POSITION_PATH, {}, signed=False, retryable=False,
+        response_metadata=metadata,
+    )
+    assert result["code"] == -1
+    assert metadata["http_status"] == 502
+    assert metadata["response_content_type"] == "text/html"
+    assert metadata["transport_error"].startswith("ValueError:")

@@ -1102,3 +1102,252 @@ def test_unresolved_data_error_from_previous_utc_day_remains_critical_with_recov
     assert "EVT-VIRTUAL" in detail
     assert "incomplete_close_fills" in detail
     assert report["status"] == "CRITICAL"
+
+
+def test_empty_exchange_snapshot_with_local_active_position_is_rechecked_and_protection_is_unknown(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-BTC": {
+            "symbol": "BTC", "direction": "LONG", "remaining_qty": 2.0,
+            "initial_qty": 2.0, "closed": False, "tp_filled_qty": {},
+            "tp_orders": [], "sl_order": {"order_id": "SL-BTC"},
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-BTC", "symbol": "BTC",
+        "direction": "LONG", "ts": _now_ms(),
+    }) + "\n", encoding="utf-8")
+
+    reads = []
+    def read_positions(**kwargs):
+        diag = kwargs.get("diagnostics")
+        reads.append(1)
+        if isinstance(diag, dict):
+            diag.update({
+                "http_status": 200, "response_code": 0, "response_msg": "",
+                "response_data_type": "list", "request_elapsed_ms": len(reads),
+            })
+        return []
+
+    open_order_calls = []
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: open_order_calls.append(1) or {
+        "status": "ok", "orders": [
+            {"symbol": "BTC-USDT", "orderId": "SL-BTC", "type": "STOP_MARKET", "stopPrice": "90",
+             "positionSide": "LONG", "origQty": "2"},
+            {"symbol": "BTC-USDT", "orderId": "TP-BTC", "type": "TAKE_PROFIT_MARKET",
+             "positionSide": "LONG", "origQty": "2"},
+        ],
+    })
+    monkeypatch.setattr(recon.bingx, "get_order", lambda *a, **k: {
+        "status": "ok", "order_status": "NEW", "executed_qty": 0.0,
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert len(reads) == 2
+    assert len(open_order_calls) == 1
+    exchange = report["checks"]["exchange_positions"]
+    assert exchange["status"] == "UNKNOWN"
+    assert exchange["empty_snapshot_recheck"] == "EMPTY_CONFIRMED"
+    assert exchange["first_snapshot_diagnostics"]["http_status"] == 200
+    assert exchange["second_snapshot_diagnostics"]["response_code"] == 0
+    assert report["checks"]["exchange_protection"]["status"] == "UNKNOWN"
+    assert report["checks"]["exchange_protection"]["positions_checked"] == 1
+    visible = report["checks"]["exchange_protection"]["by_position"]["BTC-USDT:LONG"]
+    assert visible["status"] == "UNKNOWN"
+    assert visible["visible_sl_orders"][0]["order_id"] == "SL-BTC"
+    assert any(x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE" for x in report["discrepancies"])
+    assert not any(x["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for x in report["discrepancies"])
+    critical = next(x for x in report["discrepancies"] if x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE")
+    assert critical["unconfirmed_position_count"] == 1
+    assert "first_snapshot" not in critical and "second_snapshot" not in critical
+
+    # Volatile request timings belong in checks, not the alert fingerprint.
+    second_report = recon.run_reconciliation(now_ms=_now_ms() + 1000, data_dir=data, notify=False)
+    assert second_report["checks"]["exchange_positions"]["first_snapshot_diagnostics"]["request_elapsed_ms"] != exchange["first_snapshot_diagnostics"]["request_elapsed_ms"]
+    assert recon._alert_signature(report["discrepancies"]) == recon._alert_signature(second_report["discrepancies"])
+
+
+def test_empty_first_exchange_snapshot_recovers_on_second_read_and_uses_second_snapshot(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-BTC": {
+            "symbol": "BTC", "direction": "LONG", "remaining_qty": 2.0,
+            "closed": False, "tp_orders": [], "sl_order": {"order_id": "SL-BTC"},
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-BTC", "symbol": "BTC",
+        "direction": "LONG", "ts": _now_ms(),
+    }) + "\n", encoding="utf-8")
+    reads = iter(([], [{"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "2"}]))
+    calls = []
+    def read_positions(**kwargs):
+        calls.append(1)
+        return next(reads)
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert len(calls) == 2
+    assert report["checks"]["exchange_positions"]["status"] == "OK"
+    assert report["checks"]["exchange_positions"]["empty_snapshot_recheck"] == "RECOVERED_NONEMPTY"
+    assert report["checks"]["exchange_positions"]["active_position_keys"] == 1
+    assert any(x["code"] == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED" for x in report["discrepancies"])
+    assert not any(x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE" for x in report["discrepancies"])
+    assert not any(x["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for x in report["discrepancies"])
+
+
+def test_empty_exchange_snapshot_second_read_error_keeps_position_and_protection_unknown(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text(json.dumps({
+        "EVT-BTC": {
+            "symbol": "BTC", "direction": "LONG", "remaining_qty": 2.0,
+            "closed": False, "tp_orders": [], "sl_order": {"order_id": "SL-BTC"},
+        },
+    }), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    calls = {"n": 0}
+    def read_positions(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        raise RuntimeError("temporary second-read failure")
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert calls["n"] == 2
+    assert report["checks"]["exchange_positions"]["status"] == "UNKNOWN"
+    assert report["checks"]["exchange_positions"]["empty_snapshot_recheck"] == "ERROR"
+    assert report["checks"]["exchange_protection"]["status"] == "UNKNOWN"
+    assert any(x["code"] == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_UNCONFIRMED" for x in report["discrepancies"])
+    assert not any(x["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for x in report["discrepancies"])
+
+
+def test_confirmed_empty_exchange_snapshot_aggregates_all_local_positions_without_zero_qty_claims(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    symbols = [f"COIN{i:02d}" for i in range(17)]
+    active = {
+        f"EVT-{symbol}": {
+            "symbol": symbol, "direction": "SHORT", "remaining_qty": float(i + 1),
+            "initial_qty": float(i + 1), "closed": False,
+            "tp_orders": [], "sl_order": {},
+        }
+        for i, symbol in enumerate(symbols)
+    }
+    (data / "active_trades.json").write_text(json.dumps(active), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+
+    reads = []
+    def read_positions(**kwargs):
+        reads.append(1)
+        if isinstance(kwargs.get("diagnostics"), dict):
+            kwargs["diagnostics"].update({
+                "http_status": 200, "response_code": 0,
+                "response_data_type": "list", "api_rows": 0,
+            })
+        return []
+
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {
+        "status": "ok", "orders": [],
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert len(reads) == 2
+    assert report["checks"]["exchange_positions"]["status"] == "UNKNOWN"
+    assert report["checks"]["exchange_protection"]["status"] == "UNKNOWN"
+    assert report["checks"]["exchange_protection"]["positions_checked"] == 17
+    assert not any(item["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for item in report["discrepancies"])
+    critical = [item for item in report["discrepancies"] if item["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE"]
+    assert len(critical) == 1
+    assert critical[0]["local_position_count"] == 17
+    assert critical[0]["unconfirmed_position_count"] == 17
+    detail = recon._discrepancy_message_detail(critical[0])
+    assert "17 local position(s)" in detail
+    assert "+13 more" in detail
+
+
+def test_later_post_fill_snapshot_recovers_after_two_empty_reads_and_checks_remaining_positions(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    active = {
+        "EVT-BTC": {
+            "symbol": "BTC", "direction": "SHORT", "remaining_qty": 2.0,
+            "initial_qty": 2.0, "closed": False, "tp_filled_qty": {},
+            "tp_orders": [{"leg": "tp1", "order_id": "TP-BTC"}],
+            "sl_order": {"order_id": "SL-BTC"},
+        },
+        "EVT-ETH": {
+            "symbol": "ETH", "direction": "LONG", "remaining_qty": 3.0,
+            "initial_qty": 3.0, "closed": False, "tp_filled_qty": {},
+            "tp_orders": [], "sl_order": {"order_id": "SL-ETH"},
+        },
+    }
+    (data / "active_trades.json").write_text(json.dumps(active), encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+
+    reads = []
+    def read_positions(**kwargs):
+        reads.append(1)
+        if len(reads) <= 2:
+            return []
+        return [{"symbol": "ETH-USDT", "positionSide": "LONG", "positionAmt": "3"}]
+
+    monkeypatch.setattr(recon.bingx, "get_positions", read_positions)
+    def fill_evidence(_active, key, _delta, _query_state):
+        if key == ("BTC-USDT", "SHORT"):
+            return 2.0, [{
+                "order_id": "TP-BTC", "source": "TP:tp1", "order_status": "FILLED",
+                "executed_qty": 2.0, "unapplied_fill_qty": 2.0, "avg_price_available": True,
+            }], False
+        return 0.0, [], False
+    monkeypatch.setattr(recon, "_pending_exit_fill_evidence", fill_evidence)
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", lambda **kwargs: {
+        "status": "ok", "orders": [
+            {"symbol": "ETH-USDT", "orderId": "SL-ETH", "type": "STOP_MARKET",
+             "stopPrice": "90", "positionSide": "LONG", "origQty": "3"},
+        ],
+    })
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert len(reads) == 3
+    exchange = report["checks"]["exchange_positions"]
+    assert exchange["status"] == "OK"
+    assert exchange["empty_snapshot_recheck"] == "RECOVERED_NONEMPTY_POST_FILL"
+    assert exchange["active_position_keys"] == 1
+    assert any(x["code"] == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED" for x in report["discrepancies"])
+    pending = [x for x in report["discrepancies"] if x["code"] == "TRACKER_EXIT_FILL_PENDING"]
+    assert len(pending) == 1 and pending[0]["symbol"] == "BTC-USDT"
+    mismatches = [x for x in report["discrepancies"] if x["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH"]
+    assert mismatches == []
+    # BTC's full fill is still pending tracker application; ETH is visible on the
+    # latest exchange snapshot and must have its protection checked normally.
+    assert report["checks"]["exchange_protection"]["status"] in {"OK", "WARNING"}
+    assert "ETH-USDT:LONG" in report["checks"]["exchange_protection"]["by_position"]
+    assert not any(x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE" for x in report["discrepancies"])
