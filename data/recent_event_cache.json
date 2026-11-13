@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794541929373,
+  "updated_ts": 1794542219206,
   "events": [
     {
       "event_id": "EVT_0DAAA164207220D2",
@@ -2082,6 +2082,64 @@
         "vwap": 1.4512099046617615,
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_BCDC2E3975B6C4D0",
+      "symbol": "WIF",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "BREAKER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1794211199999,
+        "pivot_2_ts": 1794535199999,
+        "detected_at_ts": 1794535199999
+      },
+      "event_fact": {
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.1517,
+        "zone_high": 0.1542,
+        "zone_low": 0.1517,
+        "breaker_from": "BULLISH_OB",
+        "liquidity_sweep_ts": 1794412799999,
+        "liquidity_sweep_level": 0.1606,
+        "mss_ts": 1794488399999,
+        "mss_pivot_ts": 1794383999999,
+        "mss_level": 0.1555,
+        "broken_ts": 1794488399999,
+        "bos_ts": 1794229199999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_2820139608C01CDA",
+      "symbol": "WIF",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1794491999999,
+        "pivot_2_ts": 1794538799999,
+        "detected_at_ts": 1794538799999
+      },
+      "event_fact": {
+        "swept_level": 0.149,
+        "sweep_depth_atr": 0.4306901245998366,
+        "reclaim_displacement_atr": 0.4306901245998366,
+        "rejection_wick_fraction": 0.4516129032258076,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1794535199999,
+        "lookback_bars": 20,
+        "volume_ratio": 1.4166100817840055,
+        "trigger_level": 0.149,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
