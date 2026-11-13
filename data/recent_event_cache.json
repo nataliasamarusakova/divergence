@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794611262283,
+  "updated_ts": 1794611542665,
   "events": [
     {
       "event_id": "EVT_69E01741F9400F02",
@@ -695,6 +695,35 @@
         "requires_retest": true,
         "trigger_level": 0.4209,
         "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_030423DBEA4202AE",
+      "symbol": "BERA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1794610799999,
+        "pivot_2_ts": 1794610799999,
+        "detected_at_ts": 1794610799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.1136,
+        "donchian_high": 0.1131,
+        "donchian_low": 0.0968,
+        "breakout_atr": 0.18320785182866003,
+        "volume_ratio": 1.983939677380822,
+        "adx": 27.575429219342617,
+        "ema200": 0.10944538336364228,
+        "compressed_recent": false,
+        "bb_width": 0.16012598150189086,
+        "trigger_level": 0.1131,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
