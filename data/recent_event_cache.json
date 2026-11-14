@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794666736765,
+  "updated_ts": 1794667004308,
   "events": [
     {
       "event_id": "EVT_9F70ADB347D29BF1",
@@ -1467,6 +1467,30 @@
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_75529CC6D5BB6B98",
+      "symbol": "EVAA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1794664799999,
+        "pivot_2_ts": 1794664799999,
+        "detected_at_ts": 1794664799999
+      },
+      "event_fact": {
+        "detection_close_price": 1.1574,
+        "bb_width": 0.08161258726444132,
+        "kc_width": 0.07403207599269113,
+        "squeeze_duration_bars": 36,
+        "compression_ratio": 1.1023949574573402,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 1.1332560379963457,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
