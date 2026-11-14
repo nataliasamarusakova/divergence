@@ -378,9 +378,12 @@ def _request(
                     "endpoint": path,
                     "method": method.upper(), "request_host": urlparse(BASE_URL).netloc,
                     "request_elapsed_ms": int((time.monotonic() - request_started) * 1000),
-                    "transport_error": f"{type(exc).__name__}:{str(exc)[:180]}",
+                    # requests exceptions may embed the fully signed URL. Keep
+                    # the exception class only whenever diagnostics are enabled.
+                    "transport_error": type(exc).__name__,
                 })
-            return {"code": -1, "msg": str(exc)}
+            safe_message = type(exc).__name__ if isinstance(response_metadata, dict) else str(exc)
+            return {"code": -1, "msg": safe_message}
 
         try:
             code = int(payload.get("code"))
@@ -1110,39 +1113,69 @@ def _shape_fingerprint(payload: Any) -> tuple[str, str]:
 
 
 def is_income_history_null_data_shape(response: Any) -> bool:
-    """True only for BingX's successful envelope with an unexpected null data body.
+    """True only for a successful HTTP/API envelope with an unexpected null body.
 
-    Do not use this recovery path for authentication, permission, rate-limit, or
-    transport failures: those require their own handling and another signed
-    account-wide request can make rate limiting worse.
+    Do not use the account-wide fallback for an HTTP error, authentication,
+    permission, rate-limit, or transport failure: another signed request could
+    amplify the underlying outage or rate limiting.
     """
-    return (
+    if not (
         isinstance(response, dict)
         and response.get("status") == "error"
         and response.get("error") == "income_history_unexpected_data_shape"
         and response.get("response_code") in (0, "0")
         and response.get("response_data_type") == "NoneType"
-    )
+    ):
+        return False
+    http_status = response.get("http_status")
+    if http_status is None:
+        # Compatibility for test/legacy result objects created before request
+        # metadata was added. Live HTTP responses carry an explicit status.
+        return True
+    try:
+        status_code = int(http_status)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 200 <= status_code < 300
 
 
-def _response_envelope_diagnostics(response: Any) -> dict[str, Any]:
-    """Return bounded, non-secret metadata for an unexpected API envelope."""
+def _response_envelope_diagnostics(
+    response: Any, request_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return bounded, non-secret API envelope and transport diagnostics."""
     if not isinstance(response, dict):
-        return {
+        diagnostics = {
             "response_type": type(response).__name__,
             "response_keys": [],
             "response_code": None,
             "response_msg": None,
             "response_data_type": None,
         }
-    message = response.get("msg")
-    return {
-        "response_type": "dict",
-        "response_keys": sorted(str(key) for key in response.keys())[:40],
-        "response_code": response.get("code"),
-        "response_msg": str(message)[:240] if message not in (None, "") else "",
-        "response_data_type": type(response.get("data")).__name__ if "data" in response else "missing",
-    }
+    else:
+        message = response.get("msg")
+        diagnostics = {
+            "response_type": "dict",
+            "response_keys": sorted(str(key) for key in response.keys())[:40],
+            "response_code": response.get("code"),
+            "response_msg": str(message)[:240] if message not in (None, "") else "",
+            "response_data_type": type(response.get("data")).__name__ if "data" in response else "missing",
+        }
+    if isinstance(request_metadata, dict):
+        for key in (
+            "http_status", "endpoint", "method", "request_host",
+            "response_content_type", "request_elapsed_ms", "transport_error",
+        ):
+            value = request_metadata.get(key)
+            if value is None:
+                continue
+            if key in {"endpoint", "method", "request_host", "response_content_type", "transport_error"}:
+                diagnostics[key] = str(value)[:240]
+            else:
+                try:
+                    diagnostics[key] = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    diagnostics[key] = str(value)[:80]
+    return diagnostics
 
 
 def _normalize_history_symbol(symbol: str) -> str | None:
@@ -1371,13 +1404,32 @@ def get_income_history(
         params = {"startTime": lo, "endTime": hi, "limit": limit}
         if bx:
             params["symbol"] = bx
+        request_metadata: dict[str, Any] = {}
         try:
-            response = _request("GET", INCOME_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
+            response = _request(
+                "GET", INCOME_HISTORY_PATH, params, signed=True,
+                timeout_sec=timeout_sec, retryable=False,
+                response_metadata=request_metadata,
+            )
         except Exception as exc:
-            return None, f"request_exception:{exc}"
+            last_shape_diagnostics.update({
+                "transport_error": type(exc).__name__,
+                **_response_envelope_diagnostics(None, request_metadata),
+            })
+            return None, f"request_exception:{type(exc).__name__}"
+        envelope = _response_envelope_diagnostics(response, request_metadata)
+        http_status = request_metadata.get("http_status")
+        if http_status is not None:
+            try:
+                parsed_http_status = int(http_status)
+            except (TypeError, ValueError, OverflowError):
+                parsed_http_status = 0
+            if not 200 <= parsed_http_status < 300:
+                last_shape_diagnostics.update(envelope)
+                return None, f"income_history_http_status_error:{http_status}"
         if not isinstance(response, dict) or response.get("code") not in (0, "0"):
             err = response.get("msg", response) if isinstance(response, dict) else response
-            last_shape_diagnostics.update(_response_envelope_diagnostics(response))
+            last_shape_diagnostics.update(envelope)
             return None, str(err)
         data = response.get("data")
         income_row_keys = (
@@ -1399,7 +1451,7 @@ def get_income_history(
         )
         if rows is None:
             fp, desc = _shape_fingerprint(data)
-            envelope = _response_envelope_diagnostics(response)
+            envelope = _response_envelope_diagnostics(response, request_metadata)
             log.warning(
                 "[BINGX] income history unexpected shape fingerprint=%s shape=%s response_code=%s response_msg=%s response_keys=%s",
                 fp, desc, envelope.get("response_code"), envelope.get("response_msg"), envelope.get("response_keys"),

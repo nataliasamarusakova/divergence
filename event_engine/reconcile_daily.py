@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import hashlib
 import sys
 import time
@@ -620,8 +621,33 @@ def _append_health(path: Path, report: dict) -> str | None:
 
 
 def _alert_signature(discrepancies: list[dict]) -> str:
-    """Fingerprint the exact discrepancy state, including quantities and identity."""
-    normalized = json.dumps(discrepancies, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    """Fingerprint stable discrepancy identity, excluding elapsed-time telemetry.
+
+    DAILY_INCOME_QUERY_INCOMPLETE includes the age of a persisted pending API
+    response and the local attempt count. Those values change on each workflow
+    run even when the upstream failure is identical. They remain visible in
+    health.jsonl and Telegram, but do not create a new alert identity. Symbol,
+    error type, response envelope, HTTP status, and fallback details stay in the
+    signature so a materially changed failure still triggers a new alert.
+    """
+    stable_discrepancies: list[dict] = []
+    for item in discrepancies:
+        if not isinstance(item, dict):
+            stable_discrepancies.append(item)
+            continue
+        stable = dict(item)
+        if stable.get("code") == "DAILY_INCOME_QUERY_INCOMPLETE":
+            detail = str(stable.get("detail") or "")
+            detail = re.sub(r";\s*null_data_pending_for_sec=\d+;\s*grace_sec=\d+", "", detail)
+            detail = re.sub(r"\s*\(attempts=\d+\)$", "", detail)
+            stable["detail"] = detail
+            response = stable.get("response_diagnostics")
+            if isinstance(response, dict):
+                response = dict(response)
+                response.pop("request_elapsed_ms", None)
+                stable["response_diagnostics"] = response
+        stable_discrepancies.append(stable)
+    normalized = json.dumps(stable_discrepancies, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -1513,6 +1539,8 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                         key: account_wide_income.get(key) for key in (
                             "response_type", "response_code", "response_msg",
                             "response_keys", "response_data_type", "shape_fingerprint",
+                            "http_status", "endpoint", "method", "request_host",
+                            "response_content_type", "transport_error",
                         ) if account_wide_income.get(key) is not None
                     }
                     if isinstance(income, dict):
@@ -1529,12 +1557,22 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     detail += f"; shape_fingerprint={shape_fingerprint}"
                 if shape_summary:
                     detail += f"; response_shape={shape_summary}"
+                # Keep request latency in health summaries, not in the alert
+                # fingerprint. The stable fields below identify the API failure
+                # without making every retry look like a new incident.
+                response_diagnostic_keys = (
+                    "response_type", "response_code", "response_msg",
+                    "response_keys", "response_data_type", "http_status",
+                    "endpoint", "method", "request_host", "response_content_type",
+                    "transport_error",
+                )
                 response_diagnostics = {
-                    key: income.get(key) for key in (
-                        "response_type", "response_code", "response_msg",
-                        "response_keys", "response_data_type",
-                    ) if isinstance(income, dict) and income.get(key) is not None
+                    key: income.get(key) for key in response_diagnostic_keys
+                    if isinstance(income, dict) and income.get(key) is not None
                 }
+                response_health_diagnostics = dict(response_diagnostics)
+                if isinstance(income, dict) and income.get("request_elapsed_ms") is not None:
+                    response_health_diagnostics["request_elapsed_ms"] = income.get("request_elapsed_ms")
                 if response_diagnostics:
                     detail += "; api_response=" + json.dumps(
                         response_diagnostics, ensure_ascii=False, separators=(",", ":"),
@@ -1570,7 +1608,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                             "grace_sec": INCOME_NULL_GRACE_SEC,
                             "accounting_value": "UNKNOWN_NOT_ZERO",
                             "shape_fingerprint": shape_fingerprint,
-                            "response_diagnostics": response_diagnostics,
+                            "response_diagnostics": response_health_diagnostics,
                         }
                         continue
                     expired_income_symbols.add(symbol)
@@ -1582,7 +1620,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 income_summaries[symbol] = {
                     "status": "ERROR", "error": detail, "attempts": attempts,
                     "shape_fingerprint": shape_fingerprint, "shape_summary": shape_summary,
-                    "response_diagnostics": response_diagnostics,
+                    "response_diagnostics": response_health_diagnostics,
                     "accounting_value": "UNKNOWN_NOT_ZERO",
                 }
                 report["discrepancies"].append({
