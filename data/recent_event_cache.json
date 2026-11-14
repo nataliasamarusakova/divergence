@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794667004308,
+  "updated_ts": 1794667324125,
   "events": [
     {
       "event_id": "EVT_9F70ADB347D29BF1",
@@ -1491,6 +1491,29 @@
         "engine": "VOLATILITY_SQUEEZE",
         "requires_retest": true,
         "trigger_level": 1.1332560379963457,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_F29441F169A4A716",
+      "symbol": "RENDER",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1794657599999,
+        "pivot_2_ts": 1794664799999,
+        "detected_at_ts": 1794664799999
+      },
+      "event_fact": {
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 1.489,
+        "range_high": 1.489,
+        "range_low": 1.471,
+        "manipulation_depth_atr": 0.31237036267332186,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
