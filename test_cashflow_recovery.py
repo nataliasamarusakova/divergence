@@ -788,3 +788,86 @@ def test_tp_fill_history_refuses_incomplete_or_wrong_quantity_evidence(monkeypat
     )
     assert price is None
     assert source == "fill_history_rows_not_exact_complete_match"
+
+
+def test_income_history_none_data_captures_http_request_diagnostics(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TRX-USDT")
+
+    def fake_request(method, path, params=None, **kwargs):
+        assert method == "GET"
+        assert path == bingx.INCOME_HISTORY_PATH
+        metadata = kwargs.get("response_metadata")
+        assert isinstance(metadata, dict)
+        metadata.update({
+            "http_status": 200,
+            "endpoint": path,
+            "method": method,
+            "request_host": "open-api-vst.bingx.com",
+            "response_content_type": "application/json",
+            "request_elapsed_ms": 47,
+        })
+        return {"code": 0, "msg": "", "data": None}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    result = bingx.get_income_history("TRX", 1_700_000_000_000, 1_700_000_001_000)
+
+    assert result["status"] == "error"
+    assert result["error"] == "income_history_unexpected_data_shape"
+    assert result["complete"] is False
+    assert result["response_code"] == 0
+    assert result["response_data_type"] == "NoneType"
+    assert result["http_status"] == 200
+    assert result["request_host"] == "open-api-vst.bingx.com"
+    assert result["response_content_type"] == "application/json"
+    assert result["request_elapsed_ms"] == 47
+    assert bingx.is_income_history_null_data_shape(result) is True
+
+
+def test_income_history_rejects_non_2xx_even_when_json_claims_success_and_null_data(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "ZRO-USDT")
+
+    def fake_request(method, path, params=None, **kwargs):
+        metadata = kwargs.get("response_metadata")
+        assert isinstance(metadata, dict)
+        metadata.update({
+            "http_status": 502,
+            "endpoint": path,
+            "method": method,
+            "request_host": "open-api-vst.bingx.com",
+            "response_content_type": "text/html",
+        })
+        return {"code": 0, "msg": "", "data": None}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    result = bingx.get_income_history("ZRO", 1_700_000_000_000, 1_700_000_001_000)
+
+    assert result["status"] == "error"
+    assert result["complete"] is False
+    assert result["error"] == "income_history_http_status_error:502"
+    assert result["http_status"] == 502
+    assert result["response_data_type"] == "NoneType"
+    assert bingx.is_income_history_null_data_shape(result) is False
+
+
+def test_income_history_does_not_accept_non_2xx_empty_array_as_zero_cashflow(monkeypatch):
+    from event_engine import bingx
+
+    def fake_request(method, path, params=None, **kwargs):
+        kwargs["response_metadata"].update({
+            "http_status": 503,
+            "request_host": "open-api-vst.bingx.com",
+            "response_content_type": "application/json",
+        })
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    result = bingx.get_income_history(None, 1_700_000_000_000, 1_700_000_001_000)
+
+    assert result["status"] == "error"
+    assert result["complete"] is False
+    assert result["records"] == []
+    assert result["error"] == "income_history_http_status_error:503"

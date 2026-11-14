@@ -262,4 +262,29 @@ def test_positions_request_diagnostic_preserves_http_status_when_json_parse_fail
     assert result["code"] == -1
     assert metadata["http_status"] == 502
     assert metadata["response_content_type"] == "text/html"
-    assert metadata["transport_error"].startswith("ValueError:")
+    assert metadata["transport_error"] == "ValueError"
+
+
+def test_request_diagnostics_never_expose_signed_query_string_on_transport_error(monkeypatch):
+    import json
+    from event_engine import bingx
+
+    class _Response:
+        status_code = 502
+        headers = {"Content-Type": "text/html"}
+        def json(self):
+            raise ValueError("request failed at https://open-api-vst.bingx.com/path?timestamp=123&signature=DO_NOT_LEAK")
+
+    monkeypatch.setattr(bingx.FAST_SESSION, "request", lambda **kwargs: _Response())
+    metadata = {}
+    result = bingx._request(
+        "GET", bingx.INCOME_HISTORY_PATH, {}, signed=False, retryable=False,
+        response_metadata=metadata,
+    )
+
+    serialized = json.dumps({"result": result, "metadata": metadata})
+    assert result["code"] == -1
+    assert "DO_NOT_LEAK" not in serialized
+    assert "signature=" not in serialized
+    assert metadata["http_status"] == 502
+    assert metadata["transport_error"] == "ValueError"

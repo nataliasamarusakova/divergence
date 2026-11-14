@@ -1351,3 +1351,137 @@ def test_later_post_fill_snapshot_recovers_after_two_empty_reads_and_checks_rema
     assert report["checks"]["exchange_protection"]["status"] in {"OK", "WARNING"}
     assert "ETH-USDT:LONG" in report["checks"]["exchange_protection"]["by_position"]
     assert not any(x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE" for x in report["discrepancies"])
+
+
+def test_daily_income_warning_alert_fingerprint_ignores_pending_age_but_keeps_error_identity(tmp_path):
+    first = [{
+        "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE", "symbol": "TRX-USDT",
+        "detail": (
+            'income_history_unexpected_data_shape; shape_fingerprint=bf40c8436b6e; '
+            'null_data_pending_for_sec=2767; grace_sec=1800 (attempts=2)'
+        ),
+        "response_diagnostics": {
+            "response_code": 0, "response_data_type": "NoneType", "http_status": 200,
+            "request_elapsed_ms": 31,
+        },
+    }]
+    later_same_incident = [{
+        "level": "WARNING", "code": "DAILY_INCOME_QUERY_INCOMPLETE", "symbol": "TRX-USDT",
+        "detail": (
+            'income_history_unexpected_data_shape; shape_fingerprint=bf40c8436b6e; '
+            'null_data_pending_for_sec=8151; grace_sec=1800 (attempts=2)'
+        ),
+        "response_diagnostics": {
+            "response_code": 0, "response_data_type": "NoneType", "http_status": 200,
+            "request_elapsed_ms": 87,
+        },
+    }]
+    changed_http_error = [{
+        **later_same_incident[0],
+        "response_diagnostics": {**later_same_incident[0]["response_diagnostics"], "http_status": 502},
+    }]
+    changed_symbol = [{**later_same_incident[0], "symbol": "ZRO-USDT"}]
+
+    assert recon._alert_signature(first) == recon._alert_signature(later_same_incident)
+    assert recon._alert_signature(later_same_incident) != recon._alert_signature(changed_http_error)
+    assert recon._alert_signature(later_same_incident) != recon._alert_signature(changed_symbol)
+
+
+def test_daily_income_repeat_alert_is_suppressed_until_hourly_reminder(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-TRX-INCOME", "symbol": "TRX",
+        "direction": "SHORT", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon, "INCOME_NULL_GRACE_SEC", 0.0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
+    income_calls = []
+
+    def null_income(symbol, *args, **kwargs):
+        income_calls.append(symbol)
+        return {
+            "status": "error", "error": "income_history_unexpected_data_shape",
+            "complete": False, "records": [], "shape_fingerprint": "NULL-TRX",
+            "shape_summary": "NoneType", "response_type": "dict", "response_code": 0,
+            "response_msg": "", "response_keys": ["code", "data", "msg"],
+            "response_data_type": "NoneType", "http_status": 200,
+            "endpoint": "/openApi/swap/v2/user/income", "method": "GET",
+            "request_host": "open-api-vst.bingx.com", "response_content_type": "application/json",
+            "request_elapsed_ms": 25,
+        }
+
+    monkeypatch.setattr(recon.bingx, "get_income_history", null_income)
+    monkeypatch.setattr(recon.time, "sleep", lambda *_: None)
+    deliveries = []
+    monkeypatch.setattr(recon, "send_detailed", lambda message: deliveries.append(message) or {"chat": {"sent": True}})
+
+    first = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=True)
+    repeat = recon.run_reconciliation(now_ms=now_ms + 5 * 60_000, data_dir=data, notify=True)
+    reminder = recon.run_reconciliation(now_ms=now_ms + 60 * 60_000, data_dir=data, notify=True)
+
+    first_summary = first["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["TRX-USDT"]
+    assert first_summary["response_diagnostics"]["http_status"] == 200
+    assert first_summary["response_diagnostics"]["request_elapsed_ms"] == 25
+    assert first_summary["response_diagnostics"]["request_host"] == "open-api-vst.bingx.com"
+    assert first["status"] == "WARNING"
+    assert first["notification"]["status"] == "SENT"
+    assert repeat["notification"]["status"] == "SUPPRESSED_REPEAT"
+    assert reminder["notification"]["status"] == "SENT"
+    assert len(deliveries) == 2
+    health = [json.loads(line) for line in (data / "health.jsonl").read_text(encoding="utf-8").splitlines()]
+    warnings = [
+        item for report in health for item in report.get("discrepancies", [])
+        if item.get("code") == "DAILY_INCOME_QUERY_INCOMPLETE"
+    ]
+    assert len(warnings) == 3
+    ages = [int(item["detail"].split("null_data_pending_for_sec=")[1].split(";")[0]) for item in warnings]
+    assert ages == [0, 300, 3600]
+    assert "null_data_pending_for_sec=300" in warnings[1]["detail"]
+    assert income_calls.count("TRX-USDT") == 3
+    assert income_calls.count(None) == 3
+
+
+def test_daily_income_http_error_does_not_trigger_account_wide_null_fallback(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    now_ms = _now_ms()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text(json.dumps({
+        "record_type": "TRADE_OPEN", "event_id": "EVT-ZRO-HTTP", "symbol": "ZRO",
+        "direction": "LONG", "ts": now_ms,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon, "INCOME_NULL_GRACE_SEC", 1800.0)
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
+    calls = []
+
+    def income(symbol, *args, **kwargs):
+        calls.append(symbol)
+        return {
+            "status": "error", "error": "income_history_http_status_error:502",
+            "complete": False, "records": [], "response_code": 0,
+            "response_data_type": "NoneType", "response_type": "dict",
+            "response_keys": ["code", "data", "msg"], "http_status": 502,
+            "endpoint": "/openApi/swap/v2/user/income", "method": "GET",
+            "request_host": "open-api-vst.bingx.com", "response_content_type": "text/html",
+        }
+
+    monkeypatch.setattr(recon.bingx, "get_income_history", income)
+    report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
+
+    assert calls == ["ZRO-USDT"]
+    summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["ZRO-USDT"]
+    assert summary["status"] == "ERROR"
+    assert summary["accounting_value"] == "UNKNOWN_NOT_ZERO"
+    warning = next(item for item in report["discrepancies"] if item["code"] == "DAILY_INCOME_QUERY_INCOMPLETE")
+    assert warning["response_diagnostics"]["http_status"] == 502
+    assert warning["response_diagnostics"]["response_content_type"] == "text/html"
+    assert report["checks"]["daily_income_pending_state"]["status"] == "OK"
+    assert report["checks"]["daily_income_pending_state"]["pending_symbols"] == []
