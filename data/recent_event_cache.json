@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794784310852,
+  "updated_ts": 1794784630821,
   "events": [
     {
       "event_id": "EVT_2367193A9B4E54B2",
@@ -24,7 +24,11 @@
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.6273193876811147,
+        "htf_slope50": -0.020578696128143004,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -55,7 +59,11 @@
         "broken_ts": 1794625199999,
         "bos_ts": 1794409199999,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.6273193876811147,
+        "htf_slope50": -0.020578696128143004,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -250,30 +258,6 @@
         "range_high": 0.5742,
         "range_low": 0.5433,
         "manipulation_depth_atr": 0.49831052404951204,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_ADA6EF1483B5E067",
-      "symbol": "PENGU",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "CRT_BEARISH",
-      "timestamps": {
-        "pivot_1_ts": 1794776399999,
-        "pivot_2_ts": 1794783599999,
-        "detected_at_ts": 1794783599999
-      },
-      "event_fact": {
-        "detection_close_price": 0.004929,
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.004943,
-        "range_high": 0.004943,
-        "range_low": 0.004877,
-        "manipulation_depth_atr": 0.15548702528447014,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
