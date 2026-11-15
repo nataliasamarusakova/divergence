@@ -492,7 +492,8 @@ def test_telegram_send_preserves_multiline_signal_with_inline_code_ticker(monkey
         def json(self):
             return {"ok": True, "result": {"message_id": 123}}
 
-    def fake_post(url, *, data, timeout):
+    def fake_post(url, *, data, timeout, allow_redirects):
+        assert allow_redirects is False
         calls.append((url, data, timeout))
         return Response()
 
@@ -538,7 +539,8 @@ def test_closed_trade_message_uses_inline_code_ticker_and_no_keyboard(monkeypatc
         def json(self):
             return {"ok": True, "result": {"message_id": 125}}
 
-    def fake_post(url, *, data, timeout):
+    def fake_post(url, *, data, timeout, allow_redirects):
+        assert allow_redirects is False
         calls.append((url, data))
         return Response()
 
@@ -581,7 +583,8 @@ def test_telegram_send_never_attaches_copy_keyboard(monkeypatch):
         def json(self):
             return {"ok": True, "result": {"message_id": 124}}
 
-    def fake_post(url, *, data, timeout):
+    def fake_post(url, *, data, timeout, allow_redirects):
+        assert allow_redirects is False
         calls.append((url, data))
         return Response()
 
@@ -601,7 +604,8 @@ def test_telegram_send_timeout_does_not_retry_or_duplicate_message(monkeypatch):
     monkeypatch.setenv("TG_CHAT_ID", "test-chat")
     calls = []
 
-    def fake_post(url, *, data, timeout):
+    def fake_post(url, *, data, timeout, allow_redirects):
+        assert allow_redirects is False
         calls.append((url, data))
         raise tg.requests.Timeout("simulated send timeout")
 
@@ -1679,6 +1683,9 @@ def test_ensure_protection_accepts_existing_break_even_sl_without_emergency_clos
     from event_engine import bingx as bx
 
     monkeypatch.setattr(bx, "to_bx_symbol", lambda s: "TEST-USDT")
+    # Existing BE protection is fully represented by the fixture; the price
+    # lookup is not part of the behavior under test and must remain offline.
+    monkeypatch.setattr(bx, "_current_close_price", lambda _symbol: 100.0)
     monkeypatch.setattr(bx, "get_contract", lambda s: {
         "quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001,
     })
@@ -3690,6 +3697,9 @@ def test_tracker_residual_close_does_not_reuse_last_tp_price(monkeypatch, tmp_pa
     monkeypatch.setattr(tr, "TRADES_PATH", trades_path)
     monkeypatch.setattr(tr, "_retry_pending_notifications", lambda: None)
     monkeypatch.setattr(tr, "_queue_notification", lambda *a, **k: None)
+    # The residual execution price is intentionally unknown in this scenario;
+    # no live ticker lookup is needed to test conservative journal accounting.
+    monkeypatch.setattr(tr, "get_live_price", lambda _symbol: None)
     monkeypatch.setattr(tr, "get_position_directional", lambda *a, **k: {"status": "not_found"})
     monkeypatch.setattr(
         tr,

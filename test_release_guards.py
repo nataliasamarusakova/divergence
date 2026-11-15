@@ -509,3 +509,44 @@ def test_pytest_notification_paths_are_isolated_from_workflow_secrets(monkeypatc
     assert 'TG_BOT_TOKEN: ""' in test_step
     assert 'TG_CHAT_IDS: ""' in test_step
     assert 'TG_CHAT_ID: ""' in test_step
+
+
+def test_ci_exchange_and_notification_secrets_are_scoped_away_from_pytest():
+    workflow = _workflow()
+    job_env = workflow.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
+    assert "${{ secrets." not in job_env
+
+    test_step = workflow.split("      - name: Run regression test suite before market execution\n", 1)[1].split("      - name:", 1)[0]
+    assert "BINGX_API_KEY" not in test_step
+    assert "BINGX_SECRET_KEY" not in test_step
+    assert "TG_BOT_TOKEN" in test_step and 'TG_BOT_TOKEN: ""' in test_step
+
+    engine_step = workflow.split("      - name: Run engine\n", 1)[1].split("      - name:", 1)[0]
+    assert "BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}" in engine_step
+    assert "BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}" in engine_step
+    assert "TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}" in engine_step
+
+    reconcile_step = workflow.split(
+        "      - name: Read-only BingX position and daily ledger reconciliation\n", 1
+    )[1].split("      - name:", 1)[0]
+    assert "BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}" in reconcile_step
+    assert "BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}" in reconcile_step
+
+
+def test_pytest_fixture_clears_import_time_exchange_credentials():
+    source = Path("conftest.py").read_text(encoding="utf-8")
+    assert 'monkeypatch.setattr(bingx, "API_KEY", "")' in source
+    assert 'monkeypatch.setattr(bingx, "SECRET_KEY", "")' in source
+    assert 'monkeypatch.setattr(ro, "EXECUTION_ENABLED", False)' in source
+
+
+
+def test_pytest_network_guard_classifies_loopback_only():
+    from conftest import _is_loopback_host
+
+    assert _is_loopback_host("localhost")
+    assert _is_loopback_host("127.0.0.1")
+    assert _is_loopback_host("::1")
+    assert not _is_loopback_host("open-api-vst.bingx.com")
+    assert not _is_loopback_host("data-api.binance.vision")
+    assert not _is_loopback_host("8.8.8.8")

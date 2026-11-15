@@ -140,6 +140,9 @@ def test_main_fails_when_current_spot_price_is_unavailable(monkeypatch, tmp_path
         "timeframe": "3h", "highestph": 1.0, "levels": [], "lowestpl": 0.5, "cwidth": 0.01,
         "accepted": [], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333,
     })
+    # This test targets the unavailable ticker path; source tick-size lookup is
+    # unrelated and must not trigger a real Binance Spot exchangeInfo request.
+    monkeypatch.setattr(diagnostic, "_source_tick_size", lambda _resolved: None)
     monkeypatch.setattr(diagnostic, "get_spot_current_price", lambda symbol, snapshot: (_ for _ in ()).throw(RuntimeError("ticker unavailable")))
     with pytest.raises(RuntimeError, match="ticker unavailable"):
         diagnostic.main()

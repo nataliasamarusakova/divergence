@@ -8,6 +8,7 @@ from event_engine import bingx as bx
 class _Response:
     def __init__(self, payload):
         self._payload = payload
+        self.status_code = 429
         self.headers = {}
 
     def json(self):
