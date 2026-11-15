@@ -84,7 +84,7 @@ jobs:
       COMPOUND_CVD_MAX: "25"
       COMPOUND_LIQ_LONG_MIN: "150000"
       SYMBOL_LOSS_COOLDOWN_MIN: "0"
-      # New positions use TP1 + terminal TP2; if the filled size cannot support both, use one terminal TP2.
+      # New positions use TP1 + terminal TP2 when executable; if the filled size cannot support both, use nearest TP1 for the full size.
       REJECT_SINGLE_TP: "false"
       REQUIRE_MULTI_TP: "false"
       FIXED_STOP_LOSS_PCT: "7.00"

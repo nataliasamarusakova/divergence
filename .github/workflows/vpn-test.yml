@@ -277,6 +277,9 @@ jobs:
             "$BINGX_BASE_URL/openApi/swap/v2/quote/contracts"
           request 'bingx_live_price_all' \
             "$BINGX_BASE_URL/openApi/swap/v2/quote/price"
+          # Also probe the exact latest-price endpoint used by event_engine.bingx.
+          request 'bingx_engine_live_price_v1_BTC' \
+            "$BINGX_BASE_URL/openApi/swap/v1/ticker/price?symbol=BTC-USDT"
 
           for symbol in ${AUDIT_SYMBOLS_BINGX//,/ }; do
             request "bingx_${symbol}_1m_limit2" \
@@ -313,7 +316,7 @@ jobs:
           # network timeout (for example curl exit 28 / HTTP 000) into a
           # cascade of misleading "missing contract" / "row count" failures.
           manifest = Path('vpn-audit/manifest.tsv').read_text().splitlines()[1:]
-          expected_request_count = 22
+          expected_request_count = 23
           if len(manifest) != expected_request_count:
               failures.append(
                   f'Manifest request count mismatch: expected {expected_request_count}, got {len(manifest)}'
@@ -441,6 +444,26 @@ jobs:
 
           # Cross-exchange price sanity check must use BingX live/latest-price data,
           # not a closed 1m candle. This is observational only; no orders are placed.
+          # The engine calls /openApi/swap/v1/ticker/price. Validate its
+          # endpoint-specific envelope instead of testing only the separate v2
+          # all-symbol quote endpoint above. BingX documents data as an object
+          # or an array for a symbol-specific response.
+          engine_price = read_json('bingx_engine_live_price_v1_BTC.body')
+          engine_data = engine_price.get('data') if isinstance(engine_price, dict) and engine_price.get('code') == 0 else None
+          if isinstance(engine_data, list):
+              engine_rows = engine_data
+          elif isinstance(engine_data, dict):
+              engine_rows = [engine_data]
+          else:
+              engine_rows = []
+          engine_row = next((row for row in engine_rows if isinstance(row, dict) and str(row.get('symbol', '')).upper() == 'BTC-USDT'), None)
+          try:
+              engine_latest_price = float(engine_row.get('price')) if engine_row else float('nan')
+          except (TypeError, ValueError, OverflowError):
+              engine_latest_price = float('nan')
+          if not math.isfinite(engine_latest_price) or engine_latest_price <= 0:
+              failures.append('BingX engine V1 latest-price endpoint returned no valid BTC-USDT price')
+
           bingx_live = read_json('bingx_live_price_all.body')
           bingx_live_rows = bingx_live.get('data') if isinstance(bingx_live, dict) else None
           if isinstance(bingx_live_rows, dict):
@@ -524,5 +547,5 @@ jobs:
           ls -lh vpn-audit || true
           rows=$(($(wc -l < vpn-audit/manifest.tsv)-1))
           echo "manifest_rows=$rows"
-          test "$rows" -eq 22
-          echo "=== DIAGNOSTIC REQUEST COUNT: 22/22 ==="
+          test "$rows" -eq 23
+          echo "=== DIAGNOSTIC REQUEST COUNT: 23/23 ==="
