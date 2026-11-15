@@ -4516,6 +4516,9 @@ def test_post_fill_rollback_unknown_persists_cleanup_quarantine(monkeypatch, fai
     monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda **k: {
         "status": "found", "positionAmt": "1", "avgPrice": "100", "entryPrice": "100",
     })
+    monkeypatch.setattr(ro, "get_position_directional", lambda *a, **k: {
+        "status": "unknown", "error": "synthetic unresolved position read",
+    })
     monkeypatch.setattr(ro, "emergency_close_position", lambda *a, **k: {
         "status": "unknown", "error": "synthetic close outcome unknown",
     })
@@ -4532,7 +4535,12 @@ def test_post_fill_rollback_unknown_persists_cleanup_quarantine(monkeypatch, fai
         f"EVT_POSTFILL_{failure_mode.upper()}",
     )
 
-    assert result["status"] in {"PROTECTION_SETUP_INVALID", "SR_ROOM_POST_FILL_REJECTED"}
+    # Once a post-fill close is unconfirmed, the result must be surfaced as a
+    # live/ambiguous execution so main() writes TRADE_OPEN and registers the
+    # nonzero exposure for tracker/reconciliation. The original rejection reason
+    # remains separately available for diagnostics.
+    assert result["status"] == "opened_protection_check_required"
+    assert result["entry_failure_status"] in {"PROTECTION_SETUP_INVALID", "SR_ROOM_POST_FILL_REJECTED"}
     assert result["rolled_back"] is False
     assert result["rollback_state_unknown"] is True
     assert result["position"]["positionAmt"] == pytest.approx(1.0)

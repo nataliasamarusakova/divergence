@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import html
 import math
 import logging
 import os
@@ -1990,6 +1991,14 @@ def load_pre_order_drift_failure_counts(path: Path, terminal_ids: set[str] | Non
         if isinstance(result, dict) and str(result.get("status", "")) == "PRE_ORDER_DRIFT_EXCEEDED":
             counts[event_id] = counts.get(event_id, 0) + 1
     return counts
+
+
+def _should_load_sr_data_failure_counts() -> bool:
+    """Whether an enabled S/R gate can reject events for unavailable data."""
+    return bool(
+        SR_3H_DIRECTIONAL_GATE_ENABLED
+        or (AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off")
+    )
 
 
 def load_sr_data_failure_counts(path: Path, terminal_ids: set[str] | None = None) -> dict[str, int]:
@@ -4407,9 +4416,9 @@ def _finalize_rollback_protection_cleanup(
     try:
         send_tg(
             f"⚠️ <b>Rollback protection cleanup pending</b>\n"
-            f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
-            f"Event: <code>{event_id}</code>\n"
-            f"Cleanup: <code>{reason[:600]}</code>\n"
+            f"Symbol: <code>{html.escape(str(symbol), quote=False)}</code> | Side: <code>{html.escape(str(direction), quote=False)}</code>\n"
+            f"Event: <code>{html.escape(str(event_id), quote=False)}</code>\n"
+            f"Cleanup: <code>{html.escape(str(reason)[:600], quote=False)}</code>\n"
             f"New entries for this symbol/side are blocked until cleanup is verified."
         )
     except Exception as exc:
@@ -4523,8 +4532,8 @@ def _handle_rollback_followup(
             try:
                 send_tg(
                     f"🚨 <b>Rollback left a live position</b>\n"
-                    f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
-                    f"Qty: <code>{post_qty}</code>\n"
+                    f"Symbol: <code>{html.escape(str(symbol), quote=False)}</code> | Side: <code>{html.escape(str(direction), quote=False)}</code>\n"
+                    f"Qty: <code>{html.escape(str(post_qty), quote=False)}</code>\n"
                     "Protection repair and emergency close were not confirmed; the position is retained for reconciliation."
                 )
             except Exception:
@@ -4583,6 +4592,67 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     # was being evaluated. The old implementation only compared trigger/event
     # prices and then discovered excessive drift after the fill, which could
     # force an expensive emergency close.
+    def _postfill_rollback_outcome(
+        failure_status: str, rollback_result: dict, cleanup_result: dict,
+        error: str, *, setup_used: dict | None = None, extra: dict | None = None,
+    ) -> dict:
+        """Keep a non-flat or ambiguous post-fill rollback in the normal tracker.
+
+        A cleanup-only quarantine prevents another entry, but does not manage the
+        live position. Preserve the last confirmed fill when a fresh read is not
+        authoritative; the tracker can then reconcile it on the next cycle.
+        """
+        rolled_back = str((rollback_result or {}).get("status", "")).lower() == "closed"
+        if rolled_back:
+            result_position = {**position, "positionAmt": 0.0}
+            status = failure_status
+        else:
+            result_position = {**position, "positionAmt": actual_qty, "avgPrice": actual_avg_price}
+            read_status = "unknown"
+            try:
+                fresh_position = get_position_directional(symbol, direction)
+                read_status = str(fresh_position.get("status", "")).lower() if isinstance(fresh_position, dict) else "unknown"
+                if read_status == "found":
+                    residual_qty = abs(_safe_float(fresh_position.get("positionAmt"), 0.0))
+                    residual_avg = _safe_float(fresh_position.get("avgPrice") or fresh_position.get("entryPrice"), actual_avg_price)
+                    if residual_qty > 0 and math.isfinite(residual_qty) and residual_avg > 0 and math.isfinite(residual_avg):
+                        result_position = {**fresh_position, "positionAmt": residual_qty, "avgPrice": residual_avg}
+                        status = "opened_protection_failed"
+                    else:
+                        read_status = "malformed_found_position"
+            except Exception as position_exc:
+                read_status = f"read_error:{type(position_exc).__name__}"
+            if read_status != "found":
+                status = "opened_protection_check_required"
+            # Do not claim a one-read NOT_FOUND is a verified rollback.
+            if status not in {"opened_protection_failed", "opened_protection_check_required"}:
+                status = "opened_protection_check_required"
+
+        result_protection = {
+            "status": "ROLLBACK_UNCONFIRMED" if not rolled_back else "ROLLED_BACK",
+            "sl_result": {}, "tp_orders": [],
+            "rollback": rollback_result,
+            "rollback_protection_cleanup": cleanup_result,
+            "protection_confirmed": False if not rolled_back else True,
+        }
+        result = {
+            "status": status, "entry_failure_status": failure_status,
+            "mode": EXECUTION_MODE, "order_id": order_id,
+            "position": result_position, "open_result": opened,
+            "execution_quality": execution_quality, "error": error,
+            "emergency_close": rollback_result, "rolled_back": rolled_back,
+            "rollback_state_unknown": not rolled_back,
+            "protection_cleanup": cleanup_result,
+            "protection": result_protection,
+            "setup_used_for_protection": setup_used if isinstance(setup_used, dict) else dict(setup),
+            "fill_ts_ms": fill_ts_ms,
+            "notional_usdt": _safe_float(result_position.get("avgPrice"), actual_avg_price) * abs(_safe_float(result_position.get("positionAmt"), 0.0)),
+            "leverage": opened.get("leverage"),
+        }
+        if isinstance(extra, dict):
+            result.update(extra)
+        return result
+
     event_type_for_risk = str(setup.get("event_type", "")).upper()
     drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type_for_risk) else MAX_ENTRY_DRIFT_PCT
     try:
@@ -4965,9 +5035,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 try:
                     send_tg(
                         f"🚨 <b>Unresolved BingX MARKET entry</b>\n"
-                        f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
-                        f"Order: <code>{opened.get('order_id') or 'unknown'}</code>\n"
-                        f"Client ID: <code>{opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'}</code>\n"
+                        f"Symbol: <code>{html.escape(str(symbol), quote=False)}</code> | Side: <code>{html.escape(str(direction), quote=False)}</code>\n"
+                        f"Order: <code>{html.escape(str(opened.get('order_id') or 'unknown'), quote=False)}</code>\n"
+                        f"Client ID: <code>{html.escape(str(opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'), quote=False)}</code>\n"
                         "The symbol-side is quarantined. Verify the exchange order before releasing it."
                     )
                 except Exception as notify_exc:
@@ -5042,9 +5112,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 try:
                     send_tg(
                         f"🚨 <b>Entry rollback not confirmed</b>\n"
-                        f"Symbol: <code>{symbol}</code> | Side: <code>{direction}</code>\n"
-                        f"Order: <code>{order_id or 'unknown'}</code>\n"
-                        f"Client ID: <code>{opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'}</code>\n"
+                        f"Symbol: <code>{html.escape(str(symbol), quote=False)}</code> | Side: <code>{html.escape(str(direction), quote=False)}</code>\n"
+                        f"Order: <code>{html.escape(str(order_id or 'unknown'), quote=False)}</code>\n"
+                        f"Client ID: <code>{html.escape(str(opened.get('client_order_id') or opened.get('clientOrderId') or 'unknown'), quote=False)}</code>\n"
                         "The symbol-side is quarantined until the order and position are reconciled."
                     )
                 except Exception as notify_exc:
@@ -5114,21 +5184,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         )
         result_position = {**position, "positionAmt": 0.0} if flattened else {**position, "positionAmt": actual_qty}
         rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
-        return {
-            "status": "ENTRY_DRIFT_EXCEEDED",
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "position": result_position,
-            "open_result": opened,
-            "execution_quality": execution_quality,
-            "error": f"signal_to_fill_distance_pct={fill_drift_pct:.6f} > limit={drift_limit:.6f}",
-            "emergency_close": rollback,
-            "rolled_back": flattened,
-            "protection_cleanup": rollback_cleanup,
-            "fill_ts_ms": fill_ts_ms,
-            "notional_usdt": actual_avg_price * actual_qty,
-            "leverage": opened.get("leverage"),
-        }
+        return _postfill_rollback_outcome(
+            "ENTRY_DRIFT_EXCEEDED", rollback, rollback_cleanup,
+            f"signal_to_fill_distance_pct={fill_drift_pct:.6f} > limit={drift_limit:.6f}",
+            setup_used=setup,
+        )
 
     try:
         setup_for_fill = dict(setup)
@@ -5162,19 +5222,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"SETUPFAIL:{trade_id}", require_live_position=True)
         rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
         rolled_back = str(rollback.get("status", "")).lower() == "closed"
-        return {
-            "status": "PROTECTION_SETUP_INVALID",
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "position": ({**position, "positionAmt": 0.0} if rolled_back else {**position, "positionAmt": actual_qty}),
-            "open_result": opened,
-            "execution_quality": execution_quality,
-            "error": str(exc),
-            "emergency_close": rollback,
-            "rolled_back": rolled_back,
-            "rollback_state_unknown": not rolled_back,
-            "protection_cleanup": rollback_cleanup,
-        }
+        return _postfill_rollback_outcome(
+            "PROTECTION_SETUP_INVALID", rollback, rollback_cleanup, str(exc),
+            setup_used=setup,
+        )
 
     try:
         sl_pct, tp_levels = build_tp_levels(setup_for_fill, direction, event_type=ev_type)
@@ -5211,20 +5262,11 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 )
                 flattened = str(rollback.get("status", "")).lower() == "closed"
                 rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
-                return {
-                    "status": "SR_ROOM_POST_FILL_REJECTED",
-                    "mode": EXECUTION_MODE,
-                    "order_id": order_id,
-                    "position": ({**position, "positionAmt": 0.0} if flattened else {**position, "positionAmt": actual_qty}),
-                    "open_result": opened,
-                    "execution_quality": execution_quality,
-                    "error": str(post_fill_sr.get("reject_reason") or "SR_ROOM_POST_FILL_REJECTED"),
-                    "sr_room": post_fill_sr,
-                    "emergency_close": rollback,
-                    "rolled_back": flattened,
-                    "rollback_state_unknown": not flattened,
-                    "protection_cleanup": rollback_cleanup,
-                }
+                return _postfill_rollback_outcome(
+                    "SR_ROOM_POST_FILL_REJECTED", rollback, rollback_cleanup,
+                    str(post_fill_sr.get("reject_reason") or "SR_ROOM_POST_FILL_REJECTED"),
+                    setup_used=setup_for_fill, extra={"sr_room": post_fill_sr},
+                )
 
         # Opposing zones after TP1 do not alter the target ladder. The entry gate
         # only rejects when TP1 itself is blocked; post-TP1 zones are recorded for
@@ -5233,19 +5275,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"TPSETUPFAIL:{trade_id}", require_live_position=True)
         rollback_cleanup = _finalize_rollback_protection_cleanup(symbol, direction, event_id, rollback)
         rolled_back = str(rollback.get("status", "")).lower() == "closed"
-        return {
-            "status": "PROTECTION_SETUP_INVALID",
-            "mode": EXECUTION_MODE,
-            "order_id": order_id,
-            "position": ({**position, "positionAmt": 0.0} if rolled_back else {**position, "positionAmt": actual_qty}),
-            "open_result": opened,
-            "execution_quality": execution_quality,
-            "error": str(exc),
-            "emergency_close": rollback,
-            "rolled_back": rolled_back,
-            "rollback_state_unknown": not rolled_back,
-            "protection_cleanup": rollback_cleanup,
-        }
+        return _postfill_rollback_outcome(
+            "PROTECTION_SETUP_INVALID", rollback, rollback_cleanup, str(exc),
+            setup_used=setup_for_fill if isinstance(setup_for_fill, dict) else setup,
+        )
 
     protection = install_protection(
         symbol=symbol,
@@ -5712,11 +5745,11 @@ def main() -> None:
     terminal_event_ids = load_terminal_event_ids(TRADES)
     pre_order_drift_fail_counts = load_pre_order_drift_failure_counts(TRADES, terminal_event_ids)
     cross_exchange_drift_fail_counts = load_cross_exchange_drift_failure_counts(TRADES, terminal_event_ids)
-    # Persisted S/R-data retry history must never influence candidate lifecycle
-    # while the S/R room gate is disabled for the current evaluation run.
+    # Load retry history whenever any mandatory or optional S/R gate can
+    # reject an event because its required market data is unavailable.
     sr_data_fail_counts = (
         load_sr_data_failure_counts(TRADES, terminal_event_ids)
-        if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off"
+        if _should_load_sr_data_failure_counts()
         else {}
     )
     # Older state files may already contain an exhausted cross-exchange retry budget

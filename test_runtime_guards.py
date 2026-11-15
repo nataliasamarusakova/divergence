@@ -83,7 +83,7 @@ def test_vpn_diagnostic_scopes_proxy_to_binance_only():
     assert "--noproxy \"\"" in workflow
     assert "wg-quick up wg0" not in workflow
     assert "wg-quick down wg0" not in workflow
-    assert 'expected_request_count = 22' in workflow
+    assert 'expected_request_count = 23' in workflow
 
 
 def test_vst_research_mode_disables_entry_caps(monkeypatch):
@@ -2740,6 +2740,7 @@ def test_sr_retry_history_is_ignored_when_sr_disabled(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
     trades = tmp_path / "trades.jsonl"
     trades.write_text(
         json.dumps({
@@ -2752,11 +2753,13 @@ def test_sr_retry_history_is_ignored_when_sr_disabled(monkeypatch, tmp_path):
     counts = ro.load_sr_data_failure_counts(trades, set())
     assert counts == {"EVT_OLD_SR": 1}
 
-    # The main cycle applies this history only when S/R is enabled. The disabled
-    # path therefore behaves as if there were no persisted SR retry budget.
+    # The optional TP-room check is disabled and the mandatory directional
+    # gate is disabled by the test environment, so no S/R-data retry budget
+    # needs to be restored in this specific configuration.
+    assert ro._should_load_sr_data_failure_counts() is False
     effective_counts = (
         ro.load_sr_data_failure_counts(trades, set())
-        if ro.AJAY_SR_ROOM_ENABLED and ro.AJAY_SR_ROOM_MODE != "off"
+        if ro._should_load_sr_data_failure_counts()
         else {}
     )
     assert effective_counts == {}
