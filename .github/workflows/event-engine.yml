@@ -21,11 +21,6 @@ jobs:
     timeout-minutes: 15
 
     env:
-      COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
-      COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
-      COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
-      BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
-      BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
@@ -188,8 +183,6 @@ jobs:
       # Research-unlimited tests re-entry behavior without per-symbol cooldown/quarantine.
       SYMBOL_MAX_CONSECUTIVE_LOSSES: "0"
       SYMBOL_QUARANTINE_MIN: "0"
-      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-      TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
       VPN_EXPECTED_COUNTRY: NL
 
     steps:
@@ -361,7 +354,17 @@ jobs:
           PY
 
       - name: Run engine
+        # Exchange, Coinalyze and Telegram secrets are scoped to the execution
+        # step only. The earlier pytest/install/diagnostic steps must never
+        # receive credentials that could authorize real external actions.
         env:
+          COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
+          COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
+          COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
           BINANCE_VPN_ENABLED: "true"
           BINANCE_HTTP_PROXY: http://127.0.0.1:18080
         run: |
@@ -391,6 +394,10 @@ jobs:
       - name: Read-only BingX position and daily ledger reconciliation
         if: always() && !cancelled()
         env:
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
           RECONCILIATION_MAX_SYMBOLS: "2"
           RECONCILIATION_INCOME_TIMEOUT_SEC: "3"
           RECONCILIATION_INCOME_REQUEST_BUDGET: "4"
