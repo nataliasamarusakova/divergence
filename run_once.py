@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 import hashlib
 import html
 import math
@@ -106,6 +107,7 @@ from event_engine.tracker import (
     _load_active_trades,
     ActiveTradeStateError,
     _load_entry_order_quarantine_latches,
+    _legacy_tp_order_fill_baseline,
 )
 
 logging.basicConfig(
@@ -192,6 +194,7 @@ DATA.mkdir(exist_ok=True)
 EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
 ACTIONS = DATA / "actions.jsonl"
+ACTION_INDEX = DATA / "action_journal_index.json"
 ACTION_JOURNAL_ROTATE_BYTES = DEFAULT_ACTION_JOURNAL_ROTATE_BYTES
 HEALTH = DATA / "health.jsonl"
 TIMEFRAME_STATE = DATA / "timeframe_scan_state.json"
@@ -866,7 +869,189 @@ def _iter_action_records() -> Any:
             yield obj
 
 
-def _load_cached_events(now_ms: int | None = None, terminal_ids: set[str] | None = None) -> list[dict]:
+def _action_index_add_row(row: dict, successful_telegram_ids: set[str], journaled_cache_candidate_ids: set[str]) -> None:
+    event_id = row.get("event_id")
+    if event_id and bool(row.get("telegram_sent")):
+        successful_telegram_ids.add(str(event_id))
+    if row.get("record_type") == "CANDIDATE_FILTER_DECISION" and row.get("stage") == "EVENT_CACHE_RECONCILIATION":
+        candidate_id = row.get("candidate_id")
+        if candidate_id:
+            journaled_cache_candidate_ids.add(str(candidate_id))
+
+
+def _consume_action_jsonl_bytes(payload: bytes, successful_telegram_ids: set[str], journaled_cache_candidate_ids: set[str]) -> None:
+    """Index complete JSONL records; malformed rows match journal-reader behavior."""
+    for raw_line in payload.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            row = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(row, dict):
+            _action_index_add_row(row, successful_telegram_ids, journaled_cache_candidate_ids)
+
+
+def _load_action_journal_index() -> tuple[set[str], set[str]]:
+    """Load action-derived indexes incrementally, decompressing each archive once.
+
+    GZIP archives are immutable. Their names, sizes and mtimes are checkpointed
+    after a complete CRC-checked read. The active JSONL is consumed only from its
+    previous complete-line byte offset. If the index is missing/corrupt, an
+    archive changes/disappears, or the active prefix no longer matches, the index
+    is rebuilt from source-of-truth journals. A failed source read is not
+    checkpointed, so the next run retries rather than silently losing history.
+    """
+    archive_dir = ACTIONS.parent / "archive"
+    archive_paths = sorted(archive_dir.glob("actions-*.jsonl.gz")) if archive_dir.exists() else []
+    current_archive_meta = {
+        path.name: {"size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
+        for path in archive_paths
+    }
+
+    raw_state = _load_json(ACTION_INDEX, None)
+    state_valid = (
+        isinstance(raw_state, dict)
+        and raw_state.get("version") == 1
+        and isinstance(raw_state.get("archives"), dict)
+        and isinstance(raw_state.get("successful_telegram_ids"), list)
+        and isinstance(raw_state.get("journaled_cache_candidate_ids"), list)
+        and isinstance(raw_state.get("active_offset"), int)
+        and raw_state.get("active_offset", -1) >= 0
+        and isinstance(raw_state.get("active_prefix_sha256"), str)
+    )
+
+    rebuild = not state_valid
+    if state_valid:
+        old_meta = raw_state["archives"]
+        # Missing or mutated immutable archive means the compact index is stale.
+        if set(old_meta) - set(current_archive_meta):
+            rebuild = True
+        else:
+            for name, meta in old_meta.items():
+                if not isinstance(meta, dict) or meta != current_archive_meta.get(name):
+                    rebuild = True
+                    break
+        # A newly-installed archive is the durable replacement for the previous
+        # active journal during rotation. Reset only the active offset; its prior
+        # rows will be re-read from that new archive. Without a new archive, a
+        # changed active prefix means unexplained truncation/rewrite and requires
+        # a complete rebuild to discard stale active-only IDs.
+        if not rebuild and ACTIONS.exists():
+            old_offset = int(raw_state["active_offset"])
+            new_archive_exists = any(name not in old_meta for name in current_archive_meta)
+            active_size = ACTIONS.stat().st_size
+            active_prefix_changed = old_offset > active_size
+            if not active_prefix_changed and old_offset > 0:
+                with ACTIONS.open("rb") as stream:
+                    stream.seek(max(0, old_offset - 128))
+                    prefix = stream.read(min(128, old_offset))
+                active_prefix_changed = hashlib.sha256(prefix).hexdigest() != raw_state["active_prefix_sha256"]
+            if active_prefix_changed:
+                if new_archive_exists:
+                    raw_state = dict(raw_state)
+                    raw_state["active_offset"] = 0
+                    raw_state["active_prefix_sha256"] = ""
+                else:
+                    rebuild = True
+
+    if rebuild:
+        successful_telegram_ids: set[str] = set()
+        journaled_cache_candidate_ids: set[str] = set()
+        indexed_archives: dict[str, dict[str, int]] = {}
+        active_offset = 0
+        active_prefix_sha256 = ""
+        archives_to_read = archive_paths
+        log.info("[ACTION_JOURNAL] Rebuilding incremental action index from source journals")
+    else:
+        successful_telegram_ids = {str(x) for x in raw_state["successful_telegram_ids"] if x}
+        journaled_cache_candidate_ids = {str(x) for x in raw_state["journaled_cache_candidate_ids"] if x}
+        indexed_archives = dict(raw_state["archives"])
+        active_offset = int(raw_state["active_offset"])
+        active_prefix_sha256 = raw_state["active_prefix_sha256"]
+        archives_to_read = [p for p in archive_paths if p.name not in indexed_archives]
+
+    # Read only newly-created archives. gzip.open is consumed to EOF so CRC/trailer
+    # validation completes before the archive is marked as indexed.
+    for archive_path in archives_to_read:
+        before = archive_path.stat()
+        try:
+            with gzip.open(archive_path, "rt", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if isinstance(row, dict):
+                        _action_index_add_row(row, successful_telegram_ids, journaled_cache_candidate_ids)
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise OSError(f"cannot build action index from archive {archive_path.name}: {exc}") from exc
+        after = archive_path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise OSError(f"action archive changed while indexing: {archive_path.name}")
+        indexed_archives[archive_path.name] = {
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+        }
+
+    # Recover active-file rotation/truncation by validating the byte immediately
+    # before the saved offset. Only complete newline-terminated records are indexed.
+    if ACTIONS.exists():
+        active_stat = ACTIONS.stat()
+        active_size = active_stat.st_size
+        if active_offset > active_size:
+            active_offset = 0
+            active_prefix_sha256 = ""
+        elif active_offset > 0:
+            with ACTIONS.open("rb") as stream:
+                stream.seek(max(0, active_offset - 128))
+                prefix = stream.read(min(128, active_offset))
+            if hashlib.sha256(prefix).hexdigest() != active_prefix_sha256:
+                active_offset = 0
+                active_prefix_sha256 = ""
+
+        with ACTIONS.open("rb") as stream:
+            stream.seek(active_offset)
+            appended = stream.read()
+        last_newline = appended.rfind(b"\n")
+        complete_payload = appended[: last_newline + 1] if last_newline >= 0 else b""
+        _consume_action_jsonl_bytes(
+            complete_payload, successful_telegram_ids, journaled_cache_candidate_ids,
+        )
+        new_offset = active_offset + len(complete_payload)
+        with ACTIONS.open("rb") as stream:
+            stream.seek(max(0, new_offset - 128))
+            prefix = stream.read(min(128, new_offset))
+        active_prefix_sha256 = hashlib.sha256(prefix).hexdigest() if new_offset else ""
+        after_active = ACTIONS.stat()
+        if (active_stat.st_size, active_stat.st_mtime_ns) != (after_active.st_size, after_active.st_mtime_ns):
+            raise OSError("active action journal changed while building incremental index")
+        active_offset = new_offset
+    else:
+        active_offset = 0
+        active_prefix_sha256 = ""
+
+    checkpoint = {
+        "version": 1,
+        "archives": indexed_archives,
+        "active_offset": active_offset,
+        "active_prefix_sha256": active_prefix_sha256,
+        "successful_telegram_ids": sorted(successful_telegram_ids),
+        "journaled_cache_candidate_ids": sorted(journaled_cache_candidate_ids),
+        "updated_ts_ms": int(time.time() * 1000),
+    }
+    _save_json_atomic(ACTION_INDEX, checkpoint)
+    return successful_telegram_ids, journaled_cache_candidate_ids
+
+
+def _load_cached_events(
+    now_ms: int | None = None,
+    terminal_ids: set[str] | None = None,
+    *,
+    journaled_candidate_ids: set[str] | None = None,
+) -> list[dict]:
     """Load live event cache and reconcile it from the durable event journal.
 
     The journal is the source of truth; the JSON cache is only a derived working
@@ -887,10 +1072,13 @@ def _load_cached_events(now_ms: int | None = None, terminal_ids: set[str] | None
     ]
 
     recovered: list[dict] = []
-    already_journaled: set[str] = set()
-    for action in _iter_action_records():
-        if action.get("record_type") == "CANDIDATE_FILTER_DECISION" and action.get("stage") == "EVENT_CACHE_RECONCILIATION":
-            already_journaled.add(str(action.get("candidate_id") or ""))
+    if journaled_candidate_ids is None:
+        already_journaled: set[str] = set()
+        for action in _iter_action_records():
+            if action.get("record_type") == "CANDIDATE_FILTER_DECISION" and action.get("stage") == "EVENT_CACHE_RECONCILIATION":
+                already_journaled.add(str(action.get("candidate_id") or ""))
+    else:
+        already_journaled = {str(x) for x in journaled_candidate_ids if x}
     if EVENTS.exists():
         try:
             with EVENTS.open("r", encoding="utf-8") as fh:
@@ -2077,6 +2265,19 @@ def _rollback_terminal_reason(status: Any) -> str | None:
     return None
 
 
+def _postfill_setup_terminal_reason(status: Any, execution_result: dict[str, Any], actual_qty: float) -> str | None:
+    """Terminalize only a protection-setup failure whose rollback is verified flat."""
+    if str(status or "") != "PROTECTION_SETUP_INVALID" or not isinstance(execution_result, dict):
+        return None
+    try:
+        qty = abs(float(actual_qty))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if math.isfinite(qty) and qty <= 1e-12 and execution_result.get("rolled_back") is True:
+        return "PROTECTION_SETUP_INVALID_ROLLED_BACK"
+    return None
+
+
 def load_successful_telegram_ids(path: Path) -> set[str]:
     """Return only event IDs for which Telegram actually reported success.
 
@@ -3189,7 +3390,13 @@ def _find_active_trade_for_position(bx_symbol: str, direction: str, active_trade
             trade.get("closed", False)
             or trade.get("entry_order_resolution_pending")
             or trade.get("protection_cleanup_only")
+            or trade.get("close_cleanup_pending")
+            or trade.get("close_notification_pending")
+            or trade.get("close_journal_pending")
         ):
+            continue
+        gone_confirmation = trade.get("position_gone_confirmation")
+        if isinstance(gone_confirmation, dict) and str(gone_confirmation.get("status", "")).upper() == "CONFIRMED":
             continue
         t_bx = to_bx_symbol(trade.get("symbol", ""))
         t_dir = str(trade.get("direction", "")).upper()
@@ -3260,6 +3467,24 @@ def _reconciliation_event_id(
     return candidate
 
 
+def _is_be_or_profit_side_stop(direction: str, avg_price: float, stop_price: float, tolerance: float = 0.003) -> bool:
+    """Recognize an exact BE or modest profit-lock stop around entry."""
+    try:
+        avg = float(avg_price)
+        stop = float(stop_price)
+        tol = max(0.0, float(tolerance))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(math.isfinite(value) for value in (avg, stop, tol)) or avg <= 0 or stop <= 0:
+        return False
+    side = str(direction or "").upper()
+    if side == "LONG":
+        return avg <= stop <= avg * (1.0 + tol)
+    if side == "SHORT":
+        return avg * (1.0 - tol) <= stop <= avg
+    return False
+
+
 def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction: str) -> dict | None:
     """Filter an account-wide snapshot with the same symbol/side/type rules as BingX's directional reader."""
     if not isinstance(snapshot, dict) or str(snapshot.get("status", "")).lower() != "ok":
@@ -3269,7 +3494,7 @@ def _protection_from_open_orders_snapshot(snapshot: dict, symbol: str, direction
         return None
 
     def symbol_key(value: Any) -> str:
-        return str(value or "").strip().upper().replace("/", "").replace("-", "")
+        return str(value or "").strip().upper().replace("/", "").replace("-", "").replace("_", "")
 
     target_symbol = symbol_key(symbol)
     target_direction = str(direction or "").upper()
@@ -3322,16 +3547,37 @@ def _missing_tp_order_state(
     tracked = tracked if isinstance(tracked, list) else []
     recorded_by_leg = matched_trade.get("tp_filled_qty")
     recorded_by_leg = recorded_by_leg if isinstance(recorded_by_leg, dict) else {}
+    raw_recorded_by_order = matched_trade.get("tp_filled_qty_by_order")
+    recorded_by_order = raw_recorded_by_order if isinstance(raw_recorded_by_order, dict) else {}
+    legacy_order_ledger = not isinstance(raw_recorded_by_order, dict) or not raw_recorded_by_order
     results: list[dict[str, Any]] = []
 
     for leg in sorted(missing_legs):
-        tp = next((
+        leg_rows = [
             item for item in tracked
             if isinstance(item, dict)
             and str(item.get("leg") or "").strip().lower() == leg
-            and item.get("order_id") not in (None, "")
-        ), None)
+        ]
+        tp = next((item for item in leg_rows if item.get("order_id") not in (None, "")), None)
         if tp is None:
+            # A row recorded as deferred proves no conditional order was sent.
+            # A definitive API rejection is also replaceable; a transport or
+            # post-ACK ambiguity must remain quarantined because the exchange
+            # may have accepted the original order.
+            no_id_row = leg_rows[-1] if leg_rows else None
+            if isinstance(no_id_row, dict) and str(no_id_row.get("status") or "").lower() == "deferred":
+                results.append({"leg": leg, "status": "not_submitted", "reason": no_id_row.get("reason")})
+                continue
+            if (
+                isinstance(no_id_row, dict)
+                and str(no_id_row.get("status") or "").lower() == "error"
+                and not bool(no_id_row.get("protection_state_unknown"))
+            ):
+                results.append({"leg": leg, "status": "rejected_not_submitted", "error": no_id_row.get("error")})
+                continue
+            if not leg_rows and str(matched_trade.get("tp_repair_state") or "").lower() == "not_attempted":
+                results.append({"leg": leg, "status": "not_attempted"})
+                continue
             return {
                 "status": "unknown", "reason": f"missing_tracked_order_id:{leg}",
                 "orders": results,
@@ -3354,7 +3600,23 @@ def _missing_tp_order_state(
         order_status = str(order.get("order_status") or "").upper()
         try:
             executed_qty = float(order.get("executed_qty"))
-            recorded_qty = float(recorded_by_leg.get(leg, 0.0) or 0.0)
+            if order_id in recorded_by_order:
+                recorded_qty = float(recorded_by_order.get(order_id, 0.0) or 0.0)
+            elif legacy_order_ledger:
+                baseline_info = dict(order)
+                if baseline_info.get("orig_qty") in (None, "", 0, 0.0):
+                    baseline_info["orig_qty"] = tp.get("qty")
+                migrated_baseline, migration_reason = _legacy_tp_order_fill_baseline(
+                    matched_trade, leg, baseline_info,
+                )
+                if migrated_baseline is None:
+                    return {
+                        "status": "unknown", "reason": f"legacy_tp_fill_ledger_ambiguous:{leg}:{migration_reason}",
+                        "orders": results + [{"leg": leg, "order_id": order_id, "order_status": order_status}],
+                    }
+                recorded_qty = float(migrated_baseline)
+            else:
+                recorded_qty = 0.0
         except (TypeError, ValueError, OverflowError):
             executed_qty = float("nan")
             recorded_qty = 0.0
@@ -3678,6 +3940,28 @@ def reconcile_all_open_positions() -> None:
         matched_trade = _find_active_trade_for_position(bx_symbol, direction, active_trades)
         hit_legs = {str(x).lower() for x in (matched_trade.get("hit_legs", []) if matched_trade else set())}
         be_activated = bool(matched_trade.get("be_activated", False)) if matched_trade else False
+        observed_sl_price = 0.0
+        if len(sl_orders) == 1:
+            observed_sl_price = _safe_float(sl_orders[0].get("stopPrice") or sl_orders[0].get("price"), 0.0)
+        live_be_or_profit_stop = _is_be_or_profit_side_stop(direction, avg_price, observed_sl_price)
+        if matched_trade and live_be_or_profit_stop and not be_activated:
+            # Adopt the exchange-confirmed stop state before computing repairs.
+            # Otherwise the next cycle sees a local matched trade with
+            # be_activated=False and can widen an existing BE/profit stop.
+            try:
+                live_sl_tracker = _sl_order_to_tracker(sl_orders)
+                update_active_trade_protection(
+                    symbol=bx_symbol,
+                    direction=direction,
+                    tp_orders=matched_trade.get("tp_orders", []) if isinstance(matched_trade.get("tp_orders"), list) else [],
+                    sl_result=live_sl_tracker,
+                    be_activated=True,
+                    be_activation_ts=int(time.time() * 1000),
+                )
+                matched_trade["be_activated"] = True
+                be_activated = True
+            except Exception as exc:
+                log.error("[RECONCILIATION] Failed to persist exchange-confirmed BE state for %s %s: %s", bx_symbol, direction, exc)
 
         effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
         configured_legs = {str(x.get("leg")).lower() for x in effective_levels if isinstance(x, dict) and x.get("leg")} if isinstance(effective_levels, list) and effective_levels else {"tp1", "tp2"}
@@ -3703,7 +3987,8 @@ def reconcile_all_open_positions() -> None:
                     # profile. Preserve a correctly sized stop at/near entry (BE)
                     # or on the protective side; never infer that it should be
                     # replaced by the default 7% stop merely because local state is absent.
-                    allow_break_even = be_activated or matched_trade is None
+                    live_be_or_profit_stop = _is_be_or_profit_side_stop(direction, avg_price, sl_price)
+                    allow_break_even = be_activated or matched_trade is None or live_be_or_profit_stop
                     if direction == "LONG":
                         price_matches = (sl_price <= avg_price * 1.003) if allow_break_even else (sl_price < avg_price)
                     elif direction == "SHORT":
@@ -3729,9 +4014,9 @@ def reconcile_all_open_positions() -> None:
                 observed_sl_price = sl_prices[0] if sl_prices else 0.0
                 if abs(observed_sl_qty - qty) > max(qty * 1e-6, 1e-12):
                     mismatch_reason = "SL_QTY_MISMATCH"
-                elif direction == "LONG" and not ((observed_sl_price <= avg_price * 1.003) if be_activated else (observed_sl_price < avg_price)):
+                elif direction == "LONG" and not ((observed_sl_price <= avg_price * 1.003) if (be_activated or matched_trade is None or _is_be_or_profit_side_stop(direction, avg_price, observed_sl_price)) else (observed_sl_price < avg_price)):
                     mismatch_reason = "SL_PRICE_NOT_PROTECTIVE"
-                elif direction == "SHORT" and not ((observed_sl_price >= avg_price * 0.997) if be_activated else (observed_sl_price > avg_price)):
+                elif direction == "SHORT" and not ((observed_sl_price >= avg_price * 0.997) if (be_activated or matched_trade is None or _is_be_or_profit_side_stop(direction, avg_price, observed_sl_price)) else (observed_sl_price > avg_price)):
                     mismatch_reason = "SL_PRICE_NOT_PROTECTIVE"
                 else:
                     mismatch_reason = "SL_ORDER_INVALID"
@@ -3827,6 +4112,9 @@ def reconcile_all_open_positions() -> None:
                             score=50.0,
                             setup=inferred_setup,
                             requested_entry_price=avg_price,
+                            be_activated=_is_be_or_profit_side_stop(direction, avg_price, sl_price),
+                            be_activation_ts=int(time.time() * 1000) if _is_be_or_profit_side_stop(direction, avg_price, sl_price) else None,
+                            tp_repair_state="attempted",
                         )
                         _record_reconciled_trade_open(
                             bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
@@ -3879,7 +4167,7 @@ def reconcile_all_open_positions() -> None:
                     r_sl_price = float(recheck_sl[0].get("stopPrice", 0) or recheck_sl[0].get("price", 0) or 0)
                     r_sl_amt = float(recheck_sl[0].get("origQty", 0) or recheck_sl[0].get("quantity", 0) or 0)
                     r_qty_matches = abs(r_sl_amt - qty) <= max(qty * 1e-6, 1e-12)
-                    allow_break_even = be_activated or matched_trade is None
+                    allow_break_even = be_activated or matched_trade is None or _is_be_or_profit_side_stop(direction, avg_price, r_sl_price)
                     if direction == "LONG":
                         r_price_matches = (r_sl_price <= avg_price * 1.003) if allow_break_even else (r_sl_price < avg_price)
                     elif direction == "SHORT":
@@ -3996,20 +4284,25 @@ def reconcile_all_open_positions() -> None:
         trade_event_id = matched_trade.get("event_id") if matched_trade else f"REC_{bx_symbol}_{direction}"
 
         preserved_orphan_sl_price = None
-        if matched_trade is None and len(recheck_sl) == 1:
-            # Preserve any single, identifiable trigger already on the protective
-            # side even if its quantity is wrong. The repair can correct quantity
-            # at the same price; defaulting to -7% would unnecessarily widen risk.
+        preserved_live_profit_sl_price = None
+        if len(recheck_sl) == 1:
+            # Preserve an exchange-confirmed BE/profit-lock trigger even when
+            # local tracking already exists; quantity repair must not widen it.
             candidate_sl_price = _safe_float(
                 recheck_sl[0].get("stopPrice") or recheck_sl[0].get("price"), 0.0
             )
-            if (
-                math.isfinite(candidate_sl_price) and candidate_sl_price > 0
-                and ((direction == "LONG" and candidate_sl_price <= avg_price * 1.003)
-                     or (direction == "SHORT" and candidate_sl_price >= avg_price * 0.997))
+            if _is_be_or_profit_side_stop(direction, avg_price, candidate_sl_price):
+                preserved_live_profit_sl_price = candidate_sl_price
+            elif matched_trade is None and math.isfinite(candidate_sl_price) and candidate_sl_price > 0 and (
+                (direction == "LONG" and candidate_sl_price <= avg_price * 1.003)
+                or (direction == "SHORT" and candidate_sl_price >= avg_price * 0.997)
             ):
                 preserved_orphan_sl_price = candidate_sl_price
-        desired_repair_sl_price = avg_price if be_activated else preserved_orphan_sl_price
+        desired_repair_sl_price = (
+            preserved_live_profit_sl_price
+            if preserved_live_profit_sl_price is not None
+            else (avg_price if be_activated else preserved_orphan_sl_price)
+        )
 
         # The tracker runs immediately before reconciliation, but a TP can fill
         # between those two passes. Never re-create a locally missing TP until
@@ -4261,6 +4554,8 @@ def reconcile_all_open_positions() -> None:
                 effective_tp_levels=res.get("effective_tp_levels"),
                 tp_mode=res.get("tp_mode"),
                 effective_weighted_rr=res.get("effective_weighted_rr"),
+                be_activated=be_activated,
+                tp_repair_state=str(res.get("tp_repair_state") or "attempted"),
             )
             if not tracked and not matched_trade:
                 reconciliation_event_id = _reconciliation_event_id(
@@ -4293,6 +4588,9 @@ def reconcile_all_open_positions() -> None:
                     score=50.0,
                     setup=reconciled_setup,
                     requested_entry_price=avg_price,
+                    be_activated=_is_be_or_profit_side_stop(direction, avg_price, _safe_float(repaired_sl.get("stop_price"), 0.0)),
+                    be_activation_ts=int(time.time() * 1000) if _is_be_or_profit_side_stop(direction, avg_price, _safe_float(repaired_sl.get("stop_price"), 0.0)) else None,
+                    tp_repair_state="attempted",
                 )
                 _record_reconciled_trade_open(
                     bx_symbol.replace("-USDT", ""), direction, avg_price, qty,
@@ -4631,6 +4929,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
         result_protection = {
             "status": "ROLLBACK_UNCONFIRMED" if not rolled_back else "ROLLED_BACK",
             "sl_result": {}, "tp_orders": [],
+            "tp_repair_state": "not_attempted",
             "rollback": rollback_result,
             "rollback_protection_cleanup": cleanup_result,
             "protection_confirmed": False if not rolled_back else True,
@@ -5638,7 +5937,7 @@ def main() -> None:
     )
     recent_symbol_losses = _load_recent_symbol_losses(TRADES)
 
-    telegram_sent_event_ids = load_successful_telegram_ids(ACTIONS)
+    telegram_sent_event_ids, journaled_cache_candidate_ids = _load_action_journal_index()
     telegram_attempted_this_cycle = send_pending_open_trade_notifications(
         current_positions=current_positions,
         successful_ids=telegram_sent_event_ids,
@@ -5766,7 +6065,10 @@ def main() -> None:
     best_opportunities_map: dict[tuple[str, str], dict] = {}
 
     scan_state = _load_timeframe_scan_state()
-    event_cache = _load_cached_events(now_ms, terminal_event_ids)
+    event_cache = _load_cached_events(
+        now_ms, terminal_event_ids,
+        journaled_candidate_ids=journaled_cache_candidate_ids,
+    )
 
     completed_1h = _completed_bucket(3_600_000, now_ms, BAR_CLOSE_GRACE_MIN)
     completed_4h = _completed_bucket(14_400_000, now_ms, BAR_CLOSE_GRACE_MIN)
@@ -6830,7 +7132,9 @@ def main() -> None:
     
                 err_str = str(execution_result.get("error", "")).lower()
                 status_now = str(execution_result.get("status", ""))
-                terminal_reason = _rollback_terminal_reason(status_now)
+                terminal_reason = _rollback_terminal_reason(status_now) or _postfill_setup_terminal_reason(
+                    status_now, execution_result, actual_qty_for_state,
+                )
                 if terminal_reason == "EXECUTION_ROLLED_BACK":
                     log.warning(
                         "[EXECUTION] %s (%s) entry was verified rolled back; terminalizing event %s.",
@@ -6873,6 +7177,11 @@ def main() -> None:
                 elif status_now == "ENTRY_DRIFT_EXCEEDED":
                     terminal_reason = "ENTRY_DRIFT_EXCEEDED"
                     log.warning("[EXECUTION] %s (%s) fill drift exceeded configured limit; terminalizing event %s.", symbol, direction, event_id)
+                elif terminal_reason == "PROTECTION_SETUP_INVALID_ROLLED_BACK":
+                    log.warning(
+                        "[EXECUTION] %s (%s) post-fill protection setup was invalid but rollback was verified; terminalizing event %s.",
+                        symbol, direction, event_id,
+                    )
                 elif status_now == "SR_3H_DIRECTIONAL_REJECTED":
                     terminal_reason = "SR_3H_DIRECTIONAL_REJECTED"
                     stats["rejected_sr_3h_direction"] = stats.get("rejected_sr_3h_direction", 0) + 1
@@ -7038,6 +7347,7 @@ def main() -> None:
                             setup=execution_result.get("setup_used_for_protection", setup),
                             requested_entry_price=_safe_float((execution_result.get("open_result") or {}).get("order_reference_price"), price) if isinstance(execution_result.get("open_result"), dict) else price,
                             entry_ts_ms=execution_result.get("fill_ts_ms"),
+                            tp_repair_state=str(protection.get("tp_repair_state") or ("attempted" if protection.get("tp_orders") else "unknown")),
                         )
                     except Exception as exc:
                         log.error("[TRACKER] Registration error for %s: %s", symbol, exc)

@@ -137,3 +137,40 @@ def test_failed_open_orders_cooldown_rewrite_restores_corrupt_source(tmp_path, m
     assert result is not None
     assert result[0] > now_ms
     assert path.read_bytes() == original
+
+
+def test_open_orders_non_json_http_429_persists_cooldown_without_retry(tmp_path, monkeypatch):
+    class _Html429Response:
+        status_code = 429
+        headers = {"Content-Type": "text/html", "Retry-After": "1"}
+
+        def json(self):
+            raise ValueError("gateway returned HTML")
+
+    class _OneShotSession:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return _Html429Response()
+
+    path = tmp_path / "bingx_open_orders_cooldown.json"
+    session = _OneShotSession()
+    monkeypatch.setattr(bx, "OPEN_ORDERS_COOLDOWN_STATE_PATH", path)
+    monkeypatch.setattr(bx, "FAST_SESSION", session)
+    monkeypatch.setattr(bx, "API_KEY", "test-key")
+    monkeypatch.setattr(bx, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(bx, "_apply_request_timestamp", lambda params: None)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_UNTIL_MS", 0)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_REASON", "")
+
+    result = bx._request("GET", bx.OPEN_ORDERS_PATH, {}, signed=True, retryable=True)
+
+    assert result["http_status"] == 429
+    assert result["rate_limited"] is True
+    assert result["local_cooldown"] is True
+    assert result["retry_after_ms"] > int(time.time() * 1000)
+    assert len(session.calls) == 1
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "HTTP 429" in persisted["reason"]

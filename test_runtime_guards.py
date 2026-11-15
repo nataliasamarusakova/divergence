@@ -1359,6 +1359,9 @@ def test_entry_order_resolution_quarantine_is_persisted_and_not_auto_closed(tmp_
     state_path = tmp_path / "active_trades.json"
     monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", state_path)
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    # The entry quarantine test is local-state-only. Do not let symbol mapping
+    # fall through to the live BingX contracts endpoint for this synthetic symbol.
+    monkeypatch.setattr(ro, "to_bx_symbol", lambda _symbol: "TEST-USDT")
     quarantine_id = tracker.queue_entry_order_resolution_pending(
         "TEST", "LONG", "cancel status unresolved", source_event_id="EVT_ENTRY",
         order_id="OID-PENDING", client_order_id="EVTOPENABC", order_status="NEW",
