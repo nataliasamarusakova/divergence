@@ -22,6 +22,14 @@ def _response_payload(response: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"ok": False, "description": "invalid Telegram API response"}
 
 
+def _safe_error_text(value: Any, token: str) -> str:
+    """Bound error text and remove the bot token embedded in Telegram URLs."""
+    message = str(value or "")
+    if token:
+        message = message.replace(token, "[REDACTED]")
+    return message[:500]
+
+
 def send_detailed(
     text: str,
     only_chat_ids: Optional[list[str]] = None,
@@ -51,8 +59,11 @@ def send_detailed(
                 f"{base_url}/sendMessage",
                 data=message_data,
                 timeout=15,
+                allow_redirects=False,
             )
-            response.raise_for_status()
+            status_code = int(getattr(response, "status_code", 0))
+            if not 200 <= status_code < 300:
+                raise requests.HTTPError(f"Telegram HTTP status={status_code}")
             payload = _response_payload(response)
             if payload.get("ok"):
                 result[str(chat_id)] = {
@@ -60,15 +71,15 @@ def send_detailed(
                     "message_id": ((payload.get("result") or {}).get("message_id")),
                 }
             else:
-                error = str(payload.get("description", "unknown Telegram API error"))
+                error = _safe_error_text(payload.get("description", "unknown Telegram API error"), token)
                 print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
                 result[str(chat_id)] = {"sent": False, "error": error}
         except requests.RequestException as exc:
-            error = str(exc)
+            error = _safe_error_text(exc, token)
             print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {error}")
             result[str(chat_id)] = {"sent": False, "error": error}
         except Exception as exc:
-            error = str(exc)
+            error = _safe_error_text(exc, token)
             print(f"[TELEGRAM] Unexpected send error for chat_id={chat_id}: {error}")
             result[str(chat_id)] = {"sent": False, "error": error}
 

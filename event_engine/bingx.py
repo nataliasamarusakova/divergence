@@ -353,11 +353,22 @@ def _request(
                 params=request_params,
                 headers=headers,
                 timeout=request_timeout,
+                # Signed requests contain an API key header and a signature in
+                # the query string. Never let requests replay either at a host
+                # selected by a 3xx Location response.
+                allow_redirects=False,
             )
+            status_raw = getattr(response, "status_code", None)
+            try:
+                status_code = int(status_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("BingX response has no valid HTTP status") from exc
+            is_http_success = 200 <= status_code < 300
             if isinstance(response_metadata, dict):
                 response_metadata.clear()
                 response_metadata.update({
-                    "http_status": int(response.status_code),
+                    "http_status": status_code,
+                    "http_error": not is_http_success,
                     "endpoint": path,
                     "method": method.upper(),
                     "request_host": urlparse(BASE_URL).netloc,
@@ -382,8 +393,28 @@ def _request(
                     # the exception class only whenever diagnostics are enabled.
                     "transport_error": type(exc).__name__,
                 })
-            safe_message = type(exc).__name__ if isinstance(response_metadata, dict) else str(exc)
-            return {"code": -1, "msg": safe_message}
+            # requests exceptions can include the complete URL, including the
+            # signed query string. Never return raw exception text to callers:
+            # most call sites log `msg` directly and do not request metadata.
+            # The exception class is safe and still identifies the transport
+            # failure category; richer diagnostics remain in redacted metadata.
+            safe_message = type(exc).__name__
+            failure = {"code": -1, "msg": safe_message}
+            if response is not None:
+                try:
+                    failure["http_status"] = int(getattr(response, "status_code"))
+                except (TypeError, ValueError, OverflowError, AttributeError):
+                    pass
+            return failure
+
+        if not isinstance(payload, dict):
+            if isinstance(response_metadata, dict):
+                response_metadata["response_root_type"] = type(payload).__name__
+            return {
+                "code": -1,
+                "msg": f"unexpected_response_root_type:{type(payload).__name__}",
+                "http_status": status_code,
+            }
 
         try:
             code = int(payload.get("code"))
@@ -400,11 +431,23 @@ def _request(
                 payload = dict(payload)
                 payload["retry_after_ms"] = retry_after_ms
                 payload["rate_limited"] = True
-        elif is_open_orders and code == 0:
+        elif is_open_orders and code == 0 and is_http_success:
             _clear_open_orders_cooldown()
 
         if signed and code == 109400 and attempt < max_timestamp_retries and _update_server_time_offset(response):
             continue
+
+        # An API envelope cannot override the transport result. In particular,
+        # HTTP 5xx + JSON code=0 is not an acknowledged order or successful read.
+        # Preserve the documented openOrders 100410 cooldown envelope so the
+        # caller can avoid retrying a rate-limited endpoint.
+        if not is_http_success and not (is_open_orders and code == 100410):
+            return {
+                "code": -1,
+                "msg": f"http_status_error:{status_code}",
+                "http_status": status_code,
+                "http_error": True,
+            }
 
         return payload
 
@@ -416,10 +459,21 @@ def refresh_contracts() -> dict[str, Any]:
     if resp.get("code") not in (0, "0"):
         raise RuntimeError(f"[BINGX] Contracts error: {resp.get('msg')}")
 
+    contract_rows = resp.get("data")
+    if not isinstance(contract_rows, list):
+        # The contracts endpoint documents a collection. `data=None` is an
+        # unknown/incomplete response, not a valid empty catalog; raising here
+        # lets `contracts()` retain its last known-good cache.
+        raise RuntimeError(
+            f"[BINGX] Contracts response has unexpected data shape: {type(contract_rows).__name__}"
+        )
+    if not all(isinstance(row, dict) for row in contract_rows):
+        raise RuntimeError("[BINGX] Contracts response contains a non-object contract row")
+
     data = {}
     by_name = {}
 
-    for c in resp.get("data", []) or []:
+    for c in contract_rows:
         sym = str(c.get("symbol", "")).strip().upper()
         name = str(c.get("displayName", "")).strip().upper()
         if sym:
@@ -635,7 +689,16 @@ def fetch_klines(
 
         raise RuntimeError(f"[BINGX] Klines error {bx}/{interval}: code={code} msg={msg}")
 
-    rows = resp.get("data") or []
+    rows = resp.get("data")
+    if not isinstance(rows, list):
+        # Kline data is documented as a candle array. Do not turn null or a
+        # changed response envelope into a normal empty-history result.
+        raise RuntimeError(
+            f"[BINGX] Klines response has unexpected data shape: {type(rows).__name__}"
+        )
+    if not all(isinstance(row, (list, tuple, dict)) for row in rows):
+        raise RuntimeError("[BINGX] Klines response contains an invalid candle row")
+
     out: list[dict] = []
     now_ms = int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
 
