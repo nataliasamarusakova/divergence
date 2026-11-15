@@ -105,10 +105,15 @@ _LIVE_PRICE_INVALID_UNTIL: dict[str, float] = {}
 _LIVE_PRICE_COOLDOWN_UNTIL = 0.0
 
 SESSION = requests.Session()
+# BingX traffic must remain direct. The Binance userspace WireProxy is deliberately
+# scoped to BinanceMarketClient; inheriting HTTP(S)_PROXY/ALL_PROXY from the host
+# would silently route signed exchange traffic through an unrelated proxy.
+SESSION.trust_env = False
 # Fast-fail session used by reconciliation/health-sensitive GETs. It deliberately
 # has no urllib3 retry adapter so a single stalled request cannot consume several
 # consecutive 10-second retry windows before the reconciliation loop can continue.
 FAST_SESSION = requests.Session()
+FAST_SESSION.trust_env = False
 
 _adapter = HTTPAdapter(
     pool_connections=20,
@@ -399,6 +404,32 @@ def _request(
                     failed_status = int(getattr(response, "status_code", 0))
                 except (TypeError, ValueError, OverflowError):
                     failed_status = 0
+                if is_open_orders and failed_status == 429:
+                    # A rate-limited openOrders response may be an HTML gateway
+                    # body rather than BingX's JSON code=100410 envelope. Do not
+                    # retry it: persist the same conservative endpoint cooldown
+                    # so subsequent workflow cycles also avoid amplifying the ban.
+                    now_ms = int(time.time() * 1000)
+                    retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
+                    _persist_open_orders_cooldown(
+                        retry_after_ms,
+                        "HTTP 429 from openOrders without a valid API envelope",
+                    )
+                    if isinstance(response_metadata, dict):
+                        response_metadata.update({
+                            "rate_limited": True,
+                            "local_cooldown": True,
+                            "retry_after_ms": retry_after_ms,
+                            "response_parse_error": type(exc).__name__,
+                        })
+                    return {
+                        "code": -1,
+                        "msg": "openOrders_http_429_without_valid_api_envelope",
+                        "http_status": 429,
+                        "rate_limited": True,
+                        "local_cooldown": True,
+                        "retry_after_ms": retry_after_ms,
+                    }
                 if failed_status in {429, 500, 502, 503, 504}:
                     retry_after_raw = str(getattr(response, "headers", {}).get("Retry-After", "") or "").strip()
                     try:
@@ -473,6 +504,7 @@ def _request(
         if (
             signed_retryable_get
             and not is_http_success
+            and not (is_open_orders and code == 100410)
             and status_code in {429, 500, 502, 503, 504}
             and http_retry_count < max_signed_get_http_retries
         ):
@@ -3819,9 +3851,11 @@ def ensure_directional_protection(
         if not math.isfinite(explicit_sl_price) or explicit_sl_price <= 0:
             return {"status": "error", "error": "invalid explicit stop_loss_price"}
         if direction == "LONG" and explicit_sl_price > avg_price:
-            return {"status": "error", "error": "LONG stop_loss_price is above avg_price"}
+            if not (avg_price <= explicit_sl_price <= avg_price * 1.003):
+                return {"status": "error", "error": "LONG stop_loss_price is above the recognized BE/profit-lock band"}
         if direction == "SHORT" and explicit_sl_price < avg_price:
-            return {"status": "error", "error": "SHORT stop_loss_price is below avg_price"}
+            if not (avg_price * 0.997 <= explicit_sl_price <= avg_price):
+                return {"status": "error", "error": "SHORT stop_loss_price is below the recognized BE/profit-lock band"}
         desired_sl_price = explicit_sl_price
     else:
         desired_sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
@@ -3841,7 +3875,14 @@ def ensure_directional_protection(
 
         is_break_even = _sl_price_matches(desired_sl_price, avg_price) and _sl_price_matches(sl_price, avg_price)
         protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
-        if is_break_even:
+        expected_profit_lock = (
+            _sl_price_matches(sl_price, desired_sl_price)
+            and (
+                (direction == "LONG" and avg_price < desired_sl_price <= avg_price * 1.003)
+                or (direction == "SHORT" and avg_price * 0.997 <= desired_sl_price < avg_price)
+            )
+        )
+        if is_break_even or expected_profit_lock:
             protective_side = True
         if protective_side and _sl_price_matches(sl_price, desired_sl_price) and _qty_matches_position(sl_qty, position_qty):
             valid_existing_sl = sl
@@ -3892,6 +3933,7 @@ def ensure_directional_protection(
                 "error": f"SL failed: {resp.get('msg')}; emergency_close={rollback.get('status')}",
                 "sl_result": {"status": "error", "error": resp.get("msg")},
                 "tp_orders": [],
+                "tp_repair_state": "not_attempted",
                 "rolled_back": rollback.get("status") == "closed",
                 "emergency_close": rollback,
             }
@@ -3930,6 +3972,7 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
+            "tp_repair_state": "not_attempted",
             "protection_audit": protection_audit,
             "error": f"SL invariant failed after placement: {protection_audit.get('audit_reason')}",
             "rolled_back": rollback.get("status") == "closed",
@@ -3953,6 +3996,7 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
+            "tp_repair_state": "not_attempted",
             "error": "no TP profile can be supported by the filled position quantity",
             "protection_audit": protection_audit,
             "rolled_back": False,
@@ -3985,6 +4029,7 @@ def ensure_directional_protection(
             "qty": position_qty,
             "sl_result": sl_result,
             "tp_orders": [],
+            "tp_repair_state": "not_attempted",
             "error": str(exc),
             "protection_audit": protection_audit,
         }
@@ -4050,6 +4095,7 @@ def ensure_directional_protection(
                     tp_results.append({
                         "leg": leg,
                         "status": "error",
+                        "order_id": old_order_id,
                         "error": f"stale TP cancel failed: {cancel_note}",
                         "qty": tp_qty,
                         "pnl_pct": pnl_pct,
@@ -4080,7 +4126,7 @@ def ensure_directional_protection(
             resp = _post_protection_order_verified(symbol, direction, market_params, client_order_id, max_attempts=2, retry_delay=0.25)
             if resp.get("code") not in (0, "0"):
                 log.error("[BINGX] TP market close failed: %s msg=%s", leg, resp.get("msg"))
-                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "protection_state_unknown": bool(resp.get("protection_state_unknown")), "qty": tp_qty, "pnl_pct": pnl_pct})
             else:
                 order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
                 tp_results.append({
@@ -4107,7 +4153,7 @@ def ensure_directional_protection(
         resp = _post_protection_order_verified(symbol, direction, params, client_order_id)
         if resp.get("code") not in (0, "0"):
             log.error("[BINGX] TP order failed: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
-            tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+            tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "protection_state_unknown": bool(resp.get("protection_state_unknown")), "qty": tp_qty, "pnl_pct": pnl_pct})
             continue
 
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
@@ -4171,6 +4217,7 @@ def ensure_directional_protection(
         "effective_tp_levels": effective_levels,
         "effective_weighted_rr": effective_weighted_rr,
         "tp_orders": tp_results,
+        "tp_repair_state": "attempted",
         "stale_tp_cancellations": stale_tp_cancellations,
         "sl_result": sl_result,
         "protection_audit": protection_audit,
@@ -4206,7 +4253,16 @@ def _validate_sl_order_for_position(
     # but only when the caller explicitly expects that entry price. Do not
     # globally relax the directional check for arbitrary equal-price stops.
     if not protective and expected_price is not None:
-        protective = _sl_price_matches(float(expected_price), avg_price) and _sl_price_matches(sl_price, avg_price)
+        expected = float(expected_price)
+        be_expected = _sl_price_matches(expected, avg_price) and _sl_price_matches(sl_price, avg_price)
+        profit_lock_expected = (
+            _sl_price_matches(sl_price, expected)
+            and (
+                (direction == "LONG" and avg_price < expected <= avg_price * 1.003)
+                or (direction == "SHORT" and avg_price * 0.997 <= expected < avg_price)
+            )
+        )
+        protective = be_expected or profit_lock_expected
 
     if not protective:
         return False

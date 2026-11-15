@@ -1123,6 +1123,98 @@ def _normalized_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace("-USDT", "")
 
 
+def _quantity_epsilon(initial_qty: float) -> float:
+    """Return a scale-aware float tolerance for position quantities.
+
+    Quantities for low-priced contracts can be very large. A fixed 1e-12
+    threshold is below the float64 ULP for many such quantities and can leave
+    a numerically non-zero dust amount after all TP legs have filled.
+    """
+    try:
+        scale = abs(float(initial_qty))
+    except (TypeError, ValueError, OverflowError):
+        scale = 0.0
+    if not math.isfinite(scale):
+        scale = 0.0
+    # Use floating-point representation error, not a broad relative tolerance:
+    # a scale*1e-12 term can erase a real exchange quantity (e.g. 1e-6 on a
+    # million-unit position). Eight ULPs cover accumulated subtraction noise.
+    return max(1e-12, math.ulp(max(scale, 1.0)) * 8.0)
+
+
+def _legacy_tp_order_fill_baseline(
+    trade: dict[str, Any], leg: str, order_info: dict[str, Any],
+) -> tuple[float | None, str]:
+    """Migrate V14.9 per-leg cumulative fills to the current TP order safely.
+
+    The immutable original setup distinguishes an original TP order from a
+    residual replacement: replacement origQty is lower than the original target
+    qty, so its own cumulative executedQty starts at zero while earlier fills
+    remain in the per-leg aggregate. If that provenance is unavailable, retain
+    the old per-leg baseline for backward compatibility and report the reason.
+    """
+    recorded_by_leg = trade.get("tp_filled_qty") if isinstance(trade.get("tp_filled_qty"), dict) else {}
+    aggregate = max(0.0, _safe_float(recorded_by_leg.get(str(leg), 0.0)))
+    if aggregate <= 0.0:
+        return 0.0, "zero_legacy_fill"
+
+    raw_orig = order_info.get("orig_qty")
+    try:
+        current_orig_qty = float(raw_orig) if raw_orig not in (None, "", 0, 0.0) else float("nan")
+        executed_qty = float(order_info.get("executed_qty"))
+    except (TypeError, ValueError, OverflowError):
+        return aggregate, "legacy_fallback_missing_order_quantity"
+    if not math.isfinite(current_orig_qty) or current_orig_qty <= 0 or not math.isfinite(executed_qty) or executed_qty < 0:
+        return aggregate, "legacy_fallback_invalid_order_quantity"
+
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    original_levels = setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else []
+    original_target = next((
+        level for level in original_levels
+        if isinstance(level, dict) and str(level.get("leg") or "").strip().lower() == str(leg).lower()
+    ), None)
+    target_qty = _safe_float(original_target.get("qty"), 0.0) if isinstance(original_target, dict) else 0.0
+    if target_qty <= 0 and isinstance(original_target, dict):
+        fraction = _safe_float(original_target.get("close_fraction"), 0.0)
+        initial_qty = abs(_safe_float(trade.get("initial_qty"), 0.0))
+        if fraction > 0 and initial_qty > 0:
+            target_qty = initial_qty * fraction
+    if target_qty <= 0:
+        return aggregate, "legacy_fallback_original_target_unavailable"
+
+    tolerance = max(1e-10, target_qty * 1e-8)
+    if executed_qty > current_orig_qty + max(1e-10, current_orig_qty * 1e-8):
+        return None, "legacy_order_executed_qty_exceeds_original_qty"
+    if current_orig_qty < target_qty - tolerance:
+        # This is a residual replacement order. Previous per-leg fills belong to
+        # earlier order IDs and must not be subtracted from this order's cumulative
+        # executedQty.
+        return 0.0, "legacy_replacement_order"
+    if abs(current_orig_qty - target_qty) <= tolerance:
+        return min(aggregate, executed_qty), "legacy_original_order"
+    return None, "legacy_order_qty_exceeds_original_target"
+
+
+def _tp_order_fill_delta(
+    leg: str,
+    order_id: str,
+    executed_qty: float,
+    filled_by_leg: dict[str, float],
+    filled_by_order: dict[str, float],
+    *,
+    legacy_order_ledger: bool,
+) -> tuple[float, float]:
+    """Return the prior and newly observed cumulative fill for one exchange order."""
+    order_key = str(order_id or "").strip()
+    if order_key and order_key in filled_by_order:
+        previous = max(0.0, _safe_float(filled_by_order.get(order_key, 0.0)))
+    elif legacy_order_ledger:
+        previous = max(0.0, _safe_float(filled_by_leg.get(str(leg), 0.0)))
+    else:
+        previous = 0.0
+    return previous, max(0.0, float(executed_qty) - previous)
+
+
 def update_active_trade_protection(
     symbol: str,
     direction: str,
@@ -1131,6 +1223,9 @@ def update_active_trade_protection(
     effective_tp_levels: list[dict] | None = None,
     tp_mode: str | None = None,
     effective_weighted_rr: float | None = None,
+    be_activated: bool | None = None,
+    be_activation_ts: int | None = None,
+    tp_repair_state: str | None = None,
 ) -> bool:
     trades = _load_active_trades()
     want_bx = to_bx_symbol(symbol) or _normalized_symbol(symbol)
@@ -1145,20 +1240,66 @@ def update_active_trade_protection(
             trade.get("closed", False)
             or trade.get("protection_cleanup_only")
             or trade.get("entry_order_resolution_pending")
+            or trade.get("close_cleanup_pending")
+            or trade.get("close_notification_pending")
+            or trade.get("close_journal_pending")
         ):
+            continue
+        gone_confirmation = trade.get("position_gone_confirmation")
+        if isinstance(gone_confirmation, dict) and str(gone_confirmation.get("status", "")).upper() == "CONFIRMED":
             continue
         trade_bx = to_bx_symbol(trade.get("symbol", "")) or _normalized_symbol(trade.get("symbol", ""))
         trade_direction = str(trade.get("direction", "")).upper()
 
         if trade_bx == want_bx and trade_direction == want_direction:
-            trade["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
+            old_tp_orders = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
+            aggregate_by_leg = trade.get("tp_filled_qty") if isinstance(trade.get("tp_filled_qty"), dict) else {}
+            by_order = trade.get("tp_filled_qty_by_order")
+            by_order = dict(by_order) if isinstance(by_order, dict) else {}
+
+            ledger_schema = int(_safe_float(trade.get("tp_fill_ledger_schema_version"), 0.0))
+            legacy_has_fills = any(_safe_float(value, 0.0) > 0 for value in aggregate_by_leg.values())
+            next_tp_orders = tp_orders if isinstance(tp_orders, list) else []
+            if ledger_schema == 1 or not legacy_has_fills:
+                for new_order in next_tp_orders:
+                    if not isinstance(new_order, dict):
+                        continue
+                    new_id = str(new_order.get("order_id") or "").strip()
+                    if new_id:
+                        # New IDs have a fresh per-order executedQty baseline.
+                        by_order.setdefault(new_id, 0.0)
+                trade["tp_fill_ledger_schema_version"] = 1
+                trade.pop("tp_fill_ledger_migration_pending", None)
+            else:
+                # Do not blindly attribute a legacy aggregate to an order ID:
+                # V14.9 may already have replaced that order after a partial fill.
+                # The tracker will migrate it using the immutable original setup
+                # and the live exchange origQty before accepting further fills.
+                trade["tp_fill_ledger_migration_pending"] = True
+            trade["tp_filled_qty_by_order"] = by_order
+            trade["tp_orders"] = next_tp_orders
             trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
             if effective_tp_levels is not None:
-                trade["effective_tp_levels"] = effective_tp_levels
+                # Keep the original target quantities as the per-leg lifetime
+                # targets. The protection API receives residual quantities during
+                # replacement; persisting those as new targets would subtract
+                # already-booked fills a second time on the next repair cycle.
+                setup_payload = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+                original_levels = setup_payload.get("effective_tp_levels") if isinstance(setup_payload.get("effective_tp_levels"), list) else None
+                if original_levels:
+                    trade["effective_tp_levels"] = [dict(item) for item in original_levels if isinstance(item, dict)]
+                elif not isinstance(trade.get("effective_tp_levels"), list) or not trade.get("effective_tp_levels"):
+                    trade["effective_tp_levels"] = effective_tp_levels
             if tp_mode:
                 trade["tp_mode"] = tp_mode
             if effective_weighted_rr is not None:
                 trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 1.6625)
+            if be_activated is not None:
+                trade["be_activated"] = bool(be_activated)
+                if be_activated:
+                    trade["be_activation_ts"] = int(be_activation_ts or trade.get("be_activation_ts") or time.time() * 1000)
+            if tp_repair_state is not None:
+                trade["tp_repair_state"] = str(tp_repair_state)
             trade["protection_last_updated_ts"] = int(time.time() * 1000)
             _save_active_trades(trades)
             return True
@@ -1211,6 +1352,9 @@ def register_active_trade(
     setup: dict | None = None,
     requested_entry_price: float | None = None,
     entry_ts_ms: int | None = None,
+    be_activated: bool = False,
+    be_activation_ts: int | None = None,
+    tp_repair_state: str = "unknown",
 ) -> None:
     direction = _normalize_direction(direction)
     trades = _load_active_trades()
@@ -1271,8 +1415,8 @@ def register_active_trade(
         "tp_orders": tp_orders if isinstance(tp_orders, list) else [],
         "sl_order": sl_result if isinstance(sl_result, dict) else {},
         "hit_legs": [],
-        "be_activated": False,
-        "be_activation_ts": None,
+        "be_activated": bool(be_activated),
+        "be_activation_ts": int(be_activation_ts or now_ms) if be_activated else None,
         "be_required": False,
         "be_last_error": None,
         "sl_order_history": [],
@@ -1296,6 +1440,13 @@ def register_active_trade(
         "tp_mode": setup_metrics["tp_mode"],
         "effective_weighted_rr": setup_metrics["effective_weighted_rr"],
         "tp_filled_qty": {},
+        "tp_filled_qty_by_order": {
+            str(item.get("order_id")): 0.0
+            for item in (tp_orders if isinstance(tp_orders, list) else [])
+            if isinstance(item, dict) and str(item.get("order_id") or "").strip()
+        },
+        "tp_fill_ledger_schema_version": 1,
+        "tp_repair_state": str(tp_repair_state or "unknown"),
         "realized_pnl_qty": 0.0,
         "realized_pnl_weighted_sum": 0.0,
         "last_tp_exec_price": None,
@@ -2974,6 +3125,13 @@ def update_active_trades() -> None:
 
             hit_legs = set(trade.get("hit_legs", []))
             filled_by_leg = {str(k): max(0.0, _safe_float(v)) for k, v in (trade.get("tp_filled_qty", {}) or {}).items()}
+            raw_filled_by_order = trade.get("tp_filled_qty_by_order")
+            filled_by_order = {
+                str(k): max(0.0, _safe_float(v))
+                for k, v in (raw_filled_by_order.items() if isinstance(raw_filled_by_order, dict) else [])
+                if str(k).strip()
+            }
+            ledger_schema = int(_safe_float(trade.get("tp_fill_ledger_schema_version"), 0.0))
             realized_qty = max(0.0, _safe_float(trade.get("realized_pnl_qty", 0.0)))
             realized_weighted = _safe_float(trade.get("realized_pnl_weighted_sum", 0.0))
 
@@ -3201,10 +3359,38 @@ def update_active_trades() -> None:
                     continue
 
                 order_status = str(order_info.get("order_status", "")).strip().upper()
-                if order_status not in {
-                    "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED",
-                }:
-                    continue
+
+                # Resolve legacy V14.9 per-leg cumulative fills before interpreting
+                # this order's current executedQty. A residual replacement has a
+                # smaller origQty than the immutable original TP target and starts
+                # its own cumulative counter at zero; previous fills remain in the
+                # aggregate per-leg total.
+                order_key = str(order_id)
+                if order_key in filled_by_order:
+                    previous_qty = max(0.0, _safe_float(filled_by_order.get(order_key, 0.0)))
+                elif ledger_schema == 1:
+                    previous_qty = 0.0
+                    filled_by_order[order_key] = 0.0
+                else:
+                    baseline_info = dict(order_info)
+                    if baseline_info.get("orig_qty") in (None, "", 0, 0.0):
+                        baseline_info["orig_qty"] = tp.get("qty")
+                    previous_qty, migration_reason = _legacy_tp_order_fill_baseline(
+                        trade, leg, baseline_info,
+                    )
+                    if previous_qty is None:
+                        trade["tp_fill_ledger_migration_pending"] = True
+                        log.critical(
+                            "[TRACKER_TP] Cannot safely migrate legacy fill ledger for %s %s %s order=%s: %s; fill accounting deferred",
+                            symbol, direction, leg, order_key, migration_reason,
+                        )
+                        continue
+                    filled_by_order[order_key] = previous_qty
+                    if migration_reason == "legacy_replacement_order":
+                        log.warning(
+                            "[TRACKER_TP] Migrated residual replacement order %s %s %s with independent zero baseline; prior leg fills retained",
+                            symbol, direction, leg, order_key,
+                        )
 
                 # BingX may report a partially executed TP as terminal CANCELED
                 # after the unfilled remainder was canceled. Its cumulative fill
@@ -3222,7 +3408,6 @@ def update_active_trades() -> None:
                     )
                     continue
 
-                previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
                 delta_qty = max(0.0, executed_qty - previous_qty)
                 original_qty = max(
                     0.0,
@@ -3249,6 +3434,7 @@ def update_active_trades() -> None:
                 )
 
                 if delta_qty <= 0:
+                    filled_by_order[order_key] = max(previous_qty, executed_qty)
                     if leg_fully_executed:
                         hit_legs.add(leg)
                     continue
@@ -3287,7 +3473,8 @@ def update_active_trades() -> None:
                 rem_qty = max(0.0, rem_qty - delta_qty)
                 realized_qty += delta_qty
                 realized_weighted += delta_qty * pnl_tp
-                filled_by_leg[leg] = executed_qty
+                filled_by_order[order_key] = max(previous_qty, executed_qty)
+                filled_by_leg[leg] = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0))) + delta_qty
 
                 trade["remaining_qty"] = rem_qty
                 trade["realized_pnl_qty"] = realized_qty
@@ -3378,8 +3565,25 @@ def update_active_trades() -> None:
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
+            trade["tp_filled_qty_by_order"] = filled_by_order
+            expected_tp_order_ids = {
+                str(item.get("order_id") or "").strip()
+                for item in trade.get("tp_orders", [])
+                if isinstance(item, dict) and str(item.get("order_id") or "").strip()
+            }
+            if expected_tp_order_ids.issubset(filled_by_order):
+                trade["tp_fill_ledger_schema_version"] = 1
+                trade.pop("tp_fill_ledger_migration_pending", None)
+            else:
+                trade["tp_fill_ledger_migration_pending"] = True
 
-            closed_by_tp = rem_qty <= 1e-12 and realized_qty > 0
+            qty_epsilon = _quantity_epsilon(init_qty)
+            if rem_qty <= qty_epsilon and realized_qty >= init_qty - qty_epsilon:
+                # Eliminate positive float dust only after aggregate TP fills
+                # account for the full initial quantity within ULP tolerance.
+                rem_qty = 0.0
+                trade["remaining_qty"] = 0.0
+            closed_by_tp = rem_qty <= qty_epsilon and realized_qty >= init_qty - qty_epsilon and realized_qty > 0
             position_gone = pos_status == "not_found"
 
             if not position_gone and not closed_by_tp:
@@ -3395,7 +3599,7 @@ def update_active_trades() -> None:
             sl_order_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
 
             sl_exit_price, filled_sl_id = _get_filled_sl_from_trade(symbol, trade)
-            if closed_by_tp and rem_qty <= 1e-12:
+            if closed_by_tp and rem_qty <= qty_epsilon:
                 exit_reason = "TAKE_PROFIT_FULL"
                 exit_price_source = "TP_WEIGHTED_AVERAGE"
             elif sl_exit_price is not None:
@@ -3563,6 +3767,7 @@ def update_active_trades() -> None:
                         "duration_min": duration_min,
                         "hit_legs": sorted(hit_legs),
                         "tp_filled_qty": filled_by_leg,
+                        "tp_filled_qty_by_order": dict(filled_by_order),
                         "tp_closed_qty": tp_closed_qty,
                         "sl_closed_qty": residual_qty if exit_reason in {"STOP_LOSS", "BREAK_EVEN", "POSITION_CLOSED"} else 0.0,
                         "total_closed_qty": init_qty,

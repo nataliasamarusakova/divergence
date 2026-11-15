@@ -432,12 +432,15 @@ def _pending_exit_fill_evidence(
 ) -> tuple[float, list[dict], bool]:
     """Find exchange-confirmed exit fills not yet reflected in tracker remaining_qty.
 
-    TP fills are cumulative per leg in tp_filled_qty, so only the positive
-    difference from the last tracker observation is counted. SL/manual exit orders
-    are considered only when the exchange says FILLED. This function never writes
-    active state and never changes the strict mismatch tolerance.
+    Exchange executedQty is cumulative per order ID, not across replacement
+    orders sharing the same TP leg. Prefer tp_filled_qty_by_order for the
+    order-specific baseline; retain tp_filled_qty as the aggregate per-leg
+    quantity and as a compatibility fallback for pre-ledger persisted state.
+    SL/manual exit orders are considered only when the exchange says FILLED.
+    This function never writes active state and never changes the strict mismatch
+    tolerance.
     """
-    candidates: list[tuple[int, str, str, str, str, float]] = []
+    candidates: list[tuple[int, str, str, str, str, float | None, dict | None, str | None, float | None]] = []
     for event_id, trade in active.items():
         if not isinstance(trade, dict) or _is_closed_or_confirmed_gone_trade(trade):
             continue
@@ -447,6 +450,9 @@ def _pending_exit_fill_evidence(
             continue
 
         recorded_by_leg = trade.get("tp_filled_qty") if isinstance(trade.get("tp_filled_qty"), dict) else {}
+        raw_recorded_by_order = trade.get("tp_filled_qty_by_order")
+        recorded_by_order = raw_recorded_by_order if isinstance(raw_recorded_by_order, dict) else {}
+        legacy_order_ledger = not isinstance(raw_recorded_by_order, dict) or not raw_recorded_by_order
         tp_orders = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
         for tp in tp_orders:
             if not isinstance(tp, dict) or tp.get("order_id") in (None, ""):
@@ -455,10 +461,18 @@ def _pending_exit_fill_evidence(
             if not leg:
                 continue
             try:
-                recorded_qty = float(recorded_by_leg.get(leg, 0.0) or 0.0)
+                order_id = str(tp["order_id"])
+                if order_id in recorded_by_order:
+                    recorded_qty: float | None = float(recorded_by_order.get(order_id, 0.0) or 0.0)
+                elif legacy_order_ledger:
+                    # The baseline for a legacy state needs the exchange order's
+                    # origQty, which is available only after the bounded query below.
+                    recorded_qty = None
+                else:
+                    recorded_qty = 0.0
             except (TypeError, ValueError, OverflowError):
                 continue
-            if not math.isfinite(recorded_qty) or recorded_qty < 0.0:
+            if recorded_qty is not None and (not math.isfinite(recorded_qty) or recorded_qty < 0.0):
                 continue
             # Query the earliest target first; in the common TP1 race this both
             # gives exact evidence and avoids unnecessary API requests for TP2.
@@ -468,27 +482,28 @@ def _pending_exit_fill_evidence(
                 leg_rank = 99
             candidates.append((
                 leg_rank, str(event_id), str(trade.get("symbol") or key[0]),
-                str(tp["order_id"]), f"TP:{leg}", recorded_qty,
+                order_id, f"TP:{leg}", recorded_qty, trade, leg,
+                _finite_nonnegative(tp.get("qty")),
             ))
 
         current_sl = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
         if current_sl.get("order_id") not in (None, ""):
             candidates.append((
                 100, str(event_id), str(trade.get("symbol") or key[0]),
-                str(current_sl["order_id"]), "SL", 0.0,
+                str(current_sl["order_id"]), "SL", 0.0, None, None, None,
             ))
         manual_exit_id = trade.get("manual_exit_order_id")
         if manual_exit_id not in (None, ""):
             candidates.append((
                 101, str(event_id), str(trade.get("symbol") or key[0]),
-                str(manual_exit_id), "MANUAL_EXIT", 0.0,
+                str(manual_exit_id), "MANUAL_EXIT", 0.0, None, None, None,
             ))
         sl_history = trade.get("sl_order_history") if isinstance(trade.get("sl_order_history"), list) else []
         for item in sl_history:
             if isinstance(item, dict) and item.get("order_id") not in (None, ""):
                 candidates.append((
                     102, str(event_id), str(trade.get("symbol") or key[0]),
-                    str(item["order_id"]), "SL_HISTORY", 0.0,
+                    str(item["order_id"]), "SL_HISTORY", 0.0, None, None, None,
                 ))
 
     candidates.sort(key=lambda item: item[0])
@@ -498,7 +513,7 @@ def _pending_exit_fill_evidence(
     budget_exhausted = False
     evidence_tolerance = max(1e-8, abs(expected_delta) * 1e-8)
 
-    for _rank, event_id, symbol, order_id, source, recorded_qty in candidates:
+    for _rank, event_id, symbol, order_id, source, recorded_qty, candidate_trade, leg, fallback_orig_qty in candidates:
         if order_id in seen_order_ids:
             continue
         seen_order_ids.add(order_id)
@@ -521,6 +536,20 @@ def _pending_exit_fill_evidence(
             continue
         if not isinstance(order, dict) or str(order.get("status", "")).lower() != "ok":
             continue
+        if recorded_qty is None and isinstance(candidate_trade, dict) and leg:
+            # A V14.9 per-leg aggregate can include fills from a prior TP order.
+            # Resolve the order-specific baseline only now, using the queried
+            # order's origQty and immutable original target stored in setup.
+            from event_engine.tracker import _legacy_tp_order_fill_baseline
+            baseline_info = dict(order)
+            if baseline_info.get("orig_qty") in (None, "", 0, 0.0):
+                baseline_info["orig_qty"] = fallback_orig_qty
+            migrated_baseline, _migration_reason = _legacy_tp_order_fill_baseline(
+                candidate_trade, leg, baseline_info,
+            )
+            if migrated_baseline is None:
+                continue
+            recorded_qty = float(migrated_baseline)
         order_status = str(order.get("order_status") or "").upper()
         allowed_statuses = {
             "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED",

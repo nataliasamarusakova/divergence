@@ -614,6 +614,7 @@ def detect_liquidity_sweep_reclaim(df: pd.DataFrame, symbol: str, timeframe: str
             "symbol": symbol, "timeframe": timeframe, "direction": "LONG", "event_type": typ,
             "timestamps": {"pivot_1_ts": int(d.loc[low_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
             "event_fact": {
+                "detection_close_price": close,
                 "swept_level": low_level, "sweep_depth_atr": float(sweep_depth_long),
                 "reclaim_displacement_atr": float((close - low_level) / atr_v),
                 "rejection_wick_fraction": float(lower_wick_fraction),
@@ -636,6 +637,7 @@ def detect_liquidity_sweep_reclaim(df: pd.DataFrame, symbol: str, timeframe: str
             "symbol": symbol, "timeframe": timeframe, "direction": "SHORT", "event_type": typ,
             "timestamps": {"pivot_1_ts": int(d.loc[high_pos, "close_time"]), "pivot_2_ts": ts, "detected_at_ts": ts},
             "event_fact": {
+                "detection_close_price": close,
                 "swept_level": high_level, "sweep_depth_atr": float(sweep_depth_short),
                 "reclaim_displacement_atr": float((high_level - close) / atr_v),
                 "rejection_wick_fraction": float(upper_wick_fraction),
@@ -689,7 +691,7 @@ def detect_ema_pullback_continuation(df: pd.DataFrame, symbol: str, timeframe: s
         "event_id": _event_id(symbol, timeframe, typ, ts, ts), "symbol": symbol,
         "timeframe": timeframe, "direction": direction, "event_type": typ,
         "timestamps": {"pivot_1_ts": ts, "pivot_2_ts": ts, "detected_at_ts": ts},
-        "event_fact": {"ema_fast": ema_f, "ema_slow": ema_s, "ema200": ema200, "body_atr": body_atr,
+        "event_fact": {"detection_close_price": float(last["close"]), "ema_fast": ema_f, "ema_slow": ema_s, "ema200": ema200, "body_atr": body_atr,
                         "volume_ratio": vol_ratio, "trigger_level": level, "requires_retest": True, "engine": "EMA_PULLBACK", "requires_htf_context": True},
     }]
 
@@ -792,6 +794,7 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
                         ts = int(d['close_time'].iloc[bos_i])
                         return [_make_event(symbol, timeframe, 'ORDER_BLOCK_BULLISH', 'LONG', ts,
                             int(d['close_time'].iloc[ob_i]), {
+                                'detection_close_price': float(d['close'].iloc[bos_i]),
                                 'engine':'ORDER_BLOCK','requires_htf_context':True,'requires_retest':True,
                                 'trigger_level':zone_high,'zone_high':zone_high,'zone_low':zone_low,
                                 'bos_level':bos_level,'ob_ts':int(d['close_time'].iloc[ob_i]),
@@ -814,6 +817,7 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
                         ts = int(d['close_time'].iloc[bos_i])
                         return [_make_event(symbol, timeframe, 'ORDER_BLOCK_BEARISH', 'SHORT', ts,
                             int(d['close_time'].iloc[ob_i]), {
+                                'detection_close_price': float(d['close'].iloc[bos_i]),
                                 'engine':'ORDER_BLOCK','requires_htf_context':True,'requires_retest':True,
                                 'trigger_level':zone_low,'zone_high':zone_high,'zone_low':zone_low,
                                 'bos_level':bos_level,'ob_ts':int(d['close_time'].iloc[ob_i]),
@@ -978,6 +982,7 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if cur_high >= zlo and cur_close < zlo:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BEARISH','SHORT',ts,int(d['close_time'].iloc[ob_i]),{
+                            'detection_close_price':float(d['close'].iloc[-1]),
                             'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
                             'trigger_level':zlo,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BULLISH_OB',
                             'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
@@ -1013,6 +1018,7 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if cur_low <= zhi and cur_close > zhi:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BULLISH','LONG',ts,int(d['close_time'].iloc[ob_i]),{
+                            'detection_close_price':float(d['close'].iloc[-1]),
                             'engine':'BREAKER_BLOCK','requires_htf_context':True,'requires_retest':True,
                             'trigger_level':zhi,'zone_high':zhi,'zone_low':zlo,'breaker_from':'BEARISH_OB',
                             'liquidity_sweep_ts':int(d['close_time'].iloc[sweep_i]),
@@ -1102,6 +1108,7 @@ def detect_mitigation_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h'
                     ts = int(d['close_time'].iloc[-1])
                     return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BULLISH', 'LONG', ts,
                         int(d['close_time'].iloc[origin_i]), {
+                            'detection_close_price':float(d['close'].iloc[-1]),
                             'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
                             'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
                             'origin_ts': int(d['close_time'].iloc[origin_i]),
@@ -1151,6 +1158,7 @@ def detect_mitigation_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h'
                     ts = int(d['close_time'].iloc[-1])
                     return [_make_event(symbol, timeframe, 'MITIGATION_BLOCK_BEARISH', 'SHORT', ts,
                         int(d['close_time'].iloc[origin_i]), {
+                            'detection_close_price':float(d['close'].iloc[-1]),
                             'engine': 'MITIGATION_BLOCK', 'requires_htf_context': True, 'requires_retest': True,
                             'trigger_level': level, 'zone_high': zone_hi, 'zone_low': zone_lo,
                             'origin_ts': int(d['close_time'].iloc[origin_i]),
@@ -1218,6 +1226,7 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
                     and float(d['close'].iloc[-1])>level and float(d['close'].iloc[-1])>float(d['open'].iloc[-1])):
                 ts=int(d['close_time'].iloc[-1])
                 return [_make_event(symbol,timeframe,'SFP_BULLISH','LONG',ts,int(d['close_time'].iloc[i]),{
+                    'detection_close_price':float(d['close'].iloc[-1]),
                     'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
                     'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
                     'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
@@ -1234,6 +1243,7 @@ def detect_sfp(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: i
                     and float(d['close'].iloc[-1])<level and float(d['close'].iloc[-1])<float(d['open'].iloc[-1])):
                 ts=int(d['close_time'].iloc[-1])
                 return [_make_event(symbol,timeframe,'SFP_BEARISH','SHORT',ts,int(d['close_time'].iloc[i]),{
+                    'detection_close_price':float(d['close'].iloc[-1]),
                     'engine':'SFP','requires_retest':True,'requires_htf_context':True,'trigger_level':level,
                     'swept_level':level,'sweep_depth_atr':sweep,'volume_ratio':vr,
                     'outside_volume_share':outside_share,'outside_volume_share_method':'candle_range_proxy',
@@ -1303,6 +1313,7 @@ def detect_liquidation_cascade_fvg(
     ts = int(d['close_time'].iloc[-1])
     typ = 'LIQUIDATION_CASCADE_FVG_LONG' if direction == 'LONG' else 'LIQUIDATION_CASCADE_FVG_SHORT'
     return [_make_event(symbol, timeframe, typ, direction, ts, int(d['close_time'].iloc[idx]), {
+        'detection_close_price':last_close,
         'engine':'LIQUIDATION_CASCADE_FVG','requires_htf_context':True,'requires_retest':True,
         'trigger_level':mid,'fvg_top':top,'fvg_bottom':bottom,'fvg_mid':mid,'fvg_index':idx,
         'impulse_atr':abs(move)/atr,'impulse_pct':impulse_pct,'volume_ratio':volume_ratio,
@@ -1329,6 +1340,7 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
             and float(c3['close']) > float(c3['open'])):
         ts=int(c3['close_time'])
         return [_make_event(symbol,timeframe,'CRT_BULLISH','LONG',ts,int(c1['close_time']),{
+            'detection_close_price':float(c3['close']),
             'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['low']),
             'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c1['low'])-float(c2['low']))/atr,
         },pivot_1_ts=int(c1['close_time']))]
@@ -1338,6 +1350,7 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
             and float(c3['close']) < float(c3['open'])):
         ts=int(c3['close_time'])
         return [_make_event(symbol,timeframe,'CRT_BEARISH','SHORT',ts,int(c1['close_time']),{
+            'detection_close_price':float(c3['close']),
             'engine':'CRT','requires_retest':True,'requires_htf_context':True,'trigger_level':float(c1['high']),
             'range_high':float(c1['high']),'range_low':float(c1['low']),'manipulation_depth_atr':(float(c2['high'])-float(c1['high']))/atr,
         },pivot_1_ts=int(c1['close_time']))]
