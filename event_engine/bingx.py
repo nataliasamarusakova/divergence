@@ -330,16 +330,22 @@ def _request(
     except (TypeError, ValueError):
         request_timeout = 10.0
     request_timeout = max(1.0, min(request_timeout, 60.0))
-    session = SESSION if retryable else FAST_SESSION
+    signed_retryable_get = bool(signed and method.upper() == "GET" and retryable)
+    # urllib3 retries replay the original query string and therefore the same
+    # timestamp/signature. Signed requests always use FAST_SESSION; safe GET
+    # retries are performed below at the application layer with a fresh nonce.
+    session = FAST_SESSION if signed or not retryable else SESSION
     headers = {}
-    max_timestamp_retries = 1 if signed else 0
+    timestamp_retry_used = False
+    http_retry_count = 0
+    max_signed_get_http_retries = 3
 
     if signed:
         if not API_KEY or not SECRET_KEY:
             return {"code": -1, "msg": "missing BingX credentials"}
         headers["X-BX-APIKEY"] = API_KEY
 
-    for attempt in range(max_timestamp_retries + 1):
+    while True:
         request_params = dict(base_params)
         if signed:
             _apply_request_timestamp(request_params)
@@ -378,6 +384,32 @@ def _request(
             if isinstance(response_metadata, dict):
                 response_metadata["request_elapsed_ms"] = int((time.monotonic() - request_started) * 1000)
         except Exception as exc:
+            # A proxy/gateway may return HTML or another non-JSON body for a
+            # retryable HTTP response. That path must still use the bounded
+            # signed-GET retry policy below; otherwise response.json() would
+            # abort before a fresh timestamp/signature can be generated. Never
+            # apply this retry to POST/DELETE or to a successful HTTP response
+            # with malformed JSON.
+            if (
+                signed_retryable_get
+                and response is not None
+                and http_retry_count < max_signed_get_http_retries
+            ):
+                try:
+                    failed_status = int(getattr(response, "status_code", 0))
+                except (TypeError, ValueError, OverflowError):
+                    failed_status = 0
+                if failed_status in {429, 500, 502, 503, 504}:
+                    retry_after_raw = str(getattr(response, "headers", {}).get("Retry-After", "") or "").strip()
+                    try:
+                        retry_delay = max(0.0, float(retry_after_raw)) if retry_after_raw else 0.5 * (2 ** http_retry_count)
+                    except (TypeError, ValueError, OverflowError):
+                        retry_delay = 0.5 * (2 ** http_retry_count)
+                    if retry_delay <= 4.0:
+                        http_retry_count += 1
+                        if retry_delay > 0:
+                            time.sleep(retry_delay)
+                        continue
             if isinstance(response_metadata, dict):
                 if response is not None:
                     response_metadata["http_status"] = getattr(response, "status_code", None)
@@ -434,8 +466,29 @@ def _request(
         elif is_open_orders and code == 0 and is_http_success:
             _clear_open_orders_cooldown()
 
-        if signed and code == 109400 and attempt < max_timestamp_retries and _update_server_time_offset(response):
+        if signed and code == 109400 and not timestamp_retry_used and _update_server_time_offset(response):
+            timestamp_retry_used = True
             continue
+
+        if (
+            signed_retryable_get
+            and not is_http_success
+            and status_code in {429, 500, 502, 503, 504}
+            and http_retry_count < max_signed_get_http_retries
+        ):
+            retry_after_raw = str(getattr(response, "headers", {}).get("Retry-After", "") or "").strip()
+            try:
+                retry_delay = max(0.0, float(retry_after_raw)) if retry_after_raw else 0.5 * (2 ** http_retry_count)
+            except (TypeError, ValueError, OverflowError):
+                retry_delay = 0.5 * (2 ** http_retry_count)
+            # Do not sleep past the exchange signing window in this job. For a
+            # longer Retry-After, return the HTTP failure and let the next cycle
+            # make a newly signed request instead of retrying too early.
+            if retry_delay <= 4.0:
+                http_retry_count += 1
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                continue
 
         # An API envelope cannot override the transport result. In particular,
         # HTTP 5xx + JSON code=0 is not an acknowledged order or successful read.
@@ -450,8 +503,6 @@ def _request(
             }
 
         return payload
-
-    return {"code": -1, "msg": "request retry exhausted"}
 
 
 def refresh_contracts() -> dict[str, Any]:
@@ -1024,12 +1075,28 @@ def _query_order(
     if timeout_sec is not None:
         request_options["timeout_sec"] = timeout_sec
     resp = _request("GET", ORDER_PATH, params, signed=True, **request_options)
-    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
-        return {"status": "error", "error": resp.get("msg") if isinstance(resp, dict) else str(resp), "code": resp.get("code") if isinstance(resp, dict) else None}
+    if not isinstance(resp, dict):
+        return {"status": "error", "error": "malformed_order_response_envelope", "code": None}
+    try:
+        response_code = int(resp.get("code"))
+    except (TypeError, ValueError, OverflowError):
+        response_code = None
+    if response_code == 109421:
+        # BingX uses 109421 when this order identity is not present. Callers may
+        # retry only the same clientOrderId; they must not infer an empty fill.
+        return {
+            "status": "absent", "error": str(resp.get("msg") or "order_not_found"),
+            "code": response_code, "order_id": str(order_id or ""),
+            "client_order_id": str(client_order_id or ""),
+        }
+    if response_code != 0:
+        return {"status": "error", "error": resp.get("msg") or "order_query_api_error", "code": resp.get("code")}
 
-    data = resp.get("data") or {}
-    order = data.get("order") or data
-    if not isinstance(order, dict):
+    data = resp.get("data")
+    if not isinstance(data, dict) or not data:
+        return {"status": "error", "error": "order_response_unexpected_data_shape", "code": resp.get("code")}
+    order = data.get("order", data)
+    if not isinstance(order, dict) or not order:
         return {"status": "error", "error": "order response missing order object", "code": resp.get("code")}
 
     def _first_float(*keys: str) -> float:
@@ -1921,8 +1988,9 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     qty = float(q)
 
     # TP count is selected after the confirmed fill from the actual position
-    # quantity. New entries use two TP legs when executable, otherwise one
-    # terminal TP2 leg; no new position may install three TP orders.
+    # quantity. New entries use two TP legs when executable, otherwise the
+    # nearest supported target (TP1) is used for the full position quantity.
+    # No new position may install three TP orders.
 
     if qty <= 0 or qty < min_qty:
         return {
@@ -3870,7 +3938,8 @@ def ensure_directional_protection(
 
     # Adapt the two-TP profile to the confirmed exchange position size. New
     # positions never receive three TP orders; if two legs are not executable,
-    # retain one terminal TP2 leg rather than place invalid partial orders.
+    # retain the nearest supported TP1 target for the full position rather than
+    # place invalid partial orders.
     tp_levels_norm = _select_supported_tp_levels(
         tp_levels_norm, position_qty=position_qty, precision=precision, min_qty=min_qty
     )

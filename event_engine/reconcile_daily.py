@@ -15,6 +15,7 @@ import math
 import os
 import re
 import hashlib
+import html
 import sys
 import time
 from collections import Counter, defaultdict
@@ -128,6 +129,11 @@ def _canonical_position_symbol(value: Any) -> str:
     if callable(resolver):
         return _symbol(resolver(value))
     return raw
+
+
+def _daily_journal_symbol(record: dict) -> str:
+    """Use the same canonical identity for journal totals and income candidates."""
+    return _canonical_position_symbol(record.get("symbol"))
 
 
 def _direction(value: Any, qty: float | None = None) -> str:
@@ -1449,7 +1455,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
             continue
         if record.get("pnl_costs_status") != "BINGX_ORDER_LINKED_FILLS_AND_INCOME_CONFIRMED" or record.get("net_pnl_usdt") is None:
             continue
-        bucket = confirmed_daily_by_symbol[_symbol(record.get("symbol"))]
+        bucket = confirmed_daily_by_symbol[_daily_journal_symbol(record)]
         bucket["net"] += float(record["net_pnl_usdt"])
         bucket["gross"] += float(record.get("realized_pnl_usdt") or 0.0)
         bucket["fees"] += float(record.get("fees_usdt") or 0.0)
@@ -1464,7 +1470,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
 
     candidate_symbols = Counter()
     for record in today_records:
-        sym = _symbol(record.get("symbol"))
+        sym = _daily_journal_symbol(record)
         if sym and record.get("record_type") in {"TRADE_OPEN", "TRADE_CLOSE"}:
             candidate_symbols[sym] += 1
     for sym, _ in local_positions:
@@ -1730,12 +1736,12 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         elif report["discrepancies"]:
             lines = [
                 f"<b>Divergence daily reconciliation: {report['status']}</b>",
-                f"Build: <code>{report.get('build_version', 'UNKNOWN')}</code>",
-                f"UTC day: <code>{report['utc_day']}</code>",
+                f"Build: <code>{html.escape(str(report.get('build_version', 'UNKNOWN')), quote=False)}</code>",
+                f"UTC day: <code>{html.escape(str(report['utc_day']), quote=False)}</code>",
             ]
             for item in report["discrepancies"][:12]:
                 detail = _discrepancy_message_detail(item)
-                lines.append(f"• <b>{item.get('level')}</b> {item.get('code')}: <code>{str(detail)[:350]}</code>")
+                lines.append(f"• <b>{html.escape(str(item.get('level', 'WARNING')), quote=False)}</b> {html.escape(str(item.get('code', 'UNKNOWN')), quote=False)}: <code>{html.escape(str(detail)[:350], quote=False)}</code>")
             lines.append("Exchange read-only check; persists local reconciliation metadata only. It does not place/cancel orders or block a later run.")
             try:
                 delivery = send_detailed("\n".join(lines))
@@ -1770,7 +1776,7 @@ def main() -> int:
         }
         _append_health(HEALTH_PATH, emergency_report)
         try:
-            send_detailed(f"<b>Divergence daily reconciliation failed</b>\n<code>{type(exc).__name__}: {str(exc)[:700]}</code>")
+            send_detailed(f"<b>Divergence daily reconciliation failed</b>\n<code>{html.escape(type(exc).__name__ + ': '+ str(exc)[:700], quote=False)}</code>")
         except Exception:
             pass
         print(json.dumps(emergency_report, ensure_ascii=False, indent=2), file=sys.stderr)

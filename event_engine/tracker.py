@@ -616,6 +616,45 @@ def _append_trade_record(record: dict) -> None:
         f.write(json.dumps(json_safe(record), ensure_ascii=False, allow_nan=False) + "\n")
 
 
+def _retry_pending_close_journal(trade: dict, event_id: str) -> bool:
+    """Persist the exact close record after an interrupted journal append.
+
+    Never reconstruct a close from mutable position state: that state may have
+    already been zeroed before the original journal write failed.
+    """
+    if not isinstance(trade, dict) or not trade.get("close_journal_pending"):
+        return False
+
+    try:
+        if _close_record_exists(event_id):
+            persisted = True
+        else:
+            snapshot = trade.get("close_journal_snapshot")
+            if (
+                not isinstance(snapshot, dict)
+                or snapshot.get("record_type") != "TRADE_CLOSE"
+                or str(snapshot.get("event_id", "")) != str(event_id)
+            ):
+                log.critical(
+                    "[TRACKER] Pending close journal for %s has no valid immutable snapshot; keeping it quarantined",
+                    event_id,
+                )
+                return False
+            _append_trade_record(snapshot)
+            persisted = True
+    except Exception as exc:
+        log.error("[TRACKER] Pending close journal retry failed for %s: %s", event_id, exc)
+        return False
+
+    if persisted:
+        trade.pop("close_journal_snapshot", None)
+        trade["close_journal_pending"] = False
+        trade["close_notification_pending"] = True
+        trade["closed"] = False
+        return True
+    return False
+
+
 def _fill_id(value: Any) -> str:
     return str(value).strip() if value not in (None, "") else ""
 
@@ -1280,7 +1319,7 @@ def format_tp_hit_message(
 ) -> str:
     return (
         f"<b>💰 {html.escape(str(name), quote=False)} (</b><code>{html.escape(format_telegram_symbol(symbol), quote=False)}</code><b>)</b>\n\n"
-        f"Leg: <b>{leg}</b>\n"
+        f"Leg: <b>{html.escape(str(leg), quote=False)}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
         f"Цена исполнения: <code>{format_price(exec_price)}</code>\n"
         f"Закрыто: <code>{closed_qty:.8f}</code>\n"
@@ -1315,8 +1354,8 @@ def format_trade_closed_message(
         f"Вход <code>{format_price(entry_price)}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
-        f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
-        f"Выход: <b>{exit_reason}</b>",
+        f"Вход: <code>{html.escape(str(event_type or ''), quote=False)}</code> · TF <b>{html.escape(str(timeframe or '1h').lower(), quote=False)}</b>",
+        f"Выход: <b>{html.escape(str(exit_reason or 'UNKNOWN'), quote=False)}</b>",
     ]
 
     return "\n".join(lines)
@@ -1379,8 +1418,8 @@ def _notify_position_state_unknown(
         eid = incident_key
         nid = _notification_id(eid, kind)
         text = (
-            f"🚨 <b>BingX position state requires verification ({symbol} {direction})</b>\n"
-            f"Status: <code>{detail}</code>\n"
+            f"🚨 <b>BingX position state requires verification ({html.escape(str(symbol), quote=False)} {html.escape(str(direction), quote=False)})</b>\n"
+            f"Status: <code>{html.escape(str(detail), quote=False)}</code>\n"
             "Бот не считает позицию закрытой и не отправляет слепой повторный ордер. "
             "Срочно проверьте фактическую позицию и SL/TP на бирже."
         )
@@ -1395,13 +1434,35 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, event_id: str |
         eid = str(event_id or f"{symbol}:{direction}:BE_FAILURE")
         nid = _notification_id(eid, "BE_FAILED")
         text = (
-            f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
-            f"Status: <code>{detail}</code>\n"
+            f"🛑 <b>BE move failed ({html.escape(str(symbol), quote=False)} {html.escape(str(direction), quote=False)})</b>\n"
+            f"Status: <code>{html.escape(str(detail), quote=False)}</code>\n"
             f"Позиция может остаться со старым SL или без SL — требуется проверка."
         )
         _queue_notification(nid, event_id=eid, kind="BE_FAILED", symbol=symbol, direction=direction, text=text)
     except Exception as exc:
         log.error("[TELEGRAM] Could not queue BE failure notification: %s", exc)
+
+
+def _apply_restored_sl_to_trade(
+    trade: dict, old_sl_id: str | None, old_sl_price: float | None,
+    result: dict, now_ms: int,
+) -> bool:
+    """Adopt a verified replacement ID after BE POST rejection restored the old SL."""
+    restored = result.get("restored_sl_order") if isinstance(result, dict) else None
+    if not isinstance(restored, dict) or not str(restored.get("order_id") or "").strip():
+        return False
+    if old_sl_id:
+        history = trade.setdefault("sl_order_history", [])
+        if all(
+            str(item.get("order_id", "")) != str(old_sl_id)
+            for item in history if isinstance(item, dict)
+        ):
+            history.append({
+                "order_id": str(old_sl_id), "stop_price": old_sl_price,
+                "replaced_ts": now_ms,
+            })
+    trade["sl_order"] = dict(restored)
+    return True
 
 
 def _move_sl_to_break_even(
@@ -1549,10 +1610,10 @@ def _move_sl_to_break_even(
                     "old_sl_id": oid,
                 }
 
-    def _restore_old_sl() -> bool:
-        """Best-effort restore of protection when the new SL could not be placed."""
+    def _restore_old_sl() -> dict | None:
+        """Best-effort restore of protection, retaining the verified new order ID."""
         if not old_sl_price or old_sl_price <= 0 or abs(old_sl_price - entry_price) / max(entry_price, 1e-12) < 1e-9:
-            return False
+            return None
         restore_side = "SELL" if direction == "LONG" else "BUY"
         restore_client_id = "EVTBERST" + hashlib.sha256(str(trade_token).upper().encode()).hexdigest().upper()[:16]
         restore_params = {
@@ -1569,31 +1630,40 @@ def _move_sl_to_break_even(
             )
         except Exception as exc:
             log.error("[TRACKER] Old SL restore exception for %s %s: %s", symbol, direction, exc)
-            return False
-        if not isinstance(restore_resp, dict) or restore_resp.get("code") != 0:
-            return False
+            return None
+        if not isinstance(restore_resp, dict) or restore_resp.get("code") not in (0, "0"):
+            return None
         restored_order = (restore_resp.get("data") or {}).get("order") or restore_resp.get("data") or {}
         restored_id = str(restored_order.get("orderId", ""))
         if not restored_id:
-            return False
+            return None
         try:
             latest = get_open_protection_directional(symbol, direction)
             if latest.get("status") != "ok":
-                return False
-            return any(
-                str(o.get("orderId", "")) == restored_id
+                return None
+            verified_order = next((
+                o for o in latest.get("sl_orders", [])
+                if str(o.get("orderId", "")) == restored_id
                 and abs(_safe_float(o.get("stopPrice") or o.get("price"), 0.0) - old_sl_price) / max(old_sl_price, 1e-12) < 0.002
                 and _safe_float(o.get("origQty") or o.get("quantity"), 0.0) > 0
-                for o in latest.get("sl_orders", [])
-            )
+            ), None)
+            if not isinstance(verified_order, dict):
+                return None
+            return {
+                "status": "created", "order_id": restored_id,
+                "stop_price": old_sl_price, "qty": qty,
+                "client_order_id": str(verified_order.get("clientOrderId") or restore_client_id),
+                "source": "RESTORED_OLD_SL",
+            }
         except Exception:
-            return False
+            return None
 
     def _fail(error: str, *, restore_old: bool = True, new_order_may_exist: bool = False, new_order_id: str = "") -> dict:
         # Restoring the old SL is safe only when we know the new POST was rejected
         # before creating an order. If a successful POST may already have created
         # the BE SL, a failed follow-up query must not recreate a second STOP.
-        restored = _restore_old_sl() if restore_old else False
+        restored_sl_order = _restore_old_sl() if restore_old else None
+        restored = isinstance(restored_sl_order, dict)
         restore_state = "succeeded" if restored else ("not_attempted_due_to_unknown_new_order" if not restore_old else "FAILED")
         log.error(
             "[TRACKER] BE move failed for %s %s: %s; old SL restore %s; new_order_may_exist=%s new_order_id=%s.",
@@ -1606,6 +1676,7 @@ def _move_sl_to_break_even(
             "order_id": new_order_id,
             "stop_price": entry_price,
             "old_sl_restored": bool(restored),
+            "restored_sl_order": restored_sl_order,
             "new_order_may_exist": bool(new_order_may_exist),
             "protection_state_unknown": bool(new_order_may_exist or not restore_old),
         }
@@ -2251,67 +2322,78 @@ def _load_exchange_fill_evidence(
     exit_order_ids = order_ids - {entry_order_id}
     if not exit_order_ids:
         return None, "abandon:journal_missing_exit_order_ids"
-    if query_end - query_start > 7 * 24 * 60 * 60 * 1000:
-        return None, "exchange_fill_query_window_exceeds_seven_days"
-
     fills_by_id: dict[str, dict] = {}
     order_fill_counts: dict[str, int] = {}
+    request_count = 0
+    max_requests = 24
+    max_pages_per_order = 10
     for order_id in sorted(order_ids):
-        try:
-            response = get_fill_history(
-                symbol, query_start, query_end, order_id=order_id,
-                page_index=1, page_size=1000, currency="USDT", timeout_sec=5.0,
-            )
-        except Exception as exc:
-            return None, f"fill_history_exception_for_order:{order_id}:{exc}"
-        if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
-            error = response.get("error", "fill_history_invalid_response") if isinstance(response, dict) else "fill_history_invalid_response"
-            diagnostic = _format_exchange_response_diagnostics(response)
-            if diagnostic:
-                error = f"{error}; {diagnostic}"
-            return None, f"fill_history_failed_for_order:{order_id}:{error}"
-        if response.get("has_more") is True:
-            return None, f"fill_history_truncated_for_order:{order_id}"
-        rows = response.get("fills")
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            return None, f"fill_history_invalid_rows_for_order:{order_id}"
-        for fill in rows:
-            fill_order_id = str(fill.get("order_id") or "").strip()
-            if fill_order_id != order_id:
-                return None, f"fill_history_order_id_mismatch:{order_id}:{fill_order_id or 'MISSING'}"
-            if _cashflow_symbol(fill.get("symbol")) != _cashflow_symbol(symbol):
-                return None, f"fill_history_symbol_mismatch_for_order:{order_id}"
-            fill_ts = int(_safe_float(fill.get("time"), 0.0))
-            qty = abs(_safe_float(fill.get("qty"), 0.0))
-            price = _safe_float(fill.get("price"), 0.0)
-            fee = _safe_float(fill.get("fee"), float("nan"))
-            fee_asset = str(fill.get("fee_asset") or "").upper()
-            trade_id = str(fill.get("trade_id") or "").strip()
-            if not trade_id or fill_ts <= 0 or not query_start <= fill_ts <= query_end:
-                return None, f"fill_history_missing_identity_or_time_for_order:{order_id}"
-            if qty <= 0 or price <= 0 or not math.isfinite(qty * price):
-                return None, f"fill_history_missing_actual_qty_price_for_order:{order_id}"
-            if not math.isfinite(fee) or fee_asset != "USDT":
-                return None, f"fill_history_fee_unknown_or_non_usdt_for_order:{order_id}"
-            pos_side = str(fill.get("position_side") or "").upper()
-            if pos_side and pos_side not in {str(direction).upper(), "BOTH"}:
-                return None, f"fill_history_position_side_mismatch_for_order:{order_id}"
-            realized_raw = fill.get("realized_pnl")
-            if realized_raw in (None, ""):
-                if order_id == entry_order_id:
-                    fill = dict(fill, realized_pnl=0.0)
-                else:
-                    return None, f"exit_fill_realized_pnl_unknown_for_order:{order_id}"
-            realized = _safe_float(fill.get("realized_pnl"), float("nan"))
-            if not math.isfinite(realized):
-                return None, f"fill_history_realized_pnl_non_finite_for_order:{order_id}"
-            normalized = dict(fill)
-            normalized.update(order_id=order_id, trade_id=trade_id, time=fill_ts, qty=qty, price=price, fee=fee, fee_asset=fee_asset, realized_pnl=realized)
-            previous = fills_by_id.get(trade_id)
-            if previous is not None and any(previous.get(k) != normalized.get(k) for k in ("order_id", "qty", "price", "fee", "realized_pnl")):
-                return None, f"duplicate_fill_id_conflict:{trade_id}"
-            fills_by_id[trade_id] = normalized
-            order_fill_counts[order_id] = order_fill_counts.get(order_id, 0) + 1
+        page_index = 1
+        while True:
+            if request_count >= max_requests:
+                return None, "fill_history_request_budget_exhausted_before_pagination_completed"
+            try:
+                response = get_fill_history(
+                    symbol, query_start, query_end, order_id=order_id,
+                    page_index=page_index, page_size=1000, currency="USDT", timeout_sec=5.0,
+                )
+                request_count += 1
+            except Exception as exc:
+                return None, f"fill_history_exception_for_order:{order_id}:{type(exc).__name__}"
+            if not isinstance(response, dict) or str(response.get("status", "")).lower() != "ok":
+                error = response.get("error", "fill_history_invalid_response") if isinstance(response, dict) else "fill_history_invalid_response"
+                diagnostic = _format_exchange_response_diagnostics(response)
+                if diagnostic:
+                    error = f"{error}; {diagnostic}"
+                return None, f"fill_history_failed_for_order:{order_id}:{error}"
+            rows = response.get("fills")
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                return None, f"fill_history_invalid_rows_for_order:{order_id}:page{page_index}"
+            has_more = response.get("has_more") is True
+            if has_more and page_index >= max_pages_per_order:
+                return None, f"fill_history_pagination_limit_exceeded_for_order:{order_id}"
+            for fill in rows:
+                fill_order_id = str(fill.get("order_id") or "").strip()
+                if fill_order_id != order_id:
+                    return None, f"fill_history_order_id_mismatch:{order_id}:{fill_order_id or 'MISSING'}"
+                if _cashflow_symbol(fill.get("symbol")) != _cashflow_symbol(symbol):
+                    return None, f"fill_history_symbol_mismatch_for_order:{order_id}"
+                fill_ts = int(_safe_float(fill.get("time"), 0.0))
+                qty = abs(_safe_float(fill.get("qty"), 0.0))
+                price = _safe_float(fill.get("price"), 0.0)
+                fee = _safe_float(fill.get("fee"), float("nan"))
+                fee_asset = str(fill.get("fee_asset") or "").upper()
+                trade_id = str(fill.get("trade_id") or "").strip()
+                if not trade_id or fill_ts <= 0 or not query_start <= fill_ts <= query_end:
+                    return None, f"fill_history_missing_identity_or_time_for_order:{order_id}"
+                if qty <= 0 or price <= 0 or not math.isfinite(qty * price):
+                    return None, f"fill_history_missing_actual_qty_price_for_order:{order_id}"
+                if not math.isfinite(fee) or fee_asset != "USDT":
+                    return None, f"fill_history_fee_unknown_or_non_usdt_for_order:{order_id}"
+                pos_side = str(fill.get("position_side") or "").upper()
+                if pos_side and pos_side not in {str(direction).upper(), "BOTH"}:
+                    return None, f"fill_history_position_side_mismatch_for_order:{order_id}"
+                realized_raw = fill.get("realized_pnl")
+                if realized_raw in (None, ""):
+                    if order_id == entry_order_id:
+                        fill = dict(fill, realized_pnl=0.0)
+                    else:
+                        return None, f"exit_fill_realized_pnl_unknown_for_order:{order_id}"
+                realized = _safe_float(fill.get("realized_pnl"), float("nan"))
+                if not math.isfinite(realized):
+                    return None, f"fill_history_realized_pnl_non_finite_for_order:{order_id}"
+                normalized = dict(fill)
+                normalized.update(order_id=order_id, trade_id=trade_id, time=fill_ts, qty=qty, price=price, fee=fee, fee_asset=fee_asset, realized_pnl=realized)
+                previous = fills_by_id.get(trade_id)
+                if previous is not None and any(previous.get(k) != normalized.get(k) for k in ("order_id", "qty", "price", "fee", "realized_pnl")):
+                    return None, f"duplicate_fill_id_conflict:{trade_id}"
+                fills_by_id[trade_id] = normalized
+                order_fill_counts[order_id] = order_fill_counts.get(order_id, 0) + 1
+            if has_more:
+                page_index += 1
+                time.sleep(0.22)
+                continue
+            break
 
     if order_fill_counts.get(entry_order_id, 0) <= 0:
         return None, "entry_order_has_no_confirmed_fills"
@@ -2562,7 +2644,7 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
         if fill_error:
             updated = dict(record)
             attempts = int(_safe_float(recovery.get("attempts"), 0.0)) + 1
-            terminal = fill_error.startswith("abandon:") or attempts >= 40 or "window_exceeds_seven_days" in fill_error
+            terminal = fill_error.startswith("abandon:") or attempts >= 40
             delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempts - 1, 4)))
             updated["fees_usdt"] = None
             updated["funding_usdt"] = None
@@ -2703,7 +2785,7 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
             log.info("[TRACKER_CASHFLOW] Exact exchange-linked net PnL event=%s gross=%.8g fees=%.8g funding=%.8g other=%.8g net=%.8g fills=%d income_rows=%d", event_id, fill_gross, fill_fees, funding, other_cashflows, net, len(fills), len(relevant))
         else:
             delay_ms = min(6 * 60 * 60 * 1000, 30 * 60 * 1000 * (2 ** min(attempts - 1, 4)))
-            terminal = attempts >= 40 or error.startswith("abandon:") or "window_exceeds_seven_days" in error
+            terminal = attempts >= 40 or error.startswith("abandon:")
             updated["fees_usdt"] = None
             updated["funding_usdt"] = None
             updated["net_pnl_usdt"] = None
@@ -2762,6 +2844,13 @@ def update_active_trades() -> None:
     updated_trades: dict[str, dict] = {}
 
     for event_id, trade in trades.items():
+        if trade.get("close_journal_pending"):
+            # Retry the persisted immutable close record before any exchange
+            # reads or close-reason inference can run again.
+            _retry_pending_close_journal(trade, str(event_id))
+            updated_trades[event_id] = trade
+            continue
+
         if trade.get("close_notification_pending"):
             # The close journal is already durable; do not re-run position/fill/
             # candle queries just because queue persistence for Telegram failed.
@@ -3072,6 +3161,7 @@ def update_active_trades() -> None:
                     trade.pop("be_possible_qty", None)
                     trade.pop("be_possible_stop_price", None)
                 else:
+                    _apply_restored_sl_to_trade(trade, old_sl_id, old_sl_price, retry, now_ms)
                     trade["be_required"] = True
                     trade["be_last_error"] = retry.get("error")
                     if retry.get("new_order_may_exist"):
@@ -3273,6 +3363,7 @@ def update_active_trades() -> None:
                                 trade.get("name", symbol), symbol, leg.upper(), entry_price
                             )                             
                         else:
+                            _apply_restored_sl_to_trade(trade, old_sl_id, old_sl_price, new_sl, now_ms)
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")
                             if new_sl.get("new_order_may_exist"):
@@ -3412,8 +3503,7 @@ def update_active_trades() -> None:
             trade["closed"] = False
             close_journal_persisted = _close_record_exists(event_id)
             if not close_journal_persisted:
-                try:
-                    _append_trade_record({
+                close_journal_record = {
                         "record_type": "TRADE_CLOSE",
                         "trade_id": trade.get("trade_id") or ("TR_" + hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:24].upper()),
                         "event_id": event_id,
@@ -3479,7 +3569,13 @@ def update_active_trades() -> None:
                         "be_activated": bool(trade.get("be_activated")),
                         "research": trade.get("research", {}),
                         "setup": trade.get("setup", {}),
-                    })
+                    }
+                trade["close_journal_snapshot"] = dict(close_journal_record)
+                trade["close_journal_pending"] = True
+                try:
+                    _append_trade_record(close_journal_record)
+                    trade.pop("close_journal_snapshot", None)
+                    trade["close_journal_pending"] = False
                     close_journal_persisted = True
                 except Exception as exc:
                     log.error("[TRACKER] Trade close journal write failed for %s: %s", event_id, exc)
