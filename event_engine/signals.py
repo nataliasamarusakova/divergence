@@ -782,7 +782,14 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
         if prior_highs:
             sh = prior_highs[-1]
             bos_level = float(d['high'].iloc[sh])
-            if float(d['close'].iloc[bos_i]) > bos_level + 0.05 * atr:
+            # A confirmed swing high is no longer a fresh BOS level after an
+            # earlier candle has already closed above it. Reusing that level
+            # would turn a later continuation close into a duplicate BOS/OB.
+            prior_close_through = any(
+                float(d['close'].iloc[i]) > bos_level
+                for i in range(sh + pivot_right + 1, bos_i)
+            )
+            if not prior_close_through and float(d['close'].iloc[bos_i]) > bos_level + 0.05 * atr:
                 for ob_i in range(bos_i - 1, max(1, bos_i - 8), -1):
                     if float(d['close'].iloc[ob_i]) < float(d['open'].iloc[ob_i]):
                         zone_high = float(d['high'].iloc[ob_i]); zone_low = float(d['low'].iloc[ob_i])
@@ -805,7 +812,13 @@ def detect_order_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', loo
         if prior_lows:
             sl = prior_lows[-1]
             bos_level = float(d['low'].iloc[sl])
-            if float(d['close'].iloc[bos_i]) < bos_level - 0.05 * atr:
+            # Mirror the bullish guard: do not reuse a swing low after an
+            # earlier close has already broken below the level.
+            prior_close_through = any(
+                float(d['close'].iloc[i]) < bos_level
+                for i in range(sl + pivot_right + 1, bos_i)
+            )
+            if not prior_close_through and float(d['close'].iloc[bos_i]) < bos_level - 0.05 * atr:
                 for ob_i in range(bos_i - 1, max(1, bos_i - 8), -1):
                     if float(d['close'].iloc[ob_i]) > float(d['open'].iloc[ob_i]):
                         zone_high = float(d['high'].iloc[ob_i]); zone_low = float(d['low'].iloc[ob_i])
@@ -1744,6 +1757,20 @@ def detect_harmonic_patterns(
 
         prices = [p[2] for p in points]
         x, a, b, c, d = prices
+
+        # Alternating pivot labels are not sufficient to establish an XABCD
+        # pattern: the actual price legs must also alternate in the expected
+        # direction. In particular, a bullish D must be below C and a bearish
+        # D must be above C. This prevents absolute ratios from accepting a
+        # geometrically inverted sequence.
+        bullish = points[0][1] == "low"
+        if bullish:
+            if not (x < b < a and c > b and d < c):
+                continue
+        else:
+            if not (a < b < x and c < b and d > c):
+                continue
+
         xa = abs(a - x)
         ab = abs(b - a)
         bc = abs(c - b)
@@ -1786,7 +1813,7 @@ def detect_harmonic_patterns(
 
         # These three use the published public ratio families from the open
         # HarmonicPatterns project / TradingView implementations.
-        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 2.618, 3.618, tol) and _ratio_near(xd_xa, 1.618, tol):
+        if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(bc_ab, 0.382, 0.886, tol) and _ratio_in(cd_bc, 2.618, 3.618, tol) and _ratio_near(ad_xa, 1.618, tol):
             candidates.append("CRAB")
         if _ratio_in(ab_xa, 0.382, 0.618, tol) and _ratio_in(xc_xa, 1.272, 1.414, tol) and _ratio_near(cd_xc, 0.786, tol):
             candidates.append("CYPHER")

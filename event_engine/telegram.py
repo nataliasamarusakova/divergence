@@ -236,7 +236,7 @@ def format_signal(
             rr_value = setup.get("realized_rr")
         tp_mode = setup.get("tp_mode") or ("single_tp" if len(tp_levels) == 1 else ("two_tp" if len(tp_levels) == 2 else "multi_tp"))
         lines.extend([
-            f"R:R: <code>{esc(str(rr_value))}</code>",
+            f"R:R: <code>{esc(format_rr(rr_value))}</code>",
             f"TP Mode: <code>{esc(tp_mode)}</code>",
         ])
 

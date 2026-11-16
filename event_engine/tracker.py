@@ -2294,6 +2294,14 @@ def _calc_stop_slippage_pct(direction: str, fill_price: float | None, stop_price
     return max(0.0, (fill - stop) / stop * 100.0)
 
 
+
+def _position_confirmation_delay(default: float = 0.5) -> float:
+    """Bounded delay between independent position-state confirmation reads."""
+    try:
+        return max(0.0, min(5.0, float(os.environ.get("BINGX_POSITION_CONFIRM_DELAY_SEC", str(default)))))
+    except (TypeError, ValueError):
+        return default
+
 def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     """Cancel and verify all remaining protection for a position that has closed.
 
@@ -2311,16 +2319,16 @@ def _cleanup_closed_trade_protection(trade: dict) -> tuple[bool, str]:
     # of protection belonging to a still-live position.
     for read_index in range(2):
         try:
-            live = get_position_directional(symbol, direction)
+            live = get_position_directional(symbol, direction, close_connection=True)
         except Exception as exc:
-            return False, f"position state read failed: {exc}"
+            return False, f"position state read failed: {type(exc).__name__}"
         live_status = str(live.get("status", "")).lower()
         if live_status == "found" and abs(_safe_float(live.get("positionAmt"), 0.0)) > 0:
             return False, "refusing cleanup because a live position exists for the same symbol/direction"
         if live_status != "not_found":
             return False, f"refusing cleanup because position state is not proven closed: {live_status or 'unknown'}"
         if read_index == 0:
-            time.sleep(0.15)
+            time.sleep(_position_confirmation_delay())
     try:
         prot = get_open_protection_directional(symbol, direction)
     except Exception as exc:
@@ -3151,38 +3159,41 @@ def update_active_trades() -> None:
                 # One empty snapshot is not proof that the position was closed.
                 # Require an independent follow-up read; any error or a reappearing
                 # position defers lifecycle closure until the next tracker cycle.
-                try:
-                    time.sleep(0.25)
-                    confirm = get_position_directional(symbol, direction)
-                except Exception as exc:
-                    trade["position_gone_confirmation"] = {
-                        "status": "PENDING", "observed_ts": now_ms,
-                        "reason": f"second_position_read_exception:{exc}",
-                    }
-                    trade["last_observation_ts"] = now_ms
-                    trade["position_state_alert_pending"] = True
-                    trade["position_state_last_error"] = trade["position_gone_confirmation"]["reason"]
-                    _notify_position_state_unknown(symbol, direction, trade["position_state_last_error"], str(event_id))
-                    updated_trades[event_id] = trade
-                    log.warning("[TRACKER] Deferring close for %s: second position read failed: %s", event_id, exc)
-                    continue
-                confirm_status = str(confirm.get("status", "")).lower()
+                confirm = None
+                confirm_status = "not_found"
+                confirm_error = None
+                for confirm_index, delay in enumerate((0.5, 1.5), start=1):
+                    time.sleep(_position_confirmation_delay(delay))
+                    try:
+                        candidate = get_position_directional(symbol, direction, close_connection=True)
+                    except Exception as exc:
+                        confirm_error = f"{type(exc).__name__}"
+                        confirm_status = "error"
+                        break
+                    candidate_status = str(candidate.get("status", "")).lower()
+                    if candidate_status != "not_found":
+                        confirm = candidate
+                        confirm_status = candidate_status
+                        break
+                    confirm = candidate
                 if confirm_status != "not_found":
+                    reason = f"confirming_position_read_{confirm_status or 'unknown'}"
+                    if confirm_error:
+                        reason += f":{confirm_error}"
                     trade["position_gone_confirmation"] = {
-                        "status": "PENDING", "observed_ts": now_ms,
-                        "reason": f"second_position_read_{confirm_status or 'unknown'}",
+                        "status": "PENDING", "observed_ts": now_ms, "reason": reason,
                     }
                     trade["last_observation_ts"] = now_ms
                     trade["position_state_alert_pending"] = True
-                    trade["position_state_last_error"] = trade["position_gone_confirmation"]["reason"]
-                    if confirm_status == "found":
+                    trade["position_state_last_error"] = reason
+                    if confirm_status == "found" and isinstance(confirm, dict):
                         trade["current_position_qty"] = abs(_safe_float(confirm.get("positionAmt"), 0.0))
                         trade["last_exchange_avg_price"] = _safe_float(confirm.get("avgPrice"), 0.0) or trade.get("last_exchange_avg_price")
-                    _notify_position_state_unknown(symbol, direction, trade["position_state_last_error"], str(event_id))
+                    _notify_position_state_unknown(symbol, direction, reason, str(event_id))
                     updated_trades[event_id] = trade
-                    log.warning("[TRACKER] Deferring close for %s: position disappearance not confirmed (%s).", event_id, confirm_status or "unknown")
+                    log.warning("[TRACKER] Deferring close for %s: position disappearance not confirmed (%s).", event_id, reason)
                     continue
-                trade["position_gone_confirmation"] = {"status": "CONFIRMED", "observed_ts": now_ms, "reads": 2}
+                trade["position_gone_confirmation"] = {"status": "CONFIRMED", "observed_ts": now_ms, "reads": 3}
                 pos = confirm
                 pos_status = "not_found"
 

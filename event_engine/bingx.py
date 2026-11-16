@@ -309,6 +309,7 @@ def _request(
     timeout_sec: float | None = None,
     retryable: bool = True,
     response_metadata: dict[str, Any] | None = None,
+    close_connection: bool = False,
 ):
     is_open_orders = method.upper() == "GET" and path == OPEN_ORDERS_PATH
     if is_open_orders:
@@ -340,7 +341,7 @@ def _request(
     # timestamp/signature. Signed requests always use FAST_SESSION; safe GET
     # retries are performed below at the application layer with a fresh nonce.
     session = FAST_SESSION if signed or not retryable else SESSION
-    headers = {}
+    headers = {"Connection": "close"} if close_connection else {}
     timestamp_retry_used = False
     http_retry_count = 0
     max_signed_get_http_retries = 3
@@ -946,6 +947,7 @@ def _normalize_orders_list(resp: dict) -> list[dict]:
 def get_positions(
     *, timeout_sec: float | None = None, retryable: bool = True,
     diagnostics: dict[str, Any] | None = None,
+    close_connection: bool = False,
 ) -> list[dict]:
     """Fetch open positions and optionally expose a sanitized response envelope.
 
@@ -962,6 +964,7 @@ def get_positions(
         timeout_sec=timeout_sec,
         retryable=retryable,
         response_metadata=request_metadata,
+        close_connection=close_connection,
     )
     if isinstance(diagnostics, dict):
         request_metadata = dict(diagnostics)
@@ -1020,6 +1023,7 @@ def get_positions(
 
 def get_open_orders_snapshot(
     *, timeout_sec: float | None = None, retryable: bool = True,
+    diagnostics: dict[str, Any] | None = None, close_connection: bool = False,
 ) -> dict:
     """Fetch one account-wide open-order snapshot for reconciliation.
 
@@ -1028,6 +1032,7 @@ def get_open_orders_snapshot(
     protection order is reported as an error so callers can fall back to the known
     per-symbol query rather than treating unknown data as missing protection.
     """
+    request_metadata: dict[str, Any] = diagnostics if isinstance(diagnostics, dict) else {}
     try:
         resp = _request(
             "GET",
@@ -1035,9 +1040,18 @@ def get_open_orders_snapshot(
             {},
             timeout_sec=timeout_sec,
             retryable=retryable,
+            response_metadata=request_metadata,
+            close_connection=close_connection,
         )
     except Exception as exc:
-        return {"status": "error", "error": f"openOrders snapshot request failed: {exc}", "orders": []}
+        if isinstance(diagnostics, dict):
+            diagnostics.update(request_metadata)
+            diagnostics["transport_error"] = type(exc).__name__
+        return {"status": "error", "error": f"openOrders snapshot request failed: {type(exc).__name__}", "orders": [], **request_metadata}
+    if isinstance(diagnostics, dict):
+        diagnostics.update(request_metadata)
+    diag = dict(request_metadata)
+    diag.update(_response_envelope_diagnostics(resp, request_metadata))
 
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
         error = resp.get("msg", "openOrders snapshot failed") if isinstance(resp, dict) else "invalid openOrders response"
@@ -1052,6 +1066,7 @@ def get_open_orders_snapshot(
             "retry_after_ms": resp.get("retry_after_ms") if isinstance(resp, dict) else None,
             "rate_limited": bool(isinstance(resp, dict) and (resp.get("rate_limited") or resp.get("local_cooldown") or code_int == 100410)),
             "local_cooldown": bool(isinstance(resp, dict) and resp.get("local_cooldown")),
+            **diag,
         }
 
     data = resp.get("data")
@@ -1060,10 +1075,10 @@ def get_open_orders_snapshot(
     elif isinstance(data, dict) and isinstance(data.get("orders"), list):
         orders = data["orders"]
     else:
-        return {"status": "error", "error": "openOrders snapshot has unexpected data shape", "orders": []}
+        return {"status": "error", "error": f"openOrders snapshot has unexpected data shape (data_type={type(data).__name__})", "orders": [], **diag}
 
     if not all(isinstance(order, dict) for order in orders):
-        return {"status": "error", "error": "openOrders snapshot contains a non-object order", "orders": []}
+        return {"status": "error", "error": "openOrders snapshot contains a non-object order", "orders": [], **diag}
 
     protection_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"}
     for order in orders:
@@ -1073,7 +1088,7 @@ def get_open_orders_snapshot(
             return {
                 "status": "error",
                 "error": "openOrders snapshot has an unidentifiable protection/order row: missing type or symbol; protection state is unknown",
-                "orders": [],
+                "orders": [], **diag,
             }
         if order_type not in protection_types:
             continue
@@ -1081,10 +1096,10 @@ def get_open_orders_snapshot(
             return {
                 "status": "error",
                 "error": "openOrders snapshot contains an unidentifiable protection order",
-                "orders": [],
+                "orders": [], **diag,
             }
 
-    return {"status": "ok", "orders": [dict(order) for order in orders], "source": "account_open_orders_snapshot"}
+    return {"status": "ok", "orders": [dict(order) for order in orders], "source": "account_open_orders_snapshot", **diag}
 
 
 def _query_order(
@@ -1761,6 +1776,24 @@ def has_open_position(symbol: str, direction: str) -> bool:
 
     want = "LONG" if direction.upper() == "LONG" else "SHORT"
     positions = get_positions()
+    if not positions:
+        # An account-wide empty snapshot is not enough to authorize a new entry:
+        # VST has intermittently returned a false empty collection. Confirm the
+        # requested direction through fresh symbol-scoped connections.
+        first = get_position_directional(symbol, want, close_connection=True)
+        first_status = str(first.get("status", "")).lower()
+        if first_status == "found":
+            return True
+        if first_status != "not_found":
+            raise RuntimeError(f"directional position state is unknown: {first.get('error') or first_status}")
+        time.sleep(0.5)
+        second = get_position_directional(symbol, want, close_connection=True)
+        second_status = str(second.get("status", "")).lower()
+        if second_status == "found":
+            return True
+        if second_status != "not_found":
+            raise RuntimeError(f"directional position confirmation is unknown: {second.get('error') or second_status}")
+        return False
 
     for p in positions:
         if str(p.get("symbol", "")).upper() != bx:
@@ -2809,7 +2842,7 @@ def get_position_mode() -> dict[str, Any]:
     return {"status": "ok", "mode": "HEDGE" if hedge else "ONE_WAY", "dualSidePosition": hedge}
 
 
-def get_position_directional(symbol: str, direction: str) -> dict:
+def get_position_directional(symbol: str, direction: str, *, close_connection: bool = False) -> dict:
     """Read one directional position without confusing unknown data with flat state.
 
     Only a valid, recognized response with no matching nonzero position can
@@ -2822,7 +2855,7 @@ def get_position_directional(symbol: str, direction: str) -> dict:
         return {"status": "error", "error": "invalid_position_query", "symbol": bx_symbol}
 
     try:
-        resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
+        resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol}, close_connection=close_connection)
     except Exception as exc:
         return {"status": "error", "error": f"position_request_exception:{exc}", "symbol": bx_symbol}
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):

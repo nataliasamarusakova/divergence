@@ -892,39 +892,51 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         # This is read-only and bounded to one additional request.
         if active is not None and not active_errors and local_positions and not exchange_positions and not exchange_errors:
             first_diagnostics = dict(exchange_snapshot_diagnostics)
-            second_diagnostics: dict[str, Any] = {}
-            time.sleep(0.5)
-            try:
-                second_rows = bingx.get_positions(
-                    timeout_sec=3.0, retryable=False, diagnostics=second_diagnostics,
-                )
-                second_positions, second_errors = _exchange_positions(second_rows)
-                if second_errors:
-                    empty_snapshot_recheck_status = "ERROR"
-                    empty_snapshot_recheck_error = ";".join(second_errors[:5])
-                elif second_positions:
-                    exchange_rows = second_rows
-                    exchange_positions = second_positions
-                    exchange_errors = []
-                    empty_snapshot_recheck_status = "RECOVERED_NONEMPTY"
-                    report["discrepancies"].append({
-                        "level": "WARNING", "code": "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED",
-                        "first_snapshot_api_rows": first_diagnostics.get("api_rows", 0),
-                        "second_snapshot_api_rows": len(second_rows),
-                        "second_active_position_keys": len(second_positions),
-                        "detail": (
-                            "The first open-position response contained no active positions while local active state was non-empty; "
-                            "a second independent read returned active positions and is used for reconciliation."
-                        ),
-                    })
-                else:
+            retry_diagnostics: list[dict[str, Any]] = []
+            retry_errors: list[str] = []
+            retry_delays = (0.5, 1.5)
+            empty_snapshot_recheck_status = "EMPTY_CONFIRMED"
+            for retry_index, delay in enumerate(retry_delays, start=1):
+                time.sleep(delay)
+                diagnostics: dict[str, Any] = {}
+                try:
+                    retry_rows = bingx.get_positions(
+                        timeout_sec=5.0, retryable=False, diagnostics=diagnostics,
+                        close_connection=True,
+                    )
+                    retry_positions, retry_parse_errors = _exchange_positions(retry_rows)
+                    retry_diagnostics.append(dict(diagnostics))
+                    if retry_parse_errors:
+                        retry_errors.extend(retry_parse_errors[:5])
+                        empty_snapshot_recheck_status = "ERROR"
+                        empty_snapshot_recheck_error = ";".join(retry_errors[:5])
+                        break
+                    if retry_positions:
+                        exchange_rows = retry_rows
+                        exchange_positions = retry_positions
+                        exchange_errors = []
+                        empty_snapshot_recheck_status = "RECOVERED_NONEMPTY"
+                        report["discrepancies"].append({
+                            "level": "INFO", "code": "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED",
+                            "first_snapshot_api_rows": first_diagnostics.get("api_rows", 0),
+                            "recovery_attempt": retry_index,
+                            "recovered_snapshot_api_rows": len(retry_rows),
+                            "second_active_position_keys": len(retry_positions),
+                            "detail": (
+                                "The first open-position response was empty while local active state was non-empty; "
+                                f"a fresh-connection read #{retry_index} recovered active positions."
+                            ),
+                        })
+                        break
                     empty_snapshot_recheck_status = "EMPTY_CONFIRMED"
-                    empty_snapshot_with_local_positions = True
-                    empty_snapshot_recheck_error = None
-            except Exception as exc:
-                empty_snapshot_recheck_status = "ERROR"
-                empty_snapshot_recheck_error = f"{type(exc).__name__}:{exc}"
-
+                except Exception as exc:
+                    retry_diagnostics.append(dict(diagnostics))
+                    empty_snapshot_recheck_status = "ERROR"
+                    empty_snapshot_recheck_error = f"{type(exc).__name__}:{exc}"
+                    break
+            if empty_snapshot_recheck_status == "EMPTY_CONFIRMED":
+                empty_snapshot_with_local_positions = True
+                empty_snapshot_recheck_error = "multiple_empty_account_snapshots_with_local_active_state"
             report["checks"]["exchange_positions"].update({
                 "status": "OK" if empty_snapshot_recheck_status == "RECOVERED_NONEMPTY" else "UNKNOWN",
                 "active_position_keys": len(exchange_positions),
@@ -932,7 +944,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 "empty_snapshot_recheck": empty_snapshot_recheck_status,
                 "empty_snapshot_recheck_error": empty_snapshot_recheck_error,
                 "first_snapshot_diagnostics": first_diagnostics,
-                "second_snapshot_diagnostics": second_diagnostics,
+                "retry_snapshot_diagnostics": retry_diagnostics,
                 "parse_errors": exchange_errors,
             })
             if empty_snapshot_recheck_status == "ERROR":
@@ -950,7 +962,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     "second_snapshot_error": empty_snapshot_recheck_error,
                     "detail": (
                         "The first BingX position response was empty while local active state was non-empty, "
-                        "and the confirming read failed. Exchange quantities and protection remain UNKNOWN."
+                        "and a fresh-connection confirming read failed. Exchange quantities and protection remain UNKNOWN."
                     ),
                 })
         catalog_status = "NOT_NEEDED"
@@ -1213,7 +1225,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     "second_snapshot_http_status": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("http_status"),
                     "second_snapshot_response_code": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("response_code"),
                     "detail": (
-                        "Two independent successful BingX position reads returned no active positions while local active state remained non-empty. "
+                        "Three successful BingX position reads (initial plus two fresh-connection retries) returned no active positions while local active state remained non-empty. "
                         "Exact complete exit fills are classified separately; every other local position remains UNKNOWN, not exchange_qty=0."
                     ),
                 })
@@ -1273,10 +1285,35 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     protection_snapshot_rate_limited = False
     protection_retry_after_ms = None
     if exchange_positions or local_positions or exchange_errors:
+        protection_diagnostics: dict[str, Any] = {}
         try:
-            candidate_snapshot = bingx.get_open_orders_snapshot(timeout_sec=3.0, retryable=False)
+            candidate_snapshot = bingx.get_open_orders_snapshot(
+                timeout_sec=5.0, retryable=False, diagnostics=protection_diagnostics,
+            )
         except Exception as exc:
             candidate_snapshot = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
+        if isinstance(candidate_snapshot, dict) and str(candidate_snapshot.get("status", "")).lower() != "ok":
+            first_open_orders_error = str(candidate_snapshot.get("error") or "openOrders_snapshot_unavailable")
+            limited = bool(candidate_snapshot.get("rate_limited") or candidate_snapshot.get("local_cooldown") or candidate_snapshot.get("code") == 100410)
+            if not limited:
+                time.sleep(0.75)
+                retry_diagnostics: dict[str, Any] = {}
+                try:
+                    retry_snapshot = bingx.get_open_orders_snapshot(
+                        timeout_sec=5.0, retryable=False, diagnostics=retry_diagnostics,
+                        close_connection=True,
+                    )
+                    if isinstance(retry_snapshot, dict):
+                        retry_snapshot["retry_diagnostics"] = retry_diagnostics
+                    if isinstance(retry_snapshot, dict) and str(retry_snapshot.get("status", "")).lower() == "ok":
+                        candidate_snapshot = retry_snapshot
+                    else:
+                        candidate_snapshot = retry_snapshot
+                        if isinstance(candidate_snapshot, dict):
+                            candidate_snapshot["first_attempt_error"] = first_open_orders_error
+                except Exception as exc:
+                    if isinstance(candidate_snapshot, dict):
+                        candidate_snapshot["retry_error"] = f"{type(exc).__name__}:{exc}"
         if isinstance(candidate_snapshot, dict) and str(candidate_snapshot.get("status", "")).lower() == "ok":
             protection_snapshot = candidate_snapshot
         else:
@@ -1284,6 +1321,10 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 str(candidate_snapshot.get("error") or "account_open_orders_snapshot_unavailable")
                 if isinstance(candidate_snapshot, dict) else "invalid_account_open_orders_snapshot_response"
             )
+            if isinstance(candidate_snapshot, dict) and candidate_snapshot.get("first_attempt_error"):
+                protection_snapshot_error = (
+                    f"{protection_snapshot_error}; first_attempt={str(candidate_snapshot['first_attempt_error'])[:160]}"
+                )
             try:
                 protection_code = int(candidate_snapshot.get("code")) if isinstance(candidate_snapshot, dict) else None
             except (TypeError, ValueError, OverflowError):
@@ -1315,7 +1356,8 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         else:
             detail = (
                 "Account-wide openOrders snapshot unavailable; protection state remains "
-                f"unknown for {len(affected_positions)} position(s). No per-symbol retries were attempted."
+                f"unknown for {len(affected_positions)} position(s). "
+                f"Cause: {protection_snapshot_error[:180]}. No per-symbol retries were attempted."
             )
         report["discrepancies"].append({
             "level": "CRITICAL", "code": "EXCHANGE_PROTECTION_STATE_UNKNOWN",
@@ -1752,23 +1794,27 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
         "scope": "account+symbol aggregate; never used to attribute per-position net PnL",
     }
 
-    levels = [str(item.get("level", "WARNING")).upper() for item in report["discrepancies"]]
+    alert_discrepancies = [
+        item for item in report["discrepancies"]
+        if str(item.get("level", "WARNING")).upper() in {"WARNING", "CRITICAL"}
+    ]
+    levels = [str(item.get("level", "WARNING")).upper() for item in alert_discrepancies]
     report["status"] = "CRITICAL" if "CRITICAL" in levels else "WARNING" if levels else "OK"
     write_error = _append_health(health_path, report)
     if write_error:
         report["status"] = "CRITICAL"
         report["discrepancies"].append({"level": "CRITICAL", "code": "HEALTH_LOG_WRITE_FAILED", "detail": write_error})
     if notify:
-        suppress, suppression_reason = _repeat_alert_suppressed(report["discrepancies"], alert_state_path, now_ms)
-        if report["discrepancies"] and suppress:
+        suppress, suppression_reason = _repeat_alert_suppressed(alert_discrepancies, alert_state_path, now_ms)
+        if alert_discrepancies and suppress:
             report["notification"] = {"status": "SUPPRESSED_REPEAT", "reason": suppression_reason}
-        elif report["discrepancies"]:
+        elif alert_discrepancies:
             lines = [
                 f"<b>Divergence daily reconciliation: {report['status']}</b>",
                 f"Build: <code>{html.escape(str(report.get('build_version', 'UNKNOWN')), quote=False)}</code>",
                 f"UTC day: <code>{html.escape(str(report['utc_day']), quote=False)}</code>",
             ]
-            for item in report["discrepancies"][:12]:
+            for item in alert_discrepancies[:12]:
                 detail = _discrepancy_message_detail(item)
                 lines.append(f"• <b>{html.escape(str(item.get('level', 'WARNING')), quote=False)}</b> {html.escape(str(item.get('code', 'UNKNOWN')), quote=False)}: <code>{html.escape(str(detail)[:350], quote=False)}</code>")
             lines.append("Exchange read-only check; persists local reconciliation metadata only. It does not place/cancel orders or block a later run.")
@@ -1779,7 +1825,7 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     for result in delivery.values()
                 )
                 if delivered:
-                    _mark_alert_sent(report["discrepancies"], alert_state_path, now_ms)
+                    _mark_alert_sent(alert_discrepancies, alert_state_path, now_ms)
                     report["notification"] = {"status": "SENT", "reason": suppression_reason}
                 else:
                     # A failed/missing Telegram delivery must not start the repeat
