@@ -240,7 +240,7 @@ MAX_TRIGGER_DELAY = float(os.environ.get("MAX_TRIGGER_DELAY_MIN", "30"))
 MAX_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_ENTRY_DRIFT_PCT", "2.00"))
 MAX_SQUEEZE_ENTRY_DRIFT_PCT = float(os.environ.get("MAX_SQUEEZE_ENTRY_DRIFT_PCT", "2.00"))
 MIN_SCORE = float(os.environ.get("MIN_SETUP_SCORE", "60"))
-MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "75"))
+MIN_SHORT_SCORE = float(os.environ.get("MIN_SHORT_SETUP_SCORE", "70"))
 
 # Trend Filter v1 is intentionally shadow-only in the current release. It is an
 # independent candidate-level diagnostic and never changes event detectors, zones,
@@ -3806,6 +3806,48 @@ def reconcile_all_open_positions() -> None:
     active_trades = _load_active_trades()
     log.info("[RECONCILIATION] Active trade state loaded: %d records.", len(active_trades))
 
+    local_live_trades = []
+    for event_id, trade in active_trades.items():
+        if not isinstance(trade, dict) or trade.get("closed"):
+            continue
+        if any(trade.get(flag) for flag in (
+            "entry_order_resolution_pending", "protection_cleanup_only",
+            "close_cleanup_pending", "close_notification_pending", "close_journal_pending",
+        )):
+            continue
+        gone = trade.get("position_gone_confirmation")
+        if isinstance(gone, dict) and str(gone.get("status", "")).upper() == "CONFIRMED":
+            continue
+        if _safe_float(trade.get("remaining_qty"), 0.0) > 1e-12:
+            local_live_trades.append(str(event_id))
+    if not positions and local_live_trades:
+        for retry_index, delay in enumerate((0.5, 1.5), start=1):
+            time.sleep(delay)
+            try:
+                retry_positions = get_positions(
+                    timeout_sec=recon_timeout, retryable=False, close_connection=True,
+                )
+            except Exception as exc:
+                log.error(
+                    "[RECONCILIATION] Empty position snapshot remains UNKNOWN after fresh-connection retry %d: %s",
+                    retry_index, type(exc).__name__,
+                )
+                retry_positions = None
+                break
+            if retry_positions:
+                positions = retry_positions
+                log.warning(
+                    "[RECONCILIATION] Empty position snapshot recovered on fresh-connection retry %d.",
+                    retry_index,
+                )
+                break
+        if not positions:
+            log.critical(
+                "[RECONCILIATION] Exchange returned empty positions despite %d local live trade(s); skipping protection repair until state is known.",
+                len(local_live_trades),
+            )
+            return
+
     # Do not make an orders request when every exchange position record is invalid.
     has_valid_position = False
     for candidate in positions:
@@ -5912,7 +5954,39 @@ def main() -> None:
     current_positions: dict[tuple[str, str], dict] = {}
     position_state_unknown = False
     try:
-        for position in get_positions():
+        position_rows = get_positions()
+        # If the account snapshot is empty while trusted local lifecycle state
+        # still records live exposure, do not interpret it as a flat account.
+        local_active = _load_active_trades()
+        local_live = []
+        for event_id, trade in local_active.items():
+            if not isinstance(trade, dict) or trade.get("closed"):
+                continue
+            if any(trade.get(flag) for flag in (
+                "entry_order_resolution_pending", "protection_cleanup_only",
+                "close_cleanup_pending", "close_notification_pending", "close_journal_pending",
+            )):
+                continue
+            gone = trade.get("position_gone_confirmation")
+            if isinstance(gone, dict) and str(gone.get("status", "")).upper() == "CONFIRMED":
+                continue
+            if _safe_float(trade.get("remaining_qty"), 0.0) > 1e-12:
+                local_live.append((str(trade.get("symbol") or ""), str(trade.get("direction") or "").upper(), event_id))
+        if not position_rows and local_live:
+            for retry_index, delay in enumerate((0.5, 1.5), start=1):
+                time.sleep(delay)
+                retry_rows = get_positions(close_connection=True)
+                if retry_rows:
+                    position_rows = retry_rows
+                    log.warning("[BINGX] Empty account position snapshot recovered on fresh-connection retry %d.", retry_index)
+                    break
+            if not position_rows:
+                position_state_unknown = True
+                log.critical(
+                    "[BINGX] Account position snapshot remains empty despite %d locally active trade(s); NEW ENTRIES BLOCKED.",
+                    len(local_live),
+                )
+        for position in position_rows:
             bx_sym = str(position.get("symbol", "")).upper()
             side = str(position.get("positionSide", position.get("positionAmt", ""))).upper()
             try:

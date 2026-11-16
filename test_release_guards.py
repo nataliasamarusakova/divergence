@@ -34,7 +34,8 @@ def test_clean_release_has_pre_order_drift_retry_budget():
     assert 'REQUIRE_MULTI_TP: "false"' in _workflow()
     assert 'REJECT_SINGLE_TP: "false"' in _workflow()
     assert 'MIN_SETUP_SCORE: "60"' in _workflow()
-    assert 'MIN_SHORT_SETUP_SCORE: "75"' in _workflow()
+    assert 'MIN_SHORT_SETUP_SCORE: "70"' in _workflow()
+    assert 'MIN_SHORT_SETUP_SCORE", "70"' in Path("run_once.py").read_text(encoding="utf-8")
     assert 'REJECT_ATR_RISK_CLIP: "false"' in _workflow()
     assert 'FIXED_STOP_LOSS_PCT: "7.00"' in _workflow()
 

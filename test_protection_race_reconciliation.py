@@ -357,3 +357,30 @@ def test_emergency_close_final_guard_refuses_market_when_entry_average_changes(m
     assert result["close_order_submitted"] is False
     assert result["observed_avg_before"] == pytest.approx(100.0)
     assert result["observed_avg_after"] == pytest.approx(101.0)
+
+
+def test_reconcile_all_open_positions_defers_when_empty_snapshot_conflicts_with_local_live_state(monkeypatch):
+    import run_once as ro
+
+    calls = []
+    def empty_positions(**kwargs):
+        calls.append(dict(kwargs))
+        return []
+
+    monkeypatch.setattr(ro, "get_positions", empty_positions)
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {
+        "EVT-NEAR": {
+            "symbol": "NEAR", "direction": "SHORT", "remaining_qty": 3.0,
+            "closed": False,
+        },
+    })
+    monkeypatch.setattr(ro.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(ro, "get_open_orders_snapshot", lambda **kwargs: pytest.fail("must not inspect/repair protection from an unknown empty position snapshot"))
+    monkeypatch.setattr(ro, "ensure_directional_protection", lambda *a, **k: pytest.fail("must not mutate protection while position state is unknown"))
+
+    ro.reconcile_all_open_positions()
+
+    assert len(calls) == 3
+    assert calls[0]["retryable"] is False
+    assert calls[1]["close_connection"] is True
+    assert calls[2]["close_connection"] is True

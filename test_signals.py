@@ -679,8 +679,26 @@ def test_telegram_message_uses_clean_setup_values_and_omits_confirmation_field()
     assert "Trigger Price:" in msg
     assert "Trigger Delay:" in msg
     assert "R:R (Effective Weighted)" not in msg
-    assert "R:R: <code>1.6625</code>" in msg
+    assert "R:R: <code>1.66R</code>" in msg
     assert "TP Mode: <code>two_tp</code>" in msg
+
+
+def test_telegram_effective_rr_uses_compact_two_decimal_formatter():
+    from event_engine.telegram import format_signal
+
+    msg = format_signal(
+        {"direction": "LONG", "symbol": "TEST", "event_type": "X", "event_fact": {}, "timestamps": {}},
+        setup={
+            "entry_reference": 100.0,
+            "invalidation_price": 93.0,
+            "risk_pct": 7.0,
+            "tp_levels": [],
+            "effective_weighted_rr": 1.2166666666666648,
+        },
+    )
+
+    assert "R:R: <code>1.22R</code>" in msg
+    assert "1.2166666666666648" not in msg
 
 
 def test_telegram_message_omits_confirmation_for_nearby_support_context():
@@ -2913,13 +2931,13 @@ def test_load_recent_successful_entries_reads_full_cooldown_window(tmp_path: Pat
     assert out["SQUEEZE"] == now - 35 * 60_000
 
 
-def test_short_defensive_score_is_stricter():
+def test_short_setup_score_uses_configured_threshold():
     import run_once as ro
     ev = {"direction": "SHORT", "event_type": "REGULAR_BEARISH_MACD", "event_fact": {"price_delta_atr": 1.0}}
     score = ro.calculate_setup_score(ev, None, pd.DataFrame({"close": [1]}))
     assert score > 0
     assert ro.MIN_SCORE == 60.0
-    assert ro.MIN_SHORT_SCORE == 75.0
+    assert ro.MIN_SHORT_SCORE == 70.0
 
 
 def test_hot_oi_penalty_applies_to_score():
@@ -4024,7 +4042,7 @@ def test_tracker_invalid_mark_does_not_become_realized_execution(monkeypatch, tm
     assert saved["exit_reason"] == "DATA_ERROR"
 
 
-def _make_ob_causality_fixture(bos_i: int) -> pd.DataFrame:
+def _make_ob_causality_fixture(bos_i: int, *, bullish: bool = True, consumed_i: int | None = None) -> pd.DataFrame:
     n = 120
     rows = []
     for i in range(n):
@@ -4038,10 +4056,23 @@ def _make_ob_causality_fixture(bos_i: int) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     pivot_i = 50
-    df.loc[pivot_i, ["open", "high", "low", "close"]] = [101.0, 106.0, 98.0, 99.0]
-    for i in range(pivot_i + 1, bos_i):
-        df.loc[i, ["high", "low"]] = [103.0, 98.5]
-    df.loc[bos_i, ["open", "high", "low", "close", "volume"]] = [99.0, 108.0, 98.0, 107.0, 2200.0]
+    if bullish:
+        df.loc[pivot_i, ["open", "high", "low", "close"]] = [101.0, 106.0, 98.0, 99.0]
+        for i in range(pivot_i + 1, bos_i):
+            df.loc[i, ["high", "low"]] = [103.0, 98.5]
+        if consumed_i is not None:
+            # Wick and close above the confirmed swing high, but a small body
+            # keeps this bar from becoming another qualifying BOS candidate.
+            df.loc[consumed_i, ["open", "high", "low", "close"]] = [104.0, 108.0, 98.0, 107.0]
+        df.loc[bos_i, ["open", "high", "low", "close", "volume"]] = [99.0, 108.0, 98.0, 107.0, 2200.0]
+    else:
+        df.loc[pivot_i, ["open", "high", "low", "close"]] = [99.0, 102.0, 94.0, 101.0]
+        for i in range(pivot_i + 1, bos_i):
+            df.loc[i, ["high", "low"]] = [101.5, 97.0]
+        if consumed_i is not None:
+            # Mirror case: a prior close below the confirmed swing low.
+            df.loc[consumed_i, ["open", "high", "low", "close"]] = [96.0, 102.0, 92.0, 93.0]
+        df.loc[bos_i, ["open", "high", "low", "close", "volume"]] = [101.0, 102.0, 92.0, 93.0, 2200.0]
     return df
 
 
@@ -4064,6 +4095,20 @@ def test_order_block_accepts_pivot_after_full_confirmation(monkeypatch):
     events = sig.detect_order_block(_make_ob_causality_fixture(53), "TEST", "1h")
     assert len(events) == 1
     assert events[0]["event_type"] == "ORDER_BLOCK_BULLISH"
+
+
+@pytest.mark.parametrize("bullish", [True, False])
+def test_order_block_rejects_reuse_after_prior_close_through_swing_level(monkeypatch, bullish):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_atr", lambda d, n=14: pd.Series([1.0] * len(d), index=d.index, dtype=float))
+    pivots = ([], [50]) if bullish else ([50], [])
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: pivots)
+
+    # The pivot is confirmed after bar 52. Bar 54 already closes through its
+    # level; a later strong close at bar 56 must not be a second BOS from it.
+    frame = _make_ob_causality_fixture(56, bullish=bullish, consumed_i=54)
+    assert sig.detect_order_block(frame, "TEST", "1h") == []
 
 
 def test_breaker_rejects_bos_pivot_confirmed_only_after_bos(monkeypatch):
@@ -4167,18 +4212,50 @@ def test_cypher_rejects_wrong_c_ratio_relative_to_xa(monkeypatch):
     assert not any(e["event_type"] == "HARMONIC_CYPHER_LONG" for e in events)
 
 
-def test_valid_crab_remains_detected(monkeypatch):
+def test_valid_crab_uses_ad_xa_extension_and_correct_wave_geometry(monkeypatch):
     import event_engine.signals as sig
 
-    # Probe the existing Crab predicate: XA=100, AB=58, BC=29,
-    # CD=90.8, XD=161.8. The predicate itself is intentionally unchanged.
-    points = {10: 100.0, 20: 200.0, 30: 142.0, 40: 171.0, 50: 261.8}
+    # Bullish Crab: XA=100, AB=61.8 (0.618 XA), BC=38.2
+    # (0.618 AB), CD=138.2 (3.618 BC), AD=161.8 (1.618 XA).
+    # D is below X and C, as required for the final bullish reversal leg.
+    points = {10: 100.0, 20: 200.0, 30: 138.2, 40: 176.4, 50: 38.2}
     kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
     df = _make_harmonic_fixture(points, kinds)
     monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
 
     events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
-    assert any(e["event_type"] == "HARMONIC_CRAB_LONG" for e in events)
+    crab = next(e for e in events if e["event_type"] == "HARMONIC_CRAB_LONG")
+    assert crab["event_fact"]["ad_xa"] == pytest.approx(1.618)
+    assert crab["event_fact"]["xd_xa"] == pytest.approx(0.618)
+
+
+def test_harmonic_detector_rejects_inverted_final_leg_even_when_ratios_match(monkeypatch):
+    import event_engine.signals as sig
+
+    # Absolute ratios all fit the Crab ranges, but D is above C on a bullish
+    # sequence. The shape must be rejected rather than labelled a bullish Crab.
+    points = {10: 100.0, 20: 200.0, 30: 138.2, 40: 192.9, 50: 361.8}
+    kinds = {10: "low", 20: "high", 30: "low", 40: "high", 50: "low"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([10, 30, 50], [20, 40]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    assert not any(e["event_type"] == "HARMONIC_CRAB_LONG" for e in events)
+
+
+def test_valid_bearish_crab_uses_mirrored_geometry(monkeypatch):
+    import event_engine.signals as sig
+
+    # Exact price mirror of the bullish fixture above.
+    points = {10: 200.0, 20: 100.0, 30: 161.8, 40: 123.6, 50: 261.8}
+    kinds = {10: "high", 20: "low", 30: "high", 40: "low", 50: "high"}
+    df = _make_harmonic_fixture(points, kinds)
+    monkeypatch.setattr(sig, "_pivots", lambda work, left=5, right=5: ([20, 40], [10, 30, 50]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST-USDT", "1h", tolerance=0.05)
+    crab = next(e for e in events if e["event_type"] == "HARMONIC_CRAB_SHORT")
+    assert crab["event_fact"]["ad_xa"] == pytest.approx(1.618)
+    assert crab["event_fact"]["xd_xa"] == pytest.approx(0.618)
 
 
 def test_bingx_live_price_parsing_uses_ticker_not_klines(monkeypatch):

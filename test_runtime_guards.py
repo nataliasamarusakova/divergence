@@ -1029,6 +1029,37 @@ def test_has_open_position_trusts_explicit_bingx_position_side(monkeypatch):
     assert bx.has_open_position("TEST", "LONG") is False
 
 
+def test_has_open_position_confirms_empty_account_snapshot_with_fresh_directional_reads(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_positions", lambda: [])
+    states = iter((
+        {"status": "not_found"},
+        {"status": "found", "positionAmt": 1.0},
+    ))
+    calls = []
+    def directional(symbol, direction, *, close_connection=False):
+        calls.append((symbol, direction, close_connection))
+        return next(states)
+    monkeypatch.setattr(bx, "get_position_directional", directional)
+    monkeypatch.setattr(bx.time, "sleep", lambda _delay: None)
+
+    assert bx.has_open_position("TEST", "LONG") is True
+    assert calls == [("TEST", "LONG", True), ("TEST", "LONG", True)]
+
+
+def test_has_open_position_fails_closed_when_empty_snapshot_confirmation_is_unknown(monkeypatch):
+    from event_engine import bingx as bx
+
+    monkeypatch.setattr(bx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    monkeypatch.setattr(bx, "get_positions", lambda: [])
+    monkeypatch.setattr(bx, "get_position_directional", lambda *a, **k: {"status": "error", "error": "read_timeout"})
+
+    with pytest.raises(RuntimeError, match="directional position state is unknown"):
+        bx.has_open_position("TEST", "LONG")
+
+
 def test_open_market_retry_does_not_reuse_canceled_status_from_previous_attempt(monkeypatch):
     from event_engine import bingx as bx
 

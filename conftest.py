@@ -23,6 +23,9 @@ def _is_loopback_host(host):
 
 @pytest.fixture(autouse=True)
 def isolate_production_entry_gates(monkeypatch, tmp_path):
+    # Keep the production confirmation backoff deterministic and fast in tests;
+    # tests validate read counts, fresh-connection flags, and state transitions.
+    monkeypatch.setenv("BINGX_POSITION_CONFIRM_DELAY_SEC", "0")
     # Unit/integration tests may use local HTTP servers for deterministic
     # redirect/transport tests, but must never resolve or connect to public
     # services. Record attempts as well as raising: broad exception handlers

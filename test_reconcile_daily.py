@@ -338,6 +338,35 @@ def test_open_orders_100410_is_aggregated_and_repeat_alert_is_stable(tmp_path, m
     assert "No per-symbol retries were attempted" in alerts[0]
 
 
+def test_open_orders_snapshot_retries_once_on_non_rate_limit_error_with_fresh_connection(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (data / "trades.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [{
+        "symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "1",
+    }])
+    calls = []
+    def snapshot(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"status": "error", "error": "ReadTimeout", "orders": [], "rate_limited": False}
+        return {"status": "ok", "orders": []}
+    monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", snapshot)
+    monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
+        "status": "ok", "complete": True, "records": [],
+    })
+    monkeypatch.setattr(recon.time, "sleep", lambda *_: None)
+
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+
+    assert len(calls) == 2
+    assert calls[0]["timeout_sec"] == 5.0 and calls[0]["retryable"] is False
+    assert calls[1]["timeout_sec"] == 5.0 and calls[1]["close_connection"] is True
+    assert report["checks"]["exchange_protection"]["status"] in {"OK", "WARNING"}
+    assert not any(item["code"] == "EXCHANGE_PROTECTION_STATE_UNKNOWN" for item in report["discrepancies"])
+
+
 def test_daily_income_reconciliation_retries_once_after_incomplete_timeout(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
@@ -1149,13 +1178,13 @@ def test_empty_exchange_snapshot_with_local_active_position_is_rechecked_and_pro
 
     report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
 
-    assert len(reads) == 2
+    assert len(reads) == 3
     assert len(open_order_calls) == 1
     exchange = report["checks"]["exchange_positions"]
     assert exchange["status"] == "UNKNOWN"
     assert exchange["empty_snapshot_recheck"] == "EMPTY_CONFIRMED"
     assert exchange["first_snapshot_diagnostics"]["http_status"] == 200
-    assert exchange["second_snapshot_diagnostics"]["response_code"] == 0
+    assert exchange["retry_snapshot_diagnostics"][0]["response_code"] == 0
     assert report["checks"]["exchange_protection"]["status"] == "UNKNOWN"
     assert report["checks"]["exchange_protection"]["positions_checked"] == 1
     visible = report["checks"]["exchange_protection"]["by_position"]["BTC-USDT:LONG"]
@@ -1196,13 +1225,19 @@ def test_empty_first_exchange_snapshot_recovers_on_second_read_and_uses_second_s
     monkeypatch.setattr(recon.bingx, "get_income_history", lambda *a, **k: {
         "status": "ok", "complete": True, "records": [],
     })
+    alerts = []
+    monkeypatch.setattr(recon, "send_detailed", lambda message: alerts.append(message) or {"test": {"sent": True}})
 
-    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
+    report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=True)
 
     assert len(calls) == 2
+    assert alerts == []
     assert report["checks"]["exchange_positions"]["status"] == "OK"
     assert report["checks"]["exchange_positions"]["empty_snapshot_recheck"] == "RECOVERED_NONEMPTY"
     assert report["checks"]["exchange_positions"]["active_position_keys"] == 1
+    recovered = next(x for x in report["discrepancies"] if x["code"] == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED")
+    assert recovered["level"] == "INFO"
+    assert report["status"] == "OK"
     assert any(x["code"] == "EXCHANGE_POSITION_EMPTY_SNAPSHOT_RECOVERED" for x in report["discrepancies"])
     assert not any(x["code"] == "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE" for x in report["discrepancies"])
     assert not any(x["code"] == "ACTIVE_POSITION_QTY_OR_IDENTITY_MISMATCH" for x in report["discrepancies"])
@@ -1275,7 +1310,7 @@ def test_confirmed_empty_exchange_snapshot_aggregates_all_local_positions_withou
 
     report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
 
-    assert len(reads) == 2
+    assert len(reads) == 3
     assert report["checks"]["exchange_positions"]["status"] == "UNKNOWN"
     assert report["checks"]["exchange_protection"]["status"] == "UNKNOWN"
     assert report["checks"]["exchange_protection"]["positions_checked"] == 17
@@ -1311,7 +1346,7 @@ def test_later_post_fill_snapshot_recovers_after_two_empty_reads_and_checks_rema
     reads = []
     def read_positions(**kwargs):
         reads.append(1)
-        if len(reads) <= 2:
+        if len(reads) <= 3:
             return []
         return [{"symbol": "ETH-USDT", "positionSide": "LONG", "positionAmt": "3"}]
 
@@ -1336,7 +1371,7 @@ def test_later_post_fill_snapshot_recovers_after_two_empty_reads_and_checks_rema
 
     report = recon.run_reconciliation(now_ms=_now_ms(), data_dir=data, notify=False)
 
-    assert len(reads) == 3
+    assert len(reads) == 4
     exchange = report["checks"]["exchange_positions"]
     assert exchange["status"] == "OK"
     assert exchange["empty_snapshot_recheck"] == "RECOVERED_NONEMPTY_POST_FILL"
