@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1794937040114,
+  "updated_ts": 1794937333799,
   "events": [
     {
       "event_id": "EVT_B0A3BE17E9FA62E2",
@@ -3290,6 +3290,30 @@
         "requires_retest": true,
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_7ED3AFDA4BD83BD4",
+      "symbol": "KAVA",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "CRT_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1794927599999,
+        "pivot_2_ts": 1794934799999,
+        "detected_at_ts": 1794934799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.02691,
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.02664,
+        "range_high": 0.02761,
+        "range_low": 0.02664,
+        "manipulation_depth_atr": 0.5333181683001111,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
