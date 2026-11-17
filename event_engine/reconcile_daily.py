@@ -1596,18 +1596,36 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
             if bingx.is_income_history_null_data_shape(income):
                 if not account_wide_income_attempted:
                     account_wide_income_attempted = True
-                    try:
-                        account_wide_income = bingx.get_income_history(
-                            None, day_start, max(day_start + 1, now_ms), limit=1000,
-                            timeout_sec=INCOME_TIMEOUT_SEC,
-                            max_range_requests=INCOME_REQUEST_BUDGET,
-                        )
-                    except Exception as exc:
-                        account_wide_income = {
-                            "status": "error", "complete": False,
-                            "error": f"account_wide_income_exception:{type(exc).__name__}:{exc}",
-                            "records": [],
-                        }
+                    # BingX VST has intermittently returned code=0/data=null for
+                    # both symbol-scoped and account-wide income queries. Retry
+                    # this shared fallback only for that exact successful-envelope
+                    # null shape; do not amplify HTTP/auth/rate-limit failures.
+                    for fallback_attempt in range(INCOME_RETRIES + 1):
+                        try:
+                            account_wide_income = bingx.get_income_history(
+                                None, day_start, max(day_start + 1, now_ms), limit=1000,
+                                timeout_sec=INCOME_TIMEOUT_SEC,
+                                max_range_requests=INCOME_REQUEST_BUDGET,
+                            )
+                        except Exception as exc:
+                            account_wide_income = {
+                                "status": "error", "complete": False,
+                                "error": f"account_wide_income_exception:{type(exc).__name__}:{exc}",
+                                "records": [],
+                            }
+                        if (
+                            isinstance(account_wide_income, dict)
+                            and account_wide_income.get("status") == "ok"
+                            and account_wide_income.get("complete") is True
+                        ):
+                            break
+                        if (
+                            fallback_attempt < INCOME_RETRIES
+                            and bingx.is_income_history_null_data_shape(account_wide_income)
+                        ):
+                            time.sleep(min(0.25 * (fallback_attempt + 1), 0.5))
+                            continue
+                        break
                 if isinstance(account_wide_income, dict) and account_wide_income.get("status") == "ok" and account_wide_income.get("complete") is True:
                     income = bingx.filter_income_history_by_symbol(account_wide_income, symbol)
                 elif isinstance(account_wide_income, dict):
