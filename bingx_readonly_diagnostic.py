@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
+import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +29,59 @@ def shape(value: Any) -> dict[str, Any]:
     return result
 
 
+def _canonical_symbol(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().upper().replace("_", "-").replace("/", "-")
+    raw = re.sub(r"-+", "-", raw)
+    if not raw:
+        return None
+    if "-" not in raw and raw.endswith("USDT") and len(raw) > 4:
+        raw = f"{raw[:-4]}-USDT"
+    elif "-" not in raw and raw.isalnum():
+        raw = f"{raw}-USDT"
+    return raw if re.fullmatch(r"[A-Z0-9]+-USDT", raw) else None
+
+
+def income_semantics(data: Any) -> dict[str, Any]:
+    """Emit only aggregate classifications; never emit account row values."""
+    if not isinstance(data, list):
+        return {"available": False, "data_type": type(data).__name__}
+    targets = {"TRX-USDT", "WLFI-USDT"}
+    match_counts = Counter()
+    income_types = Counter()
+    missing_symbol_types = Counter()
+    symbol_types = Counter()
+    key_presence = Counter()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        kind_raw = row.get("incomeType")
+        kind = str(kind_raw).strip().upper() if kind_raw not in (None, "") else "MISSING"
+        income_types[kind] += 1
+        if "symbol" in row:
+            key_presence["symbol_key_present"] += 1
+        else:
+            key_presence["symbol_key_missing"] += 1
+        raw_symbol = row.get("symbol")
+        symbol_types[type(raw_symbol).__name__] += 1
+        normalized = _canonical_symbol(raw_symbol)
+        if normalized in targets:
+            match_counts[normalized] += 1
+        if normalized is None:
+            missing_symbol_types[kind] += 1
+    return {
+        "available": True,
+        "row_count": len(data),
+        "target_symbol_match_counts": {key: match_counts.get(key, 0) for key in sorted(targets)},
+        "income_type_counts": dict(sorted(income_types.items())),
+        "rows_with_unresolved_or_missing_symbol_by_income_type": dict(sorted(missing_symbol_types.items())),
+        "symbol_value_type_counts": dict(sorted(symbol_types.items())),
+        "symbol_key_presence_counts": dict(sorted(key_presence.items())),
+        "non_dict_row_count": sum(1 for row in data if not isinstance(row, dict)),
+    }
+
+
 def probe(name: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     started = time.monotonic()
@@ -52,6 +105,8 @@ def probe(name: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
             "response_msg_type": type(response.get("msg")).__name__ if isinstance(response, dict) else None,
             "data": shape(response.get("data")) if isinstance(response, dict) and "data" in response else {"type": "missing"},
         }
+        if name == "income_account_wide_24h" and isinstance(response, dict):
+            safe["sanitized_row_summary"] = income_semantics(response.get("data"))
         return safe
     except Exception as exc:
         return {
@@ -71,7 +126,7 @@ def main() -> int:
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - 24 * 60 * 60 * 1000
     output: dict[str, Any] = {
-        "diagnostic": "BINGX_READ_ONLY_SCHEMA_DIAGNOSTIC",
+        "diagnostic": "BINGX_READ_ONLY_SEMANTIC_DIAGNOSTIC",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "base_host": bingx.BASE_URL.split("//", 1)[-1].split("/", 1)[0],
         "position_endpoint": bingx.POSITION_PATH,
@@ -79,7 +134,7 @@ def main() -> int:
         "income_window": {"start_ms": start_ms, "end_ms": now_ms, "hours": 24},
         "probes": [],
         "safety": "Signed GET only. No order, cancel, leverage, or position mutation endpoints are called.",
-        "redaction": "Response values, symbols, quantities, IDs, API keys, signatures, and raw messages are not emitted; only envelope and schema metadata are reported.",
+        "redaction": "No raw account row, symbol, amount, quantity, ID, API key, signature, or message is emitted. The account-wide income probe adds only aggregate counts for the two target symbols and row classifications.",
     }
     output["probes"].append(probe("positions_read_1", bingx.POSITION_PATH, {}))
     time.sleep(1.5)
