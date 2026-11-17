@@ -439,7 +439,7 @@ def test_income_unexpected_shape_details_are_exposed_in_daily_warning(tmp_path, 
     assert "response_data_type\":\"NoneType" in warning["detail"]
     assert warning["response_diagnostics"]["response_code"] == 0
     assert warning["response_diagnostics"]["response_keys"] == ["code", "data", "msg"]
-    assert income_calls == ["BTC-USDT", "BTC-USDT", None]
+    assert income_calls == ["BTC-USDT", "BTC-USDT", None, None]
     assert "BTC-USDT" in recon._discrepancy_message_detail(warning)
     assert "account_wide_income_unexpected_data_shape" in warning["detail"] or "income_history_unexpected_data_shape" in warning["detail"]
     assert report["build_version"] == recon.APP_VERSION
@@ -1065,14 +1065,14 @@ def test_daily_income_uses_one_account_wide_fallback_and_filters_by_real_symbol(
         "direction": "LONG", "ts": now_ms,
     }) + "\n", encoding="utf-8")
     monkeypatch.setattr(recon, "MAX_INCOME_SYMBOLS", 1)
-    monkeypatch.setattr(recon, "INCOME_RETRIES", 0)
+    monkeypatch.setattr(recon, "INCOME_RETRIES", 1)
     monkeypatch.setattr(recon.bingx, "get_positions", lambda **kwargs: [])
     monkeypatch.setattr(recon.bingx, "get_open_orders_snapshot", _stub_snapshot)
     calls = []
 
     def income(symbol, *args, **kwargs):
         calls.append(symbol)
-        if symbol is not None:
+        if symbol is not None or calls.count(None) == 1:
             return {
                 "status": "error", "complete": False, "records": [],
                 "error": "income_history_unexpected_data_shape",
@@ -1091,7 +1091,7 @@ def test_daily_income_uses_one_account_wide_fallback_and_filters_by_real_symbol(
     monkeypatch.setattr(recon.bingx, "get_income_history", income)
     report = recon.run_reconciliation(now_ms=now_ms, data_dir=data, notify=False)
 
-    assert calls == ["BTC-USDT", None]
+    assert calls == ["BTC-USDT", "BTC-USDT", None, None]
     summary = report["checks"]["daily_exchange_income_aggregates"]["symbols_checked"]["BTC-USDT"]
     assert summary["status"] == "OK"
     assert summary["trading_fees"] == pytest.approx(-0.12)
