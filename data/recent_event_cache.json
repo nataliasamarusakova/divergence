@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795104580788,
+  "updated_ts": 1795104812978,
   "events": [
     {
       "event_id": "EVT_B961F1D8FC0879DC",
@@ -5533,6 +5533,37 @@
         "requires_retest": true,
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_51FF737C526C4937",
+      "symbol": "NAORIS",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1793707199999,
+        "pivot_2_ts": 1795103999999,
+        "detected_at_ts": 1795103999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.03306,
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.03096,
+        "zone_high": 0.03096,
+        "zone_low": 0.03028,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1794988799999,
+        "liquidity_sweep_level": 0.02327,
+        "mss_ts": 1795089599999,
+        "mss_pivot_ts": 1794931199999,
+        "mss_level": 0.02473,
+        "broken_ts": 1795089599999,
+        "bos_ts": 1793721599999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
