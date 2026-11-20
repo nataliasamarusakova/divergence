@@ -477,6 +477,33 @@ def _request(
         if not isinstance(payload, dict):
             if isinstance(response_metadata, dict):
                 response_metadata["response_root_type"] = type(payload).__name__
+            # openOrders is a safety-critical account-wide snapshot. A gateway
+            # may return HTTP 429 with a valid JSON body whose root is an array,
+            # string or scalar rather than an API envelope. Classify by the
+            # transport status before returning the malformed-body error so the
+            # same persistent cooldown protects both reconciliation callers.
+            if is_open_orders and status_code == 429:
+                now_ms = int(time.time() * 1000)
+                retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
+                _persist_open_orders_cooldown(
+                    retry_after_ms,
+                    "HTTP 429 from openOrders with unexpected JSON root type",
+                )
+                if isinstance(response_metadata, dict):
+                    response_metadata.update({
+                        "rate_limited": True,
+                        "local_cooldown": True,
+                        "retry_after_ms": retry_after_ms,
+                    })
+                return {
+                    "code": -1,
+                    "msg": "openOrders_http_429_without_valid_api_envelope",
+                    "http_status": 429,
+                    "http_error": True,
+                    "rate_limited": True,
+                    "local_cooldown": True,
+                    "retry_after_ms": retry_after_ms,
+                }
             return {
                 "code": -1,
                 "msg": f"unexpected_response_root_type:{type(payload).__name__}",
