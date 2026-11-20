@@ -20,23 +20,24 @@ jobs:
     timeout-minutes: 8
     env:
       VPN_EXPECTED_COUNTRY: NL
-      AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"
+      BINANCE_BASE_URL: "https://fapi.binance.com"
+      BINANCE_HTTP_TIMEOUT_SEC: "5"
+      BINANCE_REQUEST_MIN_INTERVAL_SEC: "0.10"
+      BINANCE_MARKET_RETRY_ATTEMPTS: "2"
+      BINANCE_MARKET_RETRY_BACKOFF_SEC: "0.5"
+      BINANCE_EXCHANGE_INFO_TTL_SEC: "900"
       AJAY_SR_KLINE_LIMIT_1H: "1000"
       AJAY_SR_ROOM_ENABLED: "false"
       AJAY_SR_ROOM_MODE: "off"
       AJAY_SR_REQUIRE_DATA: "true"
-      AJAY_SR_RB: "10"
-      AJAY_SR_PRD: "284"
-      AJAY_SR_CHANNEL_W: "10"
-      AJAY_SR_STRENGTH: "2"
-      AJAY_SR_ZONE_SCALE: "1.0"
+      AJAY_SR_SWING_LENGTH: "10"
+      AJAY_SR_HISTORY_TO_KEEP: "20"
+      AJAY_SR_BOX_WIDTH: "2.5"
+      AJAY_SR_ATR_LENGTH: "50"
       AJAY_SR_ENTRY_BUFFER_PCT: "0.05"
       AJAY_SR_TARGET_BUFFER_PCT: "0.05"
       AJAY_SR_TARGET_BUFFER_R: "0.10"
       AJAY_SR_SUPPORT_CONTEXT_MAX_R: "3.0"
-      AJAY_SR_HTTP_TIMEOUT_SEC: "5"
-      AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"
-      AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"
       AJAY_SR_MAX_DATA_AGE_MIN: "190"
 
     steps:
@@ -65,7 +66,7 @@ jobs:
       - name: Install requests
         run: python -m pip install --disable-pip-version-check requests
 
-      # Keep Binance Spot diagnostic traffic on the same pinned WireProxy egress
+      # Keep Binance Futures diagnostic traffic on the same pinned WireProxy egress
       # used by the production event engine. No global WireGuard interface is made.
       - name: Install pinned Binance WireProxy
         env:
@@ -141,7 +142,8 @@ jobs:
             echo 'ERROR: global wg0 interface exists; Binance VPN must remain userspace-only' >&2
             exit 1
           fi
-          echo "AJAY_SR_HTTP_PROXY=http://127.0.0.1:18080" >> "$GITHUB_ENV"
+          echo "BINANCE_VPN_ENABLED=true" >> "$GITHUB_ENV"
+          echo "BINANCE_HTTP_PROXY=http://127.0.0.1:18080" >> "$GITHUB_ENV"
 
       - name: Resolve symbol
         id: inputs

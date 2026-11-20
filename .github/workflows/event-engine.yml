@@ -52,30 +52,23 @@ jobs:
       TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
       TREND_FILTER_HISTORY_BUFFER_BARS: "12"
       TREND_FILTER_REQUIRE_PERSISTENCE: "false"
-      # Mandatory strict 3H Binance Spot Demand/Supply direction gate.
-      # Binance Spot has no native 3h kline interval: the code aggregates three closed 1h Spot candles.
-      # Demand (pivot low) permits LONG only; Supply (pivot high) permits SHORT only.
-      # The live Spot price must be within 5% of the nearest unbroken directional zone.
-      # Data failure, stale 3H candles, missing zones, or ambiguous zones fail closed.
-      AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"
-      AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"
+      # Mandatory strict 3H Binance USDⓈ-M Futures Demand/Supply direction gate.
+      # The SR module uses the same 1H Futures candles and last price as the signal engine.
+      # Three fully closed UTC-aligned 1H Futures candles are aggregated into each 3H bar.
+      # Demand permits LONG; Supply permits SHORT. Data failure/staleness/ambiguity fails closed.
       AJAY_SR_KLINE_LIMIT_1H: "1000"
       # Optional legacy TP1-room geometry remains off; strict directional gate is separate.
       AJAY_SR_ROOM_ENABLED: "false"
       AJAY_SR_ROOM_MODE: "off"
       AJAY_SR_REQUIRE_DATA: "true"
-      AJAY_SR_RB: "10"
-      AJAY_SR_PRD: "284"
-      AJAY_SR_CHANNEL_W: "10"
-      AJAY_SR_STRENGTH: "2"
-      AJAY_SR_ZONE_SCALE: "1.0"
+      AJAY_SR_SWING_LENGTH: "10"
+      AJAY_SR_HISTORY_TO_KEEP: "20"
+      AJAY_SR_BOX_WIDTH: "2.5"
+      AJAY_SR_ATR_LENGTH: "50"
       AJAY_SR_ENTRY_BUFFER_PCT: "0.05"
       AJAY_SR_TARGET_BUFFER_PCT: "0.05"
       AJAY_SR_TARGET_BUFFER_R: "0.10"
       AJAY_SR_SUPPORT_CONTEXT_MAX_R: "3.0"
-      AJAY_SR_HTTP_TIMEOUT_SEC: "5"
-      AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"
-      AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"
       AJAY_SR_MAX_DATA_AGE_MIN: "190"
       MAX_SR_DATA_REJECTIONS: "3"
       ENTRY_WEAK_ENGINE_BLOCK_ENABLED: "true"
