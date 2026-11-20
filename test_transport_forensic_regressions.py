@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -196,3 +197,104 @@ def test_fetch_klines_rejects_null_collection_instead_of_returning_empty(monkeyp
 
     with pytest.raises(RuntimeError, match="unexpected data shape"):
         bingx.fetch_klines("BTC-USDT", "1h", limit=10)
+
+
+def test_bingx_fetch_klines_discards_non_finite_ohlcv_and_sanitizes_optional_flow(monkeypatch):
+    import time
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda _symbol: "TEST-USDT")
+    open_time = int(time.time() * 1000) - 6 * 3_600_000
+    close_time = open_time + 3_600_000 - 1
+    valid_with_bad_optional = [
+        open_time, "100", "101", "99", "100.5", "10", close_time,
+        "1000", "0", "1", "inf",
+    ]
+    invalid_nan_ohlc = [
+        open_time + 3_600_000, "nan", "101", "99", "100", "10",
+        close_time + 3_600_000,
+    ]
+    invalid_inf_volume = [
+        open_time + 2 * 3_600_000, "100", "101", "99", "100", "inf",
+        close_time + 2 * 3_600_000,
+    ]
+    valid_without_flow = [
+        open_time + 3 * 3_600_000, "100", "101", "99", "100.5", "10",
+        close_time + 3 * 3_600_000,
+    ]
+    monkeypatch.setattr(
+        bingx,
+        "_request",
+        lambda *_args, **_kwargs: {
+            "code": 0,
+            "data": [valid_with_bad_optional, invalid_nan_ohlc, invalid_inf_volume, valid_without_flow],
+        },
+    )
+
+    rows = bingx.fetch_klines("TEST", "1h", limit=10)
+
+    assert len(rows) == 2
+    assert all(
+        math.isfinite(row[key])
+        for row in rows
+        for key in ("open", "high", "low", "close", "volume")
+    )
+    assert rows[0]["quote_volume"] == 1000.0
+    assert rows[0]["taker_buy_quote"] is None
+    assert rows[0]["taker_flow_valid"] is False
+    assert rows[0]["bar_delta_usdt"] is None
+    assert rows[1]["taker_flow_valid"] is False
+
+
+def test_bingx_user_symbol_map_precedes_builtin_contract_alias(monkeypatch):
+    from event_engine import bingx as bx
+
+    custom = {"symbol": "CUSTOM-USDT", "displayName": "CUSTOM-USDT"}
+    built_in = {"symbol": "LIGHTER-USDT", "displayName": "LIGHTER-USDT"}
+    catalog = {"CUSTOM-USDT": custom, "LIGHTER-USDT": built_in}
+    monkeypatch.setattr(bx, "contracts", lambda **_kwargs: catalog)
+    monkeypatch.setattr(bx, "SYMBOL_MAP", {"LIT-USDT": "CUSTOM-USDT"})
+    monkeypatch.setattr(bx, "CACHE", {
+        "ts": 0.0,
+        "data": catalog,
+        "by_display_name": {},
+    })
+
+    assert bx.get_contract("LIT") is custom
+    assert bx.canonical_contract_symbol("LIT") == "CUSTOM-USDT"
+
+    # When both the dashed and base aliases are configured, both resolution
+    # paths must honor canonical_contract_symbol's dashed-key precedence.
+    dashed_custom = {"symbol": "DASHED-USDT", "displayName": "DASHED-USDT"}
+    base_custom = {"symbol": "BASE-USDT", "displayName": "BASE-USDT"}
+    catalog.update({"DASHED-USDT": dashed_custom, "BASE-USDT": base_custom})
+    monkeypatch.setattr(bx, "contracts", lambda **_kwargs: catalog)
+    monkeypatch.setattr(bx, "SYMBOL_MAP", {
+        "LIT-USDT": "DASHED-USDT",
+        "LIT": "BASE-USDT",
+    })
+    monkeypatch.setattr(bx, "CACHE", {
+        "ts": 0.0,
+        "data": catalog,
+        "by_display_name": {},
+    })
+    assert bx.get_contract("LIT") is dashed_custom
+    assert bx.canonical_contract_symbol("LIT") == "DASHED-USDT"
+
+
+def test_bingx_explicit_trump_sol_contract_is_not_collapsed_into_legacy_trumpsol_alias(monkeypatch):
+    from event_engine import bingx as bx
+
+    trump_sol = {"symbol": "TRUMP-SOL-USDT", "displayName": "TRUMP-SOL-USDT"}
+    trump = {"symbol": "TRUMP-USDT", "displayName": "TRUMP-USDT"}
+    catalog = {"TRUMP-SOL-USDT": trump_sol, "TRUMP-USDT": trump}
+    monkeypatch.setattr(bx, "contracts", lambda **_kwargs: catalog)
+    monkeypatch.setattr(bx, "SYMBOL_MAP", {})
+    monkeypatch.setattr(bx, "CACHE", {
+        "ts": 0.0,
+        "data": catalog,
+        "by_display_name": {},
+    })
+
+    assert bx.get_contract("TRUMP-SOL-USDT") is trump_sol
+    assert bx.canonical_contract_symbol("TRUMP-SOL-USDT") == "TRUMP-SOL-USDT"
+    assert bx.get_contract("TRUMPSOL") is trump

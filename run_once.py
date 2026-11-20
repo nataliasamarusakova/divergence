@@ -1841,9 +1841,10 @@ def _scan_buckets_to_process(
     """Return contiguous closed buckets that can be replayed safely.
 
     A new symbol/timeframe replays a bounded, contiguous recent window so a fresh
-    event formed before the symbol entered the universe is still recoverable.
-    An already-known symbol replays every missing completed bucket for which the
-    fetched history is available. We never jump over a missing bucket.
+    event formed before the symbol entered the universe is still recoverable. An
+    existing watermark that has aged out of fetched history is rebased through
+    the same bounded window. Within available history, missing buckets are never
+    skipped.
     """
     symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
     rec = symbols.get(symbol) if isinstance(symbols, dict) else None
@@ -1873,9 +1874,38 @@ def _scan_buckets_to_process(
     if last_bucket >= completed_bucket:
         return []
 
+    eligible = {int(bucket) for bucket in available_buckets if int(bucket) <= completed_bucket}
+    if not eligible:
+        return []
+
+    expected_bucket = last_bucket + 1
+    oldest_available = min(eligible)
+    if expected_bucket < oldest_available:
+        # The saved watermark has fallen behind the exchange's retained/fetched
+        # history (for example, a symbol left the liquidity universe for >400h).
+        # We cannot replay candles that the provider no longer returns. Rebase
+        # only in this explicit aged-out case, using the same bounded recent
+        # contiguous window as a first-seen symbol. A gap *inside* the available
+        # history is still never skipped.
+        max_buckets = max(
+            1,
+            int(math.ceil(
+                NEW_SYMBOL_BACKFILL_MIN
+                / (_timeframe_interval_ms(timeframe) / 60_000.0)
+            )),
+        )
+        latest = max(eligible)
+        targets_rev: list[int] = [latest]
+        while len(targets_rev) < max_buckets:
+            previous = targets_rev[-1] - 1
+            if previous not in eligible:
+                break
+            targets_rev.append(previous)
+        return list(reversed(targets_rev))
+
     targets: list[int] = []
-    for bucket in range(last_bucket + 1, completed_bucket + 1):
-        if bucket not in available_buckets:
+    for bucket in range(expected_bucket, completed_bucket + 1):
+        if bucket not in eligible:
             break
         targets.append(bucket)
     return targets

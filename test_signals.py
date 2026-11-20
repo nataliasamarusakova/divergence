@@ -4806,3 +4806,66 @@ def test_execute_new_position_blocks_non_finite_cross_exchange_reference(monkeyp
 
     assert out["status"] == "CROSS_EXCHANGE_PRICE_UNAVAILABLE"
     assert actions[-1]["reason"] == "INVALID_REFERENCE_PRICE"
+
+
+def test_ema_pullback_returns_no_signal_when_dropna_removes_all_rows():
+    from event_engine.signals import detect_ema_pullback_continuation
+
+    df = pd.DataFrame({
+        "open": [np.nan] * 250,
+        "high": [np.nan] * 250,
+        "low": [np.nan] * 250,
+        "close": [np.nan] * 250,
+        "volume": [np.nan] * 250,
+        "close_time": np.arange(250, dtype=np.int64),
+    })
+
+    assert detect_ema_pullback_continuation(df, "TEST", "1h") == []
+
+
+def test_harmonic_detector_rejects_same_candle_as_two_consecutive_pivots(monkeypatch):
+    import event_engine.signals as sig
+
+    n = 90
+    df = pd.DataFrame({
+        "open": [150.0] * n,
+        "high": [151.0] * n,
+        "low": [149.0] * n,
+        "close": [150.0] * n,
+        "close_time": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+    })
+    # These five prices form a valid bullish Gartley only if candle 30 is
+    # incorrectly counted twice: first as B (low), then as C (high).
+    df.loc[10, ["low", "open", "close", "high"]] = [100.0, 101.0, 101.0, 102.0]
+    df.loc[20, ["high", "open", "close", "low"]] = [200.0, 199.0, 199.0, 198.0]
+    df.loc[30, ["low", "high", "open", "close"]] = [138.2, 169.1, 150.0, 151.0]
+    df.loc[40, ["low", "open", "close", "high"]] = [121.4, 122.4, 122.4, 123.4]
+    monkeypatch.setattr(sig, "_pivots", lambda *_a, **_k: ([10, 30, 40], [20, 30]))
+
+    events = sig.detect_harmonic_patterns(df, "TEST", "1h", tolerance=0.05)
+
+    assert events == []
+
+
+def test_breaker_rejects_first_ob_break_when_it_precedes_liquidity_sweep(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_breaker_fixture(True)
+    # The original bullish OB at bar 109 has zlo=99.0. A close through it
+    # before the sweep at 118 consumes the OB; a later break cannot repair it.
+    df.loc[113, ["open", "high", "low", "close"]] = [100.0, 100.5, 97.0, 98.0]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
+
+
+def test_breaker_rejects_zone_reclaimed_through_far_boundary(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_breaker_fixture(True)
+    # After the bearish break at 121, a close above the far boundary of the
+    # original bullish OB invalidates the bearish breaker before the final retest.
+    df.loc[130, ["open", "high", "low", "close"]] = [102.0, 103.0, 101.5, 102.5]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []

@@ -383,3 +383,28 @@ def test_htf_context_frame_excludes_future_candles():
     df = pd.DataFrame({"close_time": [100, 200, 300], "close": [1.0, 2.0, 3.0]})
     out = run_once._frame_through_event_ts(df, 200)
     assert list(out["close_time"]) == [100, 200]
+
+
+def test_stale_scan_watermark_rebases_only_when_expected_bucket_aged_out(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 180.0)
+    state = {"version": 2, "symbols": {"BTC": {"1h": 100}}}
+    available = set(range(501, 601))
+
+    targets = run_once._scan_buckets_to_process(state, "BTC", "1h", 600, available)
+
+    # The old watermark is outside the fetched history. Replay only the bounded
+    # newest contiguous window, rather than returning [] forever.
+    assert targets == [598, 599, 600]
+    for bucket in targets:
+        run_once._mark_symbol_scanned(state, "BTC", "1h", bucket)
+
+    assert state["symbols"]["BTC"]["1h"] == 600
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 600, available) == []
+
+
+def test_stale_scan_watermark_rebase_does_not_jump_internal_history_gap(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 240.0)
+    state = {"version": 2, "symbols": {"BTC": {"1h": 100}}}
+    available = {501, 502, 504, 505}
+
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 505, available) == [504, 505]

@@ -307,9 +307,11 @@ def _make_bullish_breaker_mss_fixture(break_close: float) -> pd.DataFrame:
     # Original BOS below a confirmed swing low.
     rows[110].update({"open": 100.5, "high": 101.0, "low": 88.0, "close": 89.0, "volume": 1800.0})
     # Intervening structural high, confirmed before the sell-side sweep.
-    rows[116].update({"open": 102.0, "high": 103.0, "low": 100.0, "close": 102.2})
-    rows[117].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 102.2})
-    rows[118].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 102.2})
+    # Wicks form the pivot above the OB, but closes stay below its far edge;
+    # the first close through the zone must happen only after the sweep.
+    rows[116].update({"open": 102.0, "high": 103.0, "low": 100.0, "close": 100.5})
+    rows[117].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 100.5})
+    rows[118].update({"open": 102.0, "high": 102.5, "low": 100.0, "close": 100.5})
     # Sell-side liquidity sweep with rejection close.
     rows[119].update({"open": 92.5, "high": 94.0, "low": 88.5, "close": 100.0})
     # Close above the OB edge (101) but optionally not above MSS level (103).
@@ -3099,3 +3101,27 @@ def test_rollback_cleanup_and_quarantine_persistence_failure_sets_process_latch(
     assert result["status"] == "pending"
     assert result["pending_cleanup_id"] is None
     assert "could not be persisted" in ro._ENTRY_EXECUTION_SAFETY_LATCH_REASON
+
+
+def test_bullish_breaker_rejects_first_ob_reclaim_when_it_precedes_sweep(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_bullish_breaker_mss_fixture(104.0)
+    # The bearish OB's upper edge is 101. A close above it before the sell-side
+    # sweep at 119 consumes the original zone; the later close at 122 is stale.
+    df.loc[116, ["open", "high", "low", "close"]] = [102.0, 103.0, 100.0, 102.2]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
+
+
+def test_bullish_breaker_rejects_zone_reclaimed_through_far_boundary(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_bullish_breaker_mss_fixture(104.0)
+    # After the bullish break, a close back below the far edge invalidates it
+    # before the final retest from above.
+    df.loc[130, ["open", "high", "low", "close"]] = [98.0, 99.0, 97.0, 98.5]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
