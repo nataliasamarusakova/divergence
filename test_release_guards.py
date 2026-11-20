@@ -165,39 +165,40 @@ def test_release_has_no_legacy_sr_tp3_cap_setting():
     assert "apply_sr_tp3_cap" not in workflow
 
 
-def test_release_enforces_directional_3h_spot_gate_and_keeps_optional_room_off():
+def test_release_enforces_directional_3h_futures_gate_and_keeps_optional_room_off():
     workflow = _workflow()
     assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = True' in Path("run_once.py").read_text(encoding="utf-8")
     assert 'SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0' in Path("event_engine/sr_context.py").read_text(encoding="utf-8")
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
     assert 'AJAY_SR_REQUIRE_DATA: "true"' in workflow
-    assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
-    assert 'AJAY_SR_HTTP_PROXY: "http://127.0.0.1:18080"' in workflow
+    assert 'BINANCE_BASE_URL: https://fapi.binance.com' in workflow
+    assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
     assert 'AJAY_SR_KLINE_LIMIT_1H: "1000"' in workflow
     assert 'AJAY_SR_MAX_DATA_AGE_MIN: "190"' in workflow
-    assert 'AJAY_SR_REQUEST_MIN_INTERVAL_SEC: "0.10"' in workflow
-    assert 'AJAY_SR_RB: "10"' in workflow
-    assert 'AJAY_SR_PRD: "284"' in workflow
+    assert 'AJAY_SR_SWING_LENGTH: "10"' in workflow
+    assert 'AJAY_SR_HISTORY_TO_KEEP: "20"' in workflow
+    assert 'AJAY_SR_BOX_WIDTH: "2.5"' in workflow
+    assert 'AJAY_SR_ATR_LENGTH: "50"' in workflow
 
 
-def test_pine_sr_manual_diagnostic_workflow_is_spot_only():
+def test_pine_sr_manual_diagnostic_workflow_uses_futures_only():
     wf = Path('.github/workflows/pine-sr-diagnostic.yml').read_text(encoding='utf-8')
     assert 'workflow_dispatch' in wf
     assert 'pine_sr_diagnostic.py' in wf
     assert 'BTC-USDT' in wf
 
 
-def test_release_has_mandatory_3h_direction_gate_and_cached_spot_snapshot():
+def test_release_has_mandatory_3h_direction_gate_and_cached_futures_snapshot():
     workflow = _workflow()
     runtime = Path('run_once.py').read_text(encoding='utf-8')
     sr_source = Path('event_engine/sr_context.py').read_text(encoding='utf-8')
     assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = True' in runtime
     assert 'get_cached_sr_snapshot' in runtime
     assert 'evaluate_sr_directional_zone' in runtime
-    assert 'interval="1h"' in sr_source
+    assert 'fetch_futures_klines' in sr_source
+    assert 'interval="1h"' in sr_source or '"1h"' in sr_source
     assert '_aggregate_closed_3h_candles' in sr_source
-    assert 'AJAY_SR_SPOT_BASE_URL: "https://data-api.binance.vision"' in workflow
 
 
 def test_release_uses_binance_for_signal_market_data_and_bingx_for_execution():
@@ -298,21 +299,21 @@ def test_pytest_isolates_production_sr_environment(monkeypatch):
     assert hasattr(conftest, "isolate_production_entry_gates")
 
 
-def test_release_has_live_spot_symbol_resolver_and_persisted_sr_budget():
+def test_release_has_live_futures_symbol_resolver_and_persisted_sr_budget():
     workflow = _workflow()
-    assert 'AJAY_SR_SPOT_EXCHANGE_INFO_TTL_SEC: "900"' in workflow
     assert 'MAX_SR_DATA_REJECTIONS: "3"' in workflow
     source = Path('event_engine/sr_context.py').read_text(encoding='utf-8')
-    assert 'def resolve_spot_symbol' in source
+    assert 'def resolve_futures_symbol' in source
     assert 'SRSymbolUnavailableError' in source
-    assert 'source_price_scale' in source
-    assert 'source_volume_scale' in source
+    assert 'fetch_futures_klines' in source
+    assert 'fetch_futures_price' in source
 
 
-def test_release_does_not_use_direct_spot_klines_normalization_in_diagnostic():
+def test_release_diagnostic_uses_shared_futures_provider():
     source = Path('pine_sr_diagnostic.py').read_text(encoding='utf-8')
-    assert 'resolve_spot_symbol' in source
+    assert 'resolve_futures_symbol' in source
     assert 'get_cached_sr_snapshot' in source
+    assert 'get_futures_current_price' in source
     assert 'KLINES_URL' not in source
     assert 'normalize_symbol' not in source
 
@@ -553,3 +554,23 @@ def test_pytest_network_guard_classifies_loopback_only():
     assert not _is_loopback_host("open-api-vst.bingx.com")
     assert not _is_loopback_host("data-api.binance.vision")
     assert not _is_loopback_host("8.8.8.8")
+
+
+def test_release_has_no_spot_data_path_in_trading_or_diagnostic_code():
+    paths = [
+        Path("event_engine/sr_context.py"),
+        Path("run_once.py"),
+        Path("pine_sr_diagnostic.py"),
+        Path(".github/workflows/event-engine.yml"),
+        Path(".github/workflows/pine-sr-diagnostic.yml"),
+    ]
+    source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    forbidden = (
+        "data-api.binance.vision",
+        "/api/v3/klines",
+        "/api/v3/ticker/price",
+        "resolve_spot_symbol",
+        "get_spot_current_price",
+    )
+    assert not [token for token in forbidden if token in source]
+    assert 'BINANCE_BASE_URL: "https://fapi.binance.com"' in Path(".github/workflows/pine-sr-diagnostic.yml").read_text(encoding="utf-8")

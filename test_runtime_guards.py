@@ -401,25 +401,25 @@ def test_non_divergence_engines_are_not_treated_as_divergence():
         assert not run_once._is_divergence_event(_event(event_type, engine)), event_type
 
 
-def test_every_requires_retest_engine_has_a_configured_retest_window():
-    """A retest engine without its own window silently falls back to 30 minutes.
-
-    LIQUIDITY_SWEEP shipped without an entry, giving it two 15m candidate bars
-    against the 4-8 bars every other retest engine receives.
-    """
+def test_retest_window_policy_matches_the_selected_15m_trigger_mode():
     import run_once
 
-    retest_engines = [
-        "MA_COMPRESSION", "BREAKOUT_MOMENTUM", "DONCHIAN_RETEST", "EMA_PULLBACK",
-        "ORDER_BLOCK", "BREAKER_BLOCK", "MITIGATION_BLOCK", "SFP",
-        "LIQUIDATION_CASCADE_FVG", "CRT", "LIQUIDITY_SWEEP",
-    ]
+    continuation_engines = {
+        "BREAKOUT_MOMENTUM", "EMA_PULLBACK", "BREAKER_BLOCK", "SFP",
+        "LIQUIDITY_SWEEP", "VOLATILITY_SQUEEZE",
+    }
+    retest_engines = {
+        "MA_COMPRESSION", "DONCHIAN_RETEST", "ORDER_BLOCK", "MITIGATION_BLOCK",
+        "LIQUIDATION_CASCADE_FVG", "CRT",
+    }
+    for engine in continuation_engines:
+        ev = {"event_type": "X", "event_fact": {"engine": engine, "requires_retest": True}}
+        assert run_once._event_uses_15m_retest(ev) is False
+        assert run_once._event_max_age_min(ev) == run_once.MAX_AGE
     for engine in retest_engines:
         ev = {"event_type": "X", "event_fact": {"engine": engine, "requires_retest": True}}
-        window = run_once._event_trigger_max_delay_min(ev)
-        assert window > run_once.MAX_TRIGGER_DELAY, (
-            f"{engine} falls back to the non-retest default of {run_once.MAX_TRIGGER_DELAY} min"
-        )
+        assert run_once._event_uses_15m_retest(ev) is True
+        assert run_once._event_trigger_max_delay_min(ev) > run_once.MAX_TRIGGER_DELAY
 
 
 def test_divergence_shadow_state_records_and_closes(tmp_path):
@@ -2725,7 +2725,7 @@ def test_build_tp_levels_reflect_fixed_seven_percent_stop():
     }
     sl_pct, levels = build_tp_levels(setup, "LONG", event_type="DONCHIAN_RETEST_BREAKOUT")
     assert sl_pct == pytest.approx(7.0)
-    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.55, 10.5])
+    assert [x["pnl_pct"] for x in levels] == pytest.approx([4.2, 10.15])
 
 def test_entry_quality_shadow_mode_does_not_reject(monkeypatch):
     import run_once as ro
@@ -2926,11 +2926,11 @@ def test_execution_skip_log_reports_non_stale_reason(caplog):
         symbol="ATH",
         direction="LONG",
         event_id="EVT_TEST_SR",
-        execution_result={"status": "SR_SYMBOL_UNAVAILABLE", "error": "No active Binance Spot USDT source"},
+        execution_result={"status": "SR_SYMBOL_UNAVAILABLE", "error": "No active Binance USDⓈ-M Futures USDT perpetual contract"},
     )
 
     assert "[EXECUTION] LONG ATH skipped: SR_SYMBOL_UNAVAILABLE" in caplog.text
-    assert "No active Binance Spot USDT source" in caplog.text
+    assert "No active Binance USDⓈ-M Futures USDT perpetual contract" in caplog.text
     assert "EVT_TEST_SR" in caplog.text
 
 
@@ -3029,7 +3029,7 @@ def test_unpersisted_unknown_entry_quarantine_activates_process_safety_latch(mon
     monkeypatch.setattr(ro, "MAX_ENTRY_DRIFT_PCT", 0.0)
     monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", True)
     monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda *_a, **_k: {"snapshot": True})
-    monkeypatch.setattr(ro, "get_spot_current_price", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(ro, "get_futures_current_price", lambda *_a, **_k: 100.0)
     monkeypatch.setattr(ro, "evaluate_sr_directional_zone", lambda *_a, **_k: {
         "reject": False, "zone_type": "DEMAND", "distance_pct": 0.0,
     })

@@ -25,45 +25,35 @@ def test_format_price(value, tick_size, expected):
     assert diagnostic.format_price(value, tick_size) == expected
 
 
-def test_source_tick_size_uses_price_filter_and_logical_price_scale(monkeypatch):
-    import event_engine.sr_context as sr
+def test_source_tick_size_uses_futures_exchange_price_filter(monkeypatch):
+    import event_engine.binance as bn
 
-    monkeypatch.setattr(
-        sr,
-        "_spot_symbol_catalog",
-        lambda: {
-            "SHIBUSDT": {
-                "filters": [
-                    {"filterType": "LOT_SIZE", "tickSize": "0.1"},
-                    {"filterType": "PRICE_FILTER", "tickSize": "0.00001"},
-                ]
-            }
-        },
-    )
-    assert diagnostic._source_tick_size(
-        {"source_symbol": "SHIBUSDT", "source_price_scale": 1000.0}
-    ) == pytest.approx(0.01)
+    monkeypatch.setattr(bn, "refresh_exchange_info", lambda: {
+        "PIEVERSEUSDT": {
+            "filters": [
+                {"filterType": "LOT_SIZE", "tickSize": "0.1"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+            ]
+        }
+    })
+    assert diagnostic._source_tick_size({"source_symbol": "PIEVERSEUSDT"}) == pytest.approx(0.0001)
 
 
 def test_source_tick_size_returns_none_when_price_filter_is_missing(monkeypatch):
-    import event_engine.sr_context as sr
+    import event_engine.binance as bn
 
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda: {"FOOUSDT": {"filters": []}})
-    assert diagnostic._source_tick_size(
-        {"source_symbol": "FOOUSDT", "source_price_scale": 1.0}
-    ) is None
+    monkeypatch.setattr(bn, "refresh_exchange_info", lambda: {"FOOUSDT": {"filters": []}})
+    assert diagnostic._source_tick_size({"source_symbol": "FOOUSDT"}) is None
 
 
 def test_source_tick_size_fails_closed_on_catalog_error(monkeypatch):
-    import event_engine.sr_context as sr
+    import event_engine.binance as bn
 
     def fail():
         raise RuntimeError("offline test")
 
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", fail)
-    assert diagnostic._source_tick_size(
-        {"source_symbol": "FOOUSDT", "source_price_scale": 1.0}
-    ) is None
+    monkeypatch.setattr(bn, "refresh_exchange_info", fail)
+    assert diagnostic._source_tick_size({"source_symbol": "FOOUSDT"}) is None
 
 
 def test_main_prints_resolved_snapshot_and_exports_zone_bands_without_network(monkeypatch, capsys, tmp_path):
@@ -71,33 +61,34 @@ def test_main_prints_resolved_snapshot_and_exports_zone_bands_without_network(mo
     monkeypatch.setattr(sys, "argv", ["pine_sr_diagnostic.py", "--symbol", "BTC-USDT", "--limit", "1000", "--output", str(output_csv)])
     monkeypatch.setattr(
         diagnostic,
-        "resolve_spot_symbol",
+        "resolve_futures_symbol",
         lambda symbol: {
             "requested_symbol": "BTCUSDT",
             "source_symbol": "BTCUSDT",
-            "source_alias_kind": "EXACT",
-            "source_price_scale": 1.0,
-            "source_volume_scale": 1.0,
+            "source_alias_kind": "EXACT_FUTURES",
+            "contract_type": "PERPETUAL",
+            "quote_asset": "USDT",
         },
     )
     monkeypatch.setattr(
         diagnostic,
         "get_cached_sr_snapshot",
-        lambda symbol, limit: {"highestph": 100.0, "levels": [99.5, 98.75], "lowestpl": 97.0, "cwidth": 0.02, "zone_scale": 1.0, "timeframe": "3h", "source": "binance_spot", "source_symbol": "BTCUSDT", "accepted": [{"price": 99.5, "kind": "L", "points": 3, "countpp": 1}], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333, "latest_closed_age_min": 12.0},
+        lambda symbol, limit: {"highestph": 100.0, "levels": [99.5, 98.75], "lowestpl": 97.0, "cwidth": 0.02, "zone_scale": 1.0, "timeframe": "3h", "source": "binance_usds_m_futures", "source_symbol": "BTCUSDT", "active_zones": [{"top": 99.5, "bottom": 99.5, "center": 99.5, "kind": "L", "points": 1, "countpp": 1, "box_width": 0.0}], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333, "latest_closed_age_min": 12.0, "atr": 0.08},
     )
     monkeypatch.setattr(diagnostic, "_source_tick_size", lambda resolved: 0.25)
-    monkeypatch.setattr(diagnostic, "get_spot_current_price", lambda symbol, snapshot: 100.0)
+    monkeypatch.setattr(diagnostic, "get_futures_current_price", lambda symbol, snapshot: 100.0)
 
     assert diagnostic.main() == 0
     output = capsys.readouterr().out
     assert "REQUESTED=BTCUSDT" in output
+    assert "SOURCE=BINANCE_USDS_M_FUTURES" in output
     assert "SOURCE_SYMBOL=BTCUSDT" in output
     assert "TIMEFRAME=3h | SOURCE_KLINE_INTERVAL=1h_AGGREGATED" in output
     assert "HIGH LEVEL: 100.00" in output
     assert "99.50" in output
     assert "98.75" in output
     assert "LOW LEVEL: 97.00" in output
-    assert "CWIDTH: 0.02" in output
+    assert "ATR(50): 0.08" in output
     assert "DEMAND | center=99.50 | band=[99.50, 99.50]" in output
     assert "CLOSED_3H_BARS=333" in output
     assert "GATE_LONG=ALLOW REASON=ALLOWED" in output
@@ -109,6 +100,7 @@ def test_main_prints_resolved_snapshot_and_exports_zone_bands_without_network(mo
         rows = list(csv.DictReader(handle))
     assert rows[0]["zone_type"] == "DEMAND"
     assert float(rows[0]["center"]) == pytest.approx(99.5)
+    assert float(rows[0]["box_width"]) == pytest.approx(0.0)
     assert rows[0]["long_gate_decision"] == "ALLOW"
     assert rows[0]["long_gate_reason"] == "ALLOWED"
     assert rows[0]["long_selected"] == "True"
@@ -129,21 +121,21 @@ def test_diagnostic_uses_the_exact_production_zone_builder():
     assert diagnostic._build_zones is sr._build_zones
 
 
-def test_main_fails_when_current_spot_price_is_unavailable(monkeypatch, tmp_path):
+def test_main_fails_when_current_futures_price_is_unavailable(monkeypatch, tmp_path):
     output_csv = tmp_path / "must-not-exist.csv"
     monkeypatch.setattr(sys, "argv", ["pine_sr_diagnostic.py", "--symbol", "BTC-USDT", "--limit", "1000", "--output", str(output_csv)])
-    monkeypatch.setattr(diagnostic, "resolve_spot_symbol", lambda symbol: {
-        "requested_symbol": "BTCUSDT", "source_symbol": "BTCUSDT", "source_alias_kind": "EXACT",
-        "source_price_scale": 1.0, "source_volume_scale": 1.0,
+    monkeypatch.setattr(diagnostic, "resolve_futures_symbol", lambda symbol: {
+        "requested_symbol": "BTCUSDT", "source_symbol": "BTCUSDT", "source_alias_kind": "EXACT_FUTURES",
+        "contract_type": "PERPETUAL", "quote_asset": "USDT",
     })
     monkeypatch.setattr(diagnostic, "get_cached_sr_snapshot", lambda symbol, limit: {
         "timeframe": "3h", "highestph": 1.0, "levels": [], "lowestpl": 0.5, "cwidth": 0.01,
-        "accepted": [], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333,
+        "active_zones": [], "accepted": [], "latest_closed_timestamp": 0, "closed_candle_count_3h": 333, "atr": 0.01,
     })
     # This test targets the unavailable ticker path; source tick-size lookup is
-    # unrelated and must not trigger a real Binance Spot exchangeInfo request.
+    # unrelated and must not trigger a real Binance Futures exchangeInfo request.
     monkeypatch.setattr(diagnostic, "_source_tick_size", lambda _resolved: None)
-    monkeypatch.setattr(diagnostic, "get_spot_current_price", lambda symbol, snapshot: (_ for _ in ()).throw(RuntimeError("ticker unavailable")))
+    monkeypatch.setattr(diagnostic, "get_futures_current_price", lambda symbol, snapshot: (_ for _ in ()).throw(RuntimeError("ticker unavailable")))
     with pytest.raises(RuntimeError, match="ticker unavailable"):
         diagnostic.main()
     assert not output_csv.exists()
@@ -159,14 +151,16 @@ def test_diagnostic_workflow_uses_production_sr_parameters_and_source_window():
     def read_sr_env(text):
         values = {}
         for key, value in re.findall(r"^\s+(AJAY_SR_[A-Z0-9_]+):\s*[\"']?([^\"'\n]+)[\"']?\s*$", text, flags=re.MULTILINE):
-            if key != "AJAY_SR_HTTP_PROXY":
-                values[key] = value.strip()
+            values[key] = value.strip()
         return values
 
     diagnostic_values = read_sr_env(diagnostic_workflow)
     engine_values = read_sr_env(engine_workflow)
     assert diagnostic_values == engine_values
+    assert "AJAY_SR_SPOT_BASE_URL" not in diagnostic_workflow
+    assert "AJAY_SR_SPOT_BASE_URL" not in engine_workflow
     assert 'python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit 1000' in diagnostic_workflow
     assert "WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}" in diagnostic_workflow
-    assert "AJAY_SR_HTTP_PROXY=http://127.0.0.1:18080" in diagnostic_workflow
+    assert "BINANCE_VPN_ENABLED=true" in diagnostic_workflow
+    assert "BINANCE_HTTP_PROXY=http://127.0.0.1:18080" in diagnostic_workflow
     assert "WIREPROXY_SHA256: e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" in diagnostic_workflow

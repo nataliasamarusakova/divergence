@@ -2,8 +2,8 @@
 """Read-only diagnostic for the visible Ajay R5.41 Pine S/R values.
 
 The diagnostic intentionally uses the exact production S/R provider and symbol
-resolver: Binance Spot 1H source candles aggregated into UTC-aligned 3H bars.
-This prevents the manual tool from reintroducing a symbol-specific assumption.
+resolver: Binance USDⓈ-M Futures 1H candles aggregated into UTC-aligned 3H bars.
+The data and live price use the same Futures contract as the trading engine.
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from event_engine.sr_context import get_cached_sr_snapshot
-from event_engine.sr_context import get_spot_current_price
-from event_engine.sr_context import resolve_spot_symbol
+from event_engine.sr_context import get_futures_current_price
+from event_engine.sr_context import resolve_futures_symbol
 from event_engine.sr_context import evaluate_sr_directional_zone
 from event_engine.sr_context import _build_zones
 import event_engine.sr_context as sr_context
@@ -46,17 +46,15 @@ def format_price(value: float | None, tick_size: float | None) -> str:
 
 
 def _source_tick_size(resolved: dict[str, Any]) -> float | None:
-    """Read the source Spot tick size without creating another symbol resolver."""
+    """Read tick size from the active USDⓈ-M Futures exchange metadata."""
     try:
-        # Keep this import private so this diagnostic still treats sr_context as
-        # the single source of truth for symbol resolution and transport.
-        import event_engine.sr_context as sr
-        row = sr._spot_symbol_catalog().get(str(resolved["source_symbol"]).upper())
+        from event_engine.binance import refresh_exchange_info
+        row = refresh_exchange_info().get(str(resolved["source_symbol"]).upper())
         for item in (row or {}).get("filters", []):
             if isinstance(item, dict) and item.get("filterType") == "PRICE_FILTER":
                 tick = float(item.get("tickSize", 0) or 0)
                 if tick > 0:
-                    return tick * float(resolved.get("source_price_scale", 1.0))
+                    return tick
     except Exception:
         return None
     return None
@@ -111,51 +109,50 @@ def _format_gate_line(direction: str, columns: dict[str, Any], tick_size: float 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ajay R5.41 visible Pine SR value diagnostic")
+    parser = argparse.ArgumentParser(description="Ajay R5.41 DEMAND/SUPPLY zone diagnostic")
     parser.add_argument("--symbol", required=True, help="e.g. BTC-USDT or 1000SHIB")
-    parser.add_argument("--limit", type=int, default=1000, help="Must be 1000 Binance Spot 1H source bars to match the production bot")
+    parser.add_argument("--limit", type=int, default=1000, help="Must be 1000 Binance Futures 1H source bars to match the production bot")
     parser.add_argument("--output", default="pine-sr-zones.csv", help="CSV path for calculated Demand/Supply bands")
     args = parser.parse_args()
     if args.limit != 1000:
         parser.error("--limit must be exactly 1000 source 1H bars to match the production bot")
 
-    resolved = resolve_spot_symbol(args.symbol)
+    resolved = resolve_futures_symbol(args.symbol)
     state = get_cached_sr_snapshot(args.symbol, limit=args.limit)
     tick_size = _source_tick_size(resolved)
-    # Match the bot's fail-closed entry gate: a zone-only report without a live
-    # Binance Spot price is not a valid directional-entry diagnostic.
-    spot_price = get_spot_current_price(args.symbol, snapshot=state)
+    # Match the bot's fail-closed entry gate: zones and current price must come
+    # from the same live Binance USDⓈ-M Futures perpetual contract.
+    futures_price = get_futures_current_price(args.symbol, snapshot=state)
     try:
-        spot_price = float(spot_price)
+        futures_price = float(futures_price)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError("Binance Spot ticker price is unavailable; refusing to publish a zone-only diagnostic") from exc
-    if not math.isfinite(spot_price) or spot_price <= 0:
-        raise RuntimeError("Binance Spot ticker price is unavailable; refusing to publish a zone-only diagnostic")
+        raise RuntimeError("Binance Futures ticker price is unavailable; refusing to publish a zone-only diagnostic") from exc
+    if not math.isfinite(futures_price) or futures_price <= 0:
+        raise RuntimeError("Binance Futures ticker price is unavailable; refusing to publish a zone-only diagnostic")
 
-    print(f"AJAY R5.41 | REQUESTED={resolved['requested_symbol']} | SOURCE=BINANCE_SPOT")
+    print(f"AJAY R5.41 | REQUESTED={resolved['requested_symbol']} | SOURCE=BINANCE_USDS_M_FUTURES")
     print(f"SOURCE_SYMBOL={resolved['source_symbol']}")
+    print("CONTRACT_TYPE=PERPETUAL | QUOTE_ASSET=USDT")
     print("TIMEFRAME=3h | SOURCE_KLINE_INTERVAL=1h_AGGREGATED")
     print(f"ALIAS_KIND={resolved['source_alias_kind']}")
-    print(f"PRICE_SCALE={resolved['source_price_scale']}")
-    print(f"VOLUME_SCALE={resolved['source_volume_scale']}")
     print(f"REQUESTED_SOURCE_1H_BARS={args.limit}")
-    print(f"PINE_PARAMETERS=rb:{sr_context.SR_RB},prd:{sr_context.SR_PRD},channelW:{sr_context.SR_CHANNEL_W},strengthSR:{sr_context.SR_STRENGTH}")
+    print(f"PINE_PARAMETERS=swing_length:{sr_context.SR_SWING_LENGTH},history_to_keep:{sr_context.SR_HISTORY_TO_KEEP},box_width:{sr_context.SR_BOX_WIDTH},atr_length:{sr_context.SR_ATR_LENGTH}")
     print(f"CLOSED_3H_BARS={state.get('closed_candle_count_3h', 'not-reported')}")
     latest_ts = state.get("latest_closed_timestamp")
     if latest_ts is not None:
         print(f"LATEST_CLOSED_3H_OPEN_UTC={datetime.fromtimestamp(int(latest_ts) / 1000, tz=timezone.utc).isoformat()}")
     print(f"LATEST_CLOSED_3H_AGE_MIN={state.get('latest_closed_age_min')}")
-    print(f"CURRENT_BINANCE_SPOT_PRICE={format_price(spot_price, tick_size)}")
+    print(f"CURRENT_BINANCE_FUTURES_PRICE={format_price(futures_price, tick_size)}")
     print(f"HIGH LEVEL: {format_price(state['highestph'], tick_size)}")
     print("SR LEVELS:")
     for level in state["levels"]:
         print(format_price(float(level), tick_size))
     print(f"LOW LEVEL: {format_price(state['lowestpl'], tick_size)}")
-    print(f"CWIDTH: {state.get('cwidth')}")
+    print(f"ATR(50): {state.get('atr')}")
 
     zones = _build_zones(state)
     gate_results = {
-        direction: evaluate_sr_directional_zone(state, current_price=float(spot_price), direction=direction)
+        direction: evaluate_sr_directional_zone(state, current_price=float(futures_price), direction=direction)
         for direction in ("LONG", "SHORT")
     }
     gate_columns = {
@@ -171,7 +168,7 @@ def main() -> int:
         for prefix in ("long", "short")
         for field in ("gate_decision", "gate_reason", "gate_zone_type", "gate_allowed_direction", "gate_distance_pct", "gate_nearest_centers", "selected")
     ]
-    fieldnames = ["symbol", "source_symbol", "timeframe", "zone_type", "kind", "center", "lower", "upper", "cluster_width", "points", "countpp", "current_spot_price", "distance_to_band_pct", "latest_closed_3h_open_utc", *gate_fields]
+    fieldnames = ["symbol", "source_symbol", "timeframe", "zone_type", "kind", "center", "lower", "upper", "box_width", "points", "countpp", "current_futures_price", "distance_to_band_pct", "latest_closed_3h_open_utc", *gate_fields]
     latest_utc = datetime.fromtimestamp(int(latest_ts) / 1000, tz=timezone.utc).isoformat() if latest_ts is not None else ""
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -179,9 +176,9 @@ def main() -> int:
         for zone in zones:
             lower, upper = float(zone["lower"]), float(zone["upper"])
             distance = ""
-            if spot_price is not None:
-                gap = lower - spot_price if spot_price < lower else spot_price - upper if spot_price > upper else 0.0
-                distance = round(gap / spot_price * 100.0, 8)
+            if futures_price is not None:
+                gap = lower - futures_price if futures_price < lower else futures_price - upper if futures_price > upper else 0.0
+                distance = round(gap / futures_price * 100.0, 8)
             row = {
                 "symbol": resolved["requested_symbol"],
                 "source_symbol": resolved["source_symbol"],
@@ -191,10 +188,10 @@ def main() -> int:
                 "center": zone["center"],
                 "lower": lower,
                 "upper": upper,
-                "cluster_width": zone["cluster_width"],
+                "box_width": zone["box_width"],
                 "points": zone["points"],
                 "countpp": zone["countpp"],
-                "current_spot_price": spot_price if spot_price is not None else "",
+                "current_futures_price": futures_price,
                 "distance_to_band_pct": distance,
                 "latest_closed_3h_open_utc": latest_utc,
                 **{f"long_{key}": value for key, value in gate_columns["LONG"].items()},
@@ -219,11 +216,11 @@ def main() -> int:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as summary:
-            summary.write(f"## Ajay R5.41 S/R diagnostic — {resolved['requested_symbol']} (3H)\n\n")
-            summary.write(f"- Binance Spot source: `{resolved['source_symbol']}`\n")
+            summary.write(f"## Ajay R5.41 DEMAND/SUPPLY diagnostic — {resolved['requested_symbol']} (3H)\n\n")
+            summary.write(f"- Binance Futures contract: `{resolved['source_symbol']}`\n")
             summary.write(f"- Closed 3H bars: `{state.get('closed_candle_count_3h', 'not-reported')}`\n")
             summary.write(f"- Latest closed 3H open (UTC): `{latest_utc}`\n")
-            summary.write(f"- Current Spot price: `{format_price(spot_price, tick_size)}`\n")
+            summary.write(f"- Current Futures price: `{format_price(futures_price, tick_size)}`\n")
             summary.write(f"- Pine levels: `{', '.join(format_price(float(v), tick_size) for v in state.get('levels', []))}`\n\n")
             summary.write("### Exact bot directional gate\n\n")
             summary.write("| Direction | Decision | Reason | Nearest zone | Allowed direction | Distance |\n|---|---|---|---|---|---:|\n")
@@ -246,9 +243,9 @@ def main() -> int:
             for zone in zones:
                 lower, upper = float(zone["lower"]), float(zone["upper"])
                 gap_pct = ""
-                if spot_price is not None:
-                    gap = lower - spot_price if spot_price < lower else spot_price - upper if spot_price > upper else 0.0
-                    gap_pct = f"{gap / spot_price * 100.0:.4f}%"
+                if futures_price is not None:
+                    gap = lower - futures_price if futures_price < lower else futures_price - upper if futures_price > upper else 0.0
+                    gap_pct = f"{gap / futures_price * 100.0:.4f}%"
                 kind = "DEMAND" if zone["kind"] == "L" else "SUPPLY" if zone["kind"] == "H" else "UNKNOWN"
                 summary.write(f"| {kind} | {format_price(zone['center'], tick_size)} | {format_price(lower, tick_size)} | {format_price(upper, tick_size)} | {zone['points']} | {gap_pct} |\n")
             if not zones:

@@ -88,7 +88,7 @@ from event_engine.signals import (
 )
 from event_engine.sr_context import (
     get_cached_sr_snapshot,
-    get_spot_current_price,
+    get_futures_current_price,
     evaluate_sr_directional_zone,
     evaluate_sr_room,
     SR_DIRECTIONAL_MAX_DISTANCE_PCT,
@@ -313,16 +313,18 @@ HOT_OI_SCORE_PENALTY = float(os.environ.get("HOT_OI_SCORE_PENALTY", "15"))
 SYMBOL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SYMBOL_MAX_CONSECUTIVE_LOSSES", "3"))
 SYMBOL_QUARANTINE_MIN = float(os.environ.get("SYMBOL_QUARANTINE_MIN", "360"))
 
-# New positions use exactly two TP targets: an early partial and the final target.
-# New entries use a 1.50R final target; historical persisted TP profiles are preserved.
-NORMAL_TP_RR = (0.65, 1.50)
-NORMAL_TP_FRACTIONS = (0.25, 0.75)
-NORMAL_PLANNED_WEIGHTED_RR = 1.2875
-SQUEEZE_TP_RR = (1.00, 1.50)
-SQUEEZE_TP_FRACTIONS = (0.30, 0.70)
-SQUEEZE_PLANNED_WEIGHTED_RR = 1.3500
+# New normal positions use the configured two-leg TP ladder. Historical
+# persisted TP profiles remain unchanged during reconciliation.
+NORMAL_TP_RR = (0.60, 1.45)
+NORMAL_TP_FRACTIONS = (0.30, 0.70)
+NORMAL_PLANNED_WEIGHTED_RR = 1.195
+# Apply the same execution ladder to squeeze entries; event classification does
+# not silently change the user's requested profit-taking policy.
+SQUEEZE_TP_RR = NORMAL_TP_RR
+SQUEEZE_TP_FRACTIONS = NORMAL_TP_FRACTIONS
+SQUEEZE_PLANNED_WEIGHTED_RR = NORMAL_PLANNED_WEIGHTED_RR
 
-# Mandatory 3H Binance Spot Demand/Supply direction gate. This is deliberately
+# Mandatory 3H Binance Futures Demand/Supply direction gate. This is deliberately
 # separate from the optional TP-room geometry below: the direction gate is a
 # hard pre-order rule and defaults ON; the legacy TP-room check remains optional.
 SR_3H_DIRECTIONAL_GATE_ENABLED = True  # hard invariant; no environment variable can disable it
@@ -806,7 +808,7 @@ def _event_trigger_max_delay_min(ev: dict) -> float:
 
 def _event_max_age_min(ev: dict) -> float:
     fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
-    if fact.get("requires_retest"):
+    if _event_uses_15m_retest(ev):
         return max(float(MAX_AGE), _event_trigger_max_delay_min(ev))
     event_type = str(ev.get("event_type") or "").upper()
     if "REGULAR_" in event_type or "HIDDEN_" in event_type:
@@ -2614,6 +2616,49 @@ def _entry_drift_pct(signal_price: float, trigger_price: float, direction: str) 
     return abs(trigger_price - signal_price) / signal_price * 100.0
 
 
+# These event engines already confirm a sweep/rejection, pullback rejection, or
+# momentum release on the source timeframe. Requiring a second 15m touch of the
+# same reference level can delay/lose the intended continuation entry.
+_CONTINUATION_AFTER_SOURCE_CONFIRMATION_ENGINES = {
+    "SFP", "BREAKER_BLOCK", "EMA_PULLBACK", "LIQUIDITY_SWEEP",
+    "VOLATILITY_SQUEEZE", "BREAKOUT_MOMENTUM",
+}
+
+# Reversal/market-structure events use the mandatory 3H Demand/Supply gate as
+# their directional context rather than requiring a same-direction 4H EMA trend.
+_1H_REVERSAL_ENGINES_DEFERRED_TO_3H_SR = {
+    "SFP", "LIQUIDITY_SWEEP", "BREAKER_BLOCK", "CRT",
+}
+
+
+def _event_uses_15m_retest(ev: dict[str, Any], *, trigger_required: bool = True) -> bool:
+    if not trigger_required:
+        return False
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    if not bool(fact.get("requires_retest")):
+        return False
+    engine = str(fact.get("engine") or "").strip().upper()
+    return engine not in _CONTINUATION_AFTER_SOURCE_CONFIRMATION_ENGINES
+
+
+def _defer_1h_reversal_to_3h_sr(ev: dict[str, Any]) -> bool:
+    timeframe = str(ev.get("timeframe") or "").strip().lower()
+    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+    engine = str(fact.get("engine") or "").strip().upper()
+    return timeframe == "1h" and engine in _1H_REVERSAL_ENGINES_DEFERRED_TO_3H_SR
+
+
+def _entry_adverse_drift_pct(signal_price: float, trigger_price: float, direction: str) -> float | None:
+    """Return only adverse movement; favorable retest movement is not decay."""
+    signal = _safe_float(signal_price, 0.0)
+    trigger = _safe_float(trigger_price, 0.0)
+    side = str(direction or "").strip().upper()
+    if signal <= 0 or trigger <= 0 or side not in {"LONG", "SHORT"}:
+        return None
+    adverse = (trigger - signal) if side == "LONG" else (signal - trigger)
+    return max(0.0, adverse) / signal * 100.0
+
+
 def load_successful_trade_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -2947,12 +2992,16 @@ def check_funding_filter(
     return True, "OK"
 
 
-def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Allow one direction per symbol; resolve only true LONG/SHORT conflicts.
+def resolve_symbol_direction_conflicts(
+    opportunities: list[dict], *, preserve_symbols: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Resolve true LONG/SHORT conflicts; optionally retain unresolved symbols.
 
     The existing best_opportunities_map has already deduplicated multiple events
-    in the same (symbol, direction). Here we prevent simultaneous opposite-side
-    setups for the same symbol. Score is primary; 4H is the deterministic tie-break.
+    in the same (symbol, direction). For ordinary symbols, score is primary and
+    4H is the deterministic tie-break. When the preliminary SR fetch was
+    inconclusive, callers may preserve both directions for independent final
+    pre-order checks; an opened position still prevents an opposite second entry.
     """
     by_symbol: dict[str, list[dict]] = {}
     for opp in opportunities:
@@ -2960,10 +3009,11 @@ def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[
 
     kept: list[dict] = []
     rejected: list[dict] = []
+    preserve = {str(symbol).upper() for symbol in (preserve_symbols or set())}
     tf_rank = {"4h": 2, "1h": 1}
     for symbol, items in by_symbol.items():
         directions = {str(x.get("direction", "")).upper() for x in items}
-        if len(directions) <= 1:
+        if len(directions) <= 1 or str(symbol).upper() in preserve:
             kept.extend(items)
             continue
 
@@ -2996,6 +3046,58 @@ def resolve_symbol_direction_conflicts(opportunities: list[dict]) -> tuple[list[
             }
             rejected.append(loser)
     return kept, rejected
+
+
+def prefilter_opposite_directions_by_sr(
+    opportunities: list[dict[str, Any]],
+    *,
+    snapshot_getter: Any,
+    price_getter: Any,
+    evaluator: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter true LONG/SHORT conflicts using one 3H Futures snapshot per symbol.
+
+    Fetch/evaluation errors are explicitly deferred, not treated as a rejection;
+    the mandatory independent pre-order gate remains responsible for fail-closed
+    execution. The return decisions let the caller durably journal rejections.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in opportunities:
+        grouped.setdefault(str(item.get("symbol", "")).upper(), []).append(item)
+
+    filtered: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    for symbol, items in grouped.items():
+        directions = {str(item.get("direction", "")).upper() for item in items}
+        if not ({"LONG", "SHORT"} <= directions):
+            filtered.extend(items)
+            continue
+        try:
+            snapshot = snapshot_getter(symbol)
+            current_price = float(price_getter(symbol, snapshot=snapshot))
+            if not math.isfinite(current_price) or current_price <= 0:
+                raise ValueError(f"invalid Futures price {current_price!r}")
+        except Exception as exc:
+            for item in items:
+                decisions.append({"status": "DEFERRED", "opportunity": item, "error": str(exc)})
+                filtered.append(item)
+            continue
+
+        for item in items:
+            direction = str(item.get("direction", "")).upper()
+            try:
+                result = evaluator(snapshot, current_price=current_price, direction=direction)
+            except Exception as exc:
+                decisions.append({"status": "DEFERRED", "opportunity": item, "error": str(exc)})
+                filtered.append(item)
+                continue
+            if result.get("reject"):
+                decisions.append({"status": "REJECTED", "opportunity": item, "gate_result": result})
+                continue
+            item.setdefault("setup", {})["sr_prefilter"] = _journal_safe(result)
+            decisions.append({"status": "PASSED", "opportunity": item, "gate_result": result})
+            filtered.append(item)
+    return filtered, decisions
 
 
 def _score_gate_passed(score: float, direction: str) -> bool:
@@ -3212,7 +3314,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
     is_squeeze = _is_squeeze_event(ev_type)
 
     if is_squeeze:
-        # Squeeze: TP1 at 1.00R, final TP2 at 1.50R.
+        # Squeeze entries use the same 0.60R / 1.45R execution ladder.
         tp_levels = [
             {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
             for i, (rr, fraction) in enumerate(zip(SQUEEZE_TP_RR, SQUEEZE_TP_FRACTIONS), start=1)
@@ -3220,7 +3322,7 @@ def build_tp_levels(setup: dict, direction: str, event_type: str = "") -> Tuple[
         planned_weighted_rr = SQUEEZE_PLANNED_WEIGHTED_RR
         target_rr = SQUEEZE_TP_RR[-1]
     else:
-        # Normal: TP1 at 0.65R, final TP2 at 1.50R.
+        # Normal: TP1 at 0.60R, final TP2 at 1.45R.
         tp_levels = [
             {"leg": f"tp{i}", "pnl_pct": round(sl_pct * rr, 6), "close_fraction": fraction}
             for i, (rr, fraction) in enumerate(zip(NORMAL_TP_RR, NORMAL_TP_FRACTIONS), start=1)
@@ -5162,9 +5264,10 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "execution_quality": execution_quality_guard,
             }
 
-    pre_order_drift = _entry_drift_pct(_safe_float(setup.get("signal_price", price), price), live_reference, direction) if live_reference else None
+    drift_metric = _entry_adverse_drift_pct if str(setup.get("entry_trigger_policy") or "").upper() == "RETEST" else _entry_drift_pct
+    pre_order_drift = drift_metric(_safe_float(setup.get("signal_price", price), price), live_reference, direction) if live_reference else None
     trigger_price = _safe_float((setup.get("trigger") or {}).get("trigger_price"), 0.0)
-    trigger_live_drift = _entry_drift_pct(trigger_price, live_reference, direction) if trigger_price > 0 and live_reference else None
+    trigger_live_drift = drift_metric(trigger_price, live_reference, direction) if trigger_price > 0 and live_reference else None
     effective_pre_drift = max(x for x in (pre_order_drift, trigger_live_drift) if x is not None) if (pre_order_drift is not None or trigger_live_drift is not None) else None
     if drift_limit > 0 and effective_pre_drift is not None and effective_pre_drift > drift_limit:
         return {
@@ -5174,19 +5277,19 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "execution_quality": {"signal_to_pre_order_drift_pct": pre_order_drift, "trigger_to_pre_order_drift_pct": trigger_live_drift, "pre_order_price": live_reference, "drift_limit_pct": drift_limit},
         }
 
-    # Mandatory final 3H Binance Spot Demand/Supply direction check. It is
+    # Mandatory final 3H Binance Futures Demand/Supply direction check. It is
     # independent of the optional TP-room setting below and always runs before
-    # open_market(). Binance Spot price is used for zone distance; BingX remains
+    # open_market(). Binance Futures last price is used for zone distance; BingX remains
     # the execution venue and its live price above remains the execution reference.
     sr_result: dict[str, Any] | None = None
     sr_snapshot: dict[str, Any] | None = None
     if SR_3H_DIRECTIONAL_GATE_ENABLED:
         try:
             sr_snapshot = get_cached_sr_snapshot(symbol)
-            sr_spot_price = get_spot_current_price(symbol, snapshot=sr_snapshot)
+            sr_futures_price = get_futures_current_price(symbol, snapshot=sr_snapshot)
             sr_direction_result = evaluate_sr_directional_zone(
                 sr_snapshot,
-                current_price=float(sr_spot_price),
+                current_price=float(sr_futures_price),
                 direction=direction,
             )
         except SRSymbolUnavailableError as exc:
@@ -5206,7 +5309,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "decision": "BLOCKED", "reason": "SR_3H_DATA_UNAVAILABLE",
                 "error": str(exc), "ts": int(time.time() * 1000),
             })
-            log.warning("[SR_3H] %s %s blocked: 3H Spot S/R or current Spot price unavailable: %s", direction, symbol, exc)
+            log.warning("[SR_3H] %s %s blocked: 3H Futures S/R or current Futures price unavailable: %s", direction, symbol, exc)
             return {"status": "SR_DATA_UNAVAILABLE", "mode": EXECUTION_MODE, "order_id": None, "position": {}, "error": str(exc)}
 
         setup["sr_3h_directional_context"] = sr_direction_result
@@ -6421,6 +6524,17 @@ def main() -> None:
             htf_context: dict[str, Any] = {}
             requires_div_context = ("REGULAR_" in event_type or "HIDDEN_" in event_type) and (tf == "4h" or REQUIRE_4H_CONTEXT_FOR_1H)
             requires_strategy_context = bool(ev.get("event_fact", {}).get("requires_htf_context")) and not requires_div_context
+            defer_strategy_context_to_sr = requires_strategy_context and _defer_1h_reversal_to_3h_sr(ev)
+            if defer_strategy_context_to_sr:
+                ev.setdefault("event_fact", {})["strategy_htf_context_policy"] = "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
+                record_action({
+                    "record_type": "STRATEGY_HTF_CONTEXT_DEFERRED",
+                    "event_id": ev.get("event_id"), "symbol": symbol, "direction": direction,
+                    "event_type": event_type, "timeframe": tf,
+                    "reason": "1H_STRUCTURE_REVERSAL_CONFIRMED; FINAL_DIRECTION_CHECK_USES_3H_DEMAND_SUPPLY",
+                    "ts": int(time.time() * 1000),
+                })
+                requires_strategy_context = False
             if requires_div_context or requires_strategy_context:
                 context_tf = "1d" if tf == "4h" else "4h"
                 context_limit = int(os.environ.get("KLINE_LIMIT_1D", "250")) if context_tf == "1d" else int(os.environ.get("KLINE_LIMIT_4H", "250"))
@@ -6472,16 +6586,22 @@ def main() -> None:
                 ev.setdefault("event_fact", {}).update(ctx_meta)
 
             trigger_observed_at_ts: int | None = None
+            # Trigger policy only changes entry drift when the 15m trigger is
+            # actually enforced. With REQUIRE_TRIGGER=false preserve the legacy
+            # absolute pre-order drift check.
+            use_retest_trigger = _event_uses_15m_retest(ev, trigger_required=REQUIRE_TRIGGER)
             if REQUIRE_TRIGGER:
-                if bool(ev.get("event_fact", {}).get("requires_retest")):
-                    ref_level = _safe_float(ev.get("event_fact", {}).get("trigger_level"), 0.0)
+                if use_retest_trigger:
+                    fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
+                    ref_level = _safe_float(fact.get("trigger_level"), 0.0)
                     if ref_level <= 0:
                         stats["trigger_data_failed"] += 1
                         reject_candidate("15M_RETEST_TRIGGER", "MISSING_OR_INVALID_TRIGGER_LEVEL", trigger_level=ref_level)
                         continue
                     trigger_diag = diagnose_15m_retest_trigger(
                         d15, direction, ref_level, detected_at,
-                        max_delay_min=_event_trigger_max_delay_min(ev), volume_mult=1.10
+                        max_delay_min=_event_trigger_max_delay_min(ev), volume_mult=1.10,
+                        zone_low=fact.get("zone_low"), zone_high=fact.get("zone_high"),
                     )
                 else:
                     trigger_diag = diagnose_15m_trigger(d15, direction, event_detected_at_ts=detected_at, max_trigger_delay_min=MAX_TRIGGER_DELAY, min_vol_mult=1.05)
@@ -6538,7 +6658,10 @@ def main() -> None:
                     tf_stats["trigger_data_failed"] += 1
                     reject_candidate("15M_TRIGGER", "INVALID_TRIGGER_PRICE", trigger_price=trigger_price, trigger_diagnostics=_journal_safe(trigger_diag))
                     continue
-                drift_pct = _entry_drift_pct(signal_price, trigger_price, direction)
+                drift_pct = (
+                    _entry_adverse_drift_pct(signal_price, trigger_price, direction)
+                    if use_retest_trigger else _entry_drift_pct(signal_price, trigger_price, direction)
+                )
                 drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type) else MAX_ENTRY_DRIFT_PCT
                 if drift_pct is None:
                     stats["trigger_data_failed"] += 1
@@ -6915,6 +7038,8 @@ def main() -> None:
             }
             setup["event_timeframe"] = tf
             setup["event_type"] = event_type
+            setup["entry_trigger_policy"] = "RETEST" if use_retest_trigger else "CONTINUATION"
+            setup["requires_retest"] = bool(use_retest_trigger)
             if isinstance(trend_snapshot, dict):
                 setup["trend_filter"] = trend_snapshot
             setup["entry_context"] = _entry_context(r, ev, btc_regime_snapshot)
@@ -6977,13 +7102,84 @@ def main() -> None:
     for opp in opportunities:
         tf = str(opp.get("event", {}).get("timeframe", "1h")).lower()
         _tf_stats(stats, tf)["valid_signals"] += 1
-    opportunities, conflict_rejected = resolve_symbol_direction_conflicts(opportunities)
+    # Compare both sides of true symbol conflicts against one shared cached 3H
+    # Futures snapshot before score ranking. The final live pre-order gate remains.
+    sr_prefilter_deferred_symbols: set[str] = set()
+    if SR_3H_DIRECTIONAL_GATE_ENABLED:
+        opportunities, sr_prefilter_decisions = prefilter_opposite_directions_by_sr(
+            opportunities, snapshot_getter=get_cached_sr_snapshot,
+            price_getter=get_futures_current_price, evaluator=evaluate_sr_directional_zone,
+        )
+        sr_prefilter_deferred_symbols = {
+            str((decision.get("opportunity") or {}).get("symbol", "")).upper()
+            for decision in sr_prefilter_decisions if decision.get("status") == "DEFERRED"
+        }
+        for decision in sr_prefilter_decisions:
+            item = decision.get("opportunity") if isinstance(decision.get("opportunity"), dict) else {}
+            event = item.get("event") if isinstance(item.get("event"), dict) else {}
+            symbol = str(item.get("symbol", "")).upper()
+            direction = str(item.get("direction", "")).upper()
+            event_id = str(item.get("event_id") or event.get("event_id") or "")
+            event_type = str(event.get("event_type", ""))
+            timeframe = str(event.get("timeframe", ""))
+            candidate_id = str(item.get("candidate_id") or _candidate_identifier(
+                event_id, symbol, event_type, direction,
+                (event.get("timestamps") or {}).get("detected_at_ts"), now_ms,
+            ))
+            status = str(decision.get("status", "DEFERRED"))
+            gate_result = decision.get("gate_result") if isinstance(decision.get("gate_result"), dict) else {}
+            if status == "DEFERRED":
+                _record_candidate_decision(
+                    candidate_id=candidate_id, event_id=event_id or None, symbol=symbol,
+                    direction=direction, event_type=event_type, timeframe=timeframe,
+                    stage="SR_DIRECTION_PREFILTER", decision="DEFERRED",
+                    reason="PREFILTER_UNAVAILABLE_FINAL_GATE_WILL_RECHECK",
+                    error=decision.get("error"), evaluation_ts=now_ms,
+                )
+                log.warning("[SR_PREFILTER] Deferred %s %s; final directional gate will recheck: %s", direction, symbol, decision.get("error"))
+            elif status == "PASSED":
+                _record_candidate_decision(
+                    candidate_id=candidate_id, event_id=event_id or None, symbol=symbol,
+                    direction=direction, event_type=event_type, timeframe=timeframe,
+                    stage="SR_DIRECTION_PREFILTER", decision="PASSED",
+                    reason="DIRECTION_ALLOWED_BY_3H_DEMAND_SUPPLY",
+                    sr_gate=_journal_safe(gate_result), evaluation_ts=now_ms,
+                )
+            else:
+                reason = str(gate_result.get("reject_reason") or "SR_DIRECTION_REJECTED")
+                _record_candidate_decision(
+                    candidate_id=candidate_id, event_id=event_id or None, symbol=symbol,
+                    direction=direction, event_type=event_type, timeframe=timeframe,
+                    stage="SR_DIRECTION_PREFILTER", decision="REJECTED", reason=reason,
+                    sr_gate=_journal_safe(gate_result), evaluation_ts=now_ms, terminal=True,
+                )
+                record_action({
+                    "record_type": "SR_3H_DIRECTIONAL_PREFILTER", "event_id": event_id or None,
+                    "symbol": symbol, "direction": direction, "decision": "BLOCKED",
+                    "reason": reason, "sr_gate": _journal_safe(gate_result), "ts": now_ms,
+                })
+                if event_id:
+                    terminal_event_ids.add(event_id)
+                    executed_event_ids.add(event_id)
+                    record_trade({
+                        "record_type": "EVENT_TERMINAL", "event_id": event_id,
+                        "symbol": symbol, "direction": direction, "event_type": event_type,
+                        "reason": f"SR_3H_DIRECTION_PREFILTER:{reason}", "ts": now_ms,
+                    })
+                stats["sr_direction_prefilter_rejected"] = int(stats.get("sr_direction_prefilter_rejected", 0) or 0) + 1
+
+    opportunities, conflict_rejected = resolve_symbol_direction_conflicts(
+        opportunities, preserve_symbols=sr_prefilter_deferred_symbols,
+    )
     stats["conflict_rejected"] = len(conflict_rejected)
     stats["valid_signals"] = len(opportunities)
-    def _opportunity_rank_key(item: dict[str, Any]) -> tuple[float, str, str, float]:
+    def _opportunity_rank_key(item: dict[str, Any]) -> tuple[float, float, float, str, str]:
         event = item.get("event") if isinstance(item.get("event"), dict) else {}
-        ts = _safe_float((event.get("timestamps") or {}).get("detected_at_ts"), 0.0)
-        return (-ts, str(item.get("symbol", "")), str(item.get("direction", "")), -_safe_float(item.get("score"), 0.0))
+        setup = item.get("setup") if isinstance(item.get("setup"), dict) else {}
+        trigger = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
+        trigger_ts = _safe_float(trigger.get("trigger_bar_close_ts"), 0.0)
+        detected_ts = _safe_float((event.get("timestamps") or {}).get("detected_at_ts"), 0.0)
+        return (-trigger_ts, -_safe_float(item.get("score"), 0.0), -detected_ts, str(item.get("symbol", "")), str(item.get("direction", "")))
     opportunities.sort(key=_opportunity_rank_key)
 
     for rejected in conflict_rejected:
@@ -7008,9 +7204,9 @@ def main() -> None:
                  loser, symbol, float(rejected.get("score", 0)), rejected.get("event", {}).get("timeframe"),
                  against.get("direction"), symbol, float(against.get("score", 0)), against.get("timeframe"))
 
-    log.info("[RANKING] Unique non-conflicting signals ready: %d (ordered by event recency; score is metadata, not a rank key).", len(opportunities))
+    log.info("[RANKING] Unique non-conflicting signals ready: %d (ordered by trigger recency, then setup score).", len(opportunities))
     for i, opp in enumerate(opportunities[:5], start=1):
-        log.info("  [RANKING] #%d: %s %s | Score: %.0f (not ranked on) | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
+        log.info("  [RANKING] #%d: %s %s | Score: %.0f | %s", i, opp['direction'], opp['symbol'], opp['score'], opp['event'].get('event_type'))
 
     execution_attempts_this_cycle = 0
     opened_trades_this_cycle = 0
@@ -7263,7 +7459,7 @@ def main() -> None:
                 elif status_now == "SR_SYMBOL_UNAVAILABLE":
                     terminal_reason = "SR_SYMBOL_UNAVAILABLE"
                     stats["rejected_sr_symbol"] = stats.get("rejected_sr_symbol", 0) + 1
-                    log.warning("[SR_ROOM] %s (%s) no unambiguous Binance Spot source; terminalizing event %s: %s", symbol, direction, event_id, execution_result.get("error"))
+                    log.warning("[SR_ROOM] %s (%s) no active Binance USDⓈ-M Futures contract; terminalizing event %s: %s", symbol, direction, event_id, execution_result.get("error"))
                 elif status_now == "SR_DATA_UNAVAILABLE":
                     current_fail_count = sr_data_fail_counts.get(event_id, 0) + 1
                     sr_data_fail_counts[event_id] = current_fail_count

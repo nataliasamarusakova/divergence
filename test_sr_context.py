@@ -27,7 +27,7 @@ def _snapshot(*zones):
     for center, kind in zones:
         accepted.append({"price": center, "kind": kind, "points": 2, "countpp": len(accepted) + 1})
     return {
-        "source": "binance_spot",
+        "source": "binance_usds_m_futures",
         "timeframe": "3h",
         "interval_ms": 10_800_000,
         "source_symbol": "TESTUSDT",
@@ -221,10 +221,9 @@ def test_lazy_sr_fetch_is_cached_per_latest_closed_bar(monkeypatch):
     candles = [sr.Candle(i * 10_800_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
     fake_now = (candles[-1].ts + 10_799_999 + 60_000) / 1000.0
     monkeypatch.setattr(sr.time, "time", lambda: fake_now)
-    monkeypatch.setattr(sr, "_fetch_closed_3h_spot", lambda symbol: calls.__setitem__("n", calls["n"] + 1) or (candles, {
+    monkeypatch.setattr(sr, "_fetch_closed_3h_futures", lambda symbol, **kwargs: calls.__setitem__("n", calls["n"] + 1) or (candles, {
         "requested_symbol": "TESTUSDT", "source_symbol": "TESTUSDT", "underlying_asset": "TEST",
-        "source_price_scale": 1.0, "source_volume_scale": 1.0, "source_contract_multiplier": 1.0,
-        "source_alias_kind": "EXACT",
+        "source_alias_kind": "EXACT_FUTURES", "contract_type": "PERPETUAL", "quote_asset": "USDT",
     }))
     monkeypatch.setattr(sr, "compute_current_sr", lambda *args, **kwargs: {
         "levels": [1.0], "sr_levels": [None, 1.0], "highestph": 2.0, "lowestpl": 0.5,
@@ -232,8 +231,8 @@ def test_lazy_sr_fetch_is_cached_per_latest_closed_bar(monkeypatch):
     })
     first = sr.get_cached_sr_snapshot("TEST-USDT")
     second = sr.get_cached_sr_snapshot("TEST-USDT")
-    assert first["source"] == "binance_spot"
-    assert second["source"] == "binance_spot"
+    assert first["source"] == "binance_usds_m_futures"
+    assert second["source"] == "binance_usds_m_futures"
     assert calls["n"] == 1
 
 
@@ -290,7 +289,7 @@ def test_shadow_sr_does_not_mutate_two_tp_ladder(monkeypatch):
     )
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(2.9)
 
 
 def test_enforced_sr_data_failure_blocks_candidate_without_sending_order(monkeypatch):
@@ -303,7 +302,7 @@ def test_enforced_sr_data_failure_blocks_candidate_without_sending_order(monkeyp
     monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
-    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("spot unavailable")))
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("Futures data unavailable")))
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("order must not be sent when required SR data is unavailable"))
 
@@ -325,7 +324,7 @@ def test_sr_data_failure_does_not_block_entry_when_data_is_optional(monkeypatch)
     monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", True)
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
-    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("spot unavailable")))
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("Futures data unavailable")))
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
     called = {"open": 0}
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: called.__setitem__("open", called["open"] + 1) or {
@@ -380,8 +379,8 @@ def test_post_fill_sr_recheck_allows_zone_after_tp1(monkeypatch):
     )
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
-    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
+    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.2)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(2.9)
 
 def test_post_fill_sr_does_not_mutate_tp2_when_zone_is_after_tp1(monkeypatch):
     import run_once as ro
@@ -420,108 +419,77 @@ def test_post_fill_sr_does_not_mutate_tp2_when_zone_is_after_tp1(monkeypatch):
     )
     assert out["status"] == "opened_protected"
     assert [x["leg"] for x in captured["tp_levels"]] == ["tp1", "tp2"]
-    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.3)
-    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(3.0)
+    assert captured["tp_levels"][0]["pnl_pct"] == pytest.approx(1.2)
+    assert captured["tp_levels"][1]["pnl_pct"] == pytest.approx(2.9)
 
 
 
-def test_spot_resolver_prefers_exact_active_pair(monkeypatch):
+def test_futures_resolver_uses_exact_active_perpetual_symbol(monkeypatch):
     import event_engine.sr_context as sr
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda **kwargs: {
-        "SHIBUSDT": {"symbol": "SHIBUSDT", "baseAsset": "SHIB"},
-        "1000SHIBUSDT": {"symbol": "1000SHIBUSDT", "baseAsset": "1000SHIB"},
+
+    calls = []
+    monkeypatch.setattr(sr, "resolve_binance_futures_symbol", lambda symbol: calls.append(symbol) or symbol)
+    out = sr.resolve_futures_symbol("1000SHIB-USDT")
+    assert out["requested_symbol"] == "1000SHIBUSDT"
+    assert out["source_symbol"] == "1000SHIBUSDT"
+    assert out["source_alias_kind"] == "EXACT_FUTURES"
+    assert out["contract_type"] == "PERPETUAL"
+    assert calls == ["1000SHIBUSDT"]
+
+
+def test_futures_resolver_uses_direct_contract_without_cross_venue_scaling(monkeypatch):
+    import event_engine.sr_context as sr
+
+    monkeypatch.setattr(sr, "resolve_binance_futures_symbol", lambda symbol: symbol)
+    for logical in ("1000SHIB", "1000PEPE", "1000BONK", "1INCH"):
+        resolved = sr.resolve_futures_symbol(logical)
+        assert resolved["source_symbol"] == f"{logical}USDT"
+        assert resolved["source_alias_kind"] == "EXACT_FUTURES"
+        assert "source_price_scale" not in resolved
+        assert "source_volume_scale" not in resolved
+
+
+def test_futures_resolver_fails_closed_when_contract_is_not_listed(monkeypatch):
+    import event_engine.sr_context as sr
+
+    monkeypatch.setattr(sr, "resolve_binance_futures_symbol", lambda _symbol: None)
+    with pytest.raises(sr.SRSymbolUnavailableError, match="Binance USDⓈ-M Futures"):
+        sr.resolve_futures_symbol("NOTLISTED")
+
+
+def test_futures_1h_kline_fetch_uses_shared_binance_client_without_price_scaling(monkeypatch):
+    import event_engine.sr_context as sr
+
+    monkeypatch.setattr(sr, "SR_MIN_CANDLES", 2)
+    monkeypatch.setattr(sr, "resolve_futures_symbol", lambda _symbol: {
+        "requested_symbol": "1000SHIBUSDT", "source_symbol": "1000SHIBUSDT",
+        "underlying_asset": "1000SHIB", "source_alias_kind": "EXACT_FUTURES",
+        "contract_type": "PERPETUAL", "quote_asset": "USDT",
     })
-    out = sr.resolve_spot_symbol("SHIB")
-    assert out["source_symbol"] == "SHIBUSDT"
-    assert out["source_price_scale"] == pytest.approx(1.0)
-    assert out["source_volume_scale"] == pytest.approx(1.0)
-    out_prefixed = sr.resolve_spot_symbol("1000SHIB")
-    assert out_prefixed["source_symbol"] == "1000SHIBUSDT"
-    assert out_prefixed["source_alias_kind"] == "EXACT"
+    rows = [
+        {"open_time": i * sr.SR_SOURCE_INTERVAL_MS, "open": 1.0 + i, "high": 1.2 + i,
+         "low": 0.8 + i, "close": 1.1 + i, "volume": 5000.0 + i}
+        for i in range(6)
+    ]
+    calls = []
+    monkeypatch.setattr(sr, "fetch_futures_klines", lambda symbol, interval, limit: calls.append((symbol, interval, limit)) or rows)
+
+    candles, meta = sr._fetch_closed_1h_futures("1000SHIB", limit=6)
+    assert calls == [("1000SHIBUSDT", "1h", 6)]
+    assert len(candles) == 6
+    assert candles[0].open == pytest.approx(1.0)
+    assert candles[0].volume == pytest.approx(5000.0)
+    assert meta["source_symbol"] == "1000SHIBUSDT"
 
 
-def test_spot_resolver_maps_numeric_prefix_to_underlying_with_price_scale(monkeypatch):
-    import event_engine.sr_context as sr
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda **kwargs: {
-        "SHIBUSDT": {"symbol": "SHIBUSDT", "baseAsset": "SHIB"},
-        "PEPEUSDT": {"symbol": "PEPEUSDT", "baseAsset": "PEPE"},
-        "BONKUSDT": {"symbol": "BONKUSDT", "baseAsset": "BONK"},
-    })
-    for logical, source in (("1000SHIB", "SHIBUSDT"), ("1000PEPE", "PEPEUSDT"), ("1000BONK", "BONKUSDT")):
-        out = sr.resolve_spot_symbol(logical)
-        assert out["source_symbol"] == source
-        assert out["source_alias_kind"] == "NUMERIC_PREFIX_UNDERLYING"
-        assert out["source_price_scale"] == pytest.approx(1000.0)
-        assert out["source_volume_scale"] == pytest.approx(0.001)
-        assert out["source_contract_multiplier"] == pytest.approx(1000.0)
-
-
-def test_spot_resolver_does_not_treat_1inch_as_numeric_prefix(monkeypatch):
-    import event_engine.sr_context as sr
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda **kwargs: {
-        "1INCHUSDT": {"symbol": "1INCHUSDT", "baseAsset": "1INCH"},
-    })
-    out = sr.resolve_spot_symbol("1INCH")
-    assert out["source_symbol"] == "1INCHUSDT"
-    assert out["source_price_scale"] == pytest.approx(1.0)
-
-
-def test_spot_resolver_fails_closed_on_ambiguous_numeric_prefix_source(monkeypatch):
-    import event_engine.sr_context as sr
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda **kwargs: {
-        "1000ABCUSDT": {"symbol": "1000ABCUSDT", "baseAsset": "1000ABC"},
-        "10000ABCUSDT": {"symbol": "10000ABCUSDT", "baseAsset": "10000ABC"},
-    })
-    with pytest.raises(sr.SRSymbolUnavailableError):
-        sr.resolve_spot_symbol("ABC")
-
-
-def test_spot_resolver_fails_closed_when_no_source_exists(monkeypatch):
-    import event_engine.sr_context as sr
-    monkeypatch.setattr(sr, "_spot_symbol_catalog", lambda **kwargs: {})
-    with pytest.raises(sr.SRSymbolUnavailableError):
-        sr.resolve_spot_symbol("NOTLISTED")
-
-
-def test_spot_kline_alias_scales_prices_and_volume(monkeypatch):
+def test_futures_live_price_uses_resolved_perpetual_symbol(monkeypatch):
     import event_engine.sr_context as sr
 
-    resolved = {
-        "requested_symbol": "1000SHIBUSDT",
-        "source_symbol": "SHIBUSDT",
-        "underlying_asset": "SHIB",
-        "source_price_scale": 1000.0,
-        "source_volume_scale": 0.001,
-        "source_contract_multiplier": 1000.0,
-        "source_alias_kind": "NUMERIC_PREFIX_UNDERLYING",
-    }
-    now_ms = 10_000_000
-    monkeypatch.setattr(sr.time, "time", lambda: now_ms / 1000.0)
-    monkeypatch.setattr(sr, "SR_PRD", 0)
-    monkeypatch.setattr(sr, "SR_RB", 0)
-
-    class Response:
-        status_code = 200
-        def raise_for_status(self):
-            return None
-        def json(self):
-            return [
-                [0, "1", "1.2", "0.8", "1.1", "5000", 3_599_999],
-                [3_600_000, "1.1", "1.3", "0.9", "1.2", "6000", 7_199_999],
-            ]
-
-    monkeypatch.setattr(sr, "resolve_spot_symbol", lambda symbol, **kwargs: dict(resolved))
-    monkeypatch.setattr(sr, "_SESSION", type("S", (), {"get": lambda self, *args, **kwargs: Response()})())
-    monkeypatch.setattr(sr, "_rate_limit_before_request", lambda: None)
-    candles, meta = sr._fetch_closed_1h_spot("1000SHIB", resolved=resolved)
-    assert len(candles) == 2
-    # Spot OHLCV is converted into the logical 1000SHIB futures price/quantity unit.
-    assert candles[0].open == pytest.approx(1000.0)
-    assert candles[0].high == pytest.approx(1200.0)
-    assert candles[0].low == pytest.approx(800.0)
-    assert candles[0].close == pytest.approx(1100.0)
-    assert candles[0].volume == pytest.approx(5.0)
-    assert meta["source_symbol"] == "SHIBUSDT"
+    calls = []
+    monkeypatch.setattr(sr, "fetch_futures_price", lambda symbol: calls.append(symbol) or 2.9459)
+    out = sr.get_futures_current_price("PIEVERSE", snapshot={"source_symbol": "PIEVERSEUSDT"})
+    assert out == pytest.approx(2.9459)
+    assert calls == ["PIEVERSEUSDT"]
 
 
 def test_sr_semantics_do_not_confuse_pivot_high_below_long_entry_with_support():
@@ -559,23 +527,24 @@ def test_sr_semantics_for_short_use_low_as_opposing_high_as_supporting():
     assert supporting["nearest_supporting_zone"] is not None
 
 
-def test_custom_sr_limit_is_passed_to_spot_klines_without_using_cache(monkeypatch):
+def test_custom_sr_limit_is_passed_to_futures_klines_without_using_cache(monkeypatch):
     import event_engine.sr_context as sr
     sr.clear_sr_cache()
     seen = {}
     candles = [sr.Candle(i * 10_800_000, 1, 2, 0.5, 1.5, 10) for i in range(300)]
+
     def fake_fetch(symbol, **kwargs):
         seen.update(kwargs)
         return candles, {
-            "requested_symbol": sr.normalize_spot_symbol(symbol),
+            "requested_symbol": sr.normalize_futures_symbol(symbol),
             "source_symbol": "TESTUSDT",
             "underlying_asset": "TEST",
-            "source_price_scale": 1.0,
-            "source_volume_scale": 1.0,
-            "source_contract_multiplier": 1.0,
-            "source_alias_kind": "EXACT",
+            "source_alias_kind": "EXACT_FUTURES",
+            "contract_type": "PERPETUAL",
+            "quote_asset": "USDT",
         }
-    monkeypatch.setattr(sr, "_fetch_closed_3h_spot", fake_fetch)
+
+    monkeypatch.setattr(sr, "_fetch_closed_3h_futures", fake_fetch)
     monkeypatch.setattr(sr.time, "time", lambda: (candles[-1].ts + 10_799_999 + 60_000) / 1000.0)
     monkeypatch.setattr(sr, "compute_current_sr", lambda *args, **kwargs: {
         "levels": [1.0], "sr_levels": [None, 1.0], "highestph": 2.0, "lowestpl": 0.5,
@@ -584,66 +553,7 @@ def test_custom_sr_limit_is_passed_to_spot_klines_without_using_cache(monkeypatc
     out = sr.get_cached_sr_snapshot("TEST", limit=777)
     assert seen["limit"] == 777
     assert out["source_symbol"] == "TESTUSDT"
-
-
-def test_spot_http_400_re_resolves_symbol_and_retries_once(monkeypatch):
-    import event_engine.sr_context as sr
-
-    first = {
-        "requested_symbol": "1000SHIBUSDT",
-        "source_symbol": "1000SHIBUSDT",
-        "underlying_asset": "1000SHIB",
-        "source_price_scale": 1.0,
-        "source_volume_scale": 1.0,
-        "source_contract_multiplier": 1.0,
-        "source_alias_kind": "EXACT",
-    }
-    second = {
-        "requested_symbol": "1000SHIBUSDT",
-        "source_symbol": "SHIBUSDT",
-        "underlying_asset": "SHIB",
-        "source_price_scale": 1000.0,
-        "source_volume_scale": 0.001,
-        "source_contract_multiplier": 1000.0,
-        "source_alias_kind": "NUMERIC_PREFIX_UNDERLYING",
-    }
-    resolutions = [first, second]
-    responses = []
-    class Response:
-        def __init__(self, code, rows):
-            self.status_code = code
-            self._rows = rows
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise RuntimeError("HTTP 400")
-        def json(self):
-            return self._rows
-    responses.extend([
-        Response(400, {"code": -1121}),
-        Response(200, [
-            [0, "1", "1.2", "0.8", "1.1", "5", 3_599_999],
-            [3_600_000, "1.1", "1.3", "0.9", "1.2", "6", 7_199_999],
-        ]),
-    ])
-    monkeypatch.setattr(sr, "resolve_spot_symbol", lambda symbol, **kwargs: resolutions.pop(0))
-    monkeypatch.setattr(sr, "clear_spot_symbol_cache", lambda: None)
-    monkeypatch.setattr(sr, "_rate_limit_before_request", lambda: None)
-    monkeypatch.setattr(sr, "_SESSION", type("S", (), {"get": lambda self, *args, **kwargs: responses.pop(0)})())
-    monkeypatch.setattr(sr.time, "time", lambda: 10_000_000 / 1000.0)
-    monkeypatch.setattr(sr, "SR_PRD", 0)
-    monkeypatch.setattr(sr, "SR_RB", 0)
-    candles, meta = sr._fetch_closed_1h_spot("1000SHIB")
-    assert meta["source_symbol"] == "SHIBUSDT"
-    assert candles[0].close == pytest.approx(1100.0)
-
-
-def test_quantity_prefixed_spot_price_scale_matches_futures_unit():
-    # Current Binance market data uses approximately 1000x quoted-price ratio
-    # between 1000SHIBUSDT and SHIBUSDT; the resolver must preserve that unit.
-    spot_price = 0.00000589
-    futures_price = 0.00589
-    ratio = futures_price / spot_price
-    assert ratio == pytest.approx(1000.0, rel=1e-6)
+    assert out["source"] == "binance_usds_m_futures"
 
 
 def test_entry_overlapping_support_zone_wins_over_closer_nonoverlapping_zone(monkeypatch):

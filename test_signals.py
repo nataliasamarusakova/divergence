@@ -328,7 +328,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_long = build_event_setup({"direction": "LONG"}, df, entry_price=100.0)
     assert setup_long["invalidation_price"] < 100.0
     assert setup_long["target_price"] > 100.0
-    assert setup_long["planned_weighted_rr"] == pytest.approx(1.2875)
+    assert setup_long["planned_weighted_rr"] == pytest.approx(1.195)
     sl_pct_l, tp_levels_l = build_tp_levels(setup_long, "LONG")
     assert sl_pct_l > 0
     assert len(tp_levels_l) == 2
@@ -338,7 +338,7 @@ def test_setup_and_tp_levels_symmetry():
     setup_short = build_event_setup({"direction": "SHORT"}, df, entry_price=100.0)
     assert setup_short["invalidation_price"] > 100.0
     assert setup_short["target_price"] < 100.0
-    assert setup_short["planned_weighted_rr"] == pytest.approx(1.2875)
+    assert setup_short["planned_weighted_rr"] == pytest.approx(1.195)
     sl_pct_s, tp_levels_s = build_tp_levels(setup_short, "SHORT")
     assert sl_pct_s > 0
     assert len(tp_levels_s) == 2
@@ -2242,22 +2242,22 @@ def test_tighter_tp_levels_are_consistent_for_normal_and_squeeze():
 
     # Regular divergence setup
     div_setup = build_event_setup({"direction": "LONG", "event_type": "REGULAR_BULLISH_RSI"}, df, entry_price=100.0)
-    assert div_setup["target_rr"] == 1.50
-    assert div_setup["planned_weighted_rr"] == pytest.approx(1.2875)
+    assert div_setup["target_rr"] == 1.45
+    assert div_setup["planned_weighted_rr"] == pytest.approx(1.195)
     sl_pct_div, tp_div = build_tp_levels(div_setup, "LONG", event_type="REGULAR_BULLISH_RSI")
     assert [x["leg"] for x in tp_div] == ["tp1", "tp2"]
-    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.65)
-    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.50)
-    assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.25, 0.75])
+    assert tp_div[0]["pnl_pct"] == pytest.approx(sl_pct_div * 0.60)
+    assert tp_div[1]["pnl_pct"] == pytest.approx(sl_pct_div * 1.45)
+    assert [x["close_fraction"] for x in tp_div] == pytest.approx([0.30, 0.70])
 
     # Squeeze setup
     sq_setup = build_event_setup({"direction": "LONG", "event_type": "VOLATILITY_SQUEEZE_RELEASE"}, df, entry_price=100.0)
-    assert sq_setup["target_rr"] == 1.5
-    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.35)
+    assert sq_setup["target_rr"] == 1.45
+    assert sq_setup["planned_weighted_rr"] == pytest.approx(1.195)
     sl_pct_sq, tp_sq = build_tp_levels(sq_setup, "LONG", event_type="VOLATILITY_SQUEEZE_RELEASE")
     assert [x["leg"] for x in tp_sq] == ["tp1", "tp2"]
-    assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.00)
-    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.50)
+    assert tp_sq[0]["pnl_pct"] == pytest.approx(sl_pct_sq * 0.60)
+    assert tp_sq[1]["pnl_pct"] == pytest.approx(sl_pct_sq * 1.45)
     assert tp_sq[0]["close_fraction"] == 0.30
     assert tp_sq[1]["close_fraction"] == 0.70
 
@@ -3198,6 +3198,143 @@ def test_retest_trigger_prefers_latest_valid_retest_within_window():
                                       max_delay_min=60, volume_mult=1.10)
     assert out["ok"] is True
     assert out["trigger_bar_close_ts"] == rows[23]["close_time"]
+
+
+def test_retest_trigger_rejects_a_candle_that_invalidates_the_distal_zone_edge():
+    from event_engine.signals import diagnose_15m_retest_trigger
+    rows = []
+    base = 1_000_000
+    for i in range(30):
+        rows.append({
+            "open": 100.0, "high": 102.0, "low": 99.9, "close": 101.0,
+            "volume": 1_000.0, "close_time": base + i * 15 * 60_000,
+        })
+    event_ts = rows[20]["close_time"]
+    # The only candidate touches the retest level and closes bullish, but pierces
+    # the distal edge of the LONG order-block zone. It must not qualify.
+    rows[22].update({"open": 100.8, "high": 102.0, "low": 99.7, "close": 101.2, "volume": 2_000})
+    out = diagnose_15m_retest_trigger(
+        pd.DataFrame(rows), "LONG", 100.0, event_ts, max_delay_min=60,
+        volume_mult=1.10, zone_low=99.8, zone_high=102.0,
+    )
+    assert out["ok"] is False
+    assert out["reason"] == "no_retest_window"
+
+
+def test_retest_trigger_remains_invalid_after_a_prior_bar_breaks_distal_zone_edge():
+    from event_engine.signals import diagnose_15m_retest_trigger
+    rows = []
+    base = 1_000_000
+    for i in range(30):
+        rows.append({
+            "open": 100.0, "high": 102.0, "low": 99.9, "close": 101.0,
+            "volume": 1_000.0, "close_time": base + i * 15 * 60_000,
+        })
+    event_ts = rows[20]["close_time"]
+    # An earlier post-event candle invalidates the long zone. A later candle
+    # touches/reclaims the trigger level but cannot revive the broken setup.
+    rows[21].update({"open": 99.9, "high": 101.0, "low": 99.7, "close": 100.5, "volume": 2_000})
+    rows[22].update({"open": 100.8, "high": 102.0, "low": 99.9, "close": 101.2, "volume": 2_100})
+    out = diagnose_15m_retest_trigger(
+        pd.DataFrame(rows), "LONG", 100.0, event_ts, max_delay_min=60,
+        volume_mult=1.10, zone_low=99.8, zone_high=102.0,
+    )
+    assert out["ok"] is False
+    assert out["reason"] == "no_retest_window"
+
+
+def test_retest_trigger_rejects_malformed_zone_bounds():
+    from event_engine.signals import diagnose_15m_retest_trigger
+    rows = []
+    base = 1_000_000
+    for i in range(25):
+        rows.append({"open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0,
+                     "volume": 1_000.0, "close_time": base + i * 15 * 60_000})
+    out = diagnose_15m_retest_trigger(pd.DataFrame(rows), "LONG", 100.0, rows[20]["close_time"],
+                                      zone_low=103.0, zone_high=102.0)
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_zone_bounds"
+
+
+def test_15m_retest_policy_uses_continuation_for_already_confirmed_source_engines():
+    import run_once as ro
+    continuation_engines = ["SFP", "BREAKER_BLOCK", "EMA_PULLBACK", "LIQUIDITY_SWEEP",
+                            "VOLATILITY_SQUEEZE", "BREAKOUT_MOMENTUM"]
+    for engine in continuation_engines:
+        event = {"event_fact": {"engine": engine, "requires_retest": True}}
+        assert ro._event_uses_15m_retest(event) is False, engine
+    for engine in ["ORDER_BLOCK", "DONCHIAN_RETEST", "MA_COMPRESSION", "MITIGATION_BLOCK", "CRT"]:
+        event = {"event_fact": {"engine": engine, "requires_retest": True}}
+        assert ro._event_uses_15m_retest(event) is True, engine
+    # If global 15m trigger enforcement is disabled, do not accidentally label
+    # the setup as RETEST (which would otherwise relax pre-order drift checks).
+    assert ro._event_uses_15m_retest(
+        {"event_fact": {"engine": "ORDER_BLOCK", "requires_retest": True}},
+        trigger_required=False,
+    ) is False
+
+
+def test_only_one_hour_reversal_engines_defer_strategy_context_to_mandatory_3h_sr():
+    import run_once as ro
+    for engine in ["SFP", "LIQUIDITY_SWEEP", "BREAKER_BLOCK", "CRT"]:
+        assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "1h", "event_fact": {"engine": engine}}) is True
+        assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "4h", "event_fact": {"engine": engine}}) is False
+    assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "1h", "event_fact": {"engine": "ORDER_BLOCK"}}) is False
+
+
+def test_adverse_drift_ignores_favorable_retest_and_penalizes_chase():
+    import run_once as ro
+    assert ro._entry_adverse_drift_pct(100.0, 98.0, "LONG") == pytest.approx(0.0)
+    assert ro._entry_adverse_drift_pct(100.0, 102.0, "LONG") == pytest.approx(2.0)
+    assert ro._entry_adverse_drift_pct(100.0, 102.0, "SHORT") == pytest.approx(0.0)
+    assert ro._entry_adverse_drift_pct(100.0, 98.0, "SHORT") == pytest.approx(2.0)
+
+
+def test_sr_prefilter_keeps_the_direction_allowed_by_3h_before_score_conflict():
+    import run_once as ro
+    long = {"symbol": "TEST", "direction": "LONG", "score": 99.0, "event_id": "LONG1",
+            "event": {"event_type": "REGULAR_BULLISH_RSI", "timeframe": "1h"}, "setup": {}}
+    short = {"symbol": "TEST", "direction": "SHORT", "score": 50.0, "event_id": "SHORT1",
+             "event": {"event_type": "REGULAR_BEARISH_RSI", "timeframe": "1h"}, "setup": {}}
+    calls = {"snapshot": 0, "price": 0}
+    def snapshot_getter(symbol):
+        calls["snapshot"] += 1
+        return {"snapshot_for": symbol}
+    def price_getter(symbol, *, snapshot):
+        calls["price"] += 1
+        return 100.0
+    def evaluator(snapshot, *, current_price, direction):
+        return {"reject": direction == "LONG", "reject_reason": "WRONG_ZONE" if direction == "LONG" else None}
+    filtered, decisions = ro.prefilter_opposite_directions_by_sr(
+        [long, short], snapshot_getter=snapshot_getter, price_getter=price_getter, evaluator=evaluator,
+    )
+    kept, rejected = ro.resolve_symbol_direction_conflicts(filtered)
+    assert [item["direction"] for item in kept] == ["SHORT"]
+    assert rejected == []
+    assert [decision["status"] for decision in decisions] == ["REJECTED", "PASSED"]
+    assert calls == {"snapshot": 1, "price": 1}
+
+
+def test_sr_prefilter_defers_both_directions_when_snapshot_is_unavailable():
+    import run_once as ro
+    opportunities = [
+        {"symbol": "TEST", "direction": "LONG", "score": 90.0, "setup": {}},
+        {"symbol": "TEST", "direction": "SHORT", "score": 80.0, "setup": {}},
+    ]
+    def fail_snapshot(_symbol):
+        raise RuntimeError("temporary Futures API outage")
+    filtered, decisions = ro.prefilter_opposite_directions_by_sr(
+        opportunities, snapshot_getter=fail_snapshot, price_getter=lambda *a, **k: 100.0,
+        evaluator=lambda *a, **k: {"reject": False},
+    )
+    assert filtered == opportunities
+    assert [decision["status"] for decision in decisions] == ["DEFERRED", "DEFERRED"]
+
+    # Preserve both sides for their independent final SR checks instead of
+    # choosing a score winner while the preliminary directional data is unknown.
+    kept, rejected = ro.resolve_symbol_direction_conflicts(filtered, preserve_symbols={"TEST"})
+    assert len(kept) == 2
+    assert rejected == []
 
 
 def test_event_max_age_allows_retest_engine_window():

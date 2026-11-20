@@ -9,12 +9,10 @@ def _snapshot(*zones, cwidth=0.5, timeframe="3h"):
         for i, (center, kind) in enumerate(zones)
     ]
     return {
-        "source": "binance_spot",
+        "source": "binance_usds_m_futures",
         "timeframe": timeframe,
         "interval_ms": 10_800_000,
         "source_symbol": "TESTUSDT",
-        "source_price_scale": 1.0,
-        "source_volume_scale": 1.0,
         "latest_closed_timestamp": 1_800_000_000_000,
         "latest_closed_age_min": 10.0,
         "cwidth": cwidth,
@@ -126,47 +124,35 @@ def test_directional_gate_rejects_missing_or_non_3h_snapshot():
     assert no_timeframe["reject_reason"] == "SR_TIMEFRAME_MISMATCH"
 
 
-def test_spot_snapshot_aggregates_three_closed_1h_candles_into_3h(monkeypatch):
+def test_futures_snapshot_aggregates_three_closed_1h_candles_into_3h(monkeypatch):
     import event_engine.sr_context as sr
 
-    monkeypatch.setattr(sr, "SR_PRD", 0)
-    monkeypatch.setattr(sr, "SR_RB", 0)
-    now_ms = 26_000_000
-    monkeypatch.setattr(sr.time, "time", lambda: now_ms / 1000.0)
+    monkeypatch.setattr(sr, "SR_MIN_CANDLES", 2)
+    monkeypatch.setattr(sr, "SR_ATR_LENGTH", 1)
+    monkeypatch.setattr(sr, "SR_SWING_LENGTH", 1)
     resolved = {
         "requested_symbol": "TESTUSDT", "source_symbol": "TESTUSDT", "underlying_asset": "TEST",
-        "source_price_scale": 1.0, "source_volume_scale": 1.0,
-        "source_contract_multiplier": 1.0, "source_alias_kind": "EXACT",
+        "source_alias_kind": "EXACT_FUTURES", "contract_type": "PERPETUAL", "quote_asset": "USDT",
     }
-    response = type("Response", (), {
-        "status_code": 200,
-        "raise_for_status": lambda self: None,
-        "json": lambda self: [
-            [0, "10", "11", "9", "10.5", "100", 3_599_999],
-            [3_600_000, "10.5", "12", "10", "11", "120", 7_199_999],
-            [7_200_000, "11", "12", "10", "11.5", "90", 10_799_999],
-            [10_800_000, "11.5", "13", "11", "12", "70", 14_399_999],
-            [14_400_000, "12", "14", "11.5", "13", "80", 17_999_999],
-            [18_000_000, "13", "15", "12", "14", "95", 21_599_999],
-            # A seventh closed 1h candle is a partial 3h bucket and must not be emitted.
-            [21_600_000, "14", "16", "13", "15", "50", 25_199_999],
-            # This current 1h candle is still open and is excluded before aggregation.
-            [25_200_000, "15", "17", "14", "16", "40", 28_799_999],
-        ],
-    })()
+    hourly = [
+        sr.Candle(0, 10, 11, 9, 10.5, 100),
+        sr.Candle(3_600_000, 10.5, 12, 10, 11, 120),
+        sr.Candle(7_200_000, 11, 12, 10, 11.5, 90),
+        sr.Candle(10_800_000, 11.5, 13, 11, 12, 70),
+        sr.Candle(14_400_000, 12, 14, 11.5, 13, 80),
+        sr.Candle(18_000_000, 13, 15, 12, 14, 95),
+        # A seventh closed 1h candle is a partial 3h bucket and is not emitted.
+        sr.Candle(21_600_000, 14, 16, 13, 15, 50),
+    ]
     calls = []
-    class Session:
-        def get(self, url, **kwargs):
-            calls.append((url, kwargs))
-            return response
-    monkeypatch.setattr(sr, "resolve_spot_symbol", lambda symbol, **kwargs: dict(resolved))
-    monkeypatch.setattr(sr, "_SESSION", Session())
-    monkeypatch.setattr(sr, "_rate_limit_before_request", lambda: None)
+    monkeypatch.setattr(
+        sr, "_fetch_closed_1h_futures",
+        lambda symbol, **kwargs: calls.append((symbol, kwargs)) or (hourly, resolved),
+    )
 
-    candles, meta = sr._fetch_closed_3h_spot("TEST")
+    candles, meta = sr._fetch_closed_3h_futures("TEST")
     assert len(candles) == 2
-    assert calls[0][1]["params"]["interval"] == "1h"  # Binance Spot has no native 3h interval.
-    assert calls[0][1]["params"]["symbol"] == "TESTUSDT"
+    assert calls == [("TEST", {"resolved": None, "limit": None})]
     assert candles[0].ts == 0
     assert candles[0].open == pytest.approx(10.0)
     assert candles[0].high == pytest.approx(12.0)
@@ -203,26 +189,16 @@ def test_3h_aggregation_drops_incomplete_or_misaligned_hour_groups():
     assert candles[0].volume == pytest.approx(12.0)
 
 
-def test_get_spot_current_price_uses_spot_ticker_and_alias_price_scale(monkeypatch):
+def test_get_futures_current_price_uses_same_perpetual_symbol_without_scaling(monkeypatch):
     import event_engine.sr_context as sr
 
     captured = {}
-    class Response:
-        def raise_for_status(self): return None
-        def json(self): return {"symbol": "SHIBUSDT", "price": "0.000005"}
-    class Session:
-        def get(self, url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return Response()
-    monkeypatch.setattr(sr, "_SESSION", Session())
-    monkeypatch.setattr(sr, "_rate_limit_before_request", lambda: None)
-    out = sr.get_spot_current_price("1000SHIB", snapshot={
-        "source_symbol": "SHIBUSDT", "source_price_scale": 1000.0,
-    })
-    assert out == pytest.approx(0.005)
-    assert captured["params"]["symbol"] == "SHIBUSDT"
-    assert captured["url"].endswith("/api/v3/ticker/price")
+    monkeypatch.setattr(sr, "fetch_futures_price", lambda symbol: captured.setdefault("symbol", symbol) or 2.9459)
+    # setdefault returns the symbol, so use an explicit deterministic stub.
+    monkeypatch.setattr(sr, "fetch_futures_price", lambda symbol: captured.update({"symbol": symbol}) or 2.9459)
+    out = sr.get_futures_current_price("PIEVERSE", snapshot={"source_symbol": "PIEVERSEUSDT"})
+    assert out == pytest.approx(2.9459)
+    assert captured["symbol"] == "PIEVERSEUSDT"
 
 
 def test_execute_new_position_hard_blocks_direction_conflict_before_bingx_order(monkeypatch):
@@ -232,7 +208,7 @@ def test_execute_new_position_hard_blocks_direction_conflict_before_bingx_order(
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
     monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: _snapshot((95.0, "L")))
-    monkeypatch.setattr(ro, "get_spot_current_price", lambda symbol, snapshot=None: 100.0)
+    monkeypatch.setattr(ro, "get_futures_current_price", lambda symbol, snapshot=None: 100.0)
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("opposing entry must not reach BingX"))
     setup = {"signal_price": 100.0, "event_type": "DONCHIAN_RETEST_BREAKOUT"}
@@ -242,13 +218,13 @@ def test_execute_new_position_hard_blocks_direction_conflict_before_bingx_order(
     assert out["sr_3h"]["allowed_direction"] == "LONG"
 
 
-def test_execute_new_position_fails_closed_when_3h_spot_data_unavailable(monkeypatch):
+def test_execute_new_position_fails_closed_when_3h_futures_data_unavailable(monkeypatch):
     import run_once as ro
 
     monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", True)
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
-    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("spot down")))
+    monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("Futures data down")))
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("missing 3H context must fail closed"))
     out = ro.execute_new_position("TEST", "LONG", 100.0, {"signal_price": 100.0}, "EVT_3H_NO_DATA")
@@ -263,7 +239,7 @@ def test_execute_new_position_allows_matching_zone_to_reach_bingx_order(monkeypa
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
     monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda symbol: _snapshot((95.0, "L")))
-    monkeypatch.setattr(ro, "get_spot_current_price", lambda symbol, snapshot=None: 100.0)
+    monkeypatch.setattr(ro, "get_futures_current_price", lambda symbol, snapshot=None: 100.0)
     monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
     monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: calls.__setitem__("open", calls["open"] + 1) or {
         "status": "error", "error": "STOP_AFTER_PROOF_GATE_REACHED",
@@ -276,12 +252,12 @@ def test_execute_new_position_allows_matching_zone_to_reach_bingx_order(monkeypa
 def test_3h_fetch_fails_closed_when_incomplete_bucket_creates_history_gap(monkeypatch):
     import event_engine.sr_context as sr
 
-    monkeypatch.setattr(sr, "SR_PRD", 0)
-    monkeypatch.setattr(sr, "SR_RB", 0)
+    monkeypatch.setattr(sr, "SR_MIN_CANDLES", 2)
+    monkeypatch.setattr(sr, "SR_ATR_LENGTH", 1)
+    monkeypatch.setattr(sr, "SR_SWING_LENGTH", 1)
     resolved = {
         "requested_symbol": "TESTUSDT", "source_symbol": "TESTUSDT", "underlying_asset": "TEST",
-        "source_price_scale": 1.0, "source_volume_scale": 1.0,
-        "source_contract_multiplier": 1.0, "source_alias_kind": "EXACT",
+        "source_alias_kind": "EXACT_FUTURES", "contract_type": "PERPETUAL", "quote_asset": "USDT",
     }
     # Complete bucket at 00:00, incomplete bucket at 03:00, then complete bucket at 06:00.
     hourly = [
@@ -295,6 +271,6 @@ def test_3h_fetch_fails_closed_when_incomplete_bucket_creates_history_gap(monkey
         sr.Candle(25_200_000, 10, 11, 9, 10, 1),
         sr.Candle(28_800_000, 10, 11, 9, 10, 1),
     ]
-    monkeypatch.setattr(sr, "_fetch_closed_spot", lambda *args, **kwargs: (hourly, resolved))
-    with pytest.raises(ValueError, match="Incomplete 3H Spot history"):
-        sr._fetch_closed_3h_spot("TEST")
+    monkeypatch.setattr(sr, "_fetch_closed_1h_futures", lambda *args, **kwargs: (hourly, resolved))
+    with pytest.raises(ValueError, match="Incomplete Futures 3H history"):
+        sr._fetch_closed_3h_futures("TEST")
