@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795196203257,
+  "updated_ts": 1795196493155,
   "events": [
     {
       "event_id": "EVT_948BDFF22D8A6483",
@@ -5393,6 +5393,60 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_D46243AF477B5A62",
+      "symbol": "PROM",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "EMA_PULLBACK_CONTINUATION",
+      "timestamps": {
+        "pivot_1_ts": 1795193999999,
+        "pivot_2_ts": 1795193999999,
+        "detected_at_ts": 1795193999999
+      },
+      "event_fact": {
+        "detection_close_price": 5.003,
+        "ema_fast": 5.497082311646954,
+        "ema_slow": 5.503524989391045,
+        "ema200": 5.347261134926643,
+        "body_atr": 2.643585094527723,
+        "volume_ratio": 7.189399215781664,
+        "trigger_level": 5.497082311646954,
+        "requires_retest": true,
+        "engine": "EMA_PULLBACK",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_1D1A9255221338AE",
+      "symbol": "PROM",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "ORDER_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1795179599999,
+        "pivot_2_ts": 1795193999999,
+        "detected_at_ts": 1795193999999
+      },
+      "event_fact": {
+        "detection_close_price": 5.003,
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 5.594,
+        "zone_high": 5.919,
+        "zone_low": 5.594,
+        "bos_level": 5.391,
+        "ob_ts": 1795183199999,
+        "displacement_atr": 2.643585094527723,
+        "volume_ratio": 7.189399215781664,
+        "body_fraction": 0.650073206442167,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
