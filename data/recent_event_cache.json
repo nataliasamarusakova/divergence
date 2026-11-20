@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795143762706,
+  "updated_ts": 1795144066236,
   "events": [
     {
       "event_id": "EVT_114C22BE185C6881",
@@ -2972,6 +2972,32 @@
         "vwap": 42.607270358266675,
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E4A9D6C04AF7DB8D",
+      "symbol": "BARD",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1795143599999,
+        "pivot_2_ts": 1795143599999,
+        "detected_at_ts": 1795143599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.0904,
+        "compression_ratio": 0.30191979855154777,
+        "ma_spread_atr": 0.37283019843639076,
+        "compression_threshold": 1.2348650211911698,
+        "breakout_atr": 1.9418579165778236,
+        "volume_ratio": 14.422332753880596,
+        "requires_retest": true,
+        "trigger_level": 0.0868,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
