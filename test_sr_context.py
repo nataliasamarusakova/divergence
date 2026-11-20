@@ -570,3 +570,29 @@ def test_entry_overlapping_support_zone_wins_over_closer_nonoverlapping_zone(mon
     assert out["supporting_zone_confirmation"] is True
     assert out["directional_zone_alignment"] == "LONG_IN_DEMAND"
     assert out["nearest_supporting_zone"]["entry_overlap"] == "supporting"
+
+
+def test_normalize_futures_symbol_accepts_tradingview_perpetual_suffix():
+    import event_engine.sr_context as sr
+
+    assert sr.normalize_futures_symbol("BTCUSDT.P") == "BTCUSDT"
+    assert sr.normalize_futures_symbol("BINANCE:BTCUSDT.P") == "BTCUSDT"
+    assert sr.normalize_futures_symbol("BTCUSDT.PERP") == "BTCUSDT"
+
+
+def test_resolve_futures_symbol_maps_fully_qualified_tradingview_perpetual_ticker(monkeypatch):
+    import event_engine.sr_context as sr
+
+    received = []
+
+    def resolve(symbol):
+        received.append(symbol)
+        return symbol
+
+    monkeypatch.setattr(sr, "resolve_binance_futures_symbol", resolve)
+    resolved = sr.resolve_futures_symbol("BINANCE:BTCUSDT.P")
+    assert received == ["BTCUSDT"]
+    assert resolved["requested_symbol"] == "BTCUSDT"
+    assert resolved["source_symbol"] == "BTCUSDT"
+    assert resolved["contract_type"] == "PERPETUAL"
+    assert resolved["quote_asset"] == "USDT"

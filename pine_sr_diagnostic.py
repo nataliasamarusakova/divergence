@@ -45,6 +45,16 @@ def format_price(value: float | None, tick_size: float | None) -> str:
     return text or "0"
 
 
+
+
+def format_pine_price(value: float | None, tick_size: float | None) -> str:
+    """Format a level like Pine's str.tostring(): suppress insignificant zeros."""
+    formatted = format_price(value, tick_size)
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
+
+
 def _source_tick_size(resolved: dict[str, Any]) -> float | None:
     """Read tick size from the active USDⓈ-M Futures exchange metadata."""
     try:
@@ -109,16 +119,17 @@ def _format_gate_line(direction: str, columns: dict[str, Any], tick_size: float 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ajay R5.41 DEMAND/SUPPLY zone diagnostic")
-    parser.add_argument("--symbol", required=True, help="e.g. BTC-USDT or 1000SHIB")
+    parser = argparse.ArgumentParser(description="Ajay R5.41 dual-subsystem Pine SR diagnostic")
+    parser.add_argument("--symbol", required=True, help="TradingView Futures ticker, e.g. BTCUSDT.P")
     parser.add_argument("--limit", type=int, default=1000, help="Must be 1000 Binance Futures 1H source bars to match the production bot")
-    parser.add_argument("--output", default="pine-sr-zones.csv", help="CSV path for calculated Demand/Supply bands")
+    parser.add_argument("--output", default="pine-sr-zones.csv", help="CSV path for Demand/Supply boxes (Pine subsystem 1)")
+    parser.add_argument("--cluster-output", default="pine-sr-clusters.csv", help="CSV path for horizontal pivot-cluster SR (Pine subsystem 2)")
     args = parser.parse_args()
     if args.limit != 1000:
         parser.error("--limit must be exactly 1000 source 1H bars to match the production bot")
 
     resolved = resolve_futures_symbol(args.symbol)
-    state = get_cached_sr_snapshot(args.symbol, limit=args.limit)
+    state = get_cached_sr_snapshot(args.symbol, limit=args.limit, include_horizontal_sr=True)
     tick_size = _source_tick_size(resolved)
     # Match the bot's fail-closed entry gate: zones and current price must come
     # from the same live Binance USDⓈ-M Futures perpetual contract.
@@ -130,7 +141,11 @@ def main() -> int:
     if not math.isfinite(futures_price) or futures_price <= 0:
         raise RuntimeError("Binance Futures ticker price is unavailable; refusing to publish a zone-only diagnostic")
 
-    print(f"AJAY R5.41 | REQUESTED={resolved['requested_symbol']} | SOURCE=BINANCE_USDS_M_FUTURES")
+    tradingview_symbol = f"BINANCE:{resolved['source_symbol']}.P"
+    print("AJAY R5.41 | DUAL_PINE_SR_DIAGNOSTIC")
+    print(f"INPUT_SYMBOL={args.symbol}")
+    print(f"REQUESTED={resolved['requested_symbol']} | SOURCE=BINANCE_USDS_M_FUTURES")
+    print(f"TRADINGVIEW_SYMBOL={tradingview_symbol}")
     print(f"SOURCE_SYMBOL={resolved['source_symbol']}")
     print("CONTRACT_TYPE=PERPETUAL | QUOTE_ASSET=USDT")
     print("TIMEFRAME=3h | SOURCE_KLINE_INTERVAL=1h_AGGREGATED")
@@ -143,12 +158,14 @@ def main() -> int:
         print(f"LATEST_CLOSED_3H_OPEN_UTC={datetime.fromtimestamp(int(latest_ts) / 1000, tz=timezone.utc).isoformat()}")
     print(f"LATEST_CLOSED_3H_AGE_MIN={state.get('latest_closed_age_min')}")
     print(f"CURRENT_BINANCE_FUTURES_PRICE={format_price(futures_price, tick_size)}")
-    print(f"HIGH LEVEL: {format_price(state['highestph'], tick_size)}")
-    print("SR LEVELS:")
-    for level in state["levels"]:
-        print(format_price(float(level), tick_size))
-    print(f"LOW LEVEL: {format_price(state['lowestpl'], tick_size)}")
-    print(f"ATR(50): {state.get('atr')}")
+    print(f"LATEST_CLOSED_3H_CLOSE={format_price(state.get('latest_closed_close'), tick_size)}")
+    print("")
+    print("=== PINE SUBSYSTEM 1: SWING DEMAND / SUPPLY BOXES ===")
+    print("SOURCE=compute_current_sr | USED_BY_PRODUCTION_DIRECTIONAL_GATE=true")
+    print(f"PARAMETERS=swing_length:{sr_context.SR_SWING_LENGTH},history_to_keep:{sr_context.SR_HISTORY_TO_KEEP},box_width:{sr_context.SR_BOX_WIDTH},atr_length:{sr_context.SR_ATR_LENGTH}")
+    print(f"ATR({sr_context.SR_ATR_LENGTH})={state.get('atr')}")
+    print(f"SUPPLY_BOX_COUNT={len(state.get('supply_zones', []))}")
+    print(f"DEMAND_BOX_COUNT={len(state.get('demand_zones', []))}")
 
     zones = _build_zones(state)
     gate_results = {
@@ -210,18 +227,134 @@ def main() -> int:
                 f"| points={zone['points']} | countpp={zone['countpp']} "
                 f"| distance_pct={distance}"
             )
-    print(f"ZONE_COUNT={len(zones)}")
-    print(f"ZONES_CSV={output_path}")
+    print(f"DEMAND_SUPPLY_ZONE_COUNT={len(zones)}")
+    print(f"DEMAND_SUPPLY_ZONES_CSV={output_path}")
+
+    # The later enableSR section in the supplied Pine is an independent
+    # algorithm. Never call its output `SR LEVELS` if it came from S/D POIs.
+    horizontal = state.get("horizontal_sr") or {
+        "status": "HORIZONTAL_SR_NOT_PRESENT_IN_SNAPSHOT",
+        "levels": [],
+        "level_records": [],
+    }
+    print("")
+    print("=== PINE SUBSYSTEM 2: HORIZONTAL SUPPORT / RESISTANCE CLUSTERS ===")
+    print("SOURCE=enableSR | USED_BY_PRODUCTION_DIRECTIONAL_GATE=false")
+    print("PARAMETERS=rb:10,prd:284,ChannelW:10,strengthSR:2,zoneWidth:2,max_pivots:40,max_levels:20")
+    print(f"HORIZONTAL_SR_STATUS={horizontal.get('status', 'UNKNOWN')}")
+    print(f"HIGH_LEVEL={format_pine_price(horizontal.get('high_level'), tick_size)}")
+    print(f"LOW_LEVEL={format_pine_price(horizontal.get('low_level'), tick_size)}")
+    print(f"SR_CLUSTER_COUNT={len(horizontal.get('level_records', []))}")
+    print(f"CLUSTER_TOLERANCE_HALF_WIDTH_AT_LAST_UPDATE={format_pine_price(horizontal.get('cluster_half_width_at_update'), tick_size)}")
+    print(f"VISIBLE_ZONE_HALF_WIDTH_300BARS={format_pine_price(horizontal.get('zone_half_width'), tick_size)}")
+    print(f"VISIBLE_ZONE_WIDTH_300BARS={format_pine_price(horizontal.get('zone_width'), tick_size)}")
+    print(f"LAST_PIVOT_REFRESH_UTC={datetime.fromtimestamp(int(horizontal['latest_update_timestamp']) / 1000, tz=timezone.utc).isoformat() if horizontal.get('latest_update_timestamp') is not None else 'UNKNOWN'}")
+    print(f"LAST_PIVOT_REFRESH_BARS_AGO={horizontal.get('latest_update_bars_ago')}")
+    if horizontal.get("status") != "OK":
+        print("WARNING=Horizontal SR state cannot be guaranteed to match Pine because the fetched history does not contain complete required state.")
+
+    cluster_output_path = Path(args.cluster_output)
+    cluster_fields = [
+        "symbol", "source_symbol", "tradingview_symbol", "timeframe", "record_type", "slot", "level",
+        "band_lower", "band_upper", "points", "pivot_event_count", "candidate_kind",
+        "candidate_pivot_timestamp", "candidate_confirmation_timestamp", "cluster_lower",
+        "cluster_upper", "cluster_half_width", "current_futures_price",
+        "distance_to_band_pct", "latest_closed_3h_open_utc", "latest_update_timestamp",
+        "latest_update_bars_ago", "horizontal_sr_status",
+    ]
+    with cluster_output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=cluster_fields)
+        writer.writeheader()
+        for record in horizontal.get("level_records", []):
+            lower = record.get("band_lower")
+            upper = record.get("band_upper")
+            distance = ""
+            if lower is not None and upper is not None:
+                gap = float(lower) - futures_price if futures_price < float(lower) else futures_price - float(upper) if futures_price > float(upper) else 0.0
+                distance = round(gap / futures_price * 100.0, 8)
+            writer.writerow({
+                "symbol": resolved["requested_symbol"],
+                "source_symbol": resolved["source_symbol"],
+                "tradingview_symbol": tradingview_symbol,
+                "timeframe": "3h",
+                "record_type": "SR_CLUSTER",
+                "slot": record["slot"],
+                "level": record["level"],
+                "band_lower": lower,
+                "band_upper": upper,
+                "points": record["points"],
+                "pivot_event_count": record["pivot_event_count"],
+                "candidate_kind": record["candidate_kind"],
+                "candidate_pivot_timestamp": record["candidate_pivot_timestamp"],
+                "candidate_confirmation_timestamp": record["candidate_confirmation_timestamp"],
+                "cluster_lower": record["cluster_lower"],
+                "cluster_upper": record["cluster_upper"],
+                "cluster_half_width": record["cluster_half_width"],
+                "current_futures_price": futures_price,
+                "distance_to_band_pct": distance,
+                "latest_closed_3h_open_utc": latest_utc,
+                "latest_update_timestamp": horizontal.get("latest_update_timestamp"),
+                "latest_update_bars_ago": horizontal.get("latest_update_bars_ago"),
+                "horizontal_sr_status": horizontal.get("status"),
+            })
+            band_text = (
+                f"[{format_pine_price(float(lower), tick_size)}, {format_pine_price(float(upper), tick_size)}]"
+                if lower is not None and upper is not None else "n/a"
+            )
+            print(
+                f"SR_CLUSTER | slot={int(record['slot']):02d} "
+                f"| level={format_pine_price(float(record['level']), tick_size)} "
+                f"| band={band_text} | points={record['points']} "
+                f"| pivot_events={record['pivot_event_count']} "
+                f"| cluster_tolerance=[{format_pine_price(float(record['cluster_lower']), tick_size)}, {format_pine_price(float(record['cluster_upper']), tick_size)}] "
+                f"| distance_pct={distance}"
+            )
+        for label, level in (("HIGH_LEVEL", horizontal.get("high_level")), ("LOW_LEVEL", horizontal.get("low_level"))):
+            if level is None:
+                continue
+            half = horizontal.get("zone_half_width")
+            lower = float(level) - float(half) if half is not None else None
+            upper = float(level) + float(half) if half is not None else None
+            distance = ""
+            if lower is not None and upper is not None:
+                gap = lower - futures_price if futures_price < lower else futures_price - upper if futures_price > upper else 0.0
+                distance = round(gap / futures_price * 100.0, 8)
+            writer.writerow({
+                "symbol": resolved["requested_symbol"],
+                "source_symbol": resolved["source_symbol"],
+                "tradingview_symbol": tradingview_symbol,
+                "timeframe": "3h",
+                "record_type": label,
+                "slot": label,
+                "level": float(level),
+                "band_lower": lower,
+                "band_upper": upper,
+                "current_futures_price": futures_price,
+                "distance_to_band_pct": distance,
+                "latest_closed_3h_open_utc": latest_utc,
+                "latest_update_timestamp": horizontal.get("latest_update_timestamp"),
+                "latest_update_bars_ago": horizontal.get("latest_update_bars_ago"),
+                "horizontal_sr_status": horizontal.get("status"),
+            })
+            band_text = f"[{format_pine_price(lower, tick_size)}, {format_pine_price(upper, tick_size)}]" if lower is not None and upper is not None else "n/a"
+            print(f"{label} | level={format_pine_price(float(level), tick_size)} | visible_band={band_text}")
+    print(f"SR_LEVELS={','.join(format_pine_price(float(v), tick_size) for v in horizontal.get('levels', []))}")
+    print(f"HORIZONTAL_SR_CSV={cluster_output_path}")
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as summary:
-            summary.write(f"## Ajay R5.41 DEMAND/SUPPLY diagnostic — {resolved['requested_symbol']} (3H)\n\n")
+            summary.write(f"## Ajay R5.41 dual SR diagnostic — {resolved['requested_symbol']} (3H)\n\n")
+            summary.write(f"- TradingView instrument: `{tradingview_symbol}`\n")
             summary.write(f"- Binance Futures contract: `{resolved['source_symbol']}`\n")
             summary.write(f"- Closed 3H bars: `{state.get('closed_candle_count_3h', 'not-reported')}`\n")
             summary.write(f"- Latest closed 3H open (UTC): `{latest_utc}`\n")
             summary.write(f"- Current Futures price: `{format_price(futures_price, tick_size)}`\n")
-            summary.write(f"- Pine levels: `{', '.join(format_price(float(v), tick_size) for v in state.get('levels', []))}`\n\n")
+            summary.write(f"- Pine subsystem 1 (Demand/Supply POI): `{', '.join(format_price(float(v), tick_size) for v in state.get('levels', []))}`\n")
+            summary.write(f"- Pine subsystem 2 status: `{horizontal.get('status', 'UNKNOWN')}`\n")
+            summary.write(f"- Horizontal High Level: `{format_pine_price(horizontal.get('high_level'), tick_size)}`\n")
+            summary.write(f"- Horizontal Low Level: `{format_pine_price(horizontal.get('low_level'), tick_size)}`\n")
+            summary.write(f"- Horizontal SR clusters: `{', '.join(format_pine_price(float(v), tick_size) for v in horizontal.get('levels', []))}`\n\n")
             summary.write("### Exact bot directional gate\n\n")
             summary.write("| Direction | Decision | Reason | Nearest zone | Allowed direction | Distance |\n|---|---|---|---|---|---:|\n")
             for direction in ("LONG", "SHORT"):
@@ -250,7 +383,24 @@ def main() -> int:
                 summary.write(f"| {kind} | {format_price(zone['center'], tick_size)} | {format_price(lower, tick_size)} | {format_price(upper, tick_size)} | {zone['points']} | {gap_pct} |\n")
             if not zones:
                 summary.write("\nNo accepted Demand/Supply zones were returned by the Pine SR calculation.\n")
-            summary.write(f"\nCSV artifact: `{output_path}`\n")
+            summary.write("\n### Pine horizontal support/resistance clusters (enableSR subsystem)\n\n")
+            summary.write(f"Status: `{horizontal.get('status', 'UNKNOWN')}`\n\n")
+            summary.write(f"- Parameters: `rb=10, prd=284, ChannelW=10, strengthSR=2, zoneWidth=2`\n")
+            summary.write(f"- Cluster tolerance half-width at refresh: `{format_pine_price(horizontal.get('cluster_half_width_at_update'), tick_size)}`\n")
+            summary.write(f"- Visible band half-width from rolling 300-bar range: `{format_pine_price(horizontal.get('zone_half_width'), tick_size)}`\n")
+            summary.write(f"- High Level: `{format_pine_price(horizontal.get('high_level'), tick_size)}`\n")
+            summary.write(f"- Low Level: `{format_pine_price(horizontal.get('low_level'), tick_size)}`\n\n")
+            summary.write("| Slot | Level | Visible band lower | Visible band upper | Points | Pivot events | Candidate type |\n|---:|---:|---:|---:|---:|---:|---|\n")
+            for record in horizontal.get("level_records", []):
+                summary.write(
+                    f"| {record['slot']} | {format_pine_price(float(record['level']), tick_size)} | "
+                    f"{format_pine_price(record.get('band_lower'), tick_size)} | {format_pine_price(record.get('band_upper'), tick_size)} | "
+                    f"{record['points']} | {record['pivot_event_count']} | {record['candidate_kind']} |\n"
+                )
+            if not horizontal.get("level_records"):
+                summary.write("| — | No cluster levels | — | — | — | — | — |\n")
+            summary.write(f"\nDemand/Supply CSV: `{output_path}`\n")
+            summary.write(f"Horizontal SR CSV: `{cluster_output_path}`\n")
     return 0
 
 

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Python port of the DEMAND / SUPPLY block in the supplied Ajay R5.41 Pine v5.
 
-Only the first Pine subsystem (the swing-based DEMAND and SUPPLY boxes) is
-implemented here. The later ``enableSR``/``prd=284`` support-resistance cluster
-indicator is intentionally not part of this module.
+Both Pine SR subsystems are implemented independently: (1) swing-based DEMAND /
+SUPPLY boxes and (2) the ``enableSR`` / ``prd=284`` horizontal pivot-cluster
+levels. The latter reproduces the Pine script's ``aas`` clustering, persistent
+``sr_levs`` update behavior, High/Low labels, and 300-bar zone bands.
 
 The engine consumes closed candles in chronological order. Pivot values become
 available on the confirmation bar, ATR(50) is Pine-style RMA(True Range), boxes
@@ -159,6 +160,7 @@ def compute_current_sr(
     history_to_keep: int = 20,
     box_width: float = 2.5,
     atr_length: int = 50,
+    include_horizontal_sr: bool = False,
 ) -> dict[str, Any]:
     """Compute the latest active DEMAND/SUPPLY zones from closed OHLCV bars.
 
@@ -268,7 +270,7 @@ def compute_current_sr(
     latest_pivot_high_confirmed = pivot_highs[-1]
     latest_pivot_low_confirmed = pivot_lows[-1]
     levels = [float(z["center"]) for z in active_zones]
-    return {
+    result = {
         "algorithm": "AJAY_R541_DEMAND_SUPPLY",
         "swing_length": int(swing_length),
         "history_to_keep": int(history_to_keep),
@@ -300,4 +302,286 @@ def compute_current_sr(
         "latest_closed_timestamp": int(candles[-1].ts),
         "latest_closed_close": float(candles[-1].close),
         "closed_candle_count": len(candles),
+    }
+    if include_horizontal_sr:
+        result["horizontal_sr"] = compute_ajay_horizontal_sr(candles)
+    return result
+
+
+
+def compute_ajay_horizontal_sr(
+    candles: list[Candle],
+    *,
+    pivot_length: int = 10,
+    period: int = 284,
+    channel_width_pct: float = 10.0,
+    strength: int = 2,
+    zone_lookback: int = 300,
+    zone_width_pct: float = 2.0,
+    max_pivots: int = 40,
+    max_levels: int = 20,
+) -> dict[str, Any]:
+    """Port the second ``enableSR`` block in Ajay R5.41 Pine v5.
+
+    This is deliberately separate from ``compute_current_sr``'s Demand/Supply
+    boxes. It mirrors the Pine script's pivot-event ordering and clustering:
+
+    * ``ta.pivothigh/low(rb, rb)`` events are indexed by their confirmation bar.
+    * On every bar with a new pivot event, the last ``period`` bars determine
+      ``cwidth``; the Pine loop itself scans offsets ``0..period`` inclusive.
+    * The local ``aas`` array starts all-true on each calculation. Accepted
+      clusters mark their member pivot-event ordinals false.
+    * ``sr_levs`` persists between pivot events and is replaced (including by
+      an all-empty set) whenever a new pivot event occurs.
+    * ``highestph`` / ``lowestpl`` follow the exact assignments in the supplied
+      Pine code, including its ``nz(..., prdlowest)`` fallback.
+    * Visible line-zone bands use ``percWidth(300, zoneWidth)`` on the latest
+      closed bar, separately from the clustering tolerance ``cwidth``.
+
+    ``status`` warns when the fetched history cannot reconstruct Pine's current
+    persistent state or the full rolling windows. The function does not silently
+    claim an exact match in those cases.
+    """
+    if pivot_length < 1 or period < 1 or zone_lookback < 1:
+        raise ValueError("pivot_length, period and zone_lookback must be >= 1")
+    if strength < 1:
+        raise ValueError("strength must be >= 1, matching Pine input.int minval=1")
+    if max_pivots < 1 or max_pivots > 40:
+        raise ValueError("max_pivots must be between 1 and Pine's fixed limit of 40")
+    if max_levels < 1 or max_levels > 20:
+        raise ValueError("max_levels must be between 1 and Pine's fixed limit of 20")
+    numeric_params = (channel_width_pct, zone_width_pct)
+    if not all(math.isfinite(float(value)) and float(value) >= 0 for value in numeric_params):
+        raise ValueError("channel_width_pct and zone_width_pct must be finite and >= 0")
+
+    count = len(candles)
+    pivot_highs, pivot_lows = build_confirmed_pivots(candles, swing_length=pivot_length)
+    sr_levels: list[float | None] = [None] * (max_levels + 1)
+    sr_records: list[dict[str, Any] | None] = [None] * (max_levels + 1)
+    high_level: float | None = None
+    low_level: float | None = None
+    latest_update_idx: int | None = None
+    latest_update_event_count = 0
+    latest_update_cluster_width: float | None = None
+    latest_update_range_high: float | None = None
+    latest_update_range_low: float | None = None
+
+    for current_idx in range(count):
+        if pivot_highs[current_idx] is None and pivot_lows[current_idx] is None:
+            continue
+
+        # Pine ta.highest(period) / ta.lowest(period) are current-inclusive and
+        # use exactly `period` bars, while its explicit x-loop uses 0..period.
+        range_start = max(0, current_idx - period + 1)
+        range_bars = candles[range_start: current_idx + 1]
+        prd_highest = max(float(bar.high) for bar in range_bars)
+        prd_lowest = min(float(bar.low) for bar in range_bars)
+        cluster_width = (prd_highest - prd_lowest) * float(channel_width_pct) / 100.0
+
+        # Recreate Pine's reverse scan: offset 0 is the current confirmation
+        # bar, then older confirmation bars. The x-loop is inclusive at `period`.
+        events: list[dict[str, Any]] = []
+        event_start = max(0, current_idx - period)
+        for confirmation_idx in range(current_idx, event_start - 1, -1):
+            high_value = pivot_highs[confirmation_idx]
+            low_value = pivot_lows[confirmation_idx]
+            if high_value is None and low_value is None:
+                continue
+            pivot_idx = confirmation_idx - pivot_length
+            event = {
+                "ordinal": len(events) + 1,
+                "confirmation_index": confirmation_idx,
+                "pivot_index": pivot_idx,
+                "confirmation_timestamp": int(candles[confirmation_idx].ts),
+                "pivot_timestamp": int(candles[pivot_idx].ts) if pivot_idx >= 0 else None,
+                "high": float(high_value) if high_value is not None else None,
+                "low": float(low_value) if low_value is not None else None,
+            }
+            events.append(event)
+            # Pine updates High/Low before incrementing/checking countpp > 40,
+            # so the 41st event contributes to these two labels but not clusters.
+            if len(events) >= max_pivots + 1:
+                break
+
+        # Exact Pine assignments inside `if ph or pl`.
+        high_level = prd_lowest
+        low_level = prd_highest
+        for event in events:
+            high_input = event["high"] if event["high"] is not None else prd_lowest
+            low_input = event["low"] if event["low"] is not None else prd_lowest
+            high_level = max(high_level, float(high_input), float(low_input))
+            low_level = min(low_level, float(high_input), float(low_input))
+
+        # The source Pine declares `aas = array.new_bool(41, true)` without var:
+        # it is recreated on each chart bar, not persisted between updates.
+        aas = [True] * (max_pivots + 1)
+        sr_levels = [None] * (max_levels + 1)
+        sr_records = [None] * (max_levels + 1)
+
+        cluster_events = events[:max_pivots]
+        for candidate in cluster_events:
+            countpp = int(candidate["ordinal"])
+            if countpp >= len(aas) or not aas[countpp]:
+                continue
+            # Pine's ternary selects pivot HIGH if both ph and pl are true.
+            # Pine's cluster tolerance uses the ternary high-first candidate
+            # (`ph[x] ? high[x+rb] : low[x+rb]`). However, its two subsequent
+            # `if ph[x]` / `if pl[x]` writes target the same sr_levels slot;
+            # when both pivots exist, the LOW write happens last and wins.
+            cluster_seed_price = (
+                float(candidate["high"])
+                if candidate["high"] is not None
+                else float(candidate["low"])
+            )
+            stored_level_price = (
+                float(candidate["low"])
+                if candidate["low"] is not None
+                else float(candidate["high"])
+            )
+            upper_boundary = cluster_seed_price + cluster_width
+            lower_boundary = cluster_seed_price - cluster_width
+            tmp = [True] * (max_pivots + 1)
+            tpoint = 0
+            included: list[dict[str, Any]] = []
+
+            for event in cluster_events:
+                ordinal = int(event["ordinal"])
+                if ordinal >= len(aas):
+                    break
+                if not aas[ordinal]:
+                    continue
+                changed = False
+                for pivot_kind in ("high", "low"):
+                    pivot_value = event[pivot_kind]
+                    if pivot_value is not None and lower_boundary <= float(pivot_value) <= upper_boundary:
+                        tpoint += 1
+                        changed = True
+                        included.append({
+                            "ordinal": ordinal,
+                            "kind": pivot_kind.upper(),
+                            "price": float(pivot_value),
+                            "pivot_timestamp": event["pivot_timestamp"],
+                            "confirmation_timestamp": event["confirmation_timestamp"],
+                        })
+                if changed and ordinal < len(tmp):
+                    tmp[ordinal] = False
+
+            if tpoint >= strength:
+                for ordinal in range(len(aas)):
+                    if not tmp[ordinal]:
+                        aas[ordinal] = False
+                if countpp < len(sr_levels):
+                    sr_levels[countpp] = stored_level_price
+                    sr_records[countpp] = {
+                        "slot": countpp,
+                        "level": stored_level_price,
+                        "candidate_kind": "LOW" if candidate["low"] is not None else "HIGH",
+                        "cluster_seed_kind": "HIGH" if candidate["high"] is not None else "LOW",
+                        "cluster_seed_price": cluster_seed_price,
+                        "candidate_pivot_timestamp": candidate["pivot_timestamp"],
+                        "candidate_confirmation_timestamp": candidate["confirmation_timestamp"],
+                        "candidate_pivot_index": candidate["pivot_index"],
+                        "points": int(tpoint),
+                        "pivot_event_count": len({item["ordinal"] for item in included}),
+                        "cluster_half_width": float(cluster_width),
+                        "cluster_lower": float(lower_boundary),
+                        "cluster_upper": float(upper_boundary),
+                        "members": included,
+                    }
+
+        latest_update_idx = current_idx
+        latest_update_event_count = len(events)
+        latest_update_cluster_width = float(cluster_width)
+        latest_update_range_high = float(prd_highest)
+        latest_update_range_low = float(prd_lowest)
+
+    # The displayed Pine zonePerc is recalculated every bar even when no pivot
+    # event occurs; it is based on the latest closed bar's 300-bar range.
+    zone_start = max(0, count - zone_lookback)
+    zone_bars = candles[zone_start:]
+    zone_range_high = max((float(bar.high) for bar in zone_bars), default=None)
+    zone_range_low = min((float(bar.low) for bar in zone_bars), default=None)
+    zone_half_width = (
+        (zone_range_high - zone_range_low) * float(zone_width_pct) / 100.0
+        if zone_range_high is not None and zone_range_low is not None else None
+    )
+
+    records: list[dict[str, Any]] = []
+    for slot, record in enumerate(sr_records):
+        if slot == 0 or not isinstance(record, dict):
+            continue
+        item = dict(record)
+        level = float(item["level"])
+        if zone_half_width is not None:
+            item["band_lower"] = level - zone_half_width
+            item["band_upper"] = level + zone_half_width
+            item["band_half_width"] = zone_half_width
+        else:
+            item["band_lower"] = None
+            item["band_upper"] = None
+            item["band_half_width"] = None
+        records.append(item)
+
+    latest_update_bars_ago = (
+        count - 1 - latest_update_idx if latest_update_idx is not None else None
+    )
+    # The Pine event scan is inclusive (`for x = 0 to prd`), i.e. prd+1
+    # confirmation bars. A refresh at index `period` is the first complete scan.
+    complete_prd_scan = latest_update_idx is not None and latest_update_idx >= period
+    # Every pivot event in that scan must itself have had full left/right
+    # confirmation history. The oldest inspected confirmation index is
+    # latest_update_idx-period; its pivot needs another 2*rb bars before it.
+    complete_pivot_warmup = (
+        latest_update_idx is not None
+        and latest_update_idx >= period + 2 * pivot_length
+    )
+    complete_prd_at_update = complete_prd_scan and complete_pivot_warmup
+    complete_zone_window = count >= zone_lookback
+    if latest_update_idx is None:
+        status = "UNRECOVERABLE_NO_PIVOT_EVENT_IN_FETCHED_HISTORY"
+    elif not complete_prd_scan:
+        status = "INCOMPLETE_PRD_SCAN_WINDOW_AT_LAST_REFRESH"
+    elif not complete_pivot_warmup:
+        status = "INCOMPLETE_PIVOT_WARMUP_AT_LAST_REFRESH"
+    elif not complete_zone_window:
+        status = "INCOMPLETE_300_BAR_ZONE_WIDTH_WINDOW"
+    else:
+        status = "OK"
+
+    return {
+        "algorithm": "AJAY_R541_HORIZONTAL_SR_CLUSTERS",
+        "status": status,
+        "pivot_length": int(pivot_length),
+        "period": int(period),
+        "channel_width_pct": float(channel_width_pct),
+        "strength": int(strength),
+        "zone_lookback": int(zone_lookback),
+        "zone_width_pct": float(zone_width_pct),
+        "max_pivots": int(max_pivots),
+        "max_levels": int(max_levels),
+        "high_level": high_level,
+        "low_level": low_level,
+        "levels": [float(value) for value in sr_levels[1:] if value is not None],
+        "level_records": records,
+        "sr_level_slots": sr_levels,
+        "prd_range_high_at_update": latest_update_range_high,
+        "prd_range_low_at_update": latest_update_range_low,
+        "cluster_half_width_at_update": latest_update_cluster_width,
+        "zone_range_high": zone_range_high,
+        "zone_range_low": zone_range_low,
+        "zone_half_width": zone_half_width,
+        "zone_width": (zone_half_width * 2.0) if zone_half_width is not None else None,
+        "latest_update_index": latest_update_idx,
+        "latest_update_timestamp": (
+            int(candles[latest_update_idx].ts) if latest_update_idx is not None else None
+        ),
+        "latest_update_bars_ago": latest_update_bars_ago,
+        "latest_update_pivot_event_count": latest_update_event_count,
+        "closed_candle_count": count,
+        "prd_scan_window_complete_at_update": complete_prd_scan,
+        "prd_window_complete_at_update": complete_prd_at_update,
+        "pivot_warmup_complete_at_update": complete_pivot_warmup,
+        "zone_window_complete": complete_zone_window,
+        "latest_closed_timestamp": int(candles[-1].ts) if candles else None,
+        "latest_closed_close": float(candles[-1].close) if candles else None,
     }

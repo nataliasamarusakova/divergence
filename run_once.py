@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, List, Tuple
 
 from event_engine.version import APP_VERSION
+from event_engine.paths import DATA_DIR
 
 import pandas as pd
 import requests
@@ -188,8 +189,8 @@ def _coinalyze_rows_for_new_entries(rows: list[Any], complete: bool) -> list[Any
     """Expose only a reconciled/complete derivatives universe to entry logic."""
     return list(rows) if complete else []
 
-DATA = Path("data")
-DATA.mkdir(exist_ok=True)
+DATA = DATA_DIR
+DATA.mkdir(parents=True, exist_ok=True)
 
 EVENTS = DATA / "events.jsonl"
 TRADES = DATA / "trades.jsonl"
@@ -412,6 +413,9 @@ ENABLE_SFP_ENGINE = os.environ.get("ENABLE_SFP_ENGINE", "true").lower() == "true
 ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE = os.environ.get("ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "false").lower() == "true"
 ENABLE_CRT_ENGINE = os.environ.get("ENABLE_CRT_ENGINE", "true").lower() == "true"
 ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED", "false").lower() == "true"
+# Volatility squeeze release is a separate event family from liquidation squeeze.
+# Keep existing behavior by default while exposing an explicit per-engine switch.
+ENABLE_VOLATILITY_SQUEEZE_ENGINE = os.environ.get("ENABLE_VOLATILITY_SQUEEZE_ENGINE", "true").strip().lower() == "true"
 MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "12"))
 MAX_ACTIVE_LONGS = int(os.environ.get("MAX_ACTIVE_LONGS", "6"))
 MAX_ACTIVE_SHORTS = int(os.environ.get("MAX_ACTIVE_SHORTS", "6"))
@@ -2019,14 +2023,14 @@ def _refresh_timeframe_events(
                 # is sufficient (no events until enough buckets are recorded).
                 d = attach_oi_series(d, _load_oi_history().get(symbol))
                 d = attach_funding_series(d, _load_funding_history().get(symbol))
-                divs = detect_divergences(d, symbol, timeframe)
+                divs = detect_divergences(d, symbol, timeframe) if ENABLE_DIVERGENCE_ENGINE else []
                 vp_events = detect_volume_profile_divergence(d, symbol, timeframe) if ENABLE_VOLUME_PROFILE_DIVERGENCE_ENGINE else []
                 harmonic_events = detect_harmonic_patterns(d, symbol, timeframe) if ENABLE_HARMONIC_PATTERN_ENGINE else []
                 sqs = detect_squeeze_release(
                     d, symbol, timeframe,
                     min_squeeze_bars=3,
                     release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")),
-                )
+                ) if ENABLE_VOLATILITY_SQUEEZE_ENGINE else []
                 # Forced-liquidation squeeze is an opt-in research engine until local
                 # liquidation time-series coverage is available; the code remains intact.
                 liqs = detect_liquidation_squeeze(r, d, symbol, timeframe) if ENABLE_LIQUIDATION_SQUEEZE_ENGINE else []
@@ -2518,6 +2522,7 @@ def _entry_quality_gate(
         reasons.append(f"SHORT_OI:{oi24:.2f}%<{SHORT_OI_VETO_PCT:.2f}%")
     if (
         COMPOUND_CVD_LIQ_VETO_ENABLED
+        and d == "LONG"
         and cvd24 is not None
         and liq_long24 is not None
         and cvd24 < COMPOUND_CVD_MAX
@@ -2657,6 +2662,13 @@ def _entry_adverse_drift_pct(signal_price: float, trigger_price: float, directio
         return None
     adverse = (trigger - signal) if side == "LONG" else (signal - trigger)
     return max(0.0, adverse) / signal * 100.0
+
+
+def _entry_drift_metric_for_policy(entry_trigger_policy: Any):
+    """Select one drift policy and reuse it for pre-order and post-fill checks."""
+    if str(entry_trigger_policy or "").strip().upper() == "RETEST":
+        return _entry_adverse_drift_pct
+    return _entry_drift_pct
 
 
 def load_successful_trade_ids(path: Path) -> set[str]:
@@ -5264,7 +5276,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                 "execution_quality": execution_quality_guard,
             }
 
-    drift_metric = _entry_adverse_drift_pct if str(setup.get("entry_trigger_policy") or "").upper() == "RETEST" else _entry_drift_pct
+    # One selected policy governs both the pre-order observation and the actual fill.
+    drift_metric = _entry_drift_metric_for_policy(setup.get("entry_trigger_policy"))
     pre_order_drift = drift_metric(_safe_float(setup.get("signal_price", price), price), live_reference, direction) if live_reference else None
     trigger_price = _safe_float((setup.get("trigger") or {}).get("trigger_price"), 0.0)
     trigger_live_drift = drift_metric(trigger_price, live_reference, direction) if trigger_price > 0 and live_reference else None
@@ -5617,7 +5630,7 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
     event_type_for_risk = str(setup.get("event_type", "")).upper()
     drift_limit = MAX_SQUEEZE_ENTRY_DRIFT_PCT if _is_liquidation_squeeze_event(event_type_for_risk) else MAX_ENTRY_DRIFT_PCT
     signal_price_for_risk = _safe_float(setup.get("signal_price", price), 0.0)
-    fill_drift_pct = _entry_drift_pct(signal_price_for_risk, actual_avg_price, direction)
+    fill_drift_pct = drift_metric(signal_price_for_risk, actual_avg_price, direction)
     execution_quality["signal_to_fill_distance_pct"] = fill_drift_pct
     if drift_limit > 0 and fill_drift_pct is not None and fill_drift_pct > drift_limit:
         rollback = emergency_close_position(symbol, direction, actual_qty, reason_token=f"DRIFTFAIL:{trade_id}", require_live_position=True)
