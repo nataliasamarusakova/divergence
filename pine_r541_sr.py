@@ -334,7 +334,8 @@ def compute_ajay_horizontal_sr(
     * ``sr_levs`` persists between pivot events and is replaced (including by
       an all-empty set) whenever a new pivot event occurs.
     * ``highestph`` / ``lowestpl`` follow the exact assignments in the supplied
-      Pine code, including its ``nz(..., prdlowest)`` fallback.
+      Pine code: High replaces missing pivots with ``prdlowest``; Low replaces
+      missing pivots with ``prdhighest``.
     * Visible line-zone bands use ``percWidth(300, zoneWidth)`` on the latest
       closed bar, separately from the clustering tolerance ``cwidth``.
 
@@ -407,10 +408,16 @@ def compute_ajay_horizontal_sr(
         high_level = prd_lowest
         low_level = prd_highest
         for event in events:
-            high_input = event["high"] if event["high"] is not None else prd_lowest
-            low_input = event["low"] if event["low"] is not None else prd_lowest
-            high_level = max(high_level, float(high_input), float(low_input))
-            low_level = min(low_level, float(high_input), float(low_input))
+            # Keep the two Pine nz() fallbacks distinct. The highest label
+            # substitutes prd_lowest for missing pivots, while the lowest
+            # label substitutes prd_highest. Reusing prd_lowest for both
+            # incorrectly pins LOW_LEVEL to the bottom of the whole window.
+            high_from_ph = event["high"] if event["high"] is not None else prd_lowest
+            high_from_pl = event["low"] if event["low"] is not None else prd_lowest
+            low_from_ph = event["high"] if event["high"] is not None else prd_highest
+            low_from_pl = event["low"] if event["low"] is not None else prd_highest
+            high_level = max(high_level, float(high_from_ph), float(high_from_pl))
+            low_level = min(low_level, float(low_from_ph), float(low_from_pl))
 
         # The source Pine declares `aas = array.new_bool(41, true)` without var:
         # it is recreated on each chart bar, not persisted between updates.

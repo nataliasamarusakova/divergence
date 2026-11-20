@@ -186,7 +186,7 @@ def test_pine_sr_manual_diagnostic_workflow_uses_futures_only():
     wf = Path('.github/workflows/pine-sr-diagnostic.yml').read_text(encoding='utf-8')
     assert 'workflow_dispatch' in wf
     assert 'pine_sr_diagnostic.py' in wf
-    assert 'BTC-USDT' in wf
+    assert 'BTCUSDT.P' in wf
 
 
 def test_release_has_mandatory_3h_direction_gate_and_cached_futures_snapshot():
@@ -309,11 +309,14 @@ def test_release_has_live_futures_symbol_resolver_and_persisted_sr_budget():
     assert 'fetch_futures_price' in source
 
 
-def test_release_diagnostic_uses_shared_futures_provider():
+def test_release_diagnostic_uses_shared_futures_provider_and_zone_only_output():
     source = Path('pine_sr_diagnostic.py').read_text(encoding='utf-8')
     assert 'resolve_futures_symbol' in source
     assert 'get_cached_sr_snapshot' in source
-    assert 'get_futures_current_price' in source
+    assert 'include_horizontal_sr=True' in source
+    assert 'get_futures_current_price' not in source
+    assert 'csv' not in source.lower()
+    assert 'GITHUB_STEP_SUMMARY' not in source
     assert 'KLINES_URL' not in source
     assert 'normalize_symbol' not in source
 

@@ -214,7 +214,9 @@ def test_horizontal_sr_second_pine_subsystem_matches_hand_calculated_cluster_and
     # not the average of cluster members.
     assert result["status"] == "OK"
     assert result["high_level"] == pytest.approx(11.0)
-    assert result["low_level"] == pytest.approx(2.0)
+    # Pine uses nz(ph[x], prdhighest) and nz(pl[x], prdhighest) for LOW_LEVEL.
+    # The previous port incorrectly substituted prd_lowest and returned 2.0.
+    assert result["low_level"] == pytest.approx(3.0)
     assert result["levels"] == pytest.approx([10.0])
     assert result["cluster_half_width_at_update"] == pytest.approx(8.0)
     assert result["zone_half_width"] == pytest.approx(0.18)

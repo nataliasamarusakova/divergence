@@ -2,6 +2,8 @@
 import json
 import time
 
+import pytest
+
 from event_engine import bingx as bx
 
 
@@ -174,3 +176,50 @@ def test_open_orders_non_json_http_429_persists_cooldown_without_retry(tmp_path,
     assert len(session.calls) == 1
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert "HTTP 429" in persisted["reason"]
+
+@pytest.mark.parametrize("body", [[], "Too Many Requests", 429, None])
+def test_open_orders_json_429_unexpected_root_type_persists_cooldown(
+    body, tmp_path, monkeypatch
+):
+    class _MalformedJson429Response:
+        status_code = 429
+        headers = {"Content-Type": "application/json"}
+
+        def json(self):
+            return body
+
+    class _OneShotSession:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, *args, **kwargs):
+            self.calls += 1
+            return _MalformedJson429Response()
+
+    session = _OneShotSession()
+    path = tmp_path / "bingx_open_orders_cooldown.json"
+    monkeypatch.setattr(bx, "OPEN_ORDERS_COOLDOWN_STATE_PATH", path)
+    monkeypatch.setattr(bx, "FAST_SESSION", session)
+    monkeypatch.setattr(bx, "API_KEY", "test-key")
+    monkeypatch.setattr(bx, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(bx, "_apply_request_timestamp", lambda params: None)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_UNTIL_MS", 0)
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_REASON", "")
+
+    diagnostics = {}
+    result = bx.get_open_orders_snapshot(retryable=False, diagnostics=diagnostics)
+
+    assert result["status"] == "error"
+    assert result["rate_limited"] is True
+    assert result["local_cooldown"] is True
+    assert result["http_status"] == 429
+    assert diagnostics["rate_limited"] is True
+    assert session.calls == 1
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "unexpected JSON root type" in persisted["reason"]
+
+    # The cooldown short-circuits the next account snapshot before HTTP.
+    monkeypatch.setattr(bx, "_OPEN_ORDERS_COOLDOWN_UNTIL_MS", 0)
+    second = bx.get_open_orders_snapshot(retryable=False)
+    assert second["local_cooldown"] is True
+    assert session.calls == 1
