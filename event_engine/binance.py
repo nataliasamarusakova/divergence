@@ -167,23 +167,38 @@ class BinanceMarketClient:
         log.info("[BINANCE] Active USDT perpetual contracts=%d", len(symbols))
         return symbols
 
+    _SYMBOL_ALIASES = {
+        "LIT": "LIGHTERUSDT",
+        "LITUSDT": "LIGHTERUSDT",
+        "TRUMPSOL": "TRUMPUSDT",
+        "TRUMPSOLUSDT": "TRUMPUSDT",
+    }
+
     @staticmethod
     def _normalise_symbol(symbol: str) -> str:
         value = str(symbol or "").strip().upper()
         value = value.replace("/", "").replace("-", "").replace(" ", "")
         value = re.sub(r"_(PERP|USDT)$", "", value)
-        return value
+        return BinanceMarketClient._SYMBOL_ALIASES.get(value, value)
 
     def resolve_symbol(self, symbol: str) -> str | None:
+        raw_target = str(symbol or "").strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+        raw_target = re.sub(r"_(PERP|USDT)$", "", raw_target)
         target = self._normalise_symbol(symbol)
         symbols = self.refresh_exchange_info()
-        if target in symbols:
-            return target
-        if target.endswith("USDT") and target[:-4] + "USDT" in symbols:
-            return target[:-4] + "USDT"
-        base = target[:-4] if target.endswith("USDT") else target
-        candidate = f"{base}USDT"
-        return candidate if candidate in symbols else None
+        # Prefer the canonical instrument alias. Fall back to the literal Binance
+        # ticker only when the canonical contract is not listed on this venue.
+        candidates = list(dict.fromkeys((target, raw_target)))
+        for candidate in candidates:
+            if candidate in symbols:
+                return candidate
+            if candidate.endswith("USDT") and candidate[:-4] + "USDT" in symbols:
+                return candidate[:-4] + "USDT"
+            base = candidate[:-4] if candidate.endswith("USDT") else candidate
+            normalized_candidate = f"{base}USDT"
+            if normalized_candidate in symbols:
+                return normalized_candidate
+        return None
 
     def contract_exists(self, symbol: str) -> bool:
         return self.resolve_symbol(symbol) is not None
@@ -226,6 +241,7 @@ class BinanceMarketClient:
             "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
             "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
         }.get(interval)
+        now_ms = int(time.time() * 1000)
         out: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, (list, tuple)) or len(row) < 11:
@@ -241,19 +257,37 @@ class BinanceMarketClient:
                 quote_volume = float(row[7])
                 try:
                     trade_count = int(row[8])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     trade_count = None
                 taker_buy_base = float(row[9])
                 taker_buy_quote = float(row[10])
-            except (TypeError, ValueError, IndexError):
+            except (TypeError, ValueError, IndexError, OverflowError):
                 continue
-            if not all(map(lambda x: x == x and abs(x) != float("inf"), [open_price, high, low, close, volume, quote_volume, taker_buy_base, taker_buy_quote])):
+
+            numeric_values = (open_price, high, low, close, volume, quote_volume, taker_buy_base, taker_buy_quote)
+            if not all(math.isfinite(value) for value in numeric_values):
                 continue
-            if close_time > int(time.time() * 1000):
+            # Binance closeTime is inclusive (open + interval - 1). A zero or
+            # missing closeTime is malformed, not a request to synthesize the
+            # next bucket's opening timestamp.
+            if open_time <= 0 or close_time <= 0 or close_time < open_time or close_time > now_ms:
                 continue
+            if duration_ms is not None and close_time >= open_time + duration_ms:
+                continue
+            if min(open_price, high, low, close) <= 0 or volume < 0 or quote_volume < 0:
+                continue
+            if high < max(open_price, close, low) or low > min(open_price, close, high):
+                continue
+
+            taker_flow_valid = (
+                taker_buy_base >= 0
+                and taker_buy_quote >= 0
+                and taker_buy_base <= volume * 1.001 + 1e-8
+                and taker_buy_quote <= quote_volume * 1.001 + 1e-8
+            )
             out.append({
                 "open_time": open_time,
-                "close_time": close_time if close_time else (open_time + duration_ms if duration_ms else open_time),
+                "close_time": close_time,
                 "open": open_price,
                 "high": high,
                 "low": low,
@@ -264,13 +298,23 @@ class BinanceMarketClient:
                 "taker_buy_base": taker_buy_base,
                 "taker_buy_quote": taker_buy_quote,
                 # Keep the exchange row verbatim for forensic/audit purposes.
-                # This preserves index 8 (trade count) and index 11 (reserved/ignore)
-                # without changing the established OHLCV field semantics.
                 "raw_row": list(row),
-                "taker_flow_valid": True,
-                "bar_delta_usdt": 2.0 * taker_buy_quote - quote_volume,
+                "taker_flow_valid": taker_flow_valid,
+                "bar_delta_usdt": 2.0 * taker_buy_quote - quote_volume if taker_flow_valid else None,
             })
-        return out[-requested_limit:]
+
+        # Input order is not a contract: normalize it before downstream rolling
+        # indicators and keep one record per completed candle close timestamp.
+        out.sort(key=lambda item: (item["close_time"], item["open_time"]))
+        deduped: list[dict[str, Any]] = []
+        seen_close_times: set[int] = set()
+        for bar in out:
+            close_ts = int(bar["close_time"])
+            if close_ts in seen_close_times:
+                continue
+            seen_close_times.add(close_ts)
+            deduped.append(bar)
+        return deduped[-requested_limit:]
 
     def fetch_price(self, symbol: str) -> float:
         resolved = self.resolve_symbol(symbol)

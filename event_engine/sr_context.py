@@ -55,6 +55,16 @@ class SRSymbolUnavailableError(RuntimeError):
 
 def normalize_futures_symbol(symbol: str) -> str:
     value = str(symbol or "").strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+    # Accept a fully qualified TradingView ticker such as BINANCE:BTCUSDT.P.
+    if ":" in value:
+        value = value.rsplit(":", 1)[-1]
+    # TradingView's Binance perpetual ticker is written BTCUSDT.P. The
+    # diagnostic is Futures-only, so strip that display suffix before metadata
+    # lookup; otherwise it would incorrectly become BTCUSDTPUSDT.
+    if value.endswith(".PERP"):
+        value = value[:-5]
+    elif value.endswith(".P"):
+        value = value[:-2]
     if value.endswith("_PERP"):
         value = value[:-5]
     if value.endswith("_USDT"):
@@ -228,10 +238,12 @@ def get_futures_current_price(symbol: str, *, snapshot: dict[str, Any] | None = 
     return price
 
 
-def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str, Any]:
-    """Fetch/cache the current Pine SR state; a custom history limit is uncached."""
+def get_cached_sr_snapshot(
+    symbol: str, *, limit: int | None = None, include_horizontal_sr: bool = False
+) -> dict[str, Any]:
+    """Fetch/cache production S/D state; optional horizontal SR is diagnostic-only."""
     key = normalize_futures_symbol(symbol)
-    use_cache = limit is None
+    use_cache = limit is None and not include_horizontal_sr
     if use_cache:
         with _CACHE_LOCK:
             cached = _CACHE.get(key)
@@ -255,6 +267,7 @@ def get_cached_sr_snapshot(symbol: str, *, limit: int | None = None) -> dict[str
         history_to_keep=SR_HISTORY_TO_KEEP,
         box_width=SR_BOX_WIDTH,
         atr_length=SR_ATR_LENGTH,
+        include_horizontal_sr=include_horizontal_sr,
     )
     latest_age_min = max(0.0, (time.time() * 1000 - (latest_ts + SR_INTERVAL_MS - 1)) / 60_000.0)
     if latest_age_min > SR_MAX_DATA_AGE_MIN:

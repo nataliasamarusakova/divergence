@@ -30,8 +30,8 @@ if str(ROOT) not in sys.path:
 from event_engine import bingx  # noqa: E402
 from event_engine.version import APP_VERSION  # noqa: E402
 from event_engine.telegram import send_detailed  # noqa: E402
+from event_engine.paths import DATA_DIR  # noqa: E402
 
-DATA_DIR = Path(os.environ.get("DIVERGENCE_DATA_DIR", ROOT / "data"))
 ACTIVE_TRADES_PATH = DATA_DIR / "active_trades.json"
 TRADES_PATH = DATA_DIR / "trades.jsonl"
 HEALTH_PATH = DATA_DIR / "health.jsonl"
@@ -788,7 +788,6 @@ def _discrepancy_message_detail(item: dict) -> str:
 
 def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = None, notify: bool = True) -> dict:
     """Run one bounded, read-only reconciliation and return a JSON-safe report."""
-    global ACTIVE_TRADES_PATH, TRADES_PATH, HEALTH_PATH
     if data_dir is not None:
         data_dir = Path(data_dir)
         active_path, trades_path, health_path = data_dir / "active_trades.json", data_dir / "trades.jsonl", data_dir / "health.jsonl"
@@ -1214,6 +1213,14 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                 report["discrepancies"].append(mismatch)
 
             if unconfirmed_empty_snapshot_positions:
+                retry_snapshot_diagnostics = report["checks"]["exchange_positions"].get("retry_snapshot_diagnostics")
+                second_snapshot_diagnostics = (
+                    retry_snapshot_diagnostics[-1]
+                    if isinstance(retry_snapshot_diagnostics, list)
+                    and retry_snapshot_diagnostics
+                    and isinstance(retry_snapshot_diagnostics[-1], dict)
+                    else {}
+                )
                 report["discrepancies"].append({
                     "level": "CRITICAL",
                     "code": "EXCHANGE_POSITION_SNAPSHOT_EMPTY_WITH_LOCAL_ACTIVE_STATE",
@@ -1222,8 +1229,8 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
                     "unconfirmed_positions": unconfirmed_empty_snapshot_positions,
                     "first_snapshot_http_status": report["checks"]["exchange_positions"].get("first_snapshot_diagnostics", {}).get("http_status"),
                     "first_snapshot_response_code": report["checks"]["exchange_positions"].get("first_snapshot_diagnostics", {}).get("response_code"),
-                    "second_snapshot_http_status": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("http_status"),
-                    "second_snapshot_response_code": report["checks"]["exchange_positions"].get("second_snapshot_diagnostics", {}).get("response_code"),
+                    "second_snapshot_http_status": second_snapshot_diagnostics.get("http_status"),
+                    "second_snapshot_response_code": second_snapshot_diagnostics.get("response_code"),
                     "detail": (
                         "Three successful BingX position reads (initial plus two fresh-connection retries) returned no active positions while local active state remained non-empty. "
                         "Exact complete exit fills are classified separately; every other local position remains UNKNOWN, not exchange_qty=0."
@@ -1822,6 +1829,12 @@ def run_reconciliation(*, now_ms: int | None = None, data_dir: Path | None = Non
     if write_error:
         report["status"] = "CRITICAL"
         report["discrepancies"].append({"level": "CRITICAL", "code": "HEALTH_LOG_WRITE_FAILED", "detail": write_error})
+        # Rebuild the alert set after the write failure is known; otherwise this
+        # newly discovered critical condition is absent from Telegram delivery.
+        alert_discrepancies = [
+            item for item in report["discrepancies"]
+            if str(item.get("level", "WARNING")).upper() in {"WARNING", "CRITICAL"}
+        ]
     if notify:
         suppress, suppression_reason = _repeat_alert_suppressed(alert_discrepancies, alert_state_path, now_ms)
         if alert_discrepancies and suppress:

@@ -38,6 +38,7 @@ from event_engine.bingx import (
 from event_engine.telegram import send_detailed
 from event_engine.formatting import format_price, format_rr, format_telegram_symbol
 from event_engine.json_safe import json_safe
+from event_engine.paths import DATA_DIR
 
 log = logging.getLogger("event_engine.tracker")
 
@@ -81,7 +82,7 @@ class NotificationStateError(RuntimeError):
     """Raised when the durable notification outbox cannot be trusted safely."""
 
 
-DATA = Path("data")
+DATA = DATA_DIR
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 NOTIFICATIONS_PATH = DATA / "notifications.json"
@@ -168,6 +169,44 @@ def _load_notifications() -> dict[str, dict]:
         raise NotificationStateError(
             "notification state contains non-object records: " + ", ".join(malformed[:10])
         )
+    for notification_id, record in data.items():
+        chats = record.get("chats")
+        if chats is None:
+            continue  # legacy records without recipient details remain migratable
+        if not isinstance(chats, dict):
+            raise NotificationStateError(
+                f"notification {notification_id!r} has a non-object chats state"
+            )
+        malformed_chats = [str(chat_id) for chat_id, state in chats.items() if not isinstance(state, dict)]
+        if malformed_chats:
+            raise NotificationStateError(
+                f"notification {notification_id!r} has non-object chat states: "
+                + ", ".join(malformed_chats[:10])
+            )
+        for chat_id, state in chats.items():
+            if "sent" in state and not isinstance(state["sent"], bool):
+                raise NotificationStateError(
+                    f"notification {notification_id!r} chat {chat_id!r} has a non-boolean sent flag"
+                )
+            attempts = state.get("attempts")
+            if attempts is not None and (
+                isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0
+            ):
+                raise NotificationStateError(
+                    f"notification {notification_id!r} chat {chat_id!r} has invalid attempts"
+                )
+            retry_after_ts = state.get("retry_after_ts")
+            if retry_after_ts is not None:
+                try:
+                    retry_after_value = float(retry_after_ts)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise NotificationStateError(
+                        f"notification {notification_id!r} chat {chat_id!r} has invalid retry_after_ts"
+                    ) from exc
+                if isinstance(retry_after_ts, bool) or not math.isfinite(retry_after_value) or retry_after_value < 0:
+                    raise NotificationStateError(
+                        f"notification {notification_id!r} chat {chat_id!r} has invalid retry_after_ts"
+                    )
     return data
 
 
@@ -203,9 +242,17 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
     # sent states are preserved and are never resent to those chats.
     for cid in _configured_telegram_chat_ids():
         chat_state.setdefault(cid, {"sent": False, "attempts": 0, "last_error": None})
-    pending = [cid for cid, state in chat_state.items() if isinstance(state, dict) and not bool(state.get("sent"))]
+    now_ms = int(time.time() * 1000)
+    pending = [
+        cid for cid, state in chat_state.items()
+        if isinstance(state, dict)
+        and not bool(state.get("sent"))
+        and int(_safe_float(state.get("retry_after_ts"), 0.0)) <= now_ms
+    ]
     if not pending:
-        item["resolved"] = bool(chat_state) and all(bool(state.get("sent")) for state in chat_state.values())
+        item["resolved"] = bool(chat_state) and all(
+            isinstance(state, dict) and bool(state.get("sent")) for state in chat_state.values()
+        )
         _save_notifications(notifications)
         return bool(item["resolved"])
 
@@ -225,6 +272,13 @@ def _deliver_notification(notification_id: str, record: dict) -> bool:
         if state["sent"]:
             state["sent_ts"] = now_ms
             state["message_id"] = result.get("message_id")
+            state.pop("retry_after_ts", None)
+        else:
+            retry_after_sec = _safe_float(result.get("retry_after_sec"), 0.0)
+            if retry_after_sec > 0:
+                state["retry_after_ts"] = now_ms + int(retry_after_sec * 1000)
+            else:
+                state.pop("retry_after_ts", None)
     item["resolved"] = all(bool(state.get("sent")) for state in chat_state.values()) and bool(chat_state)
     notifications[notification_id] = item
     _save_notifications(notifications)
@@ -1252,6 +1306,7 @@ def update_active_trade_protection(
         trade_direction = str(trade.get("direction", "")).upper()
 
         if trade_bx == want_bx and trade_direction == want_direction:
+            before_payload = json.dumps(json_safe(trade), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             old_tp_orders = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
             aggregate_by_leg = trade.get("tp_filled_qty") if isinstance(trade.get("tp_filled_qty"), dict) else {}
             by_order = trade.get("tp_filled_qty_by_order")
@@ -1300,8 +1355,10 @@ def update_active_trade_protection(
                     trade["be_activation_ts"] = int(be_activation_ts or trade.get("be_activation_ts") or time.time() * 1000)
             if tp_repair_state is not None:
                 trade["tp_repair_state"] = str(tp_repair_state)
-            trade["protection_last_updated_ts"] = int(time.time() * 1000)
-            _save_active_trades(trades)
+            after_payload = json.dumps(json_safe(trade), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if after_payload != before_payload:
+                trade["protection_last_updated_ts"] = int(time.time() * 1000)
+                _save_active_trades(trades)
             return True
 
     return False
@@ -3305,7 +3362,7 @@ def update_active_trades() -> None:
             hit_legs = {str(x).lower() for x in trade.get("hit_legs", []) if x}
             is_single_tp = trade.get("tp_mode") == "single_tp"
             should_move_to_be = _be_milestone_reached(hit_legs, is_single_tp)
-            if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
+            if should_move_to_be and not trade.get("be_activated") and rem_qty > 0 and pos_status != "not_found":
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
@@ -3527,7 +3584,7 @@ def update_active_trades() -> None:
 
                     is_single_tp = trade.get("tp_mode") == "single_tp"
                     should_move_to_be = _be_milestone_reached(hit_legs, is_single_tp)
-                    if should_move_to_be and not trade.get("be_activated") and rem_qty > 0:
+                    if should_move_to_be and not trade.get("be_activated") and rem_qty > 0 and pos_status != "not_found":
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
                         old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None

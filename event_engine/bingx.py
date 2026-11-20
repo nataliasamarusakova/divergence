@@ -19,6 +19,8 @@ from decimal import (
     ROUND_FLOOR,
 )
 from typing import Any
+
+from event_engine.paths import DATA_DIR
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -64,7 +66,7 @@ OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 OPEN_ORDERS_COOLDOWN_STATE_PATH = Path(
     os.environ.get(
         "BINGX_OPEN_ORDERS_COOLDOWN_PATH",
-        str(Path(os.environ.get("DIVERGENCE_DATA_DIR", Path(__file__).resolve().parents[1] / "data")) / "bingx_open_orders_cooldown.json"),
+        str(DATA_DIR / "bingx_open_orders_cooldown.json"),
     )
 )
 OPEN_ORDERS_COOLDOWN_FALLBACK_SEC = 900.0
@@ -396,41 +398,42 @@ def _request(
             # abort before a fresh timestamp/signature can be generated. Never
             # apply this retry to POST/DELETE or to a successful HTTP response
             # with malformed JSON.
+            try:
+                failed_status = int(getattr(response, "status_code", 0)) if response is not None else 0
+            except (TypeError, ValueError, OverflowError):
+                failed_status = 0
+            # openOrders is an account-wide safety snapshot. Persist its cooldown
+            # for every HTTP 429, including retryable=False readers and HTML
+            # gateway responses. The cooldown must not depend on the generic
+            # signed-GET retry policy because those callers intentionally disable
+            # retries to avoid request fan-out during reconciliation.
+            if is_open_orders and failed_status == 429:
+                now_ms = int(time.time() * 1000)
+                retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
+                _persist_open_orders_cooldown(
+                    retry_after_ms,
+                    "HTTP 429 from openOrders without a valid API envelope",
+                )
+                if isinstance(response_metadata, dict):
+                    response_metadata.update({
+                        "rate_limited": True,
+                        "local_cooldown": True,
+                        "retry_after_ms": retry_after_ms,
+                        "response_parse_error": type(exc).__name__,
+                    })
+                return {
+                    "code": -1,
+                    "msg": "openOrders_http_429_without_valid_api_envelope",
+                    "http_status": 429,
+                    "rate_limited": True,
+                    "local_cooldown": True,
+                    "retry_after_ms": retry_after_ms,
+                }
             if (
                 signed_retryable_get
                 and response is not None
                 and http_retry_count < max_signed_get_http_retries
             ):
-                try:
-                    failed_status = int(getattr(response, "status_code", 0))
-                except (TypeError, ValueError, OverflowError):
-                    failed_status = 0
-                if is_open_orders and failed_status == 429:
-                    # A rate-limited openOrders response may be an HTML gateway
-                    # body rather than BingX's JSON code=100410 envelope. Do not
-                    # retry it: persist the same conservative endpoint cooldown
-                    # so subsequent workflow cycles also avoid amplifying the ban.
-                    now_ms = int(time.time() * 1000)
-                    retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
-                    _persist_open_orders_cooldown(
-                        retry_after_ms,
-                        "HTTP 429 from openOrders without a valid API envelope",
-                    )
-                    if isinstance(response_metadata, dict):
-                        response_metadata.update({
-                            "rate_limited": True,
-                            "local_cooldown": True,
-                            "retry_after_ms": retry_after_ms,
-                            "response_parse_error": type(exc).__name__,
-                        })
-                    return {
-                        "code": -1,
-                        "msg": "openOrders_http_429_without_valid_api_envelope",
-                        "http_status": 429,
-                        "rate_limited": True,
-                        "local_cooldown": True,
-                        "retry_after_ms": retry_after_ms,
-                    }
                 if failed_status in {429, 500, 502, 503, 504}:
                     retry_after_raw = str(getattr(response, "headers", {}).get("Retry-After", "") or "").strip()
                     try:
@@ -485,16 +488,38 @@ def _request(
         except (TypeError, ValueError, AttributeError):
             code = None
 
-        if is_open_orders and code == 100410:
+        if is_open_orders and (code == 100410 or status_code == 429):
             now_ms = int(time.time() * 1000)
-            retry_after_ms = _parse_open_orders_unblock_ms(payload.get("msg") if isinstance(payload, dict) else "")
+            retry_after_ms = (
+                _parse_open_orders_unblock_ms(payload.get("msg") if isinstance(payload, dict) else "")
+                if code == 100410 else None
+            )
             if retry_after_ms is None or retry_after_ms <= now_ms:
                 retry_after_ms = now_ms + int(OPEN_ORDERS_COOLDOWN_FALLBACK_SEC * 1000)
-            _persist_open_orders_cooldown(retry_after_ms, str(payload.get("msg") or "BingX code 100410") if isinstance(payload, dict) else "BingX code 100410")
-            if isinstance(payload, dict):
-                payload = dict(payload)
-                payload["retry_after_ms"] = retry_after_ms
-                payload["rate_limited"] = True
+            reason = str(payload.get("msg") or "BingX code 100410") if code == 100410 else "HTTP 429 from openOrders JSON response"
+            _persist_open_orders_cooldown(retry_after_ms, reason)
+            payload = dict(payload)
+            payload["retry_after_ms"] = retry_after_ms
+            payload["rate_limited"] = True
+            payload["local_cooldown"] = True
+            if isinstance(response_metadata, dict):
+                response_metadata.update({
+                    "rate_limited": True,
+                    "local_cooldown": True,
+                    "retry_after_ms": retry_after_ms,
+                })
+            # An HTTP 429 is never a successful snapshot, even if a proxy or
+            # gateway accidentally wraps it in a JSON envelope with code=0.
+            if status_code == 429 and code != 100410:
+                return {
+                    "code": -1,
+                    "msg": str(payload.get("msg") or "openOrders HTTP 429 rate limited"),
+                    "http_status": 429,
+                    "http_error": True,
+                    "rate_limited": True,
+                    "local_cooldown": True,
+                    "retry_after_ms": retry_after_ms,
+                }
         elif is_open_orders and code == 0 and is_http_success:
             _clear_open_orders_cooldown()
 
@@ -505,7 +530,7 @@ def _request(
         if (
             signed_retryable_get
             and not is_http_success
-            and not (is_open_orders and code == 100410)
+            and not (is_open_orders and (code == 100410 or payload.get("rate_limited")))
             and status_code in {429, 500, 502, 503, 504}
             and http_retry_count < max_signed_get_http_retries
         ):
@@ -527,7 +552,7 @@ def _request(
         # HTTP 5xx + JSON code=0 is not an acknowledged order or successful read.
         # Preserve the documented openOrders 100410 cooldown envelope so the
         # caller can avoid retrying a rate-limited endpoint.
-        if not is_http_success and not (is_open_orders and code == 100410):
+        if not is_http_success and not (is_open_orders and (code == 100410 or payload.get("rate_limited"))):
             return {
                 "code": -1,
                 "msg": f"http_status_error:{status_code}",
@@ -588,6 +613,11 @@ def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
     # Normalize them before catalog lookup so fallback cannot form BTCUSDT-USDT.
     if "-" not in s and s.endswith("USDT") and len(s) > 4:
         s = f"{s[:-4]}-USDT"
+
+    compact_symbol = s.replace("-", "")
+    alias = _KNOWN_CONTRACT_SYMBOL_ALIASES.get(s) or _KNOWN_CONTRACT_SYMBOL_ALIASES.get(compact_symbol)
+    if alias:
+        s = alias
 
     catalog = contracts(require_fresh=require_fresh)
     mapped = SYMBOL_MAP.get(s)

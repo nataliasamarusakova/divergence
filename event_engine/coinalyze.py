@@ -386,21 +386,43 @@ def click_next_page(page, current_page_num: int) -> bool:
     )
 
 
-def get_page_urls(html_text: str) -> list[str]:
+def _get_numbered_page_urls(html_text: str) -> dict[int, str]:
     soup = BeautifulSoup(html_text, "lxml")
     pagination = soup.select_one(".pagination")
     if not pagination:
-        return [COINALYZE_URL]
+        return {}
 
-    urls = [COINALYZE_URL]
+    urls_by_page: dict[int, str] = {}
     for a in pagination.select("a[href]"):
-        href = a.get("href", "")
+        href = str(a.get("href", "") or "").strip()
         if not href:
             continue
+        # The pagination window may also contain Previous, Next, ellipsis, and
+        # accessibility links. Only numbered page anchors are direct URLs; the
+        # live Next control is handled by click_next_page after the visible range.
+        labels = (
+            a.get_text(" ", strip=True),
+            str(a.get("aria-label", "") or "").strip(),
+            str(a.get("title", "") or "").strip(),
+            str(a.get("data-page", "") or "").strip(),
+        )
+        page_number = None
+        for label in labels:
+            match = re.fullmatch(r"(?:page\s*)?(\d+)", label, flags=re.IGNORECASE)
+            if match:
+                page_number = int(match.group(1))
+                break
+        if page_number is None or page_number < 2:
+            continue
         full = f"https://coinalyze.net{href}" if href.startswith("/") else href
-        if full not in urls:
-            urls.append(full)
+        urls_by_page.setdefault(page_number, full)
+    return urls_by_page
 
+
+def get_page_urls(html_text: str) -> list[str]:
+    # Keep the public helper's historical list[str] contract for callers/tests.
+    urls = [COINALYZE_URL]
+    urls.extend(url for _, url in sorted(_get_numbered_page_urls(html_text).items()))
     return urls[:MAX_PAGES + 1]
 
 
@@ -531,8 +553,21 @@ def fetch_data() -> list[CoinalyzeRow]:
                 })
                 page_urls = page_urls[:MAX_PAGES]
 
+            # Numbered links expose only the current pagination window on some
+            # Coinalyze layouts (for example: 1 2 3 4 5 … Next). Visit every
+            # visible URL first, then continue through the live Next control from
+            # the final loaded page. The old `elif` skipped this continuation as
+            # soon as more than one page URL was present.
+            page_num = 1
+            numbered_urls = _get_numbered_page_urls(html)
+            page_number_by_url = {url: number for number, url in numbered_urls.items()}
             if len(page_urls) > 1:
                 for i, url in enumerate(page_urls[1:], start=2):
+                    actual_page_num = page_number_by_url.get(url, i)
+                    if actual_page_num > MAX_PAGES:
+                        break
+                    if actual_page_num <= page_num:
+                        continue
                     try:
                         html = _load_page_with_retry(page, url)
                         rows = parse_table(html)
@@ -542,13 +577,16 @@ def fetch_data() -> list[CoinalyzeRow]:
                                 all_rows.append(row)
                                 seen.add(row.symbol)
                                 added += 1
-                        log.info("[COINALYZE] Page %d: +%d new rows", i, added)
+                        page_num = actual_page_num
+                        log.info("[COINALYZE] Page %d: +%d new rows", actual_page_num, added)
                     except Exception as exc:
-                        page_errors.append({"page": i, "url": url, "error": str(exc)[:200]})
-                        log.exception("[COINALYZE] Page %d failed", i)
+                        page_errors.append({"page": actual_page_num, "url": url, "error": str(exc)[:200]})
+                        log.exception("[COINALYZE] Page %d failed", actual_page_num)
+                        # The current browser page may be in an unknown state;
+                        # do not pretend subsequent click navigation is reliable.
+                        break
 
-            elif page.query_selector(".pagination") is not None:
-                page_num = 1
+            if page.query_selector(".pagination") is not None:
                 while page_num < MAX_PAGES:
                     try:
                         advanced = click_next_page(page, page_num)

@@ -2367,7 +2367,7 @@ def diagnose_15m_trigger(
         "volume_sma20": None,
         "volume_ratio": None,
         "breakout_pass": False,
-        "volume_pass": True,
+        "volume_pass": not (float(min_vol_mult) > 0),
         "data_pass": True,
         "direction_pass": True,
         "scanned_bar_details": [],
@@ -2415,6 +2415,29 @@ def diagnose_15m_trigger(
         work["close_time"] = pd.to_numeric(work["close_time"], errors="coerce")
 
     work = work.dropna(subset=["close", "high", "low"]).reset_index(drop=True)
+
+    def _volume_confirmation(index: int, current_volume: Any) -> tuple[bool, float | None, float | None]:
+        """Fail closed when enabled volume confirmation lacks a full valid window."""
+        if float(min_vol_mult) <= 0:
+            return True, None, None
+        if "volume" not in work.columns or index < 20:
+            return False, None, None
+        window = pd.to_numeric(work["volume"].iloc[index - 20:index], errors="coerce")
+        if len(window) != 20:
+            return False, None, None
+        values = window.to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values < 0).any():
+            return False, None, None
+        volume_sma20 = float(values.mean())
+        try:
+            current_value = float(current_volume)
+        except (TypeError, ValueError, OverflowError):
+            return False, volume_sma20, None
+        if not math.isfinite(current_value) or current_value < 0 or volume_sma20 <= 0:
+            return False, volume_sma20, None
+        volume_ratio = current_value / volume_sma20
+        return current_value >= volume_sma20 * float(min_vol_mult), volume_sma20, volume_ratio
+
     if len(work) < 2:
         result["reason"] = "insufficient_data"
         result["data_pass"] = False
@@ -2441,17 +2464,7 @@ def diagnose_15m_trigger(
         else:
             breakout_pass = current_close < previous_low
 
-        volume_sma20 = None
-        volume_ratio = None
-        volume_pass = True
-
-        if "volume" in work.columns and len(work) >= 20 and min_vol_mult > 0:
-            volume_window = pd.to_numeric(work["volume"].iloc[-21:-1], errors="coerce")
-            if len(volume_window) == 20 and volume_window.notna().all():
-                volume_sma20 = float(volume_window.mean())
-                if volume_sma20 > 0 and current_volume is not None:
-                    volume_ratio = current_volume / volume_sma20
-                    volume_pass = current_volume >= (volume_sma20 * min_vol_mult)
+        volume_pass, volume_sma20, volume_ratio = _volume_confirmation(i, current_volume)
 
         result["bars_after_event"] = 1
         result["bars_considered"] = 1
@@ -2526,17 +2539,7 @@ def diagnose_15m_trigger(
         else:
             breakout_pass = current_close < previous_low
 
-        volume_sma20 = None
-        volume_ratio = None
-        volume_pass = True
-
-        if "volume" in work.columns and i >= 20 and min_vol_mult > 0:
-            volume_window = pd.to_numeric(work["volume"].iloc[i - 20:i], errors="coerce")
-            if len(volume_window) == 20 and volume_window.notna().all():
-                volume_sma20 = float(volume_window.mean())
-                if volume_sma20 > 0 and current_volume is not None:
-                    volume_ratio = current_volume / volume_sma20
-                    volume_pass = current_volume >= (volume_sma20 * min_vol_mult)
+        volume_pass, volume_sma20, volume_ratio = _volume_confirmation(i, current_volume)
 
         detail = {
             "close_ts": close_ts,

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import os
+import math
+import time
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 import requests
@@ -30,6 +33,53 @@ def _safe_error_text(value: Any, token: str) -> str:
     return message[:500]
 
 
+class _PlainTextHTMLParser(HTMLParser):
+    """Flatten the generated HTML notification when Telegram's text limit is exceeded."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"br", "p", "div", "li"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"p", "div", "li"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _prepare_message(text: str) -> tuple[str, str | None]:
+    """Keep Telegram messages within 4096 chars; oversized HTML falls back to plain text."""
+    body = str(text or "")
+    if len(body) <= 4096:
+        return body, "HTML"
+    parser = _PlainTextHTMLParser()
+    try:
+        parser.feed(body)
+        parser.close()
+        plain = "".join(parser.parts)
+    except Exception:
+        plain = body
+    plain = plain.strip()
+    if len(plain) > 4096:
+        plain = plain[:4095].rstrip() + "…"
+    return plain, None
+
+
+def _retry_after_seconds(payload: dict[str, Any]) -> float | None:
+    parameters = payload.get("parameters")
+    raw = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def send_detailed(
     text: str,
     only_chat_ids: Optional[list[str]] = None,
@@ -42,38 +92,59 @@ def send_detailed(
         return {str(chat_id): {"sent": False, "error": "missing TG_BOT_TOKEN or TG_CHAT_IDS"} for chat_id in ids}
 
     base_url = f"https://api.telegram.org/bot{token}"
+    message_text, parse_mode = _prepare_message(text)
     result: dict[str, dict[str, Any]] = {}
     for chat_id in ids:
         try:
-            # Send the original multi-line HTML body unchanged. Contract tickers
-            # are inline <code> entities, which Telegram clients render as
-            # tap-to-copy text. No extra keyboard or copy button is attached.
             message_data: dict[str, Any] = {
                 "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
+                "text": message_text,
                 "disable_web_page_preview": "true",
             }
+            if parse_mode:
+                message_data["parse_mode"] = parse_mode
 
-            response = requests.post(
-                f"{base_url}/sendMessage",
-                data=message_data,
-                timeout=15,
-                allow_redirects=False,
-            )
-            status_code = int(getattr(response, "status_code", 0))
-            if not 200 <= status_code < 300:
-                raise requests.HTTPError(f"Telegram HTTP status={status_code}")
-            payload = _response_payload(response)
-            if payload.get("ok"):
-                result[str(chat_id)] = {
-                    "sent": True,
-                    "message_id": ((payload.get("result") or {}).get("message_id")),
-                }
-            else:
-                error = _safe_error_text(payload.get("description", "unknown Telegram API error"), token)
-                print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
-                result[str(chat_id)] = {"sent": False, "error": error}
+            payload: dict[str, Any] = {}
+            status_code = 0
+            for attempt in range(2):
+                response = requests.post(
+                    f"{base_url}/sendMessage",
+                    data=message_data,
+                    timeout=15,
+                    allow_redirects=False,
+                )
+                status_code = int(getattr(response, "status_code", 0))
+                payload = _response_payload(response)
+                try:
+                    api_error_code = int(payload.get("error_code"))
+                except (TypeError, ValueError, OverflowError):
+                    api_error_code = None
+                if status_code == 429 or api_error_code == 429:
+                    retry_after = _retry_after_seconds(payload)
+                    if attempt == 0 and retry_after is not None and retry_after <= 3.0:
+                        time.sleep(retry_after)
+                        continue
+                    error = _safe_error_text(payload.get("description") or "Telegram rate limited", token)
+                    result[str(chat_id)] = {
+                        "sent": False,
+                        "error": f"{error}; retry_after={retry_after if retry_after is not None else 'unknown'}s",
+                        "retry_after_sec": retry_after,
+                    }
+                    break
+                if not 200 <= status_code < 300:
+                    error = _safe_error_text(payload.get("description") or f"Telegram HTTP status={status_code}", token)
+                    result[str(chat_id)] = {"sent": False, "error": error}
+                    break
+                if payload.get("ok"):
+                    result[str(chat_id)] = {
+                        "sent": True,
+                        "message_id": ((payload.get("result") or {}).get("message_id")),
+                    }
+                else:
+                    error = _safe_error_text(payload.get("description", "unknown Telegram API error"), token)
+                    print(f"[TELEGRAM] API rejected message for chat_id={chat_id}: {error}")
+                    result[str(chat_id)] = {"sent": False, "error": error}
+                break
         except requests.RequestException as exc:
             error = _safe_error_text(exc, token)
             print(f"[TELEGRAM] Request failed for chat_id={chat_id}: {error}")
@@ -108,6 +179,15 @@ def format_signal(
 
     def esc(v: Any) -> str:
         return html.escape("—" if v is None or v == "" else str(v), quote=False)
+
+    def finite_number(value: Any, decimals: int = 3) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return "—"
+        if not math.isfinite(number):
+            return "—"
+        return str(round(number, decimals))
 
     name = getattr(coinalyze_row, "name", None) or event.get("symbol", "")
     symbol = format_telegram_symbol(event.get("symbol", ""))
@@ -161,14 +241,14 @@ def format_signal(
             "<b>Divergence</b>",
             f"P1: <code>{esc(format_price(fact.get('p1_price')))}</code>",
             f"P2: <code>{esc(format_price(fact.get('p2_price')))}</code>",
-            f"Price Δ / ATR: <code>{esc(round(float(fact.get('price_delta_atr', 0)), 3))}</code>",
+            f"Price Δ / ATR: <code>{esc(finite_number(fact.get('price_delta_atr')))}</code>",
         ])
     elif "squeeze_duration_bars" in fact:
         lines.extend([
             "",
             "<b>Volatility Squeeze</b>",
             f"Duration: <code>{esc(fact.get('squeeze_duration_bars'))} bars</code>",
-            f"BB / KC Width: <code>{esc(round(float(fact.get('compression_ratio', 0)), 3))}</code>",
+            f"BB / KC Width: <code>{esc(finite_number(fact.get('compression_ratio')))}</code>",
         ])
     elif "liq_ratio_24h" in fact:
         # Audit B3: forced-liquidation squeeze event card.
@@ -181,7 +261,7 @@ def format_signal(
             "",
             "<b>Liquidation Squeeze</b>",
             f"Liq/OI 24h: <code>{esc(round(ratio_pct, 3) if ratio_pct is not None else None)}%</code>",
-            f"Spike (ATR mult): <code>{esc(round(float(fact.get('spike_atr_mult', 0) or 0), 2))}</code>",
+            f"Spike (ATR mult): <code>{esc(finite_number(fact.get('spike_atr_mult'), 2))}</code>",
             f"OI chg 4h: <code>{esc(fact.get('oi_chg4h_pct'))}%</code>",
             f"Funding OI-w: <code>{esc(fact.get('fr_oiw'))}</code>",
             f"L/S accounts: <code>{esc(fact.get('ls_accounts'))}</code>",
