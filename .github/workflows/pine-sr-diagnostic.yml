@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "Symbol, for example BTC-USDT"
+        description: "TradingView Binance perpetual ticker, for example BTCUSDT.P"
         required: true
-        default: "BTC-USDT"
+        default: "BTCUSDT.P"
         type: string
   repository_dispatch:
     types: [run_pine_sr_diagnostic]
@@ -162,7 +162,7 @@ jobs:
           DIAG_SYMBOL: ${{ steps.inputs.outputs.symbol }}
         run: |
           set -euo pipefail
-          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit 1000 --output pine-sr-zones.csv | tee pine-sr-diagnostic.log
+          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit 1000 --output pine-sr-zones.csv --cluster-output pine-sr-clusters.csv | tee pine-sr-diagnostic.log
 
       - name: Upload diagnostic log
         uses: actions/upload-artifact@v4
@@ -171,6 +171,7 @@ jobs:
           path: |
             pine-sr-diagnostic.log
             pine-sr-zones.csv
+            pine-sr-clusters.csv
           if-no-files-found: error
 
       - name: Stop Binance WireProxy

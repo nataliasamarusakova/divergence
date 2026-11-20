@@ -129,6 +129,7 @@ jobs:
       ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE: "false"
       ENABLE_SFP_ENGINE: "true"
       ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE: "false"
+      ENABLE_VOLATILITY_SQUEEZE_ENGINE: "true"
       ENABLE_CRT_ENGINE: "true"
       EXTREME_SHORT_FUNDING: "-0.50"
       EXTREME_LONG_FUNDING: "0.50"
@@ -223,15 +224,82 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # The engine commits changing runtime state under data/ after every cycle.
+      # Tests use isolated temporary state and do not consume those runtime files,
+      # so key the success marker on the complete non-runtime repository tree plus
+      # the installed Python environment rather than on the commit SHA.
+      - name: Build exact regression-test fingerprint
+        id: pytest-fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_fingerprint="$(
+            find . -type f \
+              -not -path './.git/*' \
+              -not -path './data/*' \
+              -not -path '*/__pycache__/*' \
+              -not -path './.pytest_cache/*' \
+              -not -path './.venv/*' \
+              -not -name '*.pyc' \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          environment_fingerprint="$(
+            python - <<'PY'
+          import hashlib
+          import platform
+          import subprocess
+          import sys
+
+          freeze = subprocess.check_output(
+              [sys.executable, "-m", "pip", "freeze", "--all"], text=True
+          )
+          material = "\n".join((
+              platform.python_implementation(),
+              platform.python_version(),
+              platform.system(),
+              platform.machine(),
+              freeze,
+          ))
+          print(hashlib.sha256(material.encode("utf-8")).hexdigest())
+          PY
+          )"
+          key="pytest-success-v1-${RUNNER_OS}-${RUNNER_ARCH}-${repo_fingerprint}-${environment_fingerprint}"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+          echo "[PYTEST_CACHE] repo=${repo_fingerprint} environment=${environment_fingerprint}"
+
+      - name: Restore successful regression-test marker
+        id: pytest-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/divergence-pytest-success
+          key: ${{ steps.pytest-fingerprint.outputs.key }}
+
       - name: Run regression test suite before market execution
+        if: steps.pytest-cache.outputs.cache-hit != 'true'
         # The job has production Telegram secrets for the live engine. Explicitly
         # clear them for pytest so a regression test can never page the operator.
         env:
           TG_BOT_TOKEN: ""
           TG_CHAT_IDS: ""
           TG_CHAT_ID: ""
+          TEST_CACHE_KEY: ${{ steps.pytest-fingerprint.outputs.key }}
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pytest -q
+          mkdir -p "${RUNNER_TEMP}/divergence-pytest-success"
+          printf '%s\n' "$TEST_CACHE_KEY" > "${RUNNER_TEMP}/divergence-pytest-success/key"
+
+      - name: Save successful regression-test marker
+        if: success() && steps.pytest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/divergence-pytest-success
+          key: ${{ steps.pytest-fingerprint.outputs.key }}
 
       - name: Install Playwright Chromium
         if: steps.cache-dependencies.outputs.cache-hit != 'true'
