@@ -1371,8 +1371,14 @@ def detect_crt(df: pd.DataFrame, symbol: str, timeframe: str = '1h',
 
 def diagnose_15m_retest_trigger(df15: pd.DataFrame, direction: str, reference_level: float,
                                 event_detected_at_ts: int, max_delay_min: float = 30.0,
-                                volume_mult: float = 1.10, tolerance_pct: float = 0.25) -> dict[str, Any]:
-    """Require breakout acceptance through a retest instead of buying the first break."""
+                                volume_mult: float = 1.10, tolerance_pct: float = 0.25,
+                                zone_low: float | None = None, zone_high: float | None = None) -> dict[str, Any]:
+    """Require a confirmed retest that has not invalidated its source zone.
+
+    For a LONG, a retest candle may not pierce the distal ``zone_low``; for a
+    SHORT, it may not pierce the distal ``zone_high``. The bounds are optional
+    because not every retest engine (e.g. Donchian) defines a bounded box.
+    """
     out = {"ok": False, "reason": "no_retest_window", "trigger_bar_close_ts": None, "trigger_price": None,
            "trigger_delay_min": None, "volume_ratio": None, "retest_level": reference_level}
     if not isinstance(df15, pd.DataFrame) or len(df15) < 22:
@@ -1385,6 +1391,21 @@ def diagnose_15m_retest_trigger(df15: pd.DataFrame, direction: str, reference_le
     d = d.dropna(subset=["close_time", "open", "high", "low", "close", "volume"]).sort_values("close_time").reset_index(drop=True)
     ref = float(reference_level)
     tol = abs(ref) * max(0.0, tolerance_pct) / 100.0
+    try:
+        distal_low = float(zone_low) if zone_low is not None else None
+        distal_high = float(zone_high) if zone_high is not None else None
+    except (TypeError, ValueError, OverflowError):
+        out["reason"] = "invalid_zone_bounds"
+        return out
+    if distal_low is not None and (not math.isfinite(distal_low) or distal_low <= 0):
+        out["reason"] = "invalid_zone_bounds"
+        return out
+    if distal_high is not None and (not math.isfinite(distal_high) or distal_high <= 0):
+        out["reason"] = "invalid_zone_bounds"
+        return out
+    if distal_low is not None and distal_high is not None and distal_low > distal_high:
+        out["reason"] = "invalid_zone_bounds"
+        return out
     candidate_indices = []
     event_ts = int(event_detected_at_ts)
     for i in range(1, len(d)):
@@ -1399,10 +1420,21 @@ def diagnose_15m_retest_trigger(df15: pd.DataFrame, direction: str, reference_le
         prev = d.iloc[i-1]; cur = d.iloc[i]
         vol_mean = d["volume"].iloc[max(0, i-20):i].mean()
         vol_ratio = float(cur["volume"] / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else 0.0
+        # Once price has crossed the distal edge after the source event, a later
+        # return through the reference level must not resurrect the invalidated
+        # setup. Check the full post-event path through this candidate bar.
+        post_event = d[(d["close_time"] > event_ts) & (d["close_time"] <= ts)]
         if direction.upper() == "LONG":
-            retest = float(cur["low"]) <= ref + tol and float(cur["close"]) > ref and float(cur["close"]) > float(cur["open"])
+            invalidated = distal_low is not None and bool((post_event["low"] < distal_low).any())
+            retest = (not invalidated and float(cur["low"]) <= ref + tol
+                      and float(cur["close"]) > ref and float(cur["close"]) > float(cur["open"]))
+        elif direction.upper() == "SHORT":
+            invalidated = distal_high is not None and bool((post_event["high"] > distal_high).any())
+            retest = (not invalidated and float(cur["high"]) >= ref - tol
+                      and float(cur["close"]) < ref and float(cur["close"]) < float(cur["open"]))
         else:
-            retest = float(cur["high"]) >= ref - tol and float(cur["close"]) < ref and float(cur["close"]) < float(cur["open"])
+            out["reason"] = "invalid_direction"
+            return out
         if retest and vol_ratio >= volume_mult:
             out.update({"ok": True, "reason": "retest_passed", "trigger_bar_close_ts": ts,
                         "trigger_price": float(cur["close"]), "trigger_delay_min": round(delay, 3), "volume_ratio": round(vol_ratio, 6)})
