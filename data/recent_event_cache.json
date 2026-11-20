@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795163857254,
+  "updated_ts": 1795164148811,
   "events": [
     {
       "event_id": "EVT_AA0B685C9D0E16AF",
@@ -1792,6 +1792,84 @@
         "range_high": 0.03343,
         "range_low": 0.02925,
         "manipulation_depth_atr": 0.6390564088225114,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_983FADB83D1FBD34",
+      "symbol": "CYBER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1795161599999,
+        "pivot_2_ts": 1795161599999,
+        "detected_at_ts": 1795161599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.217,
+        "bb_width": 0.014370748066813044,
+        "kc_width": 0.011732784755928038,
+        "squeeze_duration_bars": 14,
+        "compression_ratio": 1.2248369305123545,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.211506392377964,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_42C60B642E2E1CA1",
+      "symbol": "CYBER",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MA_COMPRESSION_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1795161599999,
+        "pivot_2_ts": 1795161599999,
+        "detected_at_ts": 1795161599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.217,
+        "compression_ratio": 0.6661677588593801,
+        "ma_spread_atr": 0.37038356034428616,
+        "compression_threshold": 0.5559914232091644,
+        "breakout_atr": 1.2773984798873363,
+        "volume_ratio": 4.335889861950941,
+        "requires_retest": true,
+        "trigger_level": 0.2116,
+        "engine": "MA_COMPRESSION",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_37D0C746EAA314DD",
+      "symbol": "CYBER",
+      "timeframe": "4h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795103999999,
+        "pivot_2_ts": 1795161599999,
+        "detected_at_ts": 1795161599999
+      },
+      "event_fact": {
+        "detection_close_price": 0.217,
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.206,
+        "zone_high": 0.206,
+        "zone_low": 0.2005,
+        "bos_level": 0.2116,
+        "ob_ts": 1795132799999,
+        "displacement_atr": 1.3166710199019234,
+        "volume_ratio": 2.865356978173807,
+        "body_fraction": 0.7265624999999999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
