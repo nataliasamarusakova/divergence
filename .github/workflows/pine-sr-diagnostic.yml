@@ -26,18 +26,11 @@ jobs:
       BINANCE_MARKET_RETRY_ATTEMPTS: "2"
       BINANCE_MARKET_RETRY_BACKOFF_SEC: "0.5"
       BINANCE_EXCHANGE_INFO_TTL_SEC: "900"
-      AJAY_SR_KLINE_LIMIT_1H: "1000"
-      AJAY_SR_ROOM_ENABLED: "false"
-      AJAY_SR_ROOM_MODE: "off"
-      AJAY_SR_REQUIRE_DATA: "true"
+      AJAY_SR_KLINE_LIMIT_1H: "1500"
       AJAY_SR_SWING_LENGTH: "10"
       AJAY_SR_HISTORY_TO_KEEP: "20"
       AJAY_SR_BOX_WIDTH: "2.5"
       AJAY_SR_ATR_LENGTH: "50"
-      AJAY_SR_ENTRY_BUFFER_PCT: "0.05"
-      AJAY_SR_TARGET_BUFFER_PCT: "0.05"
-      AJAY_SR_TARGET_BUFFER_R: "0.10"
-      AJAY_SR_SUPPORT_CONTEXT_MAX_R: "3.0"
       AJAY_SR_MAX_DATA_AGE_MIN: "190"
 
     steps:
@@ -64,7 +57,7 @@ jobs:
           PY
 
       - name: Install requests
-        run: python -m pip install --disable-pip-version-check requests
+        run: python -m pip install --quiet --disable-pip-version-check requests
 
       # Keep Binance Futures diagnostic traffic on the same pinned WireProxy egress
       # used by the production event engine. No global WireGuard interface is made.
@@ -87,7 +80,6 @@ jobs:
           tar -xzf "$ARCHIVE" -C "$CACHE_DIR"
           test -f "$CACHE_DIR/wireproxy"
           install -m 0755 "$CACHE_DIR/wireproxy" "$BIN_DIR/wireproxy"
-          "$BIN_DIR/wireproxy" --version
 
       - name: Start Binance-only WireProxy
         env:
@@ -109,11 +101,11 @@ jobs:
           BindAddress = 127.0.0.1:18080
           EOF
           chmod 600 "$PROXY_CONF"
-          "$HOME/.local/bin/wireproxy" --configtest -c "$PROXY_CONF"
+          "$HOME/.local/bin/wireproxy" --configtest -c "$PROXY_CONF" >/dev/null
           "$HOME/.local/bin/wireproxy" -c "$PROXY_CONF" >"$VPN_DIR/wireproxy.log" 2>&1 &
           echo $! > "$VPN_DIR/wireproxy.pid"
           for _ in $(seq 1 30); do
-            if curl --silent --show-error --fail --noproxy "" \
+            if curl --silent --fail --noproxy "" \
               --proxy "http://127.0.0.1:18080" \
               --connect-timeout 3 --max-time 8 \
               https://ipinfo.io/json -o "$VPN_DIR/proxy-ipinfo.json"; then
@@ -134,7 +126,6 @@ jobs:
           data = json.loads((vpn_dir / "proxy-ipinfo.json").read_text())
           expected = os.environ["VPN_EXPECTED_COUNTRY"]
           actual = str(data.get("country", "")).upper()
-          print(json.dumps({k: data.get(k) for k in ("ip", "country", "city", "org")}, indent=2))
           if expected and actual != expected.upper():
               raise SystemExit(f"VPN country mismatch: expected {expected}, got {actual}")
           PY
@@ -154,25 +145,15 @@ jobs:
         run: |
           set -euo pipefail
           symbol="${INPUT_SYMBOL:-}"
-          if [[ -z "$symbol" ]]; then symbol="${EVENT_SYMBOL:-BTC-USDT}"; fi
+          if [[ -z "$symbol" ]]; then symbol="${EVENT_SYMBOL:-BTCUSDT.P}"; fi
           echo "symbol=$symbol" >> "$GITHUB_OUTPUT"
 
-      - name: Run exact 3H Pine SR and bot directional-gate diagnostic
+      - name: Display Pine SR zones (highest to lowest)
         env:
           DIAG_SYMBOL: ${{ steps.inputs.outputs.symbol }}
         run: |
           set -euo pipefail
-          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit 1000 --output pine-sr-zones.csv --cluster-output pine-sr-clusters.csv | tee pine-sr-diagnostic.log
-
-      - name: Upload diagnostic log
-        uses: actions/upload-artifact@v4
-        with:
-          name: pine-sr-${{ steps.inputs.outputs.symbol }}
-          path: |
-            pine-sr-diagnostic.log
-            pine-sr-zones.csv
-            pine-sr-clusters.csv
-          if-no-files-found: error
+          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL"
 
       - name: Stop Binance WireProxy
         if: always()
@@ -189,6 +170,5 @@ jobs:
               done
               kill -9 "$pid" >/dev/null 2>&1 || true
             fi
-            cat "$VPN_DIR/wireproxy.log" || true
             rm -rf "$VPN_DIR"
           fi
