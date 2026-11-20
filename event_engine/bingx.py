@@ -641,17 +641,43 @@ def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
     if "-" not in s and s.endswith("USDT") and len(s) > 4:
         s = f"{s[:-4]}-USDT"
 
-    compact_symbol = s.replace("-", "")
-    alias = _KNOWN_CONTRACT_SYMBOL_ALIASES.get(s) or _KNOWN_CONTRACT_SYMBOL_ALIASES.get(compact_symbol)
-    if alias:
-        s = alias
+    dashed_symbol = s if s.endswith("-USDT") else f"{s}-USDT"
+    base_symbol = dashed_symbol[:-5] if dashed_symbol.endswith("-USDT") else dashed_symbol
+    compact_symbol = dashed_symbol.replace("-", "")
+    compact_base = base_symbol.replace("-", "")
 
     catalog = contracts(require_fresh=require_fresh)
-    mapped = SYMBOL_MAP.get(s)
-    if mapped:
-        c = catalog.get(str(mapped).strip().upper())
-        if c:
-            return c
+
+    # TRUMP-SOL-USDT is a distinct contract. Its compact spelling collides
+    # with the legacy TRUMPSOL -> TRUMP-USDT provider alias, so preserve the
+    # explicit dashed contract before consulting built-in aliases.
+    if dashed_symbol == "TRUMP-SOL-USDT":
+        return catalog.get(dashed_symbol)
+
+    # Keep lookup precedence identical to canonical_contract_symbol(): an
+    # explicit user override wins over built-in provider aliases such as LIT.
+    configured = next((
+        SYMBOL_MAP.get(key)
+        for key in (dashed_symbol, base_symbol, compact_symbol, compact_base)
+        if SYMBOL_MAP.get(key)
+    ), None)
+    if configured:
+        mapped_symbol = str(configured).strip().upper().replace("_", "-").replace("/", "-")
+        if "-" not in mapped_symbol and mapped_symbol.endswith("USDT") and len(mapped_symbol) > 4:
+            mapped_symbol = f"{mapped_symbol[:-4]}-USDT"
+        elif "-" not in mapped_symbol:
+            mapped_symbol = f"{mapped_symbol}-USDT"
+        # An explicit mapping is authoritative. Do not silently fall back to a
+        # built-in alias when its configured destination is absent from catalog.
+        return catalog.get(mapped_symbol)
+
+    alias = (
+        _KNOWN_CONTRACT_SYMBOL_ALIASES.get(dashed_symbol)
+        or _KNOWN_CONTRACT_SYMBOL_ALIASES.get(compact_symbol)
+        or _KNOWN_CONTRACT_SYMBOL_ALIASES.get(s)
+    )
+    if alias:
+        s = alias
 
     direct = s if s.endswith("-USDT") else f"{s.replace('-', '')}-USDT"
     c = catalog.get(direct)
@@ -894,10 +920,25 @@ def fetch_klines(
 
         if close_time > now_ms:
             continue
+        # Comparisons with NaN are false and therefore cannot validate OHLCV
+        # geometry. Require finite core candle values before constructing a
+        # market-data row; Infinity is equally unusable for indicators/ratios.
+        if not all(math.isfinite(value) for value in (open_price, high, low, close, volume)):
+            continue
         if open_price <= 0 or high <= 0 or low <= 0 or close <= 0 or volume < 0:
             continue
         if high < low or high < open_price or high < close or low > open_price or low > close:
             continue
+
+        # Optional quote/taker fields must never leak NaN/Inf downstream.
+        # Invalid optional metrics invalidate taker-flow confirmation, but do
+        # not discard an otherwise valid OHLCV candle.
+        if quote_volume is not None and not math.isfinite(quote_volume):
+            quote_volume = None
+        if taker_buy_base is not None and not math.isfinite(taker_buy_base):
+            taker_buy_base = None
+        if taker_buy_quote is not None and not math.isfinite(taker_buy_quote):
+            taker_buy_quote = None
 
         taker_flow_valid = (
             quote_volume is not None and taker_buy_base is not None and taker_buy_quote is not None

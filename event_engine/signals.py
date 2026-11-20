@@ -662,6 +662,11 @@ def detect_ema_pullback_continuation(df: pd.DataFrame, symbol: str, timeframe: s
             return []
         d[c] = pd.to_numeric(d[c], errors="coerce")
     d = d.dropna(subset=["close", "open", "high", "low", "volume", "close_time"]).reset_index(drop=True)
+    # The raw-frame length guard above does not guarantee that enough usable
+    # rows remain after removing malformed OHLCV candles. Keep the detector
+    # bounded and return no signal instead of indexing an empty/short frame.
+    if len(d) < 220:
+        return []
     d = add_ema(d, (fast, slow, 200))
     d["atr"] = _atr(d, 14)
     last = d.iloc[-1]
@@ -976,9 +981,13 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
             if ob_i is not None:
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) < zlo]
-                for break_i in breaks:
+                # The first close through the OB is the decisive break. If it
+                # happened before the required sweep, a later close through the
+                # same level cannot retroactively repair the event sequence.
+                break_i = breaks[0] if breaks else None
+                if break_i is not None:
                     # ICT-style breaker sequencing: buy-side liquidity must be
-                    # swept first, then the later OB break is the MSS/flip event.
+                    # swept before the first decisive OB break/MSS event.
                     sweep = _liquidity_sweep_before_break(d, highs, bos_i, break_i, 'bearish', pivot_right)
                     if sweep is None:
                         continue
@@ -987,10 +996,16 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if mss is None or float(d['close'].iloc[break_i]) >= mss[1]:
                         continue
                     mss_pivot_i, mss_level = mss
+                    # A close through the far side of the original OB after
+                    # the bearish break reclaims/invalidates this breaker zone.
+                    reclaimed = any(
+                        float(d['close'].iloc[k]) >= zhi
+                        for k in range(break_i + 1, last + 1)
+                    )
+                    if reclaimed or break_i >= last:
+                        continue
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
-                    if break_i >= last:
-                        continue
                     cur_high=float(d['high'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
                     if cur_high >= zlo and cur_close < zlo:
                         ts=int(d['close_time'].iloc[-1])
@@ -1012,9 +1027,13 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
             if ob_i is not None:
                 zhi=float(d['high'].iloc[ob_i]); zlo=float(d['low'].iloc[ob_i])
                 breaks=[k for k in range(bos_i+1,last+1) if float(d['close'].iloc[k]) > zhi]
-                for break_i in breaks:
+                # The first close through the OB is the decisive break. If it
+                # happened before the required sweep, a later close through the
+                # same level cannot retroactively repair the event sequence.
+                break_i = breaks[0] if breaks else None
+                if break_i is not None:
                     # ICT-style breaker sequencing: sell-side liquidity must be
-                    # swept first, then the later OB break is the MSS/flip event.
+                    # swept before the first decisive OB break/MSS event.
                     sweep = _liquidity_sweep_before_break(d, lows, bos_i, break_i, 'bullish', pivot_right)
                     if sweep is None:
                         continue
@@ -1023,10 +1042,16 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     if mss is None or float(d['close'].iloc[break_i]) <= mss[1]:
                         continue
                     mss_pivot_i, mss_level = mss
+                    # A close through the far side of the original OB after
+                    # the bullish break loses/rejects this breaker zone.
+                    reclaimed = any(
+                        float(d['close'].iloc[k]) <= zlo
+                        for k in range(break_i + 1, last + 1)
+                    )
+                    if reclaimed or break_i >= last:
+                        continue
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
-                    if break_i >= last:
-                        continue
                     cur_low=float(d['low'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
                     if cur_low <= zhi and cur_close > zhi:
                         ts=int(d['close_time'].iloc[-1])
@@ -1772,9 +1797,13 @@ def detect_harmonic_patterns(
 
     tol = 0.05 if tolerance is None else max(0.0, float(tolerance))
     lows, highs = _pivots(w, left=left, right=right)
-    pivots = [(i, "low", float(w["low"].iloc[i])) for i in lows]
-    pivots += [(i, "high", float(w["high"].iloc[i])) for i in highs]
-    pivots.sort(key=lambda x: x[0])
+    # A single OHLC candle can satisfy both pivot-high and pivot-low tests.
+    # Its extrema have no chronological ordering and must not become two
+    # consecutive XABCD points. Exclude ambiguous pivot bars altogether.
+    ambiguous_indices = set(lows).intersection(highs)
+    pivots = [(i, "low", float(w["low"].iloc[i])) for i in lows if i not in ambiguous_indices]
+    pivots += [(i, "high", float(w["high"].iloc[i])) for i in highs if i not in ambiguous_indices]
+    pivots.sort(key=lambda x: (int(w["close_time"].iloc[x[0]]), x[0]))
     if len(pivots) < 5:
         return []
     pivots = pivots[-max(5, int(max_pivots)):]
@@ -1784,7 +1813,12 @@ def detect_harmonic_patterns(
     for start in range(0, len(pivots) - 4):
         points = pivots[start:start + 5]
         kinds = [p[1] for p in points]
+        point_times = [int(w["close_time"].iloc[p[0]]) for p in points]
         if any(kinds[i] == kinds[i + 1] for i in range(4)):
+            continue
+        # Duplicate candle timestamps (including duplicated source rows) are
+        # not five chronologically distinct swing points.
+        if any(point_times[i] >= point_times[i + 1] for i in range(4)):
             continue
 
         prices = [p[2] for p in points]
