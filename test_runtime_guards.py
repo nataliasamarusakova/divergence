@@ -272,6 +272,9 @@ def _make_breaker_mss_fixture(break_close: float) -> pd.DataFrame:
     rows[118].update({"open": 108.5, "high": 111.5, "low": 107.0, "close": 108.0})
     # Close below the OB edge (99) but optionally not below MSS level (97).
     rows[121].update({"open": 100.0, "high": 100.5, "low": 96.5, "close": break_close, "volume": 1600.0})
+    # Price remains below the flipped zone after the break; only the final bar retests it.
+    for index in range(122, 139):
+        rows[index].update({"open": 98.0, "high": 98.5, "low": 97.5, "close": 98.0})
     # Retest the broken zone from below.
     rows[139].update({"open": 98.0, "high": 100.0, "low": 96.5, "close": 98.5})
     return pd.DataFrame(rows)
@@ -316,6 +319,9 @@ def _make_bullish_breaker_mss_fixture(break_close: float) -> pd.DataFrame:
     rows[119].update({"open": 92.5, "high": 94.0, "low": 88.5, "close": 100.0})
     # Close above the OB edge (101) but optionally not above MSS level (103).
     rows[122].update({"open": 102.0, "high": 104.0, "low": 101.0, "close": break_close, "volume": 1600.0})
+    # Price remains above the flipped zone after the break; only the final bar retests it.
+    for index in range(123, 139):
+        rows[index].update({"open": 104.0, "high": 104.5, "low": 103.5, "close": 104.0})
     # Retest the broken zone from above.
     rows[139].update({"open": 104.0, "high": 106.0, "low": 100.5, "close": 104.5})
     return pd.DataFrame(rows)
@@ -355,6 +361,17 @@ def test_bullish_breaker_source_retest_must_stay_inside_zone(monkeypatch, pierce
     else:
         assert len(events) == 1
         assert events[0]["event_type"] == "BREAKER_BLOCK_BULLISH"
+
+
+def test_bullish_breaker_rejects_second_retest_of_same_zone(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_bullish_breaker_mss_fixture(104.0)
+    # First post-break touch consumes the zone, even without a close rejection.
+    df.loc[130, ["open", "high", "low", "close"]] = [101.5, 103.0, 100.5, 102.0]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
 
 
 def test_bullish_breaker_rejects_reuse_after_prior_close_through_bos_pivot(monkeypatch):
@@ -823,7 +840,10 @@ def test_incomplete_coinalyze_still_runs_position_reconciliation(monkeypatch):
     monkeypatch.setattr(run_once, "EXECUTION_ENABLED", True)
     monkeypatch.setattr(run_once, "_validate_execution_config", lambda: (True, ""))
     monkeypatch.setattr(run_once, "update_active_trades", lambda: trace.append("tracker"))
-    monkeypatch.setattr(run_once, "reconcile_all_open_positions", lambda: trace.append("reconcile"))
+    monkeypatch.setattr(
+        run_once, "reconcile_all_open_positions",
+        lambda: (trace.append("reconcile"), {"status": "complete", "complete": True, "issues": []})[1],
+    )
     monkeypatch.setattr(run_once, "_fetch_market_klines_scan", lambda *args, **kwargs: [])
     monkeypatch.setattr(run_once, "fetch_data", lambda: (_ for _ in ()).throw(CoinalyzeIncompleteDataError("page 2 failed", [row])))
     monkeypatch.setattr(run_once, "_record_oi_snapshots", lambda *args, **kwargs: 0)
@@ -3160,3 +3180,83 @@ def test_bullish_breaker_rejects_zone_reclaimed_through_far_boundary(monkeypatch
     monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
 
     assert sig.detect_breaker_block(df, "TEST", "1h") == []
+
+
+def test_reconciliation_entry_gate_fails_closed_unless_complete():
+    import run_once as ro
+
+    assert ro._reconciliation_blocks_new_entries({"status": "complete", "complete": True}) is False
+    assert ro._reconciliation_blocks_new_entries({"status": "unknown", "complete": False}) is True
+    assert ro._reconciliation_blocks_new_entries({"status": "deferred", "complete": False}) is True
+    assert ro._reconciliation_blocks_new_entries({"status": "incomplete", "complete": False}) is True
+    assert ro._reconciliation_blocks_new_entries(None) is True
+    assert ro._reconciliation_blocks_new_entries({"status": "complete", "complete": False}) is True
+    assert ro._reconciliation_blocks_new_entries({"status": "complete", "complete": True, "issues": [{"kind": "unknown"}]}) is True
+
+
+def test_reconciliation_empty_account_without_local_exposure_is_complete(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
+    outcome = ro.reconcile_all_open_positions()
+
+    assert outcome == {
+        "status": "complete",
+        "complete": True,
+        "positions_received": 0,
+        "positions_checked": 0,
+        "issues": [],
+    }
+
+
+def test_pending_open_telegram_retry_skips_cleanup_and_quarantine_sentinels(monkeypatch):
+    import run_once as ro
+
+    sent_messages = []
+    action_rows = []
+    active = {
+        "ENTRY_ORDER_PENDING_PREFIX_ONLY": {
+            "symbol": "BTC", "direction": "LONG", "remaining_qty": 1.0,
+        },
+        "ROLLBACK_CLEANUP_PREFIX_ONLY": {
+            "symbol": "ETH", "direction": "LONG", "remaining_qty": 1.0,
+        },
+        "EVT_ENTRY_PENDING_FLAG": {
+            "symbol": "SOL", "direction": "LONG", "entry_order_resolution_pending": True,
+        },
+        "EVT_PROTECTION_CLEANUP_FLAG": {
+            "symbol": "XRP", "direction": "LONG", "protection_cleanup_only": True,
+        },
+        "EVT_CLOSE_CLEANUP_FLAG": {
+            "symbol": "DOGE", "direction": "LONG", "close_cleanup_pending": True,
+        },
+        "EVT_CLOSE_NOTIFICATION_FLAG": {
+            "symbol": "LINK", "direction": "LONG", "close_notification_pending": True,
+        },
+        "EVT_CLOSE_JOURNAL_FLAG": {
+            "symbol": "JUP", "direction": "LONG", "close_journal_pending": True,
+        },
+        "EVT_REAL_OPEN": {
+            "symbol": "ADA", "direction": "LONG", "event_type": "CRT_BULLISH",
+            "timeframe": "1h", "score": 82, "setup": {"entry_reference": 1.0},
+        },
+    }
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: active)
+    monkeypatch.setattr(ro, "to_bx_symbol", lambda symbol: f"{symbol}-USDT")
+    monkeypatch.setattr(ro, "format_signal", lambda *a, **k: "valid-open-message")
+    monkeypatch.setattr(ro, "send_tg", lambda message: sent_messages.append(message) or True)
+    monkeypatch.setattr(ro, "record_action", lambda row: action_rows.append(row))
+
+    current_positions = {
+        (f"{symbol}-USDT", "LONG"): {"symbol": f"{symbol}-USDT", "positionAmt": "1", "avgPrice": "1"}
+        for symbol in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LINK", "JUP", "ADA")
+    }
+    successful_ids = set()
+    attempted = ro.send_pending_open_trade_notifications(current_positions, successful_ids)
+
+    assert attempted == {"EVT_REAL_OPEN"}
+    assert successful_ids == {"EVT_REAL_OPEN"}
+    assert sent_messages == ["valid-open-message"]
+    assert len(action_rows) == 1
+    assert action_rows[0]["event_id"] == "EVT_REAL_OPEN"

@@ -2446,9 +2446,24 @@ def send_pending_open_trade_notifications(
     """
     attempted: set[str] = set()
     active = _load_active_trades()
+    sentinel_flags = (
+        "entry_order_resolution_pending",
+        "protection_cleanup_only",
+        "close_cleanup_pending",
+        "close_notification_pending",
+        "close_journal_pending",
+    )
+    sentinel_prefixes = ("ENTRY_ORDER_PENDING_", "ROLLBACK_CLEANUP_")
     for event_id, trade in active.items():
         event_id = str(event_id)
-        if trade.get("closed", False) or event_id in successful_ids:
+        if not isinstance(trade, dict):
+            continue
+        if (
+            trade.get("closed", False)
+            or event_id in successful_ids
+            or any(bool(trade.get(flag)) for flag in sentinel_flags)
+            or event_id.upper().startswith(sentinel_prefixes)
+        ):
             continue
 
         symbol = str(trade.get("symbol", ""))
@@ -4009,7 +4024,44 @@ def _stable_live_protection_audit(
     return {"status": "unknown", "reason": "protection_audit_not_stable"}
 
 
-def reconcile_all_open_positions() -> None:
+def reconcile_all_open_positions() -> dict[str, Any]:
+    """Reconcile every exchange position and report whether entry is safe.
+
+    A successful position snapshot alone is not enough: every live position's
+    protection must also have a known, stable state.  The caller uses this
+    summary as a cycle-wide entry gate while continuing to service existing
+    positions on later cycles.
+    """
+    reconciliation_issues: list[dict[str, Any]] = []
+    positions_received = 0
+    positions_checked = 0
+
+    def mark_issue(kind: str, reason: str, *, symbol: str = "", direction: str = "") -> None:
+        reconciliation_issues.append({
+            "kind": str(kind),
+            "reason": str(reason),
+            "symbol": str(symbol or ""),
+            "direction": str(direction or ""),
+        })
+
+    def result() -> dict[str, Any]:
+        kinds = {item["kind"] for item in reconciliation_issues}
+        if not kinds:
+            status = "complete"
+        elif "unknown" in kinds:
+            status = "unknown"
+        elif "deferred" in kinds:
+            status = "deferred"
+        else:
+            status = "incomplete"
+        return {
+            "status": status,
+            "complete": status == "complete",
+            "positions_received": positions_received,
+            "positions_checked": positions_checked,
+            "issues": list(reconciliation_issues),
+        }
+
     # Reconciliation must never monopolize the 5-minute event loop. The normal
     # BingX session intentionally retries GETs, but that can turn one network
     # problem into a long sequence of waits. Reconciliation uses fail-fast GETs
@@ -4034,9 +4086,11 @@ def reconcile_all_open_positions() -> None:
     try:
         positions = get_positions(timeout_sec=recon_timeout, retryable=False)
     except Exception as exc:
+        mark_issue("unknown", f"positions_snapshot_failed:{type(exc).__name__}:{exc}")
         log.error("[RECONCILIATION] Failed to fetch positions: %s", exc)
-        return
+        return result()
 
+    positions_received = len(positions)
     log.info("[RECONCILIATION] Open-position response received: %d records.", len(positions))
     active_trades = _load_active_trades()
     log.info("[RECONCILIATION] Active trade state loaded: %d records.", len(active_trades))
@@ -4077,11 +4131,15 @@ def reconcile_all_open_positions() -> None:
                 )
                 break
         if not positions:
+            mark_issue(
+                "unknown",
+                f"empty_exchange_snapshot_conflicts_with_{len(local_live_trades)}_local_live_trade(s)",
+            )
             log.critical(
                 "[RECONCILIATION] Exchange returned empty positions despite %d local live trade(s); skipping protection repair until state is known.",
                 len(local_live_trades),
             )
-            return
+            return result()
 
     # Do not make an orders request when every exchange position record is invalid.
     has_valid_position = False
@@ -4130,16 +4188,19 @@ def reconcile_all_open_positions() -> None:
     for position_index, p in enumerate(positions, start=1):
         elapsed = time.monotonic() - started
         if elapsed >= recon_budget:
+            deferred_count = max(0, len(positions) - position_index + 1)
+            mark_issue("deferred", f"reconciliation_budget_exhausted:{deferred_count}_position_record(s)")
             log.warning(
                 "[RECONCILIATION] Time budget reached after %.1fs; deferred %d/%d position records to next cycle.",
                 elapsed,
-                max(0, len(positions) - position_index + 1),
+                deferred_count,
                 len(positions),
             )
             break
 
         bx_symbol = str(p.get("symbol", "")).upper()
         if not bx_symbol:
+            mark_issue("unknown", "position_record_missing_symbol")
             continue
 
         position_side = str(p.get("positionSide", "")).upper()
@@ -4147,9 +4208,11 @@ def reconcile_all_open_positions() -> None:
             amt = float(p.get("positionAmt", 0) or 0)
             avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
         except (ValueError, TypeError):
+            mark_issue("unknown", "unparseable_exchange_position_fields", symbol=bx_symbol)
             continue
 
         if not math.isfinite(amt) or not math.isfinite(avg_price) or amt == 0 or avg_price <= 0:
+            mark_issue("unknown", "invalid_exchange_position_fields", symbol=bx_symbol)
             # Invalid exchange payloads must not flow into protection repair,
             # active-trade state, or journals as NaN/Infinity quantities/prices.
             record_action({
@@ -4164,6 +4227,7 @@ def reconcile_all_open_positions() -> None:
 
         direction = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
         qty = abs(amt)
+        positions_checked += 1
 
         protection_started = time.monotonic()
         if protection_snapshot is not None:
@@ -4199,6 +4263,7 @@ def reconcile_all_open_positions() -> None:
             len(prot.get("sl_orders", []) or []), len(prot.get("tp_orders", []) or []),
         )
         if prot.get("status") != "ok":
+            mark_issue("unknown", f"protection_state_unavailable:{prot.get('error') or prot.get('status')}", symbol=bx_symbol, direction=direction)
             log.warning("[RECONCILIATION] Cannot inspect protection for %s: %s", bx_symbol, prot.get("error"))
             record_action({
                 "record_type": "PROTECTION_STATE_UNKNOWN",
@@ -4238,6 +4303,7 @@ def reconcile_all_open_positions() -> None:
                 matched_trade["be_activated"] = True
                 be_activated = True
             except Exception as exc:
+                mark_issue("incomplete", f"be_state_persist_failed:{type(exc).__name__}:{exc}", symbol=bx_symbol, direction=direction)
                 log.error("[RECONCILIATION] Failed to persist exchange-confirmed BE state for %s %s: %s", bx_symbol, direction, exc)
 
         effective_levels = matched_trade.get("effective_tp_levels") if matched_trade else None
@@ -4400,7 +4466,12 @@ def reconcile_all_open_positions() -> None:
                         )
                         log.warning("[RECONCILIATION] Registered orphan protected position %s (%s) into tracker and journal.", bx_symbol, direction)
                     except Exception as exc:
+                        mark_issue("incomplete", f"orphan_tracker_registration_failed:{type(exc).__name__}:{exc}", symbol=bx_symbol, direction=direction)
                         log.error("[RECONCILIATION] Failed to register protected orphan %s (%s): %s", bx_symbol, direction, exc)
+                elif not tracked and matched_trade:
+                    mark_issue("incomplete", "active_trade_protection_state_not_persisted", symbol=bx_symbol, direction=direction)
+            else:
+                mark_issue("incomplete", "exchange_protection_could_not_be_mapped_to_tracker", symbol=bx_symbol, direction=direction)
             continue
 
         log.warning(
@@ -4419,6 +4490,7 @@ def reconcile_all_open_positions() -> None:
             retryable=False,
         )
         if recheck.get("status") != "ok":
+            mark_issue("unknown", f"pre_repair_protection_recheck_failed:{recheck.get('error') or recheck.get('status')}", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_RECHECK_UNKNOWN",
                 "symbol": bx_symbol, "direction": direction, "position_qty": qty,
@@ -4530,6 +4602,7 @@ def reconcile_all_open_positions() -> None:
                 tp_quantity_metadata_incomplete = True
 
         if tp_quantity_metadata_incomplete:
+            mark_issue("deferred", "tp_quantity_metadata_incomplete", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_REPAIR_DEFERRED_TP_QUANTITY_UNKNOWN",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4589,6 +4662,11 @@ def reconcile_all_open_positions() -> None:
             bx_symbol, matched_trade, missing_tp_legs,
         )
         if missing_tp_state.get("status") not in {"not_needed", "safe_to_replace"}:
+            mark_issue(
+                "deferred" if missing_tp_state.get("status") in {"unknown", "fill_pending_tracker"} else "incomplete",
+                f"missing_tp_state_{missing_tp_state.get('status')}:{missing_tp_state.get('reason', '')}",
+                symbol=bx_symbol, direction=direction,
+            )
             record_action({
                 "record_type": "PROTECTION_REPAIR_DEFERRED_TP_STATE",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4609,6 +4687,7 @@ def reconcile_all_open_positions() -> None:
             timeout_sec=recon_timeout,
         )
         if fresh_live.get("status") != "ok":
+            mark_issue("unknown", f"fresh_live_protection_audit_failed:{fresh_live.get('reason') or fresh_live.get('status')}", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_REPAIR_DEFERRED_LIVE_STATE",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4625,6 +4704,7 @@ def reconcile_all_open_positions() -> None:
             planned_remaining_tp_qty = sum(float(level["qty"]) for level in tp_levels)
             tp_qty_tolerance = max(1e-8, qty * 1e-6)
             if abs(planned_remaining_tp_qty - qty) > tp_qty_tolerance:
+                mark_issue("deferred", "planned_remaining_tp_quantity_mismatch", symbol=bx_symbol, direction=direction)
                 record_action({
                     "record_type": "PROTECTION_REPAIR_DEFERRED_TP_QUANTITY_MISMATCH",
                     "event_id": (matched_trade or {}).get("event_id"),
@@ -4694,6 +4774,7 @@ def reconcile_all_open_positions() -> None:
             expected_price=expected_sl_price, expected_qty=qty,
         )
         if post_repair.get("status") != "ok":
+            mark_issue("unknown", f"post_repair_protection_state_unknown:{post_repair.get('error') or post_repair.get('status')}", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_POST_REPAIR_UNKNOWN",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4752,6 +4833,7 @@ def reconcile_all_open_positions() -> None:
                 timeout_sec=recon_timeout,
             )
             if final_live.get("status") != "ok":
+                mark_issue("unknown", f"emergency_close_live_audit_unknown:{final_live.get('reason') or final_live.get('status')}", symbol=bx_symbol, direction=direction)
                 record_action({
                     "record_type": "PROTECTION_EMERGENCY_CLOSE_SKIPPED",
                     "event_id": (matched_trade or {}).get("event_id"),
@@ -4764,6 +4846,7 @@ def reconcile_all_open_positions() -> None:
                 continue
 
             if final_live.get("sl_valid"):
+                mark_issue("incomplete", "repair_deferred_after_fresh_valid_sl_but_tp_state_incomplete", symbol=bx_symbol, direction=direction)
                 record_action({
                     "record_type": "PROTECTION_EMERGENCY_CLOSE_SKIPPED",
                     "event_id": (matched_trade or {}).get("event_id"),
@@ -4784,6 +4867,7 @@ def reconcile_all_open_positions() -> None:
                 require_unprotected_position=True,
                 expected_sl_price=expected_sl_price,
             )
+            mark_issue("deferred", "emergency_close_attempted_reconciliation_required", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_EMERGENCY_CLOSE_RESULT",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4795,6 +4879,7 @@ def reconcile_all_open_positions() -> None:
             continue
 
         if missing_returned_tp_ids:
+            mark_issue("incomplete", "returned_tp_orders_not_visible_after_repair", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_REPAIR_TP_MISMATCH",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4807,6 +4892,7 @@ def reconcile_all_open_positions() -> None:
             continue
 
         if status != "PROTECTED" or not repaired_tp or not repaired_sl:
+            mark_issue("incomplete", f"protection_repair_incomplete:{status or 'UNKNOWN'}", symbol=bx_symbol, direction=direction)
             record_action({
                 "record_type": "PROTECTION_REPAIR_INCOMPLETE",
                 "event_id": (matched_trade or {}).get("event_id"),
@@ -4879,7 +4965,18 @@ def reconcile_all_open_positions() -> None:
             first_tp = min((float(x.get("pnl_pct", 0)) for x in (repaired_tp or []) if x.get("pnl_pct") is not None), default=0.0)
             log.info("[RECONCILIATION] Protection restored for %s (%s): SL=%.2f%%, first TP=+%.2f%%", bx_symbol, direction, sl_pct, first_tp)
     
-    log.info("[RECONCILIATION] Finished in %.1fs.", time.monotonic() - started)
+    summary = result()
+    if summary["complete"]:
+        log.info(
+            "[RECONCILIATION] Finished in %.1fs; all %d position(s) have a resolved protection state.",
+            time.monotonic() - started, positions_checked,
+        )
+    else:
+        log.error(
+            "[RECONCILIATION] Finished in %.1fs with status=%s; new entries must remain blocked. issues=%s",
+            time.monotonic() - started, summary["status"], summary["issues"],
+        )
+    return summary
 
 
 def _market_entry_outcome_unknown(execution_result: dict[str, Any]) -> bool:
@@ -5998,6 +6095,16 @@ def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> 
     return str(mode or "off").lower() == "enforce" and (not isinstance(snapshot, dict) or snapshot.get("trend_decision") != "ALIGNED")
 
 
+def _reconciliation_blocks_new_entries(reconciliation_result: Any) -> bool:
+    """Fail closed unless reconciliation explicitly confirms full completion."""
+    return not (
+        isinstance(reconciliation_result, dict)
+        and reconciliation_result.get("complete") is True
+        and str(reconciliation_result.get("status", "")).lower() == "complete"
+        and not reconciliation_result.get("issues")
+    )
+
+
 def main() -> None:
     global _KLINE_CACHE_ACTIVE
     _KLINE_REQUEST_CACHE.clear()
@@ -6020,6 +6127,7 @@ def main() -> None:
         return
 
     _begin_kline_request_cache_cycle()
+    reconciliation_state_unknown = False
 
     if EXECUTION_ENABLED:
         try:
@@ -6033,12 +6141,19 @@ def main() -> None:
 
         try:
             log.info("[RECONCILIATION] Reconciling open positions and protection...")
-            reconcile_all_open_positions()
+            reconciliation_result = reconcile_all_open_positions()
+            reconciliation_state_unknown = _reconciliation_blocks_new_entries(reconciliation_result)
+            if reconciliation_state_unknown:
+                log.critical(
+                    "[RECONCILIATION] Protection reconciliation is not complete (status=%s); NEW ENTRIES BLOCKED for this cycle.",
+                    reconciliation_result.get("status") if isinstance(reconciliation_result, dict) else "missing_result",
+                )
         except ActiveTradeStateError as exc:
             log.critical("[RECONCILIATION] Active position state is not trustworthy; aborting cycle before scanning entries: %s", exc)
             return
         except Exception as exc:
-            log.error("[RECONCILIATION] Error: %s", exc)
+            reconciliation_state_unknown = True
+            log.critical("[RECONCILIATION] Error; NEW ENTRIES BLOCKED for this cycle: %s", exc, exc_info=True)
 
     stats = {
         "coinalyze_rows": 0,
@@ -6189,7 +6304,7 @@ def main() -> None:
     now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     current_open_positions: dict[tuple[str, str], bool] = {}
     current_positions: dict[tuple[str, str], dict] = {}
-    position_state_unknown = False
+    position_state_unknown = bool(reconciliation_state_unknown)
     try:
         position_rows = get_positions()
         # If the account snapshot is empty while trusted local lifecycle state

@@ -3568,6 +3568,8 @@ def _make_breaker_fixture(with_liquidity_sweep: bool) -> pd.DataFrame:
     df.loc[118, ["open", "high", "low", "close"]] = [108.5, sweep_high, 107.0, 108.0]
     # First decisive break through the bullish OB low = bearish MSS/flip.
     df.loc[121, ["open", "high", "low", "close", "volume"]] = [100.0, 100.5, 97.0, 98.0, 1600.0]
+    # Price remains below the zone after the break; only the final bar retests it.
+    df.loc[122:138, ["open", "high", "low", "close"]] = [98.0, 98.5, 97.5, 98.0]
     # Current bar retests the broken zone from below.
     df.loc[139, ["open", "high", "low", "close"]] = [98.0, 100.0, 96.5, 98.5]
     return df
@@ -4877,6 +4879,18 @@ def test_bearish_breaker_source_retest_must_stay_inside_zone(monkeypatch, pierce
         assert len(events) == 1
         assert events[0]["event_type"] == "BREAKER_BLOCK_BEARISH"
 
+
+
+def test_bearish_breaker_rejects_second_retest_of_same_zone(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_breaker_fixture(True)
+    # First touch happens after the break; the later final-bar retest must not
+    # create a second event for the same flipped OB zone.
+    df.loc[130, ["open", "high", "low", "close"]] = [98.2, 99.5, 97.0, 98.2]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
 
 
 def test_breaker_rejects_reuse_after_prior_close_through_bos_pivot(monkeypatch):

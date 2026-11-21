@@ -223,3 +223,48 @@ def test_open_orders_json_429_unexpected_root_type_persists_cooldown(
     second = bx.get_open_orders_snapshot(retryable=False)
     assert second["local_cooldown"] is True
     assert session.calls == 1
+
+
+def test_reconciliation_summary_marks_open_orders_100410_as_entry_unsafe(monkeypatch):
+    import run_once as ro
+
+    positions = [
+        {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.02", "avgPrice": "60000"},
+        {"symbol": "ETH-USDT", "positionSide": "SHORT", "positionAmt": "-0.5", "avgPrice": "3000"},
+    ]
+    monkeypatch.setattr(ro, "get_positions", lambda **kwargs: positions)
+    monkeypatch.setattr(ro, "_load_active_trades", lambda: {})
+    monkeypatch.setattr(ro, "get_open_orders_snapshot", lambda **kwargs: {
+        "status": "error", "code": 100410, "rate_limited": True,
+        "error": "openOrders disabled",
+    })
+    monkeypatch.setattr(
+        ro, "get_open_protection_directional",
+        lambda *a, **k: pytest.fail("must not fan out after account-wide 100410"),
+    )
+    monkeypatch.setattr(ro, "record_action", lambda _row: None)
+
+    outcome = ro.reconcile_all_open_positions()
+
+    assert outcome["status"] == "unknown"
+    assert outcome["complete"] is False
+    assert outcome["positions_received"] == 2
+    assert outcome["positions_checked"] == 2
+    assert len(outcome["issues"]) == 2
+    assert {issue["symbol"] for issue in outcome["issues"]} == {"BTC-USDT", "ETH-USDT"}
+
+
+def test_reconciliation_returns_unknown_when_position_snapshot_fails(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(
+        ro, "get_positions",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("position endpoint unavailable")),
+    )
+    outcome = ro.reconcile_all_open_positions()
+
+    assert outcome["status"] == "unknown"
+    assert outcome["complete"] is False
+    assert outcome["positions_received"] == 0
+    assert outcome["positions_checked"] == 0
+    assert outcome["issues"][0]["reason"].startswith("positions_snapshot_failed:RuntimeError:")
