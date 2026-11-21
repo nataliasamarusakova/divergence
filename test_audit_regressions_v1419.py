@@ -205,6 +205,21 @@ def test_bingx_and_binance_resolve_lit_and_trumpsol_aliases(monkeypatch):
     assert client.resolve_symbol("TRUMPSOL") == "TRUMPUSDT"
 
 
+def test_binance_alias_never_falls_back_to_a_different_literal_instrument(monkeypatch):
+    from event_engine.binance import BinanceMarketClient
+
+    client = BinanceMarketClient()
+    for logical_symbol, literal_symbol in (
+        ("LIT", "LITUSDT"),
+        ("TRUMPSOL", "TRUMPSOLUSDT"),
+    ):
+        monkeypatch.setattr(
+            client, "refresh_exchange_info",
+            lambda **kwargs: {literal_symbol: {"symbol": literal_symbol}},
+        )
+        assert client.resolve_symbol(logical_symbol) is None
+
+
 def test_divergence_engine_flag_prevents_detector_execution(monkeypatch):
     import run_once as ro
 

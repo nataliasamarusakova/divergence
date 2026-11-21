@@ -4859,6 +4859,37 @@ def test_breaker_rejects_first_ob_break_when_it_precedes_liquidity_sweep(monkeyp
     assert sig.detect_breaker_block(df, "TEST", "1h") == []
 
 
+@pytest.mark.parametrize("pierces_far_boundary", [True, False])
+def test_bearish_breaker_source_retest_must_stay_inside_zone(monkeypatch, pierces_far_boundary):
+    import event_engine.signals as sig
+
+    df = _make_breaker_fixture(True)
+    # The bearish breaker zone is [99, 101]. A valid retest from below may
+    # touch 99, but a wick above 101 invalidates the source-timeframe setup.
+    if pierces_far_boundary:
+        df.loc[139, ["open", "high", "low", "close"]] = [100.5, 102.0, 98.0, 98.5]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+
+    events = sig.detect_breaker_block(df, "TEST", "1h")
+    if pierces_far_boundary:
+        assert events == []
+    else:
+        assert len(events) == 1
+        assert events[0]["event_type"] == "BREAKER_BLOCK_BEARISH"
+
+
+
+def test_breaker_rejects_reuse_after_prior_close_through_bos_pivot(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_breaker_fixture(True)
+    # The swing high at bar 105 is already consumed by a close after its
+    # confirmation (bar 107) but before the BOS displacement at bar 110.
+    df.loc[108, ["open", "high", "low", "close"]] = [100.3, 100.7, 100.2, 100.5]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([115], [105, 115]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
+
 def test_breaker_rejects_zone_reclaimed_through_far_boundary(monkeypatch):
     import event_engine.signals as sig
 

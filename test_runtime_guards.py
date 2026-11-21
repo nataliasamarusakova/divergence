@@ -338,6 +338,37 @@ def test_bullish_breaker_accepts_close_through_confirmed_mss(monkeypatch):
     assert events[0]["event_fact"]["mss_level"] == 103.0
 
 
+@pytest.mark.parametrize("pierces_far_boundary", [True, False])
+def test_bullish_breaker_source_retest_must_stay_inside_zone(monkeypatch, pierces_far_boundary):
+    import event_engine.signals as sig
+
+    df = _make_bullish_breaker_mss_fixture(104.0)
+    # The bullish breaker zone is [99, 101]. A retest from above may not wick
+    # through the distal 99 boundary on the source-timeframe confirmation bar.
+    if pierces_far_boundary:
+        df.loc[139, ["open", "high", "low", "close"]] = [100.0, 102.0, 98.0, 101.5]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+
+    events = sig.detect_breaker_block(df, "TEST", "1h")
+    if pierces_far_boundary:
+        assert events == []
+    else:
+        assert len(events) == 1
+        assert events[0]["event_type"] == "BREAKER_BLOCK_BULLISH"
+
+
+def test_bullish_breaker_rejects_reuse_after_prior_close_through_bos_pivot(monkeypatch):
+    import event_engine.signals as sig
+
+    df = _make_bullish_breaker_mss_fixture(104.0)
+    # The swing low is already consumed by a close before the BOS candle.
+    # Keep this earlier candle's body small so it cannot itself be a BOS.
+    df.loc[108, ["open", "high", "low", "close"]] = [99.55, 100.0, 99.4, 99.55]
+    monkeypatch.setattr(sig, "_pivots", lambda d, left=3, right=2: ([105, 115], [116]))
+
+    assert sig.detect_breaker_block(df, "TEST", "1h") == []
+
+
 def test_breaker_sell_side_sweep_requires_rejection_close():
     import event_engine.signals as sig
 
