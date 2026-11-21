@@ -223,6 +223,7 @@ BAR_CLOSE_GRACE_MIN = float(os.environ.get("BAR_CLOSE_GRACE_MIN", "2"))
 # This recovers fresh events that formed before the symbol entered the liquidity
 # universe, without turning first-seen symbols into unrestricted historical replays.
 NEW_SYMBOL_BACKFILL_MIN = float(os.environ.get("NEW_SYMBOL_BACKFILL_MIN", "120"))
+MIN_SCAN_HISTORY_BARS = 60
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "0"))
 MIN_VOL = float(os.environ.get("MIN_VOLUME_24H", "25000000"))
@@ -1831,6 +1832,45 @@ def _timeframe_interval_ms(timeframe: str) -> int:
         raise ValueError(f"Unsupported scan timeframe: {timeframe!r}") from exc
 
 
+def _contiguous_bucket_segment_bounds(
+    available_buckets: set[int], bucket: int,
+) -> tuple[int, int, int]:
+    """Return the closed contiguous segment containing ``bucket``."""
+    if bucket not in available_buckets:
+        return 0, 0, 0
+    first = last = bucket
+    while first - 1 in available_buckets:
+        first -= 1
+    while last + 1 in available_buckets:
+        last += 1
+    return first, last, last - first + 1
+
+
+def _latest_contiguous_bucket_segment(available_buckets: set[int]) -> tuple[int, int, int]:
+    """Return (first, last, count) for the newest contiguous available segment."""
+    if not available_buckets:
+        return 0, 0, 0
+    return _contiguous_bucket_segment_bounds(available_buckets, max(available_buckets))
+
+
+def _bounded_recent_segment_targets(
+    eligible: set[int], timeframe: str,
+) -> list[int]:
+    """Choose a bounded tail of the latest segment after a detector warm-up."""
+    segment_first, segment_last, segment_count = _latest_contiguous_bucket_segment(eligible)
+    if segment_count < MIN_SCAN_HISTORY_BARS:
+        return []
+    max_buckets = max(
+        1,
+        int(math.ceil(
+            NEW_SYMBOL_BACKFILL_MIN / (_timeframe_interval_ms(timeframe) / 60_000.0)
+        )),
+    )
+    first_processable = segment_first + MIN_SCAN_HISTORY_BARS - 1
+    first_target = max(first_processable, segment_last - max_buckets + 1)
+    return list(range(first_target, segment_last + 1))
+
+
 def _scan_buckets_to_process(
     scan_state: dict,
     symbol: str,
@@ -1838,77 +1878,64 @@ def _scan_buckets_to_process(
     completed_bucket: int,
     available_buckets: set[int],
 ) -> list[int]:
-    """Return contiguous closed buckets that can be replayed safely.
+    """Return closed buckets from one contiguous, sufficiently-warmed segment.
 
-    A new symbol/timeframe replays a bounded, contiguous recent window so a fresh
-    event formed before the symbol entered the universe is still recoverable. An
-    existing watermark that has aged out of fetched history is rebased through
-    the same bounded window. Within available history, missing buckets are never
-    skipped.
+    New symbols and aged-out watermarks replay a bounded tail of the newest
+    contiguous segment. An internal hole is skipped only when newer closed bars
+    exist and the newest segment has a full detector warm-up. A missing bucket at
+    the right edge still waits for exchange data. Every returned bucket belongs
+    to a single segment; the caller must use that segment as the history floor so
+    detectors never treat bars across a missing bucket as adjacent observations.
     """
     symbols = scan_state.get("symbols", {}) if isinstance(scan_state, dict) else {}
     rec = symbols.get(symbol) if isinstance(symbols, dict) else None
-    if not isinstance(rec, dict) or rec.get(timeframe) in (None, ""):
-        eligible = {bucket for bucket in available_buckets if bucket <= completed_bucket}
-        if not eligible:
-            return []
-        # Replay only a bounded recent window, moving backwards from the newest
-        # available bucket and stopping at the first historical gap. This keeps
-        # first-seen symbols causal and bounded while covering the configured
-        # fresh-event/retest lifetime.
-        max_buckets = max(1, int(math.ceil(NEW_SYMBOL_BACKFILL_MIN / (_timeframe_interval_ms(timeframe) / 60_000.0))))
-        latest = max(eligible)
-        targets_rev: list[int] = [latest]
-        while len(targets_rev) < max_buckets:
-            prev = targets_rev[-1] - 1
-            if prev not in eligible:
-                break
-            targets_rev.append(prev)
-        return list(reversed(targets_rev))
-
-    try:
-        last_bucket = int(rec.get(timeframe))
-    except (TypeError, ValueError):
-        return [completed_bucket] if completed_bucket in available_buckets else []
-
-    if last_bucket >= completed_bucket:
-        return []
-
     eligible = {int(bucket) for bucket in available_buckets if int(bucket) <= completed_bucket}
     if not eligible:
         return []
 
+    if not isinstance(rec, dict) or rec.get(timeframe) in (None, ""):
+        return _bounded_recent_segment_targets(eligible, timeframe)
+
+    try:
+        last_bucket = int(rec.get(timeframe))
+    except (TypeError, ValueError):
+        # Corrupt watermark: recover from the newest contiguous segment rather
+        # than repeatedly pinning the scanner to an invalid persisted value.
+        return _bounded_recent_segment_targets(eligible, timeframe)
+
+    if last_bucket >= completed_bucket:
+        return []
+
     expected_bucket = last_bucket + 1
     oldest_available = min(eligible)
-    if expected_bucket < oldest_available:
-        # The saved watermark has fallen behind the exchange's retained/fetched
-        # history (for example, a symbol left the liquidity universe for >400h).
-        # We cannot replay candles that the provider no longer returns. Rebase
-        # only in this explicit aged-out case, using the same bounded recent
-        # contiguous window as a first-seen symbol. A gap *inside* the available
-        # history is still never skipped.
-        max_buckets = max(
-            1,
-            int(math.ceil(
-                NEW_SYMBOL_BACKFILL_MIN
-                / (_timeframe_interval_ms(timeframe) / 60_000.0)
-            )),
-        )
-        latest = max(eligible)
-        targets_rev: list[int] = [latest]
-        while len(targets_rev) < max_buckets:
-            previous = targets_rev[-1] - 1
-            if previous not in eligible:
-                break
-            targets_rev.append(previous)
-        return list(reversed(targets_rev))
+    newest_available = max(eligible)
 
-    targets: list[int] = []
-    for bucket in range(expected_bucket, completed_bucket + 1):
-        if bucket not in eligible:
-            break
-        targets.append(bucket)
-    return targets
+    if expected_bucket < oldest_available:
+        # The watermark has aged out of fetched history. The unavailable interval
+        # cannot be replayed, so recover from the newest contiguous retained tail.
+        return _bounded_recent_segment_targets(eligible, timeframe)
+
+    if expected_bucket not in eligible:
+        if newest_available <= expected_bucket:
+            # The missing candle is at the live edge: wait for the data provider.
+            return []
+        # An internal historical gap is followed by newer completed bars. Rebase
+        # to the newest contiguous segment after its 60-bar detector warm-up.
+        return _bounded_recent_segment_targets(eligible, timeframe)
+
+    # Expected bucket exists. Continue only inside its own contiguous segment.
+    # If this segment began after a gap, skip its initial warm-up bars rather
+    # than calculating patterns with pre-gap candles or stalling on <60 rows.
+    segment_first, segment_last, segment_count = _contiguous_bucket_segment_bounds(
+        eligible, expected_bucket,
+    )
+    if segment_count < MIN_SCAN_HISTORY_BARS:
+        return []
+    first_processable = segment_first + MIN_SCAN_HISTORY_BARS - 1
+    first_target = max(expected_bucket, first_processable)
+    if first_target > segment_last:
+        return []
+    return list(range(first_target, segment_last + 1))
 
 
 def _frame_through_bucket(klines: list[dict], timeframe: str, bucket: int) -> list[dict]:
@@ -2031,16 +2058,80 @@ def _refresh_timeframe_events(
             )
             if not targets:
                 if _symbol_scan_due(scan_state, symbol, timeframe, completed_bucket):
-                    log.warning(
-                        "[SCAN_STATE] %s %s has no contiguous closed bucket available through %d; watermark deferred.",
-                        symbol, timeframe.upper(), completed_bucket,
-                    )
+                    rec = (scan_state.get("symbols", {}) or {}).get(symbol, {}) if isinstance(scan_state, dict) else {}
+                    try:
+                        expected_bucket = int(rec.get(timeframe)) + 1 if isinstance(rec, dict) and rec.get(timeframe) not in (None, "") else None
+                    except (TypeError, ValueError):
+                        expected_bucket = None
+                    oldest_available = min(available_buckets, default=0)
+                    newest_available = max(available_buckets, default=-1)
+                    if (
+                        expected_bucket is not None
+                        and expected_bucket >= oldest_available
+                        and expected_bucket not in available_buckets
+                        and newest_available > expected_bucket
+                    ):
+                        segment_first, segment_last, segment_count = _latest_contiguous_bucket_segment(available_buckets)
+                        log.warning(
+                            "[SCAN_STATE] %s %s internal gap after watermark: expected_bucket=%d; newest_contiguous_segment=%d..%d (%d bars), waiting for %d-bar warm-up.",
+                            symbol, timeframe.upper(), expected_bucket, segment_first, segment_last, segment_count, MIN_SCAN_HISTORY_BARS,
+                        )
+                    elif expected_bucket is not None and expected_bucket in available_buckets:
+                        segment_first, segment_last, segment_count = _contiguous_bucket_segment_bounds(available_buckets, expected_bucket)
+                        log.warning(
+                            "[SCAN_STATE] %s %s contiguous segment %d..%d has %d bars; waiting for %d-bar warm-up before bucket %d.",
+                            symbol, timeframe.upper(), segment_first, segment_last, segment_count, MIN_SCAN_HISTORY_BARS, expected_bucket,
+                        )
+                    elif expected_bucket is not None and expected_bucket < oldest_available:
+                        segment_first, segment_last, segment_count = _latest_contiguous_bucket_segment(available_buckets)
+                        log.warning(
+                            "[SCAN_STATE] %s %s watermark aged out; newest segment %d..%d has %d bars, waiting for %d-bar warm-up.",
+                            symbol, timeframe.upper(), segment_first, segment_last, segment_count, MIN_SCAN_HISTORY_BARS,
+                        )
+                    else:
+                        log.warning(
+                            "[SCAN_STATE] %s %s has no contiguous closed bucket available through %d; watermark deferred.",
+                            symbol, timeframe.upper(), completed_bucket,
+                        )
                 continue
+
+            # Resolve the one contiguous segment containing the returned targets.
+            # All detectors use only that segment, including first-seen symbols
+            # and rebased/aged-out watermarks; no pattern may bridge a missing bar.
+            history_floor_bucket, history_last_bucket, _ = _contiguous_bucket_segment_bounds(
+                available_buckets, targets[0],
+            )
+            saved_rec = (scan_state.get("symbols", {}) or {}).get(symbol, {}) if isinstance(scan_state, dict) else {}
+            try:
+                expected_bucket = int(saved_rec.get(timeframe)) + 1 if isinstance(saved_rec, dict) and saved_rec.get(timeframe) not in (None, "") else None
+            except (TypeError, ValueError):
+                expected_bucket = None
+            if (
+                expected_bucket is not None
+                and expected_bucket >= min(available_buckets, default=expected_bucket)
+                and expected_bucket not in available_buckets
+                and max(available_buckets, default=-1) > expected_bucket
+            ):
+                log.warning(
+                    "[SCAN_STATE] %s %s rebasing after internal gap at bucket %d; history segment=%d..%d, scan targets=%d..%d.",
+                    symbol, timeframe.upper(), expected_bucket, history_floor_bucket,
+                    history_last_bucket, targets[0], targets[-1],
+                )
+            elif expected_bucket is not None and expected_bucket < min(available_buckets, default=expected_bucket):
+                log.warning(
+                    "[SCAN_STATE] %s %s watermark aged out; rebasing to history segment=%d..%d, scan targets=%d..%d.",
+                    symbol, timeframe.upper(), history_floor_bucket,
+                    history_last_bucket, targets[0], targets[-1],
+                )
 
             symbol_scanned_any = False
             for bucket in targets:
                 frame_rows = _frame_through_bucket(klines, timeframe, bucket)
-                if len(frame_rows) < 60:
+                frame_rows = [
+                    row for row in frame_rows
+                    if int(row.get("close_time", 0)) // interval_ms >= history_floor_bucket
+                ]
+                if len(frame_rows) < MIN_SCAN_HISTORY_BARS:
                     log.warning(
                         "[SIGNALS] %s %s bucket=%d has only %d historical candles; watermark deferred at prior bucket.",
                         timeframe.upper(), symbol, bucket, len(frame_rows),
@@ -6500,7 +6591,10 @@ def main() -> None:
             tf_stats["fresh_divergence"] += int(is_divergence)
             log.info("[SIGNALS] Fresh event: %s %s | TF: %s | Type: %s | Age: %.1fm", direction, symbol, tf, event_type, age)
 
-            if btc_regime_df is not None and not _is_btc_symbol(symbol):
+            if not _is_btc_symbol(symbol):
+                # BTC is a mandatory context gate for every new altcoin entry.
+                # Missing/invalid BTC data fails closed; open-position management
+                # has already completed earlier in main() and is unaffected.
                 btc_ok, btc_reason = check_btc_regime(btc_regime_df, direction)
                 if not btc_ok:
                     stats["rejected_btc"] += 1

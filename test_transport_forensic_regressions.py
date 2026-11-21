@@ -281,12 +281,12 @@ def test_bingx_user_symbol_map_precedes_builtin_contract_alias(monkeypatch):
     assert bx.canonical_contract_symbol("LIT") == "DASHED-USDT"
 
 
-def test_bingx_explicit_trump_sol_contract_is_not_collapsed_into_legacy_trumpsol_alias(monkeypatch):
+def test_bingx_resolves_trump_and_sol_only_from_separate_catalog_entries(monkeypatch):
     from event_engine import bingx as bx
 
-    trump_sol = {"symbol": "TRUMP-SOL-USDT", "displayName": "TRUMP-SOL-USDT"}
     trump = {"symbol": "TRUMP-USDT", "displayName": "TRUMP-USDT"}
-    catalog = {"TRUMP-SOL-USDT": trump_sol, "TRUMP-USDT": trump}
+    sol = {"symbol": "SOL-USDT", "displayName": "SOL-USDT"}
+    catalog = {"TRUMP-USDT": trump, "SOL-USDT": sol}
     monkeypatch.setattr(bx, "contracts", lambda **_kwargs: catalog)
     monkeypatch.setattr(bx, "SYMBOL_MAP", {})
     monkeypatch.setattr(bx, "CACHE", {
@@ -295,6 +295,26 @@ def test_bingx_explicit_trump_sol_contract_is_not_collapsed_into_legacy_trumpsol
         "by_display_name": {},
     })
 
-    assert bx.get_contract("TRUMP-SOL-USDT") is trump_sol
-    assert bx.canonical_contract_symbol("TRUMP-SOL-USDT") == "TRUMP-SOL-USDT"
-    assert bx.get_contract("TRUMPSOL") is trump
+    assert bx.get_contract("TRUMPUSDT") is trump
+    assert bx.get_contract("SOLUSDT") is sol
+    for unknown in ("TRUMP-SOL-USDT", "TRUMPSOL", "TRUMPSOLUSDT"):
+        assert bx.get_contract(unknown) is None
+        assert bx.canonical_contract_symbol(unknown) not in {"TRUMP-USDT", "SOL-USDT"}
+        history_symbol = bx._normalize_history_symbol(unknown)
+        assert history_symbol not in {"TRUMP-USDT", "SOL-USDT"}
+
+
+def test_binance_does_not_translate_unlisted_historical_spellings(monkeypatch):
+    from event_engine.binance import BinanceMarketClient
+
+    client = BinanceMarketClient()
+    catalog = {
+        "TRUMPUSDT": {"symbol": "TRUMPUSDT"},
+        "SOLUSDT": {"symbol": "SOLUSDT"},
+    }
+    monkeypatch.setattr(client, "refresh_exchange_info", lambda **_kwargs: catalog)
+
+    assert client.resolve_symbol("TRUMPUSDT") == "TRUMPUSDT"
+    assert client.resolve_symbol("SOLUSDT") == "SOLUSDT"
+    for unknown in ("TRUMPSOL", "TRUMPSOLUSDT", "TRUMPSOL-USDT", "TRUMP-SOL-USDT"):
+        assert client.resolve_symbol(unknown) is None

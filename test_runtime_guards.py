@@ -1034,18 +1034,22 @@ def test_btc_regime_snapshot_rejects_non_finite_values():
         }
 
 
-def test_btc_filter_rejects_non_finite_values_as_insufficient_data():
+def test_btc_filter_fails_closed_on_non_finite_or_missing_context():
     import pandas as pd
     from event_engine.signals import check_btc_regime
 
+    assert check_btc_regime(None, "LONG") == (False, "BTC_CONTEXT_UNAVAILABLE")
+    assert check_btc_regime(pd.DataFrame(), "LONG") == (False, "BTC_CONTEXT_UNAVAILABLE")
+    assert check_btc_regime(pd.DataFrame({"open": [1, 2, 3, 4, 5]}), "LONG") == (False, "BTC_CONTEXT_UNAVAILABLE")
+
     base = [100.0, 101.0, 102.0, 103.0, 104.0]
-    for bad_value in (float("nan"), float("inf"), float("-inf")):
+    for bad_value in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
         for bad_index in (-1, -2, -5):
             values = list(base)
             values[bad_index] = bad_value
             ok, reason = check_btc_regime(pd.DataFrame({"close": values}), "LONG")
-            assert ok is True
-            assert reason == "INSUFFICIENT_DATA"
+            assert ok is False
+            assert reason == "BTC_CONTEXT_UNAVAILABLE"
 
 
 

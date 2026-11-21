@@ -186,23 +186,32 @@ def test_binance_klines_reject_malformed_rows_sort_and_deduplicate(monkeypatch):
     assert bars[-1]["bar_delta_usdt"] is None
 
 
-def test_bingx_and_binance_resolve_lit_and_trumpsol_aliases(monkeypatch):
+def test_bingx_and_binance_resolve_only_configured_or_catalogued_symbols(monkeypatch):
     from event_engine import bingx
     from event_engine.binance import BinanceMarketClient
 
     catalog = {
         "LIGHTER-USDT": {"symbol": "LIGHTER-USDT", "displayName": "LIGHTER-USDT"},
         "TRUMP-USDT": {"symbol": "TRUMP-USDT", "displayName": "TRUMP-USDT"},
+        "SOL-USDT": {"symbol": "SOL-USDT", "displayName": "SOL-USDT"},
     }
     monkeypatch.setattr(bingx, "contracts", lambda **kwargs: catalog)
     assert bingx.get_contract("LIT") is catalog["LIGHTER-USDT"]
-    assert bingx.get_contract("TRUMPSOL") is catalog["TRUMP-USDT"]
+    assert bingx.get_contract("TRUMPUSDT") is catalog["TRUMP-USDT"]
+    assert bingx.get_contract("SOLUSDT") is catalog["SOL-USDT"]
+    assert bingx.get_contract("UNLISTEDPAIR") is None
 
     client = BinanceMarketClient()
-    symbols = {"LIGHTERUSDT": {"symbol": "LIGHTERUSDT"}, "TRUMPUSDT": {"symbol": "TRUMPUSDT"}}
+    symbols = {
+        "LIGHTERUSDT": {"symbol": "LIGHTERUSDT"},
+        "TRUMPUSDT": {"symbol": "TRUMPUSDT"},
+        "SOLUSDT": {"symbol": "SOLUSDT"},
+    }
     monkeypatch.setattr(client, "refresh_exchange_info", lambda **kwargs: symbols)
     assert client.resolve_symbol("LIT") == "LIGHTERUSDT"
-    assert client.resolve_symbol("TRUMPSOL") == "TRUMPUSDT"
+    assert client.resolve_symbol("TRUMPUSDT") == "TRUMPUSDT"
+    assert client.resolve_symbol("SOLUSDT") == "SOLUSDT"
+    assert client.resolve_symbol("UNLISTEDPAIR") is None
 
 
 def test_binance_alias_never_falls_back_to_a_different_literal_instrument(monkeypatch):
@@ -211,7 +220,6 @@ def test_binance_alias_never_falls_back_to_a_different_literal_instrument(monkey
     client = BinanceMarketClient()
     for logical_symbol, literal_symbol in (
         ("LIT", "LITUSDT"),
-        ("TRUMPSOL", "TRUMPSOLUSDT"),
     ):
         monkeypatch.setattr(
             client, "refresh_exchange_info",
@@ -519,3 +527,17 @@ def test_compound_cvd_liquidation_veto_is_long_only(monkeypatch):
     assert long_result[0] is False
     assert any(reason.startswith("CVD_LIQ:") for reason in long_result[1])
     assert short_result == (True, [], False)
+
+
+def test_binance_keeps_trump_and_sol_as_distinct_catalogued_symbols(monkeypatch):
+    from event_engine.binance import BinanceMarketClient
+
+    client = BinanceMarketClient()
+    symbols = {
+        "TRUMPUSDT": {"symbol": "TRUMPUSDT"},
+        "SOLUSDT": {"symbol": "SOLUSDT"},
+    }
+    monkeypatch.setattr(client, "refresh_exchange_info", lambda **kwargs: symbols)
+    assert client.resolve_symbol("TRUMPUSDT") == "TRUMPUSDT"
+    assert client.resolve_symbol("SOLUSDT") == "SOLUSDT"
+    assert client.resolve_symbol("UNLISTEDPAIR") is None

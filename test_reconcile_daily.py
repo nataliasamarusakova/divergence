@@ -559,14 +559,29 @@ def test_corrupt_income_pending_state_fails_closed_without_overwrite(tmp_path, m
     assert pending_path.read_bytes() == original
 
 
-def test_trump_legacy_exchange_symbol_is_canonicalized_without_merging_sol():
+def test_position_symbol_canonicalization_keeps_trump_and_sol_separate(monkeypatch):
+    from event_engine import bingx
+
+    catalog = {
+        "TRUMP-USDT": {"symbol": "TRUMP-USDT", "displayName": "TRUMP-USDT"},
+        "SOL-USDT": {"symbol": "SOL-USDT", "displayName": "SOL-USDT"},
+    }
+    monkeypatch.setattr(bingx, "CACHE", {
+        "ts": 1_800_000_000.0,
+        "data": catalog,
+        "by_display_name": {},
+    })
+
     assert recon._canonical_position_symbol("TRUMP") == "TRUMP-USDT"
     assert recon._canonical_position_symbol("TRUMPUSDT") == "TRUMP-USDT"
     assert recon._canonical_position_symbol("TRUMP-USDT") == "TRUMP-USDT"
-    assert recon._canonical_position_symbol("TRUMPSOL-USDT") == "TRUMP-USDT"
-    assert recon._canonical_position_symbol("TRUMPSOLUSDT") == "TRUMP-USDT"
     assert recon._canonical_position_symbol("SOL") == "SOL-USDT"
     assert recon._canonical_position_symbol("SOL-USDT") == "SOL-USDT"
+
+    # Historical/unknown spellings are unresolved keys, never aliases for
+    # either currently supported instrument.
+    assert recon._canonical_position_symbol("TRUMPSOL-USDT") == "TRUMPSOL-USDT"
+    assert recon._canonical_position_symbol("TRUMPSOLUSDT") == "TRUMPSOL-USDT"
     assert recon._canonical_position_symbol("TRUMP-SOL-USDT") == "TRUMP-SOL-USDT"
 
 

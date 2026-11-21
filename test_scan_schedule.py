@@ -75,27 +75,60 @@ def test_timeframe_scan_state_unsupported_version_is_explicitly_empty(tmp_path, 
 
 def test_scan_buckets_replays_contiguous_missing_closed_buckets():
     state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
-    available = {96, 97, 98, 99, 100}
+    available = set(range(40, 101))
     assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [99, 100]
 
 
-def test_scan_buckets_never_jumps_over_missing_bucket():
+def test_scan_buckets_waits_when_missing_bucket_is_at_the_right_edge():
     state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
-    available = {98, 100}
-    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == []
+    available = {96, 97, 98}
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 99, available) == []
+
+
+def test_scan_buckets_rebases_after_internal_gap_with_contiguous_warmup(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 120.0)
+    state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
+    # A missing bucket 99 is followed by 70 contiguous closed buckets. The
+    # scanner must resume on the most recent bounded tail, not wait 400 hours.
+    available = {96, 97, 98} | set(range(200, 270))
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 269, available) == [268, 269]
+
+
+def test_scan_buckets_waits_until_internal_gap_segment_has_detector_warmup():
+    state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
+    available = {96, 97, 98} | set(range(200, 250))
+    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 249, available) == []
+
+
+def test_scan_buckets_rebases_from_gap_without_cross_gap_indicator_history(monkeypatch):
+    monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 60.0)
+    state = {"version": 2, "symbols": {"BTC": {"1h": 98}}}
+    available = {96, 97, 98} | set(range(200, 270))
+    first, last, count = run_once._latest_contiguous_bucket_segment(available)
+    assert (first, last, count) == (200, 269, 70)
+    targets = run_once._scan_buckets_to_process(state, "BTC", "1h", 269, available)
+    assert targets == [269]
+
+
+def test_scan_buckets_resume_inside_a_new_segment_without_pre_gap_history():
+    state = {"version": 2, "symbols": {"BTC": {"1h": 259}}}
+    available = {96, 97, 98} | set(range(200, 270))
+    targets = run_once._scan_buckets_to_process(state, "BTC", "1h", 269, available)
+    assert targets == list(range(260, 270))
+    assert run_once._contiguous_bucket_segment_bounds(available, targets[0]) == (200, 269, 70)
 
 
 def test_new_symbol_replays_only_bounded_recent_contiguous_buckets(monkeypatch):
     monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 120.0)
     state = {"version": 2, "symbols": {}}
-    available = {97, 98, 99, 100}
+    available = set(range(36, 101))
     assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [99, 100]
 
 
 def test_new_symbol_backfill_stops_at_recent_history_gap(monkeypatch):
     monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 180.0)
     state = {"version": 2, "symbols": {}}
-    available = {96, 98, 99, 100}
+    available = {35} | set(range(38, 101))
     assert run_once._scan_buckets_to_process(state, "BTC", "1h", 100, available) == [98, 99, 100]
 
 
@@ -402,9 +435,11 @@ def test_stale_scan_watermark_rebases_only_when_expected_bucket_aged_out(monkeyp
     assert run_once._scan_buckets_to_process(state, "BTC", "1h", 600, available) == []
 
 
-def test_stale_scan_watermark_rebase_does_not_jump_internal_history_gap(monkeypatch):
+def test_stale_scan_watermark_rebase_uses_newest_contiguous_segment(monkeypatch):
     monkeypatch.setattr(run_once, "NEW_SYMBOL_BACKFILL_MIN", 240.0)
     state = {"version": 2, "symbols": {"BTC": {"1h": 100}}}
-    available = {501, 502, 504, 505}
+    available = {501, 502} | set(range(540, 606))
 
-    assert run_once._scan_buckets_to_process(state, "BTC", "1h", 505, available) == [504, 505]
+    targets = run_once._scan_buckets_to_process(state, "BTC", "1h", 605, available)
+    assert targets == [602, 603, 604, 605]
+    assert run_once._contiguous_bucket_segment_bounds(available, targets[0]) == (540, 605, 66)

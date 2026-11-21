@@ -471,7 +471,7 @@ def test_telegram_symbol_is_compact_usdt_pair_and_does_not_duplicate_suffix():
     assert format_telegram_symbol("OP/USDT") == "OPUSDT"
     assert format_telegram_symbol("OP_USDT") == "OPUSDT"
     assert format_telegram_symbol("OPUSDT") == "OPUSDT"
-    assert format_telegram_symbol("TRUMP-SOL-USDT") == "TRUMP-SOLUSDT"
+    assert format_telegram_symbol("TRUMP-USDT") == "TRUMPUSDT"
     assert format_telegram_symbol("") == "—"
 
 
