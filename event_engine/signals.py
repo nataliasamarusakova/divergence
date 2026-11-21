@@ -975,7 +975,20 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
         prior_highs = [i for i in highs if search_start <= i + pivot_right < bos_i]
         prior_lows = [i for i in lows if search_start <= i + pivot_right < bos_i]
         # Bullish OB -> broken downward -> bearish breaker retest.
-        if prior_highs and float(d['close'].iloc[bos_i]) > float(d['high'].iloc[prior_highs[-1]]) + 0.05 * atr:
+        if prior_highs:
+            swing_high_i = prior_highs[-1]
+            swing_high = float(d['high'].iloc[swing_high_i])
+            # A BOS must break a still-unconsumed confirmed swing. Otherwise a
+            # later displacement candle can reuse a level already closed above
+            # and manufacture a second BOS from stale structure.
+            prior_close_through = any(
+                float(d['close'].iloc[k]) > swing_high
+                for k in range(swing_high_i + pivot_right + 1, bos_i)
+            )
+        else:
+            prior_close_through = True
+            swing_high = 0.0
+        if prior_highs and not prior_close_through and float(d['close'].iloc[bos_i]) > swing_high + 0.05 * atr:
             ob_i = next((k for k in range(bos_i-1, max(search_start, bos_i-8), -1)
                          if float(d['close'].iloc[k]) < float(d['open'].iloc[k])), None)
             if ob_i is not None:
@@ -1007,7 +1020,10 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     cur_high=float(d['high'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
-                    if cur_high >= zlo and cur_close < zlo:
+                    # The source-timeframe retest itself must stay inside the
+                    # breaker box. The later 15m trigger only checks candles
+                    # after detected_at_ts and cannot invalidate this same bar.
+                    if zlo <= cur_high <= zhi and cur_close < zlo:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BEARISH','SHORT',ts,int(d['close_time'].iloc[ob_i]),{
                             'detection_close_price':float(d['close'].iloc[-1]),
@@ -1021,7 +1037,19 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                             'broken_ts':int(d['close_time'].iloc[break_i]),'bos_ts':int(d['close_time'].iloc[bos_i]),
                         },pivot_1_ts=int(d['close_time'].iloc[ob_i]))]
         # Bearish OB -> broken upward -> bullish breaker retest.
-        if prior_lows and float(d['close'].iloc[bos_i]) < float(d['low'].iloc[prior_lows[-1]]) - 0.05 * atr:
+        if prior_lows:
+            swing_low_i = prior_lows[-1]
+            swing_low = float(d['low'].iloc[swing_low_i])
+            # Mirror the fresh-BOS rule for a bearish OB: a prior close below
+            # the confirmed swing low consumes it before this displacement bar.
+            prior_close_through = any(
+                float(d['close'].iloc[k]) < swing_low
+                for k in range(swing_low_i + pivot_right + 1, bos_i)
+            )
+        else:
+            prior_close_through = True
+            swing_low = 0.0
+        if prior_lows and not prior_close_through and float(d['close'].iloc[bos_i]) < swing_low - 0.05 * atr:
             ob_i = next((k for k in range(bos_i-1, max(search_start, bos_i-8), -1)
                          if float(d['close'].iloc[k]) > float(d['open'].iloc[k])), None)
             if ob_i is not None:
@@ -1053,7 +1081,7 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     cur_low=float(d['low'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
-                    if cur_low <= zhi and cur_close > zhi:
+                    if zlo <= cur_low <= zhi and cur_close > zhi:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BULLISH','LONG',ts,int(d['close_time'].iloc[ob_i]),{
                             'detection_close_price':float(d['close'].iloc[-1]),

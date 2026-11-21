@@ -186,9 +186,13 @@ class BinanceMarketClient:
         raw_target = re.sub(r"_(PERP|USDT)$", "", raw_target)
         target = self._normalise_symbol(symbol)
         symbols = self.refresh_exchange_info()
-        # Prefer the canonical instrument alias. Fall back to the literal Binance
-        # ticker only when the canonical contract is not listed on this venue.
-        candidates = list(dict.fromkeys((target, raw_target)))
+        # A known alias identifies a specific underlying, not a fallback hint.
+        # If its canonical Binance contract is unavailable, never substitute a
+        # different instrument that happens to trade under the alias's literal
+        # ticker (e.g. LITUSDT/Litentry for logical LIT -> LIGHTERUSDT).
+        # Ordinary non-aliased symbols retain the literal fallback for provider
+        # spelling differences.
+        candidates = [target] if target != raw_target else list(dict.fromkeys((target, raw_target)))
         for candidate in candidates:
             if candidate in symbols:
                 return candidate
