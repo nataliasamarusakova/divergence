@@ -170,8 +170,6 @@ class BinanceMarketClient:
     _SYMBOL_ALIASES = {
         "LIT": "LIGHTERUSDT",
         "LITUSDT": "LIGHTERUSDT",
-        "TRUMPSOL": "TRUMPUSDT",
-        "TRUMPSOLUSDT": "TRUMPUSDT",
     }
 
     @staticmethod

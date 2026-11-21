@@ -2687,16 +2687,16 @@ def build_15m_trigger(
 
 
 def check_btc_regime(
-    btc_1h_df: pd.DataFrame,
+    btc_1h_df: pd.DataFrame | None,
     direction: str,
 ) -> tuple[bool, str]:
-
-    if len(btc_1h_df) < 5 or "close" not in btc_1h_df.columns:
-        return True, "INSUFFICIENT_DATA"
+    """Fail closed for new directional entries when BTC context is unavailable."""
+    if not isinstance(btc_1h_df, pd.DataFrame) or len(btc_1h_df) < 5 or "close" not in btc_1h_df.columns:
+        return False, "BTC_CONTEXT_UNAVAILABLE"
 
     close = pd.to_numeric(btc_1h_df["close"], errors="coerce")
     if close.isna().any():
-        return True, "INSUFFICIENT_DATA"
+        return False, "BTC_CONTEXT_UNAVAILABLE"
 
     last_close = float(close.iloc[-1])
     prev_1h = float(close.iloc[-2])
@@ -2708,7 +2708,7 @@ def check_btc_regime(
         or prev_1h <= 0
         or prev_4h <= 0
     ):
-        return True, "INSUFFICIENT_DATA"
+        return False, "BTC_CONTEXT_UNAVAILABLE"
 
     chg_1h_pct = ((last_close - prev_1h) / prev_1h) * 100.0
     chg_4h_pct = ((last_close - prev_4h) / prev_4h) * 100.0

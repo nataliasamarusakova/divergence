@@ -92,9 +92,6 @@ _KNOWN_CONTRACT_SYMBOL_ALIASES = {
     "LIT": "LIGHTER-USDT",
     "LITUSDT": "LIGHTER-USDT",
     "LIT-USDT": "LIGHTER-USDT",
-    "TRUMPSOL": "TRUMP-USDT",
-    "TRUMPSOLUSDT": "TRUMP-USDT",
-    "TRUMPSOL-USDT": "TRUMP-USDT",
 }
 
 # Live-price requests are used by the tracker and by execution sizing. A bad
@@ -648,12 +645,6 @@ def get_contract(symbol: str, *, require_fresh: bool = False) -> dict | None:
 
     catalog = contracts(require_fresh=require_fresh)
 
-    # TRUMP-SOL-USDT is a distinct contract. Its compact spelling collides
-    # with the legacy TRUMPSOL -> TRUMP-USDT provider alias, so preserve the
-    # explicit dashed contract before consulting built-in aliases.
-    if dashed_symbol == "TRUMP-SOL-USDT":
-        return catalog.get(dashed_symbol)
-
     # Keep lookup precedence identical to canonical_contract_symbol(): an
     # explicit user override wins over built-in provider aliases such as LIT.
     configured = next((
@@ -729,11 +720,6 @@ def canonical_contract_symbol(symbol: Any) -> str:
             raw = f"{raw[:-4]}-USDT"
         else:
             raw = f"{raw}-USDT"
-
-    # This is a distinct market, not the legacy TRUMPSOL spelling used by
-    # BingX for TRUMP. Preserve the explicitly dashed TRUMP-SOL contract.
-    if raw == "TRUMP-SOL-USDT":
-        return raw
 
     base = raw[:-5] if raw.endswith("-USDT") else raw
     compact_raw = raw.replace("-", "")
