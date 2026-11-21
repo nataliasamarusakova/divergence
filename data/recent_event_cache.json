@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795279289493,
+  "updated_ts": 1795279584888,
   "events": [
     {
       "event_id": "EVT_A845337B8379FEBD",
@@ -1878,6 +1878,53 @@
         "vwap": 0.02425685441762936,
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_AC4FEDAE81435FE6",
+      "symbol": "CAP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1795276799999,
+        "pivot_2_ts": 1795276799999,
+        "detected_at_ts": 1795276799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.08917,
+        "bb_width": 0.006636949901875022,
+        "kc_width": 0.006237026028025838,
+        "squeeze_duration_bars": 3,
+        "compression_ratio": 1.0641209243078578,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.09001048698598707,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_89BB23DA379088BD",
+      "symbol": "CAP",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MACD_4H_BEARISH_CROSS",
+      "timestamps": {
+        "pivot_1_ts": 1795276799999,
+        "pivot_2_ts": 1795276799999,
+        "detected_at_ts": 1795276799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.08917,
+        "macd": -0.00238838762913246,
+        "macd_signal": -0.00229097970303327,
+        "macd_hist": -9.740792609919027e-05,
+        "ema200": 0.09164720432902422,
+        "distance_ema200_atr": null,
+        "engine": "MACD_4H",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
