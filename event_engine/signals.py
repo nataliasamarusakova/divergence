@@ -949,6 +949,31 @@ def _mss_level_before_sweep(
     return None
 
 
+def _breaker_zone_touched_before_current(
+    frame: pd.DataFrame, break_index: int, current_index: int,
+    zone_low: float, zone_high: float,
+) -> bool:
+    """Return whether price already touched the breaker zone after its break.
+
+    Breaker events represent the first retest of a flipped order block. A prior
+    wick/range intersection consumes that retest even when its candle did not
+    close with the required rejection; otherwise a later return could emit a
+    duplicate event for an already-tested zone.
+    """
+    for index in range(int(break_index) + 1, int(current_index)):
+        try:
+            candle_high = float(frame['high'].iloc[index])
+            candle_low = float(frame['low'].iloc[index])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if (
+            math.isfinite(candle_high) and math.isfinite(candle_low)
+            and candle_high >= zone_low and candle_low <= zone_high
+        ):
+            return True
+    return False
+
+
 def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', lookback: int = 120,
                          min_displacement_atr: float = 0.80) -> list[dict[str, Any]]:
     """Detect a true breaker: liquidity sweep -> MSS/OB break -> flip-zone retest."""
@@ -1020,10 +1045,14 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     cur_high=float(d['high'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
+                    # Only the first post-break contact can be the breaker retest.
+                    # Earlier range overlap consumes the zone even if it did not
+                    # produce a valid rejection close.
+                    prior_retest = _breaker_zone_touched_before_current(d, break_i, last, zlo, zhi)
                     # The source-timeframe retest itself must stay inside the
                     # breaker box. The later 15m trigger only checks candles
                     # after detected_at_ts and cannot invalidate this same bar.
-                    if zlo <= cur_high <= zhi and cur_close < zlo:
+                    if not prior_retest and zlo <= cur_high <= zhi and cur_close < zlo:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BEARISH','SHORT',ts,int(d['close_time'].iloc[ob_i]),{
                             'detection_close_price':float(d['close'].iloc[-1]),
@@ -1081,7 +1110,8 @@ def detect_breaker_block(df: pd.DataFrame, symbol: str, timeframe: str = '1h', l
                     # The breaker must be retested AFTER the decisive break;
                     # do not count the same candle as both break and retest.
                     cur_low=float(d['low'].iloc[-1]); cur_close=float(d['close'].iloc[-1])
-                    if zlo <= cur_low <= zhi and cur_close > zhi:
+                    prior_retest = _breaker_zone_touched_before_current(d, break_i, last, zlo, zhi)
+                    if not prior_retest and zlo <= cur_low <= zhi and cur_close > zhi:
                         ts=int(d['close_time'].iloc[-1])
                         return [_make_event(symbol,timeframe,'BREAKER_BLOCK_BULLISH','LONG',ts,int(d['close_time'].iloc[ob_i]),{
                             'detection_close_price':float(d['close'].iloc[-1]),
