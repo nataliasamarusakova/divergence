@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795284698824,
+  "updated_ts": 1795284989601,
   "events": [
     {
       "event_id": "EVT_7AC9B4390D4BABEF",
@@ -610,6 +610,66 @@
         "range_high": 0.22822,
         "range_low": 0.21463,
         "manipulation_depth_atr": 0.3866812784904746,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_6C07F499E33C44AC",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1795283999999,
+        "pivot_2_ts": 1795283999999,
+        "detected_at_ts": 1795283999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04551,
+        "donchian_high": 0.04388,
+        "donchian_low": 0.03883,
+        "breakout_atr": 1.375247695685071,
+        "volume_ratio": 3.1861506859736854,
+        "adx": 30.91071149184751,
+        "ema200": 0.04420598543774177,
+        "compressed_recent": false,
+        "bb_width": 0.14569049342910717,
+        "trigger_level": 0.04388,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_CC8F814C718C903C",
+      "symbol": "NIGHT",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795186799999,
+        "pivot_2_ts": 1795283999999,
+        "detected_at_ts": 1795283999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04551,
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.04319,
+        "zone_high": 0.04319,
+        "zone_low": 0.04257,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1795233599999,
+        "liquidity_sweep_level": 0.04022,
+        "mss_ts": 1795280399999,
+        "mss_pivot_ts": 1795215599999,
+        "mss_level": 0.04297,
+        "broken_ts": 1795280399999,
+        "bos_ts": 1795190399999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
