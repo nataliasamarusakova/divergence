@@ -24,8 +24,12 @@ PAGE_LOAD_MAX_ATTEMPTS = 2
 PAGE_LOAD_RETRY_DELAY_SECONDS = 2.0
 DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "").strip()
 
-encoded_url = base64.b64encode(COINALYZE_URL.encode('utf-8')).decode('utf-8')
+# --- НАЧАЛО БЛОКА ОТЛАДКИ ---
+# Обратите внимание: 'if' и последующие строки должны быть без лишних пробелов в начале!
+if COINALYZE_URL:
+    encoded_url = base64.b64encode(COINALYZE_URL.encode('utf-8')).decode('utf-8')
     print(f"DEBUG_BASE64_URL: {encoded_url}")
+# --- КОНЕЦ БЛОКА ОТЛАДКИ ---
 
 
 class CoinalyzeIncompleteDataError(RuntimeError):
