@@ -814,7 +814,17 @@ def _event_trigger_max_delay_min(ev: dict) -> float:
 def _event_max_age_min(ev: dict) -> float:
     fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
     if _event_uses_15m_retest(ev):
-        return max(float(MAX_AGE), _event_trigger_max_delay_min(ev))
+        # Keep the source event alive through the full retest window AND the
+        # configured period in which the final eligible 15m close can still be
+        # evaluated/traded.  Retest diagnostics use inclusive close-time
+        # boundaries (delay <= max_delay), while the last candle is only
+        # available after its close.  Without this buffer, an event whose last
+        # eligible candle closes exactly at max_delay expires before that
+        # candle can be read.  The separate trigger-freshness check below still
+        # rejects a candle once it is older than MAX_TRIGGER_TO_ORDER_DELAY_MIN.
+        retest_window_min = _event_trigger_max_delay_min(ev)
+        trigger_freshness_buffer_min = max(0.0, float(MAX_TRIGGER_TO_ORDER_DELAY_MIN))
+        return max(float(MAX_AGE), retest_window_min + trigger_freshness_buffer_min)
     event_type = str(ev.get("event_type") or "").upper()
     if "REGULAR_" in event_type or "HIDDEN_" in event_type:
         return max(float(MAX_AGE), DIVERGENCE_POST_CONFIRM_MAX_AGE_MIN)

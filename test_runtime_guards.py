@@ -472,6 +472,122 @@ def test_retest_window_policy_matches_the_selected_15m_trigger_mode():
         assert run_once._event_trigger_max_delay_min(ev) > run_once.MAX_TRIGGER_DELAY
 
 
+@pytest.mark.parametrize(
+    ("engine", "window_min"),
+    [
+        ("CRT", 60.0),
+        ("ORDER_BLOCK", 120.0),
+        ("DONCHIAN_RETEST", 120.0),
+        ("MA_COMPRESSION", 120.0),
+    ],
+)
+def test_last_eligible_retest_candle_survives_event_cache_until_trigger_stales(
+    tmp_path, monkeypatch, engine, window_min,
+):
+    """Do not expire a retest event before its final eligible 15m close can be checked."""
+    import run_once
+    from event_engine.signals import diagnose_15m_retest_trigger
+
+    monkeypatch.setattr(run_once, "MAX_AGE", 60.0)
+    monkeypatch.setattr(run_once, "MAX_TRIGGER_TO_ORDER_DELAY_MIN", 8.0)
+    monkeypatch.setattr(run_once, "CRT_RETEST_MAX_DELAY_MIN", 60.0)
+    monkeypatch.setattr(run_once, "ORDER_BLOCK_RETEST_MAX_DELAY_MIN", 120.0)
+    monkeypatch.setattr(run_once, "MA_COMPRESSION_RETEST_MAX_DELAY_MIN", 120.0)
+    monkeypatch.setenv("DONCHIAN_RETEST_MAX_DELAY_MIN", "120")
+
+    event_ts = 1_800_000_000_000 - 1  # inclusive Binance closeTime (.999)
+    final_trigger_close_ts = int(event_ts + window_min * 60_000)
+    event = {
+        "event_id": f"EVT_RETEST_WINDOW_{engine}",
+        "symbol": "TESTUSDT",
+        "timeframe": "1h",
+        "direction": "LONG",
+        "event_type": f"{engine}_BULLISH",
+        "timestamps": {
+            "pivot_1_ts": event_ts - 3_600_000,
+            "pivot_2_ts": event_ts,
+            "detected_at_ts": event_ts,
+        },
+        "event_fact": {
+            "engine": engine,
+            "requires_retest": True,
+            "trigger_level": 100.0,
+        },
+    }
+
+    # Construct a valid retest only on the final candle allowed by max_delay.
+    # Earlier candles stay above the retest tolerance and therefore cannot pass.
+    rows = []
+    first_close_ts = event_ts - 20 * 15 * 60_000
+    candle_count = 20 + 1 + int(window_min // 15)
+    for index in range(candle_count):
+        close_ts = int(first_close_ts + index * 15 * 60_000)
+        rows.append({
+            "open": 100.6, "high": 100.8, "low": 100.4, "close": 100.6,
+            "volume": 100.0, "close_time": close_ts,
+        })
+    rows[-1].update({
+        "open": 99.8, "high": 100.4, "low": 99.7, "close": 100.2,
+        "volume": 120.0, "close_time": final_trigger_close_ts,
+    })
+    trigger = diagnose_15m_retest_trigger(
+        pd.DataFrame(rows), "LONG", 100.0, event_ts,
+        max_delay_min=window_min, volume_mult=1.10,
+    )
+    assert trigger["ok"] is True
+    assert trigger["trigger_bar_close_ts"] == final_trigger_close_ts
+
+    event_lifetime_min = run_once._event_max_age_min(event)
+    assert event_lifetime_min == pytest.approx(window_min + 8.0)
+
+    # At +2m after the final eligible bar closes, that bar is still within the
+    # independent 8m trigger-freshness limit and the durable event must survive
+    # cache reconciliation so the trigger diagnostic can actually be called.
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    monkeypatch.setattr(run_once, "EVENTS", events_path)
+    monkeypatch.setattr(run_once, "EVENT_CACHE", tmp_path / "recent_event_cache.json")
+    rejected = []
+    monkeypatch.setattr(run_once, "_record_candidate_decision", lambda **row: rejected.append(row))
+
+    evaluation_ts = final_trigger_close_ts + 2 * 60_000
+    recovered = run_once._load_cached_events(
+        evaluation_ts, set(), journaled_candidate_ids=set(),
+    )
+    assert [row["event_id"] for row in recovered] == [event["event_id"]]
+    assert rejected == []
+
+    freshness_status, trigger_age = run_once._trigger_freshness_status(
+        {"trigger_bar_close_ts": final_trigger_close_ts},
+        now_ms=evaluation_ts,
+        max_delay_min=8.0,
+    )
+    assert freshness_status is None
+    assert trigger_age == pytest.approx(2.0)
+
+    # Both the source-event lifetime and the independent trigger limit are
+    # inclusive at the exact configured boundary; one millisecond later the
+    # trigger is stale and the source event may expire as well.
+    exact_deadline_ts = final_trigger_close_ts + 8 * 60_000
+    assert run_once._event_is_fresh(event, exact_deadline_ts, event_lifetime_min)
+    boundary_status, boundary_age = run_once._trigger_freshness_status(
+        {"trigger_bar_close_ts": final_trigger_close_ts},
+        now_ms=exact_deadline_ts,
+        max_delay_min=8.0,
+    )
+    assert boundary_status is None
+    assert boundary_age == pytest.approx(8.0)
+    after_deadline_ts = exact_deadline_ts + 1
+    assert not run_once._event_is_fresh(event, after_deadline_ts, event_lifetime_min)
+    stale_status, stale_age = run_once._trigger_freshness_status(
+        {"trigger_bar_close_ts": final_trigger_close_ts},
+        now_ms=after_deadline_ts,
+        max_delay_min=8.0,
+    )
+    assert stale_status == "TRIGGER_STALE"
+    assert stale_age == pytest.approx(8.0 + 1 / 60_000)
+
+
 def test_divergence_shadow_state_records_and_closes(tmp_path):
     from pathlib import Path
     from event_engine.shadow import record_divergence_shadow_open, update_divergence_shadow_state
