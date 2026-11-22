@@ -326,10 +326,11 @@ SQUEEZE_TP_RR = NORMAL_TP_RR
 SQUEEZE_TP_FRACTIONS = NORMAL_TP_FRACTIONS
 SQUEEZE_PLANNED_WEIGHTED_RR = NORMAL_PLANNED_WEIGHTED_RR
 
-# Mandatory 3H Binance Futures Demand/Supply direction gate. This is deliberately
-# separate from the optional TP-room geometry below: the direction gate is a
-# hard pre-order rule and defaults ON; the legacy TP-room check remains optional.
-SR_3H_DIRECTIONAL_GATE_ENABLED = True  # hard invariant; no environment variable can disable it
+# Optional 3H Binance Futures Demand/Supply gate. Temporarily disabled by
+# default while signal-entry behavior is evaluated without S/R-zone filtering.
+# Set SR_3H_DIRECTIONAL_GATE_ENABLED=true to restore the gate explicitly.
+# The independent legacy TP-room geometry below remains disabled separately.
+SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "false").strip().lower() == "true"
 
 # Optional Ajay R5.41 opposing-zone/TP-room check, now sourced from the same 3H snapshot.
 AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
@@ -2775,8 +2776,9 @@ _CONTINUATION_AFTER_SOURCE_CONFIRMATION_ENGINES = {
     "VOLATILITY_SQUEEZE", "BREAKOUT_MOMENTUM",
 }
 
-# Reversal/market-structure events use the mandatory 3H Demand/Supply gate as
-# their directional context rather than requiring a same-direction 4H EMA trend.
+# When the 3H Demand/Supply gate is enabled, these 1H reversal/structure events
+# defer their direction check to that gate instead of requiring same-side 4H EMA.
+# With the gate disabled they return to the normal causal 4H strategy-context check.
 _1H_REVERSAL_ENGINES_DEFERRED_TO_3H_SR = {
     "SFP", "LIQUIDITY_SWEEP", "BREAKER_BLOCK", "CRT",
 }
@@ -2796,7 +2798,11 @@ def _defer_1h_reversal_to_3h_sr(ev: dict[str, Any]) -> bool:
     timeframe = str(ev.get("timeframe") or "").strip().lower()
     fact = ev.get("event_fact") if isinstance(ev.get("event_fact"), dict) else {}
     engine = str(fact.get("engine") or "").strip().upper()
-    return timeframe == "1h" and engine in _1H_REVERSAL_ENGINES_DEFERRED_TO_3H_SR
+    return bool(
+        SR_3H_DIRECTIONAL_GATE_ENABLED
+        and timeframe == "1h"
+        and engine in _1H_REVERSAL_ENGINES_DEFERRED_TO_3H_SR
+    )
 
 
 def _entry_adverse_drift_pct(signal_price: float, trigger_price: float, direction: str) -> float | None:
@@ -5518,10 +5524,9 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             "execution_quality": {"signal_to_pre_order_drift_pct": pre_order_drift, "trigger_to_pre_order_drift_pct": trigger_live_drift, "pre_order_price": live_reference, "drift_limit_pct": drift_limit},
         }
 
-    # Mandatory final 3H Binance Futures Demand/Supply direction check. It is
-    # independent of the optional TP-room setting below and always runs before
-    # open_market(). Binance Futures last price is used for zone distance; BingX remains
-    # the execution venue and its live price above remains the execution reference.
+    # Optional final 3H Binance Futures Demand/Supply direction check. When
+    # disabled, no production S/R snapshot or directional-zone evaluation is
+    # performed here. BingX remains the execution venue.
     sr_result: dict[str, Any] | None = None
     sr_snapshot: dict[str, Any] | None = None
     if SR_3H_DIRECTIONAL_GATE_ENABLED:
@@ -5582,8 +5587,8 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
             float(sr_direction_result.get("distance_pct", 0.0)), SR_DIRECTIONAL_MAX_DISTANCE_PCT,
         )
 
-    # Optional TP-room geometry check. It reuses the mandatory 3H snapshot when
-    # the directional gate is enabled; it never fetches a second timeframe.
+    # Optional TP-room geometry check. It reuses the 3H snapshot if the
+    # directional gate is enabled; it never fetches a second timeframe.
     if AJAY_SR_ROOM_ENABLED and AJAY_SR_ROOM_MODE != "off":
         # Data retrieval may be optional only for this legacy TP-room check. The
         # mandatory direction gate above has already failed closed when required.
@@ -5683,6 +5688,34 @@ def execute_new_position(symbol: str, direction: str, price: float, setup: dict,
                     "position": {},
                     "error": str(exc),
                 }
+
+    # Revalidate the closed 15M trigger at the actual MARKET submission boundary.
+    # The candidate-level check in main() happens before BingX/Binance price fetches;
+    # those network calls can consume the remaining freshness allowance.
+    trigger_meta = setup.get("trigger") if isinstance(setup.get("trigger"), dict) else {}
+    final_trigger_status, final_trigger_age_min = _trigger_freshness_status(
+        trigger_meta,
+        now_ms=int(time.time() * 1000),
+        max_delay_min=MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+        required=REQUIRE_TRIGGER,
+    )
+    if final_trigger_status:
+        trigger_close_ts = _safe_float(trigger_meta.get("trigger_bar_close_ts"), 0.0) or None
+        log.info(
+            "[EXECUTION] %s %s blocked at MARKET boundary: %s age=%s limit=%.2fm close_ts=%s.",
+            direction, symbol, final_trigger_status,
+            f"{final_trigger_age_min:.3f}m" if final_trigger_age_min is not None else "unknown",
+            MAX_TRIGGER_TO_ORDER_DELAY_MIN, trigger_close_ts,
+        )
+        return {
+            "status": final_trigger_status,
+            "mode": EXECUTION_MODE,
+            "order_id": None,
+            "error": "15M trigger is stale or its close timestamp is unverifiable at MARKET submission",
+            "trigger_age_min": final_trigger_age_min,
+            "trigger_bar_close_ts": trigger_close_ts,
+            "trigger_freshness_limit_min": MAX_TRIGGER_TO_ORDER_DELAY_MIN,
+        }
 
     log.info("[EXECUTION] Opening market position after all pre-order gates: %s %s at ref price %.8g...", direction, symbol, live_reference)
     try:
@@ -6833,7 +6866,10 @@ def main() -> None:
                 # information without changing the validator or detector formulas.
                 ctx_df = _frame_through_event_ts(raw_ctx_df, detected_at)
                 if requires_div_context:
-                    valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(ev, ctx_df, context_timeframe=context_tf)
+                    valid_ctx, ctx_reason, ctx_meta = validate_divergence_context(
+                        ev, ctx_df, context_timeframe=context_tf,
+                        require_context_data=True,
+                    )
                 else:
                     valid_ctx, ctx_reason, ctx_meta = validate_strategy_htf_context(ev, ctx_df, context_timeframe=context_tf)
                 if not valid_ctx:
@@ -7364,8 +7400,9 @@ def main() -> None:
     for opp in opportunities:
         tf = str(opp.get("event", {}).get("timeframe", "1h")).lower()
         _tf_stats(stats, tf)["valid_signals"] += 1
-    # Compare both sides of true symbol conflicts against one shared cached 3H
-    # Futures snapshot before score ranking. The final live pre-order gate remains.
+    # When enabled, compare both sides of symbol conflicts against one shared
+    # cached 3H Futures snapshot before score ranking. Otherwise ordinary score
+    # conflict resolution applies without S/R-zone filtering.
     sr_prefilter_deferred_symbols: set[str] = set()
     if SR_3H_DIRECTIONAL_GATE_ENABLED:
         opportunities, sr_prefilter_decisions = prefilter_opposite_directions_by_sr(
@@ -7655,6 +7692,8 @@ def main() -> None:
                 attempt_limit = "unlimited" if MAX_TRADES <= 0 else str(MAX_TRADES)
                 log.info("[EXECUTION] Attempt #%d/%s: %s %s (Score: %.0f, Ref: %.8g)...", execution_attempts_this_cycle, attempt_limit, direction, symbol, score, price)
                 execution_result = execute_new_position(symbol=symbol, direction=direction, price=price, setup=setup, event_id=event_id)
+                if isinstance(execution_result, dict) and execution_result.get("trigger_age_min") is not None:
+                    trigger_age_min = _safe_float(execution_result.get("trigger_age_min"), trigger_age_min)
                 actual_position = execution_result.get("position", {}) if isinstance(execution_result, dict) else {}
                 actual_qty_for_state = _safe_float(actual_position.get("positionAmt"), 0.0) if isinstance(actual_position, dict) else 0.0
                 if actual_qty_for_state > 0:
@@ -7717,7 +7756,7 @@ def main() -> None:
                 elif status_now == "SR_3H_DIRECTIONAL_REJECTED":
                     terminal_reason = "SR_3H_DIRECTIONAL_REJECTED"
                     stats["rejected_sr_3h_direction"] = stats.get("rejected_sr_3h_direction", 0) + 1
-                    log.info("[SR_3H] %s (%s) rejected by mandatory 3H Demand/Supply direction gate: %s", symbol, direction, execution_result.get("error"))
+                    log.info("[SR_3H] %s (%s) rejected by enabled 3H Demand/Supply direction gate: %s", symbol, direction, execution_result.get("error"))
                 elif status_now == "SR_SYMBOL_UNAVAILABLE":
                     terminal_reason = "SR_SYMBOL_UNAVAILABLE"
                     stats["rejected_sr_symbol"] = stats.get("rejected_sr_symbol", 0) + 1

@@ -2972,13 +2972,78 @@ def test_sr_retry_history_is_ignored_when_sr_disabled(monkeypatch, tmp_path):
     assert effective_counts == {}
 
 
+def test_execute_new_position_rechecks_trigger_freshness_at_market_order_boundary(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "_ENTRY_EXECUTION_SAFETY_LATCH_REASON", None)
+    monkeypatch.setattr(ro, "_pending_protection_cleanup_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ro, "REQUIRE_TRIGGER", True)
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "_trigger_freshness_status", lambda *args, **kwargs: ("TRIGGER_STALE", 8.01))
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("stale trigger must not reach open_market"))
+    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
+
+    result = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {
+            "risk_pct": 7.0,
+            "signal_price": 100.0,
+            "event_type": "DONCHIAN_RETEST_BREAKOUT",
+            "trigger": {
+                "trigger_price": 100.0,
+                "trigger_bar_close_ts": 1_700_000_000_000,
+                "trigger_observed_at_ts": 1_700_000_000_000,
+            },
+        },
+        "EVT_TRIGGER_BOUNDARY",
+    )
+    assert result["status"] == "TRIGGER_STALE"
+    assert result["trigger_age_min"] == pytest.approx(8.01)
+
+
+def test_execute_new_position_blocks_missing_trigger_timestamp_at_market_boundary(monkeypatch):
+    import run_once as ro
+
+    monkeypatch.setattr(ro, "_ENTRY_EXECUTION_SAFETY_LATCH_REASON", None)
+    monkeypatch.setattr(ro, "_pending_protection_cleanup_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ro, "REQUIRE_TRIGGER", True)
+    monkeypatch.setattr(ro, "CROSS_EXCHANGE_PRICE_GUARD_ENABLED", False)
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
+    monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
+    monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(ro, "open_market", lambda *args, **kwargs: pytest.fail("unverifiable trigger must not reach open_market"))
+    monkeypatch.setattr(ro, "record_action", lambda *args, **kwargs: None)
+
+    result = ro.execute_new_position(
+        "TEST", "LONG", 100.0,
+        {
+            "risk_pct": 7.0,
+            "signal_price": 100.0,
+            "event_type": "DONCHIAN_RETEST_BREAKOUT",
+            "trigger": {"trigger_price": 100.0},
+        },
+        "EVT_TRIGGER_TIMESTAMP_UNKNOWN",
+    )
+    assert result["status"] == "TRIGGER_TIMESTAMP_UNKNOWN"
+    assert result["trigger_age_min"] is None
+
+
 def test_execute_new_position_skips_sr_path_when_disabled(monkeypatch):
     import run_once as ro
 
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_ENABLED", False)
     monkeypatch.setattr(ro, "AJAY_SR_ROOM_MODE", "off")
     monkeypatch.setattr(ro, "_current_close_price", lambda symbol: 100.0)
     monkeypatch.setattr(ro, "fetch_binance_price", lambda symbol: 100.0)
+    # Active-trade journal enrichment resolves the BingX symbol. Keep this unit
+    # test hermetic; the live contract catalog is covered by BingX adapter tests.
+    monkeypatch.setattr(ro, "to_bx_symbol", lambda symbol: f"{symbol}-USDT")
     monkeypatch.setattr(ro, "get_cached_sr_snapshot", lambda *args, **kwargs: pytest.fail("S/R snapshot must not be fetched while disabled"))
     monkeypatch.setattr(ro, "wait_for_position_fill_directional", lambda *args, **kwargs: {
         "status": "found", "symbol": "TEST", "side": "LONG", "positionAmt": 10.0, "avgPrice": 100.0,

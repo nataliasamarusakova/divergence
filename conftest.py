@@ -97,6 +97,10 @@ def isolate_production_entry_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(ro, "API_KEY", "")
     monkeypatch.setattr(ro, "SECRET_KEY", "")
     monkeypatch.setattr(ro, "EXECUTION_ENABLED", False)
+    # Direct execution-helper tests do not model the complete upstream 15M
+    # candidate pipeline unless they explicitly opt in. The dedicated market-
+    # boundary freshness tests enable REQUIRE_TRIGGER themselves.
+    monkeypatch.setattr(ro, "REQUIRE_TRIGGER", False)
     monkeypatch.setattr(ro, "send_tg", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(tracker, "send_detailed", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(reconciliation, "send_detailed", lambda *_args, **_kwargs: {})

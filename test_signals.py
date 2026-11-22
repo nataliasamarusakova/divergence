@@ -1036,6 +1036,43 @@ def test_volume_confirmed_divergence_defaults_on_and_enforces_both_thresholds(mo
     assert any(e["event_type"] == "REGULAR_BULLISH_RSI" for e in events)
 
 
+def test_validate_divergence_context_rejects_missing_htf_when_required():
+    import event_engine.signals as sig
+
+    ev = {
+        "symbol": "TEST-USDT",
+        "event_type": "REGULAR_BULLISH_RSI",
+        "direction": "LONG",
+        "timestamps": {"detected_at_ts": 1_700_000_000_000},
+        "event_fact": {"price_delta_atr": 1.0},
+    }
+    ok, reason, meta = sig.validate_divergence_context(
+        ev, None, "4h", require_context_data=True,
+    )
+    assert ok is False
+    assert reason == "DIVERGENCE_HTF_CONTEXT_UNAVAILABLE"
+    assert meta["context_validated"] is False
+
+
+def test_regular_divergence_may_reverse_htf_trend_when_context_is_available(monkeypatch):
+    import event_engine.signals as sig
+
+    monkeypatch.setattr(sig, "_trend_context", lambda df, direction: {"trend": "DOWN", "trend_ok": False})
+    ev = {
+        "symbol": "TEST-USDT",
+        "event_type": "REGULAR_BULLISH_RSI",
+        "direction": "LONG",
+        "timestamps": {"detected_at_ts": 1_700_000_000_000},
+        "event_fact": {"price_delta_atr": 1.0},
+    }
+    ok, reason, meta = sig.validate_divergence_context(
+        ev, pd.DataFrame(index=range(60)), "4h", require_context_data=True,
+    )
+    assert ok is True
+    assert reason == "REGULAR_CONTEXT_OK"
+    assert meta["htf_trend_ok"] is False
+
+
 def test_validate_divergence_context_marks_matching_htf_confirmation(monkeypatch):
     import event_engine.signals as sig
 
@@ -3274,12 +3311,21 @@ def test_15m_retest_policy_uses_continuation_for_already_confirmed_source_engine
     ) is False
 
 
-def test_only_one_hour_reversal_engines_defer_strategy_context_to_mandatory_3h_sr():
+def test_only_one_hour_reversal_engines_defer_strategy_context_when_3h_sr_is_enabled(monkeypatch):
     import run_once as ro
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", True)
     for engine in ["SFP", "LIQUIDITY_SWEEP", "BREAKER_BLOCK", "CRT"]:
         assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "1h", "event_fact": {"engine": engine}}) is True
         assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "4h", "event_fact": {"engine": engine}}) is False
     assert ro._defer_1h_reversal_to_3h_sr({"timeframe": "1h", "event_fact": {"engine": "ORDER_BLOCK"}}) is False
+
+
+def test_one_hour_reversal_engines_restore_4h_strategy_context_when_3h_sr_is_disabled(monkeypatch):
+    import run_once as ro
+    monkeypatch.setattr(ro, "SR_3H_DIRECTIONAL_GATE_ENABLED", False)
+    for engine in ["SFP", "LIQUIDITY_SWEEP", "BREAKER_BLOCK", "CRT"]:
+        event = {"timeframe": "1h", "event_fact": {"engine": engine, "requires_htf_context": True}}
+        assert ro._defer_1h_reversal_to_3h_sr(event) is False, engine
 
 
 def test_adverse_drift_ignores_favorable_retest_and_penalizes_chase():
