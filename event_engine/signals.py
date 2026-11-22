@@ -2762,12 +2762,16 @@ def validate_divergence_context(
     ev: dict[str, Any],
     df_htf: pd.DataFrame | None = None,
     context_timeframe: str = "4h",
+    *,
+    require_context_data: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Validate divergence semantics: hidden requires aligned trend; regular needs non-trending/exhaustion context.
+    """Validate divergence semantics against optional or required HTF context.
 
-    The validator is intentionally conservative and causal. When higher-TF data is
-    supplied, it is preferred for regime confirmation. Otherwise the event is not
-    rejected solely for missing context; the caller can decide whether to require it.
+    Hidden continuation divergence must align with the higher-timeframe trend.
+    Regular divergence is a reversal candidate: it requires meaningful price
+    displacement but is not vetoed solely because the HTF trend points the other
+    way. When ``require_context_data`` is true, at least 60 closed HTF bars must be
+    supplied; otherwise the caller may explicitly permit the local fallback.
     """
     event_type = str(ev.get("event_type", "")).upper()
     direction = str(ev.get("direction", "")).upper()
@@ -2776,7 +2780,15 @@ def validate_divergence_context(
     if "REGULAR_" not in event_type and "HIDDEN_" not in event_type:
         return True, "NOT_DIVERGENCE", meta
 
-    if isinstance(df_htf, pd.DataFrame) and len(df_htf) >= 60:
+    has_context_data = isinstance(df_htf, pd.DataFrame) and len(df_htf) >= 60
+    if require_context_data and not has_context_data:
+        meta.update({
+            "context_source": str(context_timeframe).lower(),
+            "context_bars": len(df_htf) if isinstance(df_htf, pd.DataFrame) else 0,
+        })
+        return False, "DIVERGENCE_HTF_CONTEXT_UNAVAILABLE", meta
+
+    if has_context_data:
         ctx = _trend_context(df_htf, direction)
         meta.update({"context_source": str(context_timeframe).lower(), "htf_trend": ctx.get("trend"), "htf_trend_ok": ctx.get("trend_ok")})
         try:
