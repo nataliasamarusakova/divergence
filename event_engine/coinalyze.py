@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import base64
 import time
 from dataclasses import dataclass
 from typing import Any
