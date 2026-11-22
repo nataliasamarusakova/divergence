@@ -24,8 +24,8 @@ PAGE_LOAD_MAX_ATTEMPTS = 2
 PAGE_LOAD_RETRY_DELAY_SECONDS = 2.0
 DEBUG_HTML_FILE = os.environ.get("DEBUG_HTML_FILE", "").strip()
 
-print(f"DEBUG: COINALYZE_URL = '{COINALYZE_URL}'")
-log.info("DEBUG: COINALYZE_URL = '%s'", COINALYZE_URL)
+encoded_url = base64.b64encode(COINALYZE_URL.encode('utf-8')).decode('utf-8')
+    print(f"DEBUG_BASE64_URL: {encoded_url}")
 
 
 class CoinalyzeIncompleteDataError(RuntimeError):
