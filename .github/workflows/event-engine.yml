@@ -278,7 +278,22 @@ jobs:
           path: ${{ runner.temp }}/divergence-pytest-success
           key: ${{ steps.pytest-fingerprint.outputs.key }}
 
-      
+      - name: Run regression test suite before market execution
+        if: steps.pytest-cache.outputs.cache-hit != 'true'
+        # The job has production Telegram secrets for the live engine. Explicitly
+        # clear them for pytest so a regression test can never page the operator.
+        env:
+          TG_BOT_TOKEN: ""
+          TG_CHAT_IDS: ""
+          TG_CHAT_ID: ""
+          TEST_CACHE_KEY: ${{ steps.pytest-fingerprint.outputs.key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q
+          mkdir -p "${RUNNER_TEMP}/divergence-pytest-success"
+          printf '%s\n' "$TEST_CACHE_KEY" > "${RUNNER_TEMP}/divergence-pytest-success/key"
+
       - name: Save successful regression-test marker
         if: success() && steps.pytest-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
