@@ -248,7 +248,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1795366542289,
+    "last_observation_ts": 1795366882268,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -306,7 +306,7 @@
     "peak_pnl_pct": 2.4979761767086757,
     "mae_pct": -2.023823291314905,
     "max_drawdown_pct": -4.5217994680235805,
-    "current_pnl_pct": -1.214293974788955,
+    "current_pnl_pct": -1.098646929570945,
     "score": 100.0,
     "event_type": "REGULAR_BULLISH_STOCH",
     "timeframe": "1h",
@@ -522,7 +522,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1795366542289,
+    "last_observation_ts": 1795366882268,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
@@ -531,277 +531,6 @@
     "current_price_source": "LIVE_TICKER",
     "current_position_qty": 1156.4,
     "protection_last_updated_ts": 1795360861335
-  },
-  "EVT_16DE5C38E4C01DEE": {
-    "trade_id": "TR_C0700DD90DB8C855B87CA1A4",
-    "event_id": "EVT_16DE5C38E4C01DEE",
-    "symbol": "BLESS",
-    "name": "Bless",
-    "direction": "LONG",
-    "entry_price": 0.01683,
-    "actual_entry_price": 0.01683,
-    "requested_entry_price": 0.016802,
-    "signal_reference_price": 0.016993,
-    "pre_order_reference_price": 0.016802,
-    "entry_slippage_pct": 0.16664682775860162,
-    "adverse_entry_slippage_pct": 0.16664682775860162,
-    "initial_qty": 595.1,
-    "initial_notional_usdt": 10.015533000000001,
-    "remaining_qty": 416.6,
-    "entry_ts": 1795361528036,
-    "tp_orders": [
-      {
-        "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2124526355017719808",
-        "price": 0.018538,
-        "qty": 416.6
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2124533769842548736",
-      "stop_price": 0.01683,
-      "qty": 416.6
-    },
-    "hit_legs": [
-      "tp1"
-    ],
-    "be_activated": true,
-    "be_activation_ts": 1795363289305,
-    "be_required": false,
-    "be_last_error": null,
-    "sl_order_history": [
-      {
-        "order_id": "2124526350697586688",
-        "stop_price": 0.015652,
-        "replaced_ts": 1795363289305
-      }
-    ],
-    "peak_pnl_pct": 7.338086749851455,
-    "mae_pct": -2.899584076054678,
-    "max_drawdown_pct": -10.184194890077244,
-    "current_pnl_pct": 1.6815210932857902,
-    "score": 80.0,
-    "event_type": "MA_COMPRESSION_BREAKOUT",
-    "timeframe": "1h",
-    "research": {
-      "fr_oiw": 0.01,
-      "pfr_oiw": 0.0657,
-      "liq_short24": 645200.0,
-      "liq_long24": 624200.0,
-      "ls_accounts": 1.82,
-      "oi": 23900000.0,
-      "oi_chg24_pct": 47.42,
-      "oi_chg4h_pct": 34.78,
-      "oi_vol_ratio": 0.096,
-      "oi_mktcap_ratio": 0.787,
-      "volume24": 249000000.0,
-      "btc_corr7d": -0.34,
-      "cvd24": 0.0,
-      "lls24": 49.4203
-    },
-    "setup": {
-      "entry_reference": 0.01683,
-      "invalidation_price": 0.0156519,
-      "target_price": 0.018538245,
-      "risk_pct": 7.000000000000008,
-      "risk_pct_raw": 13.488952129624055,
-      "risk_was_clipped": false,
-      "stop_loss_policy": "fixed",
-      "target_rr": 1.45,
-      "planned_weighted_rr": 1.195,
-      "realized_rr": null,
-      "trigger_ok": true,
-      "trigger": {
-        "event_detected_at_ts": 1795359599999,
-        "trigger_observed_at_ts": 1795361508911,
-        "trigger_bar_close_ts": 1795361399999,
-        "trigger_price": 0.016584,
-        "trigger_delay_min": 30.0,
-        "signal_to_trigger_drift_pct": 0.0,
-        "volume_ratio": 1.293013
-      },
-      "signal_price": 0.016993,
-      "entry_risk": {
-        "signal_to_trigger_drift_pct": 0.0,
-        "oi_chg24_pct": 47.42,
-        "hot_oi_warning": false,
-        "oi_chg24_status": "KNOWN",
-        "short_defensive_mode": false,
-        "symbol_quarantine_until_ts": null
-      },
-      "event_timeframe": "1h",
-      "event_type": "MA_COMPRESSION_BREAKOUT",
-      "entry_trigger_policy": "RETEST",
-      "requires_retest": true,
-      "trend_filter": {
-        "version": "trend-v1-2026-10-04",
-        "enabled": true,
-        "mode": "shadow",
-        "symbol": "BLESS",
-        "event_direction": "LONG",
-        "event_type": "MA_COMPRESSION_BREAKOUT",
-        "decision_ts": 1795361399999,
-        "trend_decision": "ALIGNED",
-        "trend_reject_reason": null,
-        "trend_4h": "BULL",
-        "trend_1h": "LONG",
-        "trend_persistence": "PERSISTENT",
-        "trend_4h_bars": 400,
-        "trend_1h_bars": 400,
-        "trend_4h_bar_close_ts": 1795348799999,
-        "trend_1h_bar_close_ts": 1795359599999,
-        "trend_persistence_1h_return_pct": 21.26596731606367,
-        "trend_persistence_4h_return_pct": 12.78853162711589,
-        "btc_regime": "BULLISH",
-        "btc_bar_close_ts": 1795359599999,
-        "btc_chg_1h_pct": 0.30948380933557573,
-        "btc_chg_4h_pct": 0.09351631194017825,
-        "btc_context_veto": false,
-        "require_persistence": false,
-        "min_bars_1h": 400,
-        "min_bars_4h": 400,
-        "persistence_lookback_1h": 6,
-        "persistence_lookback_4h": 3,
-        "slope_lookback_4h": 6,
-        "btc_bars": 10,
-        "trend_4h_close": 0.013926,
-        "trend_4h_ema50": 0.011733083552083398,
-        "trend_4h_ema200": 0.009828647477955312,
-        "trend_4h_ema50_slope_pct": 2.7840531140099767,
-        "trend_4h_slope_lookback": 6,
-        "trend_1h_close": 0.016993,
-        "trend_1h_ema20": 0.013834141779788572,
-        "trend_1h_ema50": 0.01333624007674243,
-        "trend_1h_ema200": 0.01184436065820171,
-        "trend_1h_ema50_slope_pct": 2.4375921324960803
-      },
-      "entry_context": {
-        "btc_chg_1h_pct": 0.30948380933557573,
-        "btc_chg_4h_pct": 0.09351631194017825,
-        "btc_close": 60901.9,
-        "btc_available": true,
-        "fr_oiw": 0.01,
-        "pfr_oiw": 0.0657,
-        "oi": 23900000.0,
-        "oi_chg24_pct": 47.42,
-        "oi_chg24_status": "KNOWN",
-        "oi_chg4h_pct": 34.78,
-        "volume24": 249000000.0,
-        "cvd24": 0.0,
-        "ls_accounts": 1.82,
-        "liq_long24": 624200.0,
-        "liq_short24": 645200.0,
-        "btc_corr7d": -0.34,
-        "htf_trend": "UP",
-        "htf_trend_ok": null,
-        "context_source": null
-      },
-      "confluence_events": [
-        {
-          "event_id": "EVT_0EC940E8B1C799CA",
-          "event_type": "DONCHIAN_RETEST_BREAKOUT",
-          "timeframe": "1h",
-          "score": 80.0,
-          "detected_at_ts": 1795359599999
-        }
-      ],
-      "conflict_events": [],
-      "pre_order_reference_price": 0.016802,
-      "tp_levels": [
-        {
-          "leg": "tp1",
-          "pnl_pct": 4.2,
-          "close_fraction": 0.3
-        },
-        {
-          "leg": "tp2",
-          "pnl_pct": 10.15,
-          "close_fraction": 0.7
-        }
-      ],
-      "effective_tp_levels": [
-        {
-          "leg": "tp1",
-          "pnl_pct": 4.2,
-          "close_fraction": 0.29994958830448665,
-          "qty": 178.5
-        },
-        {
-          "leg": "tp2",
-          "pnl_pct": 10.15,
-          "close_fraction": 0.7000504116955134,
-          "qty": 416.6
-        }
-      ],
-      "tp_mode": "two_tp",
-      "effective_weighted_rr": 1.1950428499411851
-    },
-    "planned_risk_pct": 7.000000000000008,
-    "planned_target_rr": 1.45,
-    "planned_weighted_rr": 1.195,
-    "planned_entry_reference": 0.01683,
-    "planned_invalidation_price": 0.0156519,
-    "planned_target_price": 0.018538245,
-    "tp_levels": [
-      {
-        "leg": "tp1",
-        "pnl_pct": 4.2,
-        "close_fraction": 0.3
-      },
-      {
-        "leg": "tp2",
-        "pnl_pct": 10.15,
-        "close_fraction": 0.7
-      }
-    ],
-    "effective_tp_levels": [
-      {
-        "leg": "tp1",
-        "pnl_pct": 4.2,
-        "close_fraction": 0.29994958830448665,
-        "qty": 178.5
-      },
-      {
-        "leg": "tp2",
-        "pnl_pct": 10.15,
-        "close_fraction": 0.7000504116955134,
-        "qty": 416.6
-      }
-    ],
-    "tp_mode": "two_tp",
-    "effective_weighted_rr": 1.1950428499411851,
-    "tp_filled_qty": {
-      "tp1": 178.5
-    },
-    "tp_filled_qty_by_order": {
-      "2124526353792983040": 178.5,
-      "2124526355017719808": 0.0
-    },
-    "tp_fill_ledger_schema_version": 1,
-    "tp_repair_state": "attempted",
-    "realized_pnl_qty": 178.5,
-    "realized_pnl_weighted_sum": 826.2121212121194,
-    "last_tp_exec_price": 0.017609,
-    "last_close_exec_price": null,
-    "realized_pnl_pct": null,
-    "realized_rr": null,
-    "exit_price": null,
-    "exit_reason": null,
-    "closed_ts": null,
-    "duration_min": null,
-    "closed": false,
-    "last_observation_ts": 1795366542289,
-    "close_journal_pending": false,
-    "close_notification_pending": false,
-    "close_cleanup_pending": false,
-    "close_cleanup_last_error": null,
-    "last_exchange_avg_price": 0.01683,
-    "current_price_source": "LIVE_TICKER",
-    "current_position_qty": 416.6,
-    "protection_last_updated_ts": 1795363298264,
-    "last_tp_exec_price_source": "ORDER_AVG_PRICE"
   },
   "VP_E804E57860378740": {
     "trade_id": "TR_A011B0ACB81D54564CB58866",
@@ -849,9 +578,9 @@
     "be_last_error": null,
     "sl_order_history": [],
     "peak_pnl_pct": 0.4473461491959971,
-    "mae_pct": -3.8447587957925142,
-    "max_drawdown_pct": -4.292104944988512,
-    "current_pnl_pct": -3.8447587957925142,
+    "mae_pct": -4.521823237818877,
+    "max_drawdown_pct": -4.969169387014874,
+    "current_pnl_pct": -3.0226091161890802,
     "score": 85.0,
     "event_type": "VOLUME_PROFILE_DISTRIBUTION",
     "timeframe": "4h",
@@ -1052,7 +781,7 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1795366542289,
+    "last_observation_ts": 1795366882268,
     "close_journal_pending": false,
     "close_notification_pending": false,
     "close_cleanup_pending": false,
