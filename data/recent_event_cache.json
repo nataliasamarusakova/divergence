@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795426343387,
+  "updated_ts": 1795426925392,
   "events": [
     {
       "event_id": "EVT_028817DEF3552DD7",
@@ -1643,6 +1643,34 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E29A2B7E9943C5D9",
+      "symbol": "MUBARAK",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795366799999,
+        "pivot_2_ts": 1795424399999,
+        "detected_at_ts": 1795424399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.02325,
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.02057,
+        "zone_high": 0.02057,
+        "zone_low": 0.02025,
+        "bos_level": 0.02177,
+        "ob_ts": 1795402799999,
+        "displacement_atr": 4.090463213274109,
+        "volume_ratio": 9.534549912352837,
+        "body_fraction": 0.9722222222222214,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
