@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795467177332,
+  "updated_ts": 1795467413601,
   "events": [
     {
       "event_id": "EVT_09D3EE4C1EFF1C2A",
@@ -1869,6 +1869,37 @@
         "requires_retest": true,
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_9329CF229CC7C2C9",
+      "symbol": "APR",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "BREAKER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795100399999,
+        "pivot_2_ts": 1795463999999,
+        "detected_at_ts": 1795463999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.03245,
+        "engine": "BREAKER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.03187,
+        "zone_high": 0.03187,
+        "zone_low": 0.03092,
+        "breaker_from": "BEARISH_OB",
+        "liquidity_sweep_ts": 1795319999999,
+        "liquidity_sweep_level": 0.02612,
+        "mss_ts": 1795460399999,
+        "mss_pivot_ts": 1795305599999,
+        "mss_level": 0.02716,
+        "broken_ts": 1795460399999,
+        "bos_ts": 1795107599999,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
