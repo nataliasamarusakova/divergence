@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795461713474,
+  "updated_ts": 1795462007135,
   "events": [
     {
       "event_id": "EVT_135FACEC0BEF0F19",
@@ -564,6 +564,35 @@
         "range_high": 0.07765,
         "range_low": 0.07588,
         "manipulation_depth_atr": 0.4124354562533883,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_59C304AA0563A0C2",
+      "symbol": "CYS",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1795456799999,
+        "pivot_2_ts": 1795460399999,
+        "detected_at_ts": 1795460399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05668,
+        "swept_level": 0.05822,
+        "sweep_depth_atr": 0.17337829038973923,
+        "reclaim_displacement_atr": 0.5804403634786894,
+        "rejection_wick_fraction": 0.498753117206983,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1795456799999,
+        "lookback_bars": 20,
+        "volume_ratio": 3.2150739456487294,
+        "trigger_level": 0.05822,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
