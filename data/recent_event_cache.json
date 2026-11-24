@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795560983246,
+  "updated_ts": 1795561319875,
   "events": [
     {
       "event_id": "EVT_3B7E9B9F602DD553",
@@ -1411,35 +1411,6 @@
       }
     },
     {
-      "event_id": "EVT_9A9F2750995482B2",
-      "symbol": "GUA",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-      "timestamps": {
-        "pivot_1_ts": 1795553999999,
-        "pivot_2_ts": 1795557599999,
-        "detected_at_ts": 1795557599999
-      },
-      "event_fact": {
-        "detection_close_price": 0.04055,
-        "swept_level": 0.0446,
-        "sweep_depth_atr": 1.481679224929231,
-        "reclaim_displacement_atr": 1.8074701388443941,
-        "rejection_wick_fraction": 0.7717277486910993,
-        "atr_reference": "previous_bar",
-        "atr_reference_ts": 1795553999999,
-        "lookback_bars": 20,
-        "volume_ratio": 7.502255187851131,
-        "trigger_level": 0.0446,
-        "requires_retest": true,
-        "engine": "LIQUIDITY_SWEEP",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_4A66300975930DD4",
       "symbol": "XMR",
       "timeframe": "1h",
@@ -1525,82 +1496,6 @@
         "range_high": 0.12479,
         "range_low": 0.12344,
         "manipulation_depth_atr": 0.11089061889982645,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "HAR_229DA75E0A81DF1B",
-      "symbol": "DOT",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HARMONIC_BUTTERFLY_LONG",
-      "timestamps": {
-        "x_ts": 1795402799999,
-        "a_ts": 1795445999999,
-        "b_ts": 1795492799999,
-        "c_ts": 1795499999999,
-        "d_ts": 1795539599999,
-        "detected_at_ts": 1795557599999
-      },
-      "event_fact": {
-        "trigger_level": 0.6444,
-        "detection_close_price": 0.6521,
-        "pattern": "BUTTERFLY",
-        "x_price": 0.649,
-        "a_price": 0.723,
-        "b_price": 0.6638,
-        "c_price": 0.6935,
-        "d_price": 0.6444,
-        "ab_xa": 0.8000000000000009,
-        "bc_ab": 0.5016891891891899,
-        "bc_xa": 0.4013513513513524,
-        "xc_xa": 0.6013513513513515,
-        "cd_bc": 1.653198653198651,
-        "cd_xc": 1.1033707865168552,
-        "ad_xa": 1.0621621621621629,
-        "xd_xa": 0.06216216216216285,
-        "xd_xc": 0.10337078651685506,
-        "ratio_tolerance": 0.05,
-        "engine": "HARMONIC_PATTERN",
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "HAR_D0AB2EBA0D9ED512",
-      "symbol": "PENGU",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "HARMONIC_BUTTERFLY_LONG",
-      "timestamps": {
-        "x_ts": 1795402799999,
-        "a_ts": 1795442399999,
-        "b_ts": 1795492799999,
-        "c_ts": 1795499999999,
-        "d_ts": 1795539599999,
-        "detected_at_ts": 1795557599999
-      },
-      "event_fact": {
-        "trigger_level": 0.004126,
-        "detection_close_price": 0.004237,
-        "pattern": "BUTTERFLY",
-        "x_price": 0.004179,
-        "a_price": 0.004811,
-        "b_price": 0.004337,
-        "c_price": 0.00452,
-        "d_price": 0.004126,
-        "ab_xa": 0.750000000000001,
-        "bc_ab": 0.3860759493670882,
-        "bc_xa": 0.28955696202531656,
-        "xc_xa": 0.5395569620253156,
-        "cd_bc": 2.153005464480871,
-        "cd_xc": 1.1554252199413495,
-        "ad_xa": 1.083860759493671,
-        "xd_xa": 0.08386075949367107,
-        "xd_xc": 0.15542521994134958,
-        "ratio_tolerance": 0.05,
-        "engine": "HARMONIC_PATTERN",
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
