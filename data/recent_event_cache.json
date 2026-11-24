@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795492321242,
+  "updated_ts": 1795492608016,
   "events": [
     {
       "event_id": "EVT_BCB1B91AE9FAEDE2",
@@ -1382,6 +1382,59 @@
         "mss_level": 0.005192,
         "broken_ts": 1795485599999,
         "bos_ts": 1795233599999,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_CB600567E09E36C4",
+      "symbol": "LISTA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1795485599999,
+        "pivot_2_ts": 1795489199999,
+        "detected_at_ts": 1795489199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09372,
+        "swept_level": 0.10092,
+        "sweep_depth_atr": 0.5150659777585922,
+        "reclaim_displacement_atr": 1.8542375199309298,
+        "rejection_wick_fraction": 0.6627906976744187,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1795485599999,
+        "lookback_bars": 20,
+        "volume_ratio": 2.7274777639557235,
+        "trigger_level": 0.10092,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_4AB6A10908EEB8A5",
+      "symbol": "LISTA",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "CRT_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1795481999999,
+        "pivot_2_ts": 1795489199999,
+        "detected_at_ts": 1795489199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.09372,
+        "engine": "CRT",
+        "requires_retest": true,
+        "requires_htf_context": true,
+        "trigger_level": 0.09979,
+        "range_high": 0.09979,
+        "range_low": 0.09332,
+        "manipulation_depth_atr": 0.2639351330217494,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
