@@ -52,14 +52,15 @@ jobs:
       TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
       TREND_FILTER_HISTORY_BUFFER_BARS: "12"
       TREND_FILTER_REQUIRE_PERSISTENCE: "false"
-      # Temporarily disable production 3H Demand/Supply zone filtering.
-      # 1H reversal engines consequently use the ordinary causal 4H strategy context.
-      SR_3H_DIRECTIONAL_GATE_ENABLED: "false"
-      # Keep the separate legacy TP-room geometry disabled as well.
+      # Restore the mandatory 3H Binance Futures Demand/Supply directional gate.
+      # It also restores the opposite-direction prefilter before score conflict resolution.
+      # Data staleness, missing snapshots, and ambiguous zones remain fail-closed.
+      SR_3H_DIRECTIONAL_GATE_ENABLED: "true"
+      # Preserve the original v14.27 policy: separate legacy TP-room geometry stays off.
       AJAY_SR_ROOM_ENABLED: "false"
       AJAY_SR_ROOM_MODE: "off"
-      AJAY_SR_REQUIRE_DATA: "false"
-      # Dormant 3H S/R parameters are retained for a deliberate future re-enable.
+      AJAY_SR_REQUIRE_DATA: "true"
+      # Parameters for the restored mandatory 3H Demand/Supply directional gate.
       AJAY_SR_KLINE_LIMIT_1H: "1000"
       AJAY_SR_SWING_LENGTH: "10"
       AJAY_SR_HISTORY_TO_KEEP: "20"
@@ -114,10 +115,10 @@ jobs:
       REQUIRE_4H_CONTEXT_FOR_1H: "true"
       ENABLE_MACD_4H_ENGINE: "true"
       ENABLE_MA_COMPRESSION_ENGINE: "true"
-      # Pattern activation is explicitly held to V12 parity: every detector enabled
-      # in V12 remains enabled; detector families disabled in V12 remain disabled.
-      # ENTRY_BLOCKED_EVENT_TYPES is telemetry-only while ENTRY_QUALITY_MODE=shadow.
-      # The hard DISABLED_EVENT_TYPES denylist is empty so these event types can execute.
+      # All implemented signal-detector families are enabled. Individual detectors
+      # still require their own causal price/volume/derivatives pattern and confirmation.
+      # ENTRY_BLOCKED_EVENT_TYPES remains telemetry-only while ENTRY_QUALITY_MODE=shadow.
+      # The hard DISABLED_EVENT_TYPES denylist is empty.
       ENABLE_DIVERGENCE_ENGINE: "true"
       ENABLE_BREAKOUT_MOMENTUM_ENGINE: "true"
       ENABLE_DONCHIAN_RETEST_ENGINE: "true"
@@ -125,10 +126,10 @@ jobs:
       ENABLE_EMA_PULLBACK_ENGINE: "true"
       ENABLE_ORDER_BLOCK_ENGINE: "true"
       ENABLE_BREAKER_BLOCK_ENGINE: "true"
-      ENABLE_MITIGATION_BLOCK_ENGINE: "false"
-      ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE: "false"
+      ENABLE_MITIGATION_BLOCK_ENGINE: "true"
+      ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE: "true"
       ENABLE_SFP_ENGINE: "true"
-      ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE: "false"
+      ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE: "true"
       ENABLE_VOLATILITY_SQUEEZE_ENGINE: "true"
       ENABLE_CRT_ENGINE: "true"
       EXTREME_SHORT_FUNDING: "-0.50"
@@ -161,7 +162,7 @@ jobs:
       RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
       RECONCILIATION_MAX_SECONDS: "45"
       BINGX_HTTP_TIMEOUT_SEC: "10"
-      LIQ_SQUEEZE_ENGINE_ENABLED: "false"
+      LIQ_SQUEEZE_ENGINE_ENABLED: "true"
       LIQ_SQUEEZE_MIN_LIQ_OI_RATIO: "0.01"
       LIQ_SQUEEZE_MIN_OI_CHG4H_PCT: "1.5"
       LIQ_SQUEEZE_FUNDING_EXTREME: "0.03"
