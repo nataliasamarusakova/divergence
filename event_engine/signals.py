@@ -1367,7 +1367,7 @@ def detect_liquidation_cascade_fvg(
     min_liq_oi_ratio: float = 0.005,
     min_impulse_pct_4h: float = 5.0,
 ) -> list[dict[str, Any]]:
-    """Research-only cascade+FVG proxy; disabled by default until local liquidation series exist."""
+    """Research-only cascade+FVG proxy using Coinalyze's aggregated 24h liquidation context."""
     if timeframe.lower() not in {'1h', '4h'} or row is None:
         return []
     d = _prepare_pattern_frame(df, {'open','high','low','close','volume','close_time'}, 80)

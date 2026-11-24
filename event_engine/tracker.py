@@ -1040,6 +1040,252 @@ def _rebuild_data_error_close(record: dict, opened_record: dict | None, fills: l
     }, None
 
 
+def _rebuild_data_error_close_from_order_details(
+    record: dict, opened_record: dict | None,
+) -> tuple[dict | None, str | None]:
+    """Rebuild a close from exact terminal order snapshots when fillHistory lags.
+
+    This fallback deliberately requires every journaled exit order to be
+    readable and terminal, validates symbol/side/positionSide, and requires the
+    sum of exact executedQty values to cover the complete original position.
+    Order average prices can establish gross price PnL, but not fees or funding;
+    those accounting fields therefore remain UNKNOWN.
+    """
+    opened = opened_record if isinstance(opened_record, dict) else {}
+    execution = opened.get("execution") if isinstance(opened.get("execution"), dict) else {}
+    result_open = opened.get("result") if isinstance(opened.get("result"), dict) else {}
+    protection = result_open.get("protection") if isinstance(result_open.get("protection"), dict) else {}
+    if not protection and isinstance(opened.get("protection"), dict):
+        protection = opened.get("protection")
+
+    symbol = str(record.get("symbol") or opened.get("symbol") or "").strip()
+    direction = str(record.get("direction") or opened.get("direction") or "").upper()
+    entry_order_id = _fill_id(record.get("entry_order_id") or execution.get("order_id") or execution.get("orderId"))
+    entry_price = _safe_float(execution.get("actual_entry_price"), 0.0) or _safe_float(record.get("entry_price"), 0.0)
+    entry_qty = abs(_safe_float(execution.get("actual_qty"), 0.0))
+    target_qty = abs(_safe_float(record.get("total_closed_qty") or record.get("initial_qty"), 0.0)) or entry_qty
+    if not symbol or direction not in {"LONG", "SHORT"}:
+        return None, "missing_trade_identity_for_order_detail_reconstruction"
+    if not entry_order_id:
+        return None, "missing_entry_order_id_for_reconstruction"
+    if entry_price <= 0 or entry_qty <= 0 or target_qty <= 0:
+        return None, "missing_confirmed_entry_execution_for_order_detail_reconstruction"
+    quantity_tolerance = max(1e-10, target_qty * 1e-6)
+    if abs(entry_qty - target_qty) > quantity_tolerance:
+        return None, f"entry_journal_qty_mismatch:{entry_qty:.12g}/{target_qty:.12g}"
+
+    sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
+    sl_ids = {
+        _fill_id(record.get("sl_order_id")),
+        _fill_id(record.get("filled_sl_order_id")),
+        _fill_id(sl_result.get("order_id") or sl_result.get("orderId")),
+    }
+    sl_ids.discard("")
+    for source in (record, opened):
+        history = source.get("sl_order_history") if isinstance(source.get("sl_order_history"), list) else []
+        for item in history:
+            if isinstance(item, dict):
+                order_id = _fill_id(item.get("order_id") or item.get("orderId"))
+                if order_id:
+                    sl_ids.add(order_id)
+
+    tp_ids = {_fill_id(value) for value in (record.get("tp_order_ids") or []) if _fill_id(value)}
+    tp_orders = protection.get("tp_orders") if isinstance(protection.get("tp_orders"), list) else []
+    if not tp_ids:
+        tp_ids = {
+            _fill_id(item.get("order_id") or item.get("orderId"))
+            for item in tp_orders if isinstance(item, dict)
+        }
+        tp_ids.discard("")
+
+    exit_ids = {
+        _fill_id(value) for value in (record.get("exit_order_ids") or []) if _fill_id(value)
+    }
+    exit_ids.update(sl_ids)
+    exit_ids.update(tp_ids)
+    for key in ("manual_exit_order_id", "close_order_id", "exit_order_id", "filled_sl_order_id"):
+        value = _fill_id(record.get(key))
+        if value:
+            exit_ids.add(value)
+    exit_ids.discard(entry_order_id)
+    if not exit_ids:
+        return None, "missing_direct_exit_order_ids_for_order_detail_reconstruction"
+
+    expected_symbol = canonical_contract_symbol(symbol) or symbol.upper().replace("_", "-").replace("/", "-")
+    expected_entry_side = "BUY" if direction == "LONG" else "SELL"
+    expected_close_side = "SELL" if direction == "LONG" else "BUY"
+    terminal_statuses = {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+
+    # Verify the entry order independently too. The local TRADE_OPEN row is
+    # useful linkage, but it is not enough to calculate a recovered close if its
+    # entry execution quantity/average price has not been re-confirmed by BingX.
+    try:
+        entry_info = get_order(symbol, entry_order_id)
+    except Exception as exc:
+        return None, f"entry_order_detail_query_exception:{type(exc).__name__}"
+    if not isinstance(entry_info, dict) or str(entry_info.get("status") or "").lower() != "ok":
+        detail = str(entry_info.get("error") or entry_info.get("status") or "invalid_entry_order_response") if isinstance(entry_info, dict) else "invalid_entry_order_response"
+        return None, f"entry_order_detail_unavailable:{detail[:160]}"
+    entry_status = str(entry_info.get("order_status") or "").upper()
+    if entry_status not in {"FILLED", "CANCELED", "CANCELLED"}:
+        return None, f"entry_order_not_terminal:{entry_status or 'UNKNOWN'}"
+    entry_executed_raw = entry_info.get("executed_qty")
+    try:
+        entry_executed_qty = float(entry_executed_raw) if entry_executed_raw is not None else float("nan")
+    except (TypeError, ValueError, OverflowError):
+        entry_executed_qty = float("nan")
+    entry_avg_price = _safe_float(entry_info.get("avg_price"), 0.0)
+    entry_raw = entry_info.get("raw_order") if isinstance(entry_info.get("raw_order"), dict) else {}
+    entry_raw_id = _fill_id(entry_raw.get("orderId") or entry_raw.get("orderID"))
+    entry_raw_symbol = str(entry_raw.get("symbol") or "").upper().replace("_", "-").replace("/", "-")
+    entry_raw_side = str(entry_raw.get("side") or "").upper()
+    entry_position_side = str(entry_raw.get("positionSide") or entry_raw.get("position_side") or "").upper()
+    if entry_raw_id != entry_order_id:
+        return None, f"entry_order_id_identity_mismatch:{entry_order_id}:{entry_raw_id or 'MISSING'}"
+    if not entry_raw_symbol or canonical_contract_symbol(entry_raw_symbol) != expected_symbol:
+        return None, f"entry_order_symbol_mismatch:{entry_order_id}:{entry_raw_symbol or 'MISSING'}"
+    if entry_raw_side != expected_entry_side:
+        return None, f"entry_order_side_mismatch:{entry_order_id}:{entry_raw_side or 'MISSING'}"
+    if entry_position_side not in {direction, "BOTH"}:
+        return None, f"entry_order_position_side_mismatch:{entry_order_id}:{entry_position_side or 'MISSING'}"
+    if not math.isfinite(entry_executed_qty) or entry_executed_qty <= 0:
+        return None, f"entry_order_executed_qty_unknown_or_invalid:{entry_order_id}"
+    if abs(entry_executed_qty - target_qty) > quantity_tolerance:
+        return None, f"entry_order_qty_mismatch:{entry_executed_qty:.12g}/{target_qty:.12g}"
+    if entry_avg_price <= 0:
+        return None, f"entry_order_avg_price_unknown:{entry_order_id}"
+    if abs(entry_avg_price - entry_price) / max(entry_avg_price, entry_price, 1e-12) > 0.005:
+        return None, f"entry_order_avg_price_mismatch:{entry_avg_price:.12g}/{entry_price:.12g}"
+    entry_price = entry_avg_price
+    time.sleep(0.22)
+
+    order_rows: list[dict] = []
+    for order_id in sorted(exit_ids):
+        try:
+            info = get_order(symbol, order_id)
+        except Exception as exc:
+            return None, f"order_detail_query_exception:{order_id}:{type(exc).__name__}"
+        if not isinstance(info, dict) or str(info.get("status") or "").lower() != "ok":
+            detail = str(info.get("error") or info.get("status") or "invalid_order_response") if isinstance(info, dict) else "invalid_order_response"
+            return None, f"order_detail_unavailable:{order_id}:{detail[:160]}"
+
+        order_status = str(info.get("order_status") or "").upper()
+        if order_status not in terminal_statuses:
+            return None, f"exit_order_not_terminal:{order_id}:{order_status or 'UNKNOWN'}"
+        executed_raw = info.get("executed_qty")
+        if executed_raw is None:
+            return None, f"exit_order_executed_qty_unknown:{order_id}"
+        try:
+            executed_qty = float(executed_raw)
+        except (TypeError, ValueError, OverflowError):
+            return None, f"exit_order_executed_qty_invalid:{order_id}"
+        if not math.isfinite(executed_qty) or executed_qty < 0:
+            return None, f"exit_order_executed_qty_invalid:{order_id}"
+        avg_price = _safe_float(info.get("avg_price"), 0.0)
+        if executed_qty > 0 and avg_price <= 0:
+            return None, f"exit_order_avg_price_unknown:{order_id}"
+        if order_status == "FILLED" and executed_qty <= 0:
+            return None, f"filled_exit_order_has_zero_qty:{order_id}"
+
+        raw_order = info.get("raw_order") if isinstance(info.get("raw_order"), dict) else {}
+        returned_order_id = _fill_id(info.get("order_id") or raw_order.get("orderId") or raw_order.get("orderID"))
+        if returned_order_id and returned_order_id != order_id:
+            return None, f"exit_order_identity_mismatch:{order_id}:{returned_order_id}"
+        raw_symbol = str(raw_order.get("symbol") or "").upper().replace("_", "-").replace("/", "-")
+        if not raw_symbol:
+            return None, f"exit_order_symbol_unknown:{order_id}"
+        if canonical_contract_symbol(raw_symbol) != expected_symbol:
+            return None, f"exit_order_symbol_mismatch:{order_id}:{raw_symbol}"
+        raw_position_side = str(raw_order.get("positionSide") or raw_order.get("position_side") or "").upper()
+        if raw_position_side not in {direction, "BOTH"}:
+            return None, f"exit_order_position_side_unknown_or_mismatch:{order_id}:{raw_position_side or 'MISSING'}"
+        raw_side = str(raw_order.get("side") or "").upper()
+        if raw_side != expected_close_side:
+            return None, f"exit_order_side_unknown_or_mismatch:{order_id}:{raw_side or 'MISSING'}"
+        if not returned_order_id:
+            return None, f"exit_order_id_missing_in_exchange_snapshot:{order_id}"
+
+        original_qty = _safe_float(info.get("orig_qty"), 0.0)
+        if original_qty > 0 and executed_qty > original_qty + max(1e-10, original_qty * 1e-8):
+            return None, f"exit_order_executed_qty_exceeds_original:{order_id}"
+        order_rows.append({
+            "order_id": order_id,
+            "status": order_status,
+            "executed_qty": executed_qty,
+            "avg_price": avg_price,
+            "time": int(_safe_float(raw_order.get("updateTime") or raw_order.get("time"), 0.0)),
+        })
+        # Keep recovery bounded under BingX's per-UID history/order query limits.
+        time.sleep(0.22)
+
+    filled_rows = [row for row in order_rows if row["executed_qty"] > quantity_tolerance * 1e-6]
+    filled_qty = sum(row["executed_qty"] for row in filled_rows)
+    if abs(filled_qty - target_qty) > quantity_tolerance:
+        return None, f"order_detail_close_qty_mismatch:{filled_qty:.12g}/{target_qty:.12g}"
+    if not filled_rows:
+        return None, "no_executed_exit_order_details"
+
+    blended_exit = sum(row["executed_qty"] * row["avg_price"] for row in filled_rows) / filled_qty
+    weighted_pnl_sum = 0.0
+    gross_pnl_usdt = 0.0
+    for row in filled_rows:
+        px = row["avg_price"]
+        qty = row["executed_qty"]
+        pnl_pct = ((px - entry_price) / entry_price * 100.0) if direction == "LONG" else ((entry_price - px) / entry_price * 100.0)
+        weighted_pnl_sum += qty * pnl_pct
+        gross_pnl_usdt += ((px - entry_price) * qty) if direction == "LONG" else ((entry_price - px) * qty)
+    realized_pnl_pct = weighted_pnl_sum / target_qty
+
+    sl_fills = [row for row in filled_rows if row["order_id"] in sl_ids]
+    used_order_ids = sorted(row["order_id"] for row in filled_rows)
+    if sl_fills:
+        sl_qty = sum(row["executed_qty"] for row in sl_fills)
+        exit_price = sum(row["executed_qty"] * row["avg_price"] for row in sl_fills) / sl_qty
+        exit_price_source = "BINGX_ORDER_DETAILS_SL_AVG_PRICE"
+        exit_reason = "BREAK_EVEN" if bool(record.get("be_activated")) and abs(exit_price - entry_price) / max(entry_price, 1e-12) < 0.003 else "STOP_LOSS"
+        exit_execution_qty = sl_qty
+        filled_sl_order_id = sorted(row["order_id"] for row in sl_fills)[-1]
+    elif used_order_ids and set(used_order_ids).issubset(tp_ids):
+        exit_price = blended_exit
+        exit_price_source = "BINGX_ORDER_DETAILS_TP_WEIGHTED_AVERAGE"
+        exit_reason = "TAKE_PROFIT_FULL"
+        exit_execution_qty = filled_qty
+        filled_sl_order_id = None
+    else:
+        latest_time = max(row["time"] for row in filled_rows)
+        latest_order_ids = {row["order_id"] for row in filled_rows if row["time"] == latest_time}
+        if len(latest_order_ids) != 1 or (latest_time <= 0 and len(used_order_ids) > 1):
+            return None, "ambiguous_final_close_order_details_without_unique_timestamp"
+        latest_order_id = next(iter(latest_order_ids))
+        last_filled_rows = [row for row in filled_rows if row["order_id"] == latest_order_id]
+        exit_execution_qty = sum(row["executed_qty"] for row in last_filled_rows)
+        exit_price = sum(row["executed_qty"] * row["avg_price"] for row in last_filled_rows) / exit_execution_qty
+        exit_price_source = "BINGX_ORDER_DETAILS_FINAL_ORDER_AVG_PRICE"
+        exit_reason = "POSITION_CLOSED_BY_ORDER_DETAILS"
+        filled_sl_order_id = None
+
+    return {
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "exit_price_source": exit_price_source,
+        "blended_exit_price": blended_exit,
+        "exit_execution_qty": exit_execution_qty,
+        "total_close_fill_qty": filled_qty,
+        "realized_pnl_pct": realized_pnl_pct,
+        "realized_pnl_usdt": gross_pnl_usdt,
+        "realized_pnl_usdt_source": "DERIVED_FROM_EXACT_BINGX_ORDER_AVERAGES_GROSS",
+        "fees_usdt": None,
+        "exit_order_ids": used_order_ids,
+        "exit_trade_ids": [],
+        "exit_reason": exit_reason,
+        "filled_sl_order_id": filled_sl_order_id,
+        "fill_count": len(filled_rows),
+        "entry_fill_count": 0,
+        "confirmed_qty": target_qty,
+        "recovery_source": "BINGX_ORDER_DETAILS",
+    }, None
+
+
 def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: int = 3) -> int:
     """Repair DATA_ERROR close rows only from complete, verified exchange fills."""
     if not TRADES_PATH.exists():
@@ -1092,6 +1338,22 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
         )
         fills, query_error = _fetch_trade_fill_history(record, opened, now_ms)
         result, reconstruct_error = (None, query_error) if query_error else _rebuild_data_error_close(record, opened, fills)
+        recovery_source = "BINGX_FILL_HISTORY"
+        if result is None:
+            # fillHistory can lag order state in VST or temporarily return a
+            # successful empty page. Re-read the exact journaled order IDs as a
+            # second independent source; never fall back to symbol/time matches.
+            order_result, order_error = _rebuild_data_error_close_from_order_details(record, opened)
+            if order_result is not None:
+                result = order_result
+                reconstruct_error = None
+                recovery_source = "BINGX_ORDER_DETAILS"
+            elif query_error:
+                reconstruct_error = f"{query_error}; order_detail_fallback:{order_error}"
+            elif reconstruct_error:
+                reconstruct_error = f"{reconstruct_error}; order_detail_fallback:{order_error}"
+            else:
+                reconstruct_error = order_error
         log.info(
             "[TRACKER_RECOVERY] DATA_ERROR attempt END event=%s elapsed=%.2fs fills=%d query_error=%s reconstructed=%s",
             event_id, time.monotonic() - record_started, len(fills), query_error or "none", bool(result),
@@ -1109,20 +1371,31 @@ def _recover_data_error_trade_closes(*, now_ms: int | None = None, max_records: 
                 "exit_order_ids_recovered": result["exit_order_ids"],
                 "exit_trade_ids_recovered": result["exit_trade_ids"],
                 "realized_pnl_pct": result["realized_pnl_pct"],
-                "realized_pnl_pct_source": "BINGX_FILL_HISTORY_PRICE_WEIGHTED",
+                "realized_pnl_pct_source": (
+                    "BINGX_FILL_HISTORY_PRICE_WEIGHTED"
+                    if recovery_source == "BINGX_FILL_HISTORY"
+                    else "BINGX_ORDER_DETAILS_PRICE_WEIGHTED_GROSS"
+                ),
                 "realized_pnl_usdt": result["realized_pnl_usdt"],
                 "realized_pnl_usdt_source": result["realized_pnl_usdt_source"],
                 "fees_usdt": result["fees_usdt"],
                 "funding_usdt": None,  # Unknown funding must remain null, not an assumed zero.
                 "net_pnl_usdt": None,
-                "pnl_costs_status": "FEES_RECONCILED_FUNDING_UNKNOWN" if result["fees_usdt"] is not None else "FEES_OR_ENTRY_FILLS_UNKNOWN_FUNDING_UNKNOWN",
+                "pnl_costs_status": (
+                    "FEES_RECONCILED_FUNDING_UNKNOWN"
+                    if result["fees_usdt"] is not None
+                    else "GROSS_ORDER_DETAILS_CONFIRMED_FEES_UNKNOWN_FUNDING_UNKNOWN"
+                    if recovery_source == "BINGX_ORDER_DETAILS"
+                    else "FEES_OR_ENTRY_FILLS_UNKNOWN_FUNDING_UNKNOWN"
+                ),
                 "exit_reason": result["exit_reason"],
                 "exit_reason_confidence": "confirmed",
-                "exit_reason_source": "BINGX_FILL_HISTORY",
+                "exit_reason_source": recovery_source,
                 "data_error_previous": record.get("data_error") or record.get("exit_reason"),
                 "data_error": None,
+                "filled_sl_order_id": result.get("filled_sl_order_id") or record.get("filled_sl_order_id"),
                 "fill_history_recovery": {
-                    "status": "RECOVERED", "attempts": attempts,
+                    "status": "RECOVERED", "source": recovery_source, "attempts": attempts,
                     "recovered_ts": now_ms, "fills": result["fill_count"],
                     "entry_fills": result["entry_fill_count"], "qty_confirmed": result["confirmed_qty"],
                     "order_ids": result["exit_order_ids"], "trade_ids": result["exit_trade_ids"],
@@ -1175,6 +1448,42 @@ def _normalize_direction(direction: str) -> str:
 
 def _normalized_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace("-USDT", "")
+
+
+def _clear_reappeared_exit_fill_pending(trade: dict, observed_ts: int) -> bool:
+    """Resolve a transient disappearance when the same tracked position reappears.
+
+    This does not close/reopen a trade, alter quantity, or touch protection. It
+    only removes the stale "waiting for exit evidence" marker after a fresh
+    directional position read has positively found the position again.
+    """
+    if not isinstance(trade, dict):
+        return False
+    confirmation = trade.get("position_gone_confirmation")
+    pending = trade.get("exit_fill_pending")
+    confirmation_status = str(confirmation.get("status") or "").upper() if isinstance(confirmation, dict) else ""
+    pending_status = str(pending.get("status") or "").upper() if isinstance(pending, dict) else ""
+    if confirmation_status != "PENDING_EXIT_EVIDENCE":
+        return False
+    if isinstance(pending, dict) and pending_status != "PENDING":
+        return False
+
+    prior = pending if isinstance(pending, dict) else {}
+    trade["exit_fill_pending_last_resolution"] = {
+        "status": "POSITION_REAPPEARED",
+        "resolved_ts": int(observed_ts),
+        "first_observed_ts": prior.get("first_observed_ts"),
+        "last_observed_ts": prior.get("last_observed_ts"),
+        "reason": prior.get("reason") or (confirmation.get("reason") if isinstance(confirmation, dict) else None),
+    }
+    trade.pop("exit_fill_pending", None)
+    trade["position_gone_confirmation"] = {
+        "status": "REAPPEARED", "observed_ts": int(observed_ts),
+    }
+    if str(trade.get("position_state_last_error") or "") == "position_not_found_but_exit_fill_not_yet_verified":
+        trade["position_state_alert_pending"] = False
+        trade.pop("position_state_last_error", None)
+    return True
 
 
 def _quantity_epsilon(initial_qty: float) -> float:
@@ -1559,7 +1868,8 @@ def format_trade_closed_message(
         f"{emoji} <b>{display_name} (</b><code>{display_symbol}</code><b>) — сделка закрыта</b>",
         "",
         f"Направление: <b>{direction_text}</b>",
-        f"Вход <code>{format_price(entry_price)}</code> → Выход <code>{exit_text}</code>   <b>{pnl_text}</b>",
+        f"Вход: <code>{format_price(entry_price)}</code> · Последнее исполнение выхода: <code>{exit_text}</code>",
+        f"Совокупный PnL сделки: <b>{pnl_text}</b> (с учётом частичных закрытий)",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Вход: <code>{html.escape(str(event_type or ''), quote=False)}</code> · TF <b>{html.escape(str(timeframe or '1h').lower(), quote=False)}</b>",
@@ -3042,7 +3352,9 @@ def _recover_trade_cashflows(*, now_ms: int | None = None, max_records: int = 6)
 
 def update_active_trades() -> None:
     # Reconcile historical DATA_ERROR closes even when no positions remain open.
-    # Only fill-history-confirmed prices and quantities are accepted.
+    # Prefer exact fill history; use exact terminal order snapshots only when all
+    # journaled closing orders prove the complete quantity and identity. Fees and
+    # funding remain unknown when they cannot be linked to fills/income.
     try:
         _recover_data_error_trade_closes()
     except Exception as exc:
@@ -3256,6 +3568,11 @@ def update_active_trades() -> None:
 
             pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
             if pos_status == "found":
+                if _clear_reappeared_exit_fill_pending(trade, now_ms):
+                    log.info(
+                        "[TRACKER] Position reappeared for %s %s; cleared stale pending exit-evidence marker.",
+                        symbol, direction,
+                    )
                 exchange_avg = _safe_float(pos.get("avgPrice"))
                 if exchange_avg > 0:
                     trade["last_exchange_avg_price"] = exchange_avg
@@ -3693,10 +4010,51 @@ def update_active_trades() -> None:
             unknown_execution = position_gone and not closed_by_tp and sl_exit_price is None and manual_exit_price <= 0
             estimated_exit_price = (cur_price if _safe_float(cur_price, 0.0) > 0 else estimated_mark_price)
             if unknown_execution:
-                trade["data_error"] = trade.get("data_error") or "UNKNOWN_EXECUTION_PRICE"
-                exit_reason = "DATA_ERROR"
-                exit_price = None
-                exit_price_source = "UNKNOWN_EXECUTION"
+                # An empty position snapshot proves only that no position was
+                # returned at this instant. It does not identify the closing
+                # execution or prove that the VST order/fill history is already
+                # visible. Keep the original trade and symbol-side identity live
+                # until exact SL/TP/manual order evidence becomes available.
+                # Writing DATA_ERROR + remaining_qty=0 here caused a later
+                # reconciliation cycle to create a second RECONCILED_POSITION
+                # record for the same still-protected exchange position.
+                trade["position_gone_confirmation"] = {
+                    "status": "PENDING_EXIT_EVIDENCE",
+                    "observed_ts": now_ms,
+                    "reads": 3,
+                    "reason": "position_not_found_but_no_exact_exit_execution_evidence",
+                }
+                trade["exit_fill_pending"] = {
+                    "status": "PENDING",
+                    "first_observed_ts": _safe_float(
+                        (trade.get("exit_fill_pending") or {}).get("first_observed_ts"), now_ms,
+                    ),
+                    "last_observed_ts": now_ms,
+                    "reason": "position_not_found_but_no_exact_exit_execution_evidence",
+                    "remaining_qty": rem_qty,
+                    "journaled_exit_order_ids": sorted({
+                        str(value) for value in (
+                            [filled_sl_id, trade.get("manual_exit_order_id")]
+                            + [item.get("order_id") for item in trade.get("tp_orders", []) if isinstance(item, dict)]
+                            + [item.get("order_id") for item in trade.get("sl_order_history", []) if isinstance(item, dict)]
+                            + [((trade.get("sl_order") or {}).get("order_id")) if isinstance(trade.get("sl_order"), dict) else None]
+                        ) if value not in (None, "")
+                    }),
+                }
+                trade["last_observation_ts"] = now_ms
+                trade["position_state_alert_pending"] = True
+                trade["position_state_last_error"] = "position_not_found_but_exit_fill_not_yet_verified"
+                trade["remaining_qty"] = rem_qty
+                _notify_position_state_unknown(
+                    symbol, direction, "position_not_found_but_exit_fill_not_yet_verified",
+                    str(event_id), kind="EXIT_FILL_PENDING",
+                )
+                updated_trades[event_id] = trade
+                log.warning(
+                    "[TRACKER] Holding trade %s in PENDING_EXIT_EVIDENCE; no DATA_ERROR close or cleanup until exact exit execution is verified.",
+                    event_id,
+                )
+                continue
             elif residual_qty > 0:
                 residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
                 if residual_pnl is None:

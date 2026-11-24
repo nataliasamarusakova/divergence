@@ -74,6 +74,9 @@ _OPEN_ORDERS_COOLDOWN_UNTIL_MS = 0
 _OPEN_ORDERS_COOLDOWN_REASON = ""
 FILL_HISTORY_PATH = "/openApi/swap/v2/trade/fillHistory"
 INCOME_HISTORY_PATH = "/openApi/swap/v2/user/income"
+# BingX can return temporary service-busy errors inside an HTTP-200 envelope.
+# Automatic replay is permitted only for signed GET requests, never order writes.
+TRANSIENT_READ_API_CODES = frozenset({100500, 100503, 109500, 110500})
 POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 
@@ -343,7 +346,10 @@ def _request(
     headers = {"Connection": "close"} if close_connection else {}
     timestamp_retry_used = False
     http_retry_count = 0
+    api_retry_count = 0
+    api_retry_codes: list[int] = []
     max_signed_get_http_retries = 3
+    max_signed_get_api_retries = 2
 
     if signed:
         if not API_KEY or not SECRET_KEY:
@@ -388,6 +394,9 @@ def _request(
             payload = response.json()
             if isinstance(response_metadata, dict):
                 response_metadata["request_elapsed_ms"] = int((time.monotonic() - request_started) * 1000)
+                if api_retry_count:
+                    response_metadata["transient_api_retry_count"] = api_retry_count
+                    response_metadata["transient_api_retry_codes"] = list(api_retry_codes)
         except Exception as exc:
             # A proxy/gateway may return HTML or another non-JSON body for a
             # retryable HTTP response. That path must still use the bounded
@@ -457,6 +466,9 @@ def _request(
                     # the exception class only whenever diagnostics are enabled.
                     "transport_error": type(exc).__name__,
                 })
+                if api_retry_count:
+                    response_metadata["transient_api_retry_count"] = api_retry_count
+                    response_metadata["transient_api_retry_codes"] = list(api_retry_codes)
             # requests exceptions can include the complete URL, including the
             # signed query string. Never return raw exception text to callers:
             # most call sites log `msg` directly and do not request metadata.
@@ -511,6 +523,26 @@ def _request(
             code = int(payload.get("code"))
         except (TypeError, ValueError, AttributeError):
             code = None
+
+        if (
+            signed_retryable_get
+            and is_http_success
+            and code in TRANSIENT_READ_API_CODES
+            and api_retry_count < max_signed_get_api_retries
+        ):
+            # These errors arrive as a valid HTTP-200 JSON envelope, so the
+            # transport retry path does not see them. Retry with a fresh signed
+            # timestamp, using a short bounded backoff. If BingX remains busy,
+            # return the final envelope and let the next engine cycle retry.
+            retry_delay = 0.5 * (2 ** api_retry_count)
+            api_retry_count += 1
+            api_retry_codes.append(code)
+            if isinstance(response_metadata, dict):
+                response_metadata["transient_api_retry_count"] = api_retry_count
+                response_metadata["transient_api_retry_code"] = code
+                response_metadata["transient_api_retry_codes"] = list(api_retry_codes)
+            time.sleep(retry_delay)
+            continue
 
         if is_open_orders and (code == 100410 or status_code == 429):
             now_ms = int(time.time() * 1000)
@@ -1202,7 +1234,9 @@ def _query_order(
     else:
         params["clientOrderId"] = str(client_order_id)
 
-    request_options = {"retryable": False}
+    # A single-order lookup is read-only and may be repeated safely with a new
+    # signature when BingX returns a transient service-busy API code.
+    request_options = {"retryable": True}
     if timeout_sec is not None:
         request_options["timeout_sec"] = timeout_sec
     resp = _request("GET", ORDER_PATH, params, signed=True, **request_options)
@@ -1425,6 +1459,7 @@ def _response_envelope_diagnostics(
         for key in (
             "http_status", "endpoint", "method", "request_host",
             "response_content_type", "request_elapsed_ms", "transport_error",
+            "transient_api_retry_count", "transient_api_retry_code",
         ):
             value = request_metadata.get(key)
             if value is None:
@@ -1506,7 +1541,7 @@ def get_fill_history(
     else:
         requested_currency = ""
     try:
-        resp = _request("GET", FILL_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=False)
+        resp = _request("GET", FILL_HISTORY_PATH, params, signed=True, timeout_sec=timeout_sec, retryable=True)
     except Exception as exc:
         return {"status": "error", "error": f"request_exception:{exc}", "fills": []}
     if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
@@ -1669,7 +1704,7 @@ def get_income_history(
         try:
             response = _request(
                 "GET", INCOME_HISTORY_PATH, params, signed=True,
-                timeout_sec=timeout_sec, retryable=False,
+                timeout_sec=timeout_sec, retryable=True,
                 response_metadata=request_metadata,
             )
         except Exception as exc:
