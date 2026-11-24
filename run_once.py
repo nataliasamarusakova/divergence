@@ -326,11 +326,10 @@ SQUEEZE_TP_RR = NORMAL_TP_RR
 SQUEEZE_TP_FRACTIONS = NORMAL_TP_FRACTIONS
 SQUEEZE_PLANNED_WEIGHTED_RR = NORMAL_PLANNED_WEIGHTED_RR
 
-# Optional 3H Binance Futures Demand/Supply gate. Temporarily disabled by
-# default while signal-entry behavior is evaluated without S/R-zone filtering.
-# Set SR_3H_DIRECTIONAL_GATE_ENABLED=true to restore the gate explicitly.
+# Mandatory 3H Binance Futures Demand/Supply gate, restored as the default.
+# It protects the final entry and prefilters opposite-direction conflicts before scoring.
 # The independent legacy TP-room geometry below remains disabled separately.
-SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "false").strip().lower() == "true"
+SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "true").strip().lower() == "true"
 
 # Optional Ajay R5.41 opposing-zone/TP-room check, now sourced from the same 3H snapshot.
 AJAY_SR_ROOM_ENABLED = os.environ.get("AJAY_SR_ROOM_ENABLED", "false").lower() == "true"
@@ -410,11 +409,11 @@ ENABLE_EMA_PULLBACK_ENGINE = os.environ.get("ENABLE_EMA_PULLBACK_ENGINE", "true"
 ENABLE_ORDER_BLOCK_ENGINE = os.environ.get("ENABLE_ORDER_BLOCK_ENGINE", "true").lower() == "true"
 ENABLE_BREAKER_BLOCK_ENGINE = os.environ.get("ENABLE_BREAKER_BLOCK_ENGINE", "true").lower() == "true"
 ENABLE_MITIGATION_BLOCK_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_ENGINE", "true").lower() == "true"
-ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE", "false").lower() == "true"
+ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE = os.environ.get("ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE", "true").lower() == "true"
 ENABLE_SFP_ENGINE = os.environ.get("ENABLE_SFP_ENGINE", "true").lower() == "true"
-ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE = os.environ.get("ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "false").lower() == "true"
+ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE = os.environ.get("ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "true").lower() == "true"
 ENABLE_CRT_ENGINE = os.environ.get("ENABLE_CRT_ENGINE", "true").lower() == "true"
-ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED", "false").lower() == "true"
+ENABLE_LIQUIDATION_SQUEEZE_ENGINE = os.environ.get("LIQ_SQUEEZE_ENGINE_ENABLED", "true").lower() == "true"
 # Volatility squeeze release is a separate event family from liquidation squeeze.
 # Keep existing behavior by default while exposing an explicit per-engine switch.
 ENABLE_VOLATILITY_SQUEEZE_ENGINE = os.environ.get("ENABLE_VOLATILITY_SQUEEZE_ENGINE", "true").strip().lower() == "true"
@@ -2163,8 +2162,8 @@ def _refresh_timeframe_events(
                     min_squeeze_bars=3,
                     release_lookback_bars=int(os.environ.get("SQUEEZE_RELEASE_LOOKBACK_BARS", "4")),
                 ) if ENABLE_VOLATILITY_SQUEEZE_ENGINE else []
-                # Forced-liquidation squeeze is an opt-in research engine until local
-                # liquidation time-series coverage is available; the code remains intact.
+                # Liquidation squeeze is enabled as a research detector using Coinalyze's
+                # aggregated 24h liquidation context; missing data yields no event.
                 liqs = detect_liquidation_squeeze(r, d, symbol, timeframe) if ENABLE_LIQUIDATION_SQUEEZE_ENGINE else []
                 strategy_events: list[dict] = []
                 if timeframe.lower() == "4h" and ENABLE_MACD_4H_ENGINE:

@@ -336,3 +336,102 @@ def test_tracker_does_not_mark_zero_quantity_filled_tp_as_hit(monkeypatch, tmp_p
     assert result["hit_legs"] == []
     assert result["realized_pnl_qty"] == 0.0
     assert result["tp_filled_qty"] == {}
+
+
+def test_tracker_keeps_position_identity_pending_when_position_disappears_without_exit_fill(monkeypatch, tmp_path):
+    import copy
+    import json
+    from event_engine import tracker
+
+    event_id = "EVT_PENDING_EXIT_EVIDENCE"
+    state = {
+        event_id: {
+            "event_id": event_id,
+            "symbol": "BTC-USDT",
+            "direction": "LONG",
+            "entry_price": 100.0,
+            "initial_qty": 1.0,
+            "remaining_qty": 1.0,
+            "entry_ts": 1_700_000_000_000,
+            "tp_orders": [],
+            "hit_legs": [],
+            "tp_filled_qty": {},
+            "realized_pnl_qty": 0.0,
+            "realized_pnl_weighted_sum": 0.0,
+            "sl_order": {"order_id": "SL-PENDING", "stop_price": 107.0},
+            "closed": False,
+        }
+    }
+    path = tmp_path / "active_trades.json"
+    saved = {}
+    journal = []
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
+    monkeypatch.setattr(tracker, "_recover_data_error_trade_closes", lambda: None)
+    monkeypatch.setattr(tracker, "_recover_trade_cashflows", lambda **_kwargs: None)
+    monkeypatch.setattr(tracker, "_retry_pending_notifications", lambda: None)
+    monkeypatch.setattr(tracker, "_load_active_trades", lambda: copy.deepcopy(state))
+    monkeypatch.setattr(tracker, "_save_active_trades", lambda rows: (saved.clear(), saved.update(copy.deepcopy(rows))))
+    monkeypatch.setattr(tracker, "_append_trade_record", lambda row: journal.append(copy.deepcopy(row)))
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *_a, **_k: {"status": "not_found", "positionAmt": 0})
+    monkeypatch.setattr(tracker, "get_live_price", lambda *_a, **_k: 99.0)
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *_a, **_k: [])
+    monkeypatch.setattr(tracker, "_update_mfe_mae", lambda *_a, **_k: None)
+    monkeypatch.setattr(tracker, "_update_live_pnl_extrema", lambda *_a, **_k: None)
+    monkeypatch.setattr(tracker, "_get_filled_sl_from_trade", lambda *_a, **_k: (None, None))
+    monkeypatch.setattr(tracker, "_notify_position_state_unknown", lambda *_a, **_kw: None)
+    monkeypatch.setattr(tracker.time, "sleep", lambda *_a, **_k: None)
+
+    tracker.update_active_trades()
+
+    assert journal == []
+    assert event_id in saved
+    trade = saved[event_id]
+    assert trade["remaining_qty"] == 1.0
+    assert trade["closed"] is False
+    assert trade["position_gone_confirmation"]["status"] == "PENDING_EXIT_EVIDENCE"
+    assert trade["exit_fill_pending"]["status"] == "PENDING"
+    assert "exit_reason" not in trade
+
+
+def test_reappeared_position_clears_only_stale_exit_evidence_pending_marker():
+    from event_engine.tracker import _clear_reappeared_exit_fill_pending
+
+    trade = {
+        "event_id": "EVT_REAPPEARED",
+        "remaining_qty": 39.3,
+        "position_gone_confirmation": {
+            "status": "PENDING_EXIT_EVIDENCE", "observed_ts": 1000,
+            "reason": "position_not_found_but_no_exact_exit_execution_evidence",
+        },
+        "exit_fill_pending": {
+            "status": "PENDING", "first_observed_ts": 900,
+            "last_observed_ts": 1000, "remaining_qty": 39.3,
+        },
+        "position_state_alert_pending": True,
+        "position_state_last_error": "position_not_found_but_exit_fill_not_yet_verified",
+        "sl_order": {"order_id": "SL-1"},
+    }
+
+    assert _clear_reappeared_exit_fill_pending(trade, 1200) is True
+    assert "exit_fill_pending" not in trade
+    assert trade["position_gone_confirmation"]["status"] == "REAPPEARED"
+    assert trade["exit_fill_pending_last_resolution"]["status"] == "POSITION_REAPPEARED"
+    assert trade["exit_fill_pending_last_resolution"]["first_observed_ts"] == 900
+    assert trade["remaining_qty"] == 39.3
+    assert trade["sl_order"]["order_id"] == "SL-1"
+    assert trade["position_state_alert_pending"] is False
+    assert "position_state_last_error" not in trade
+
+
+def test_reappeared_position_does_not_clear_unrelated_pending_state():
+    from event_engine.tracker import _clear_reappeared_exit_fill_pending
+
+    trade = {
+        "position_gone_confirmation": {"status": "PENDING", "reason": "network_error"},
+        "exit_fill_pending": {"status": "PENDING", "reason": "other_exit_flow"},
+        "position_state_alert_pending": True,
+        "position_state_last_error": "unrelated_protection_state_unknown",
+    }
+    before = {key: dict(value) if isinstance(value, dict) else value for key, value in trade.items()}
+    assert _clear_reappeared_exit_fill_pending(trade, 1200) is False
+    assert trade == before

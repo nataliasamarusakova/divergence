@@ -95,9 +95,10 @@ def test_divergence_predicate_is_reachable_for_real_execution():
     )
 
 
-def test_mitigation_engine_is_disabled():
-    """Negative in both production windows under both directional settings."""
-    assert 'ENABLE_MITIGATION_BLOCK_ENGINE: "false"' in _workflow()
+def test_mitigation_engine_and_both_directions_are_enabled():
+    workflow = _workflow()
+    assert 'ENABLE_MITIGATION_BLOCK_ENGINE: "true"' in workflow
+    assert 'ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE: "true"' in workflow
 
 
 def test_break_even_policy_matches_documented_ladder():
@@ -151,8 +152,9 @@ def test_release_uses_fixed_seven_percent_stop():
     assert 'TREND_FILTER_MIN_1H_BARS: "400"' in workflow
     assert 'TREND_FILTER_MIN_4H_BARS: "400"' in workflow
     assert 'TREND_FILTER_REQUIRE_PERSISTENCE: "false"' in workflow
-    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "false")' in Path("run_once.py").read_text(encoding="utf-8")
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "true")' in Path("run_once.py").read_text(encoding="utf-8")
     assert 'SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0' in Path("event_engine/sr_context.py").read_text(encoding="utf-8")
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED: "true"' in workflow
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
     assert 'MAX_ENTRY_RISK_PCT: "7.00"' in workflow
@@ -165,13 +167,14 @@ def test_release_has_no_legacy_sr_tp3_cap_setting():
     assert "apply_sr_tp3_cap" not in workflow
 
 
-def test_release_temporarily_disables_3h_zone_gate_and_keeps_optional_room_off():
+def test_release_restores_3h_demand_supply_gate_and_keeps_legacy_tp_room_off():
     workflow = _workflow()
-    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "false")' in Path("run_once.py").read_text(encoding="utf-8")
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "true")' in Path("run_once.py").read_text(encoding="utf-8")
     assert 'SR_DIRECTIONAL_MAX_DISTANCE_PCT = 5.0' in Path("event_engine/sr_context.py").read_text(encoding="utf-8")
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED: "true"' in workflow
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
-    assert 'AJAY_SR_REQUIRE_DATA: "false"' in workflow
+    assert 'AJAY_SR_REQUIRE_DATA: "true"' in workflow
     assert 'BINANCE_BASE_URL: https://fapi.binance.com' in workflow
     assert 'BINANCE_HTTP_PROXY: http://127.0.0.1:18080' in workflow
     assert 'AJAY_SR_KLINE_LIMIT_1H: "1000"' in workflow
@@ -189,15 +192,14 @@ def test_pine_sr_manual_diagnostic_workflow_uses_futures_only():
     assert 'BTCUSDT.P' in wf
 
 
-def test_release_keeps_3h_sr_code_available_but_zone_gate_disabled():
+def test_release_restores_production_3h_demand_supply_directional_gate():
     workflow = _workflow()
     runtime = Path('run_once.py').read_text(encoding='utf-8')
     sr_source = Path('event_engine/sr_context.py').read_text(encoding='utf-8')
-    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED: "false"' in workflow
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED: "true"' in workflow
     assert 'AJAY_SR_ROOM_ENABLED: "false"' in workflow
     assert 'AJAY_SR_ROOM_MODE: "off"' in workflow
-    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "false")' in runtime
-    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED: "false"' in workflow
+    assert 'SR_3H_DIRECTIONAL_GATE_ENABLED = os.environ.get("SR_3H_DIRECTIONAL_GATE_ENABLED", "true")' in runtime
     assert 'get_cached_sr_snapshot' in runtime
     assert 'evaluate_sr_directional_zone' in runtime
     assert 'fetch_futures_klines' in sr_source

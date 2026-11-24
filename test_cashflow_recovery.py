@@ -65,7 +65,7 @@ def test_income_history_normalizes_actual_signed_cashflows(monkeypatch):
     assert result["records"][0]["order_id"] == ""
     assert captured["path"] == bingx.INCOME_HISTORY_PATH
     assert captured["params"]["startTime"] == 1_700_000_000_000
-    assert captured["kwargs"]["retryable"] is False
+    assert captured["kwargs"]["retryable"] is True
 
 
 def test_cashflow_symbol_uses_canonical_bingx_display_name(monkeypatch):

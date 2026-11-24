@@ -245,7 +245,8 @@ def test_divergence_engine_flag_prevents_detector_execution(monkeypatch):
         "ENABLE_MACD_4H_ENGINE", "ENABLE_MA_COMPRESSION_ENGINE", "ENABLE_BREAKOUT_MOMENTUM_ENGINE",
         "ENABLE_DONCHIAN_RETEST_ENGINE", "ENABLE_LIQUIDITY_SWEEP_ENGINE", "ENABLE_EMA_PULLBACK_ENGINE",
         "ENABLE_ORDER_BLOCK_ENGINE", "ENABLE_BREAKER_BLOCK_ENGINE", "ENABLE_MITIGATION_BLOCK_ENGINE",
-        "ENABLE_SFP_ENGINE", "ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "ENABLE_CRT_ENGINE",
+        "ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE", "ENABLE_SFP_ENGINE",
+        "ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE", "ENABLE_LIQUIDATION_SQUEEZE_ENGINE", "ENABLE_CRT_ENGINE",
     ):
         monkeypatch.setattr(ro, name, False)
     monkeypatch.setattr(ro, "_symbol_scan_due", lambda *_args: True)
@@ -260,6 +261,7 @@ def test_divergence_engine_flag_prevents_detector_execution(monkeypatch):
     monkeypatch.setattr(ro, "detect_divergences", lambda *_args: pytest.fail("disabled detector was called"))
     monkeypatch.setattr(ro, "ENABLE_VOLATILITY_SQUEEZE_ENGINE", False)
     monkeypatch.setattr(ro, "detect_squeeze_release", lambda *_args, **_kwargs: pytest.fail("disabled squeeze detector was called"))
+    monkeypatch.setattr(ro, "detect_liquidation_squeeze", lambda *_args, **_kwargs: pytest.fail("disabled liquidation squeeze detector was called"))
     monkeypatch.setattr(ro, "_mark_symbol_scanned", lambda *_args: None)
     monkeypatch.setattr(ro, "_save_timeframe_scan_state", lambda *_args: None)
     monkeypatch.setattr(ro, "emit_event", lambda *_args: True)

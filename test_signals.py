@@ -3438,10 +3438,13 @@ def test_early_loss_cut_does_not_claim_exit_when_position_was_already_absent(tmp
 
     tr.update_active_trades()
 
-    row = json.loads(trades_path.read_text(encoding="utf-8").strip())
-    assert row["exit_reason"] == "DATA_ERROR"
-    assert row["exit_price"] is None
+    saved = json.loads(active_path.read_text(encoding="utf-8"))
+    row = saved["EVT_ELC_RACE"]
+    assert not trades_path.exists()
+    assert row["remaining_qty"] == pytest.approx(1.0)
+    assert row["position_gone_confirmation"]["status"] == "PENDING_EXIT_EVIDENCE"
     assert any(kwargs.get("kind") == "EARLY_LOSS_CUT_CLOSE_ATTRIBUTION_UNKNOWN" for _, kwargs in queued)
+    assert any(kwargs.get("kind") == "EXIT_FILL_PENDING" for _, kwargs in queued)
 
 def test_early_loss_cut_guard_block_does_not_require_undefined_cut(monkeypatch):
     import event_engine.tracker as tr
@@ -3922,18 +3925,14 @@ def test_tracker_residual_close_does_not_reuse_last_tp_price(monkeypatch, tmp_pa
 
     tr.update_active_trades()
 
-    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    saved = json.loads(active_path.read_text(encoding="utf-8"))["EVT_RESIDUAL"]
 
-    assert saved["exit_price"] is None
-    assert saved["exit_price_source"] == "UNKNOWN_EXECUTION"
-    assert saved["estimated_exit_price"] == pytest.approx(95.0)
-    assert saved["realized_pnl_pct"] is None
-    assert saved["exit_reason"] == "DATA_ERROR"
-    assert saved["realized_pnl_usdt"] is None
-    # The journal stores only the known partial TP state; the residual execution
-    # and therefore total realized PnL remain explicitly unknown.
-    assert saved["exit_price"] != pytest.approx(101.0)
-    assert not json.loads(active_path.read_text(encoding="utf-8"))
+    assert not trades_path.exists()
+    assert saved["remaining_qty"] == pytest.approx(75.0)
+    assert saved["realized_pnl_qty"] == pytest.approx(25.0)
+    assert saved["realized_pnl_weighted_sum"] == pytest.approx(25.0)
+    assert saved["position_gone_confirmation"]["status"] == "PENDING_EXIT_EVIDENCE"
+    assert saved["exit_fill_pending"]["status"] == "PENDING"
 
 
 def test_tracker_known_sl_fill_still_has_priority_over_market_estimate(monkeypatch, tmp_path):
@@ -4220,11 +4219,12 @@ def test_tracker_invalid_mark_does_not_become_realized_execution(monkeypatch, tm
     monkeypatch.setattr(tr, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
 
     tr.update_active_trades()
-    saved = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    saved = json.loads(active_path.read_text(encoding="utf-8"))["EVT_BAD_MARK"]
 
-    assert saved["exit_price"] is None
-    assert saved["realized_pnl_pct"] is None
-    assert saved["exit_reason"] == "DATA_ERROR"
+    assert not trades_path.exists()
+    assert saved["remaining_qty"] == pytest.approx(10.0)
+    assert saved["position_gone_confirmation"]["status"] == "PENDING_EXIT_EVIDENCE"
+    assert saved["exit_fill_pending"]["status"] == "PENDING"
 
 
 def _make_ob_causality_fixture(bos_i: int, *, bullish: bool = True, consumed_i: int | None = None) -> pd.DataFrame:
@@ -4663,7 +4663,8 @@ def test_closed_trade_with_failed_protection_cleanup_remains_retryable(tmp_path,
         "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": now_ms - 60 * 60_000,
         "tp_orders": [], "sl_order": {}, "sl_order_history": [],
         "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
-        "realized_pnl_weighted_sum": 0.0, "closed": False, "manual_exit_reason": None,
+        "realized_pnl_weighted_sum": 0.0, "closed": False,
+        "manual_exit_reason": "MANUAL_MARKET_CLOSE", "manual_exit_price": 99.0,
     }
     active_path.write_text(json.dumps({"EVT_CLEANUP_RETRY": trade}), encoding="utf-8")
     monkeypatch.setattr(tr, "ACTIVE_TRADES_PATH", active_path)

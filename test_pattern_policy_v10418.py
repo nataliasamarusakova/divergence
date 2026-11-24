@@ -1,6 +1,6 @@
-"""Release guard: event engines active in archived V12 must remain enabled.
+"""Release guards for the full signal-detector policy.
 
-This intentionally checks the workflow configuration, not exchange execution.
+This checks workflow activation, not whether market conditions produce a signal.
 Shadow event flags are telemetry and do not veto orders while ENTRY_QUALITY_MODE=shadow.
 """
 from pathlib import Path
@@ -21,7 +21,7 @@ def _env() -> dict[str, str]:
     return result
 
 
-def test_all_pattern_engines_enabled_in_v12_remain_enabled_in_v10418():
+def test_all_previously_active_pattern_engines_remain_enabled_in_current_release():
     env = _env()
     enabled_in_v12 = {
         "ENABLE_DIVERGENCE_ENGINE",
@@ -42,16 +42,16 @@ def test_all_pattern_engines_enabled_in_v12_remain_enabled_in_v10418():
         assert env.get(flag, "false").lower() == "true", f"V12-enabled pattern engine disabled: {flag}"
 
 
-def test_engines_disabled_in_v12_are_not_accidentally_enabled():
+def test_all_previously_disabled_pattern_families_are_enabled_in_current_release():
     env = _env()
-    disabled_in_v12 = {
+    newly_enabled = {
         "ENABLE_MITIGATION_BLOCK_ENGINE",
         "ENABLE_MITIGATION_BLOCK_BULLISH_ENGINE",
         "ENABLE_LIQUIDATION_CASCADE_FVG_ENGINE",
         "LIQ_SQUEEZE_ENGINE_ENABLED",
     }
-    for flag in sorted(disabled_in_v12):
-        assert env.get(flag, "false").lower() == "false", f"Pattern engine disabled in V12 is unexpectedly enabled: {flag}"
+    for flag in sorted(newly_enabled):
+        assert env.get(flag, "false").lower() == "true", f"Requested signal family is disabled: {flag}"
 
 
 def test_pattern_shadow_flags_do_not_hard_block_events():

@@ -2122,7 +2122,7 @@ def test_get_order_accepts_explicit_read_timeout(monkeypatch):
 
     assert out["status"] == "ok"
     assert captured["timeout_sec"] == 1.5
-    assert captured["retryable"] is False
+    assert captured["retryable"] is True
 
 
 def test_get_order_by_client_order_id_queries_exchange_with_client_id(monkeypatch):
@@ -2157,7 +2157,7 @@ def test_get_order_by_client_order_id_queries_exchange_with_client_id(monkeypatc
             bx.ORDER_PATH,
             {"symbol": "TEST-USDT", "clientOrderId": "EVTCID9"},
             True,
-            {"retryable": False},
+            {"retryable": True},
         )
     ]
 

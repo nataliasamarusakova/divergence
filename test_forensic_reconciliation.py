@@ -44,7 +44,7 @@ def test_fill_history_supports_bingx_tradeprice_volume_aliases(monkeypatch):
     assert captured["path"] == bingx.FILL_HISTORY_PATH
     assert captured["params"]["orderId"] == "order-7"
     assert captured["params"]["pageIndex"] == 2
-    assert captured["kwargs"]["retryable"] is False
+    assert captured["kwargs"]["retryable"] is True
 
 
 def test_official_fill_history_shape_uses_explicit_currency_filter_for_fee_asset(monkeypatch):
@@ -217,6 +217,7 @@ def test_successful_recovery_persists_pnl_provenance_and_cost_uncertainty(tmp_pa
         rows = [row for row in fills if row["order_id"] == order_id]
         return {"status": "ok", "fills": rows, "has_more": False}
     monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
+    monkeypatch.setattr(tracker, "get_order", lambda *_a, **_k: {"status": "error", "error": "not_available_in_test"})
 
     recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert recovered == 1
@@ -242,6 +243,7 @@ def test_incomplete_data_error_fills_remain_unresolved_with_retry_metadata(tmp_p
         order_id = str(kwargs.get("order_id") or "")
         return {"status": "ok", "fills": [row for row in fills if row["order_id"] == order_id], "has_more": False}
     monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
+    monkeypatch.setattr(tracker, "get_order", lambda *_a, **_k: {"status": "error", "error": "not_available_in_test"})
 
     recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert recovered == 0
@@ -266,6 +268,7 @@ def test_recovery_preserves_unparseable_forensic_rows(tmp_path, monkeypatch):
         order_id = str(kwargs.get("order_id") or "")
         return {"status": "ok", "fills": [row for row in fills if row["order_id"] == order_id], "has_more": False}
     monkeypatch.setattr(tracker, "get_fill_history", fake_fill_history)
+    monkeypatch.setattr(tracker, "get_order", lambda *_a, **_k: {"status": "error", "error": "not_available_in_test"})
 
     tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000)
     assert journal.read_text(encoding="utf-8").splitlines()[-1] == damaged.rstrip("\n")
@@ -489,3 +492,167 @@ def test_fill_history_accepts_observed_fill_history_orders_gateway_key(monkeypat
     assert result["fills"][0]["qty"] == pytest.approx(1261.0)
     assert result["fills"][0]["fee"] == pytest.approx(-0.002)
     assert result["fills"][0]["fee_asset"] == "USDT"
+
+
+def test_data_error_reconstruction_falls_back_to_exact_terminal_order_details(monkeypatch):
+    from event_engine import tracker
+
+    opened, closed, _fills = _close_fixture(incomplete=True)
+    queried = []
+
+    orders = {
+        "ENTRY-1": {
+            "status": "ok", "order_id": "ENTRY-1", "order_status": "FILLED",
+            "avg_price": 100.0, "executed_qty": 3.0, "orig_qty": 3.0,
+            "raw_order": {
+                "orderId": "ENTRY-1", "symbol": "BTC-USDT", "positionSide": "LONG",
+                "side": "BUY", "status": "FILLED", "time": 1_700_000_000_000,
+            },
+        },
+        "EARLY-CLOSE": {
+            "status": "ok", "order_id": "EARLY-CLOSE", "order_status": "CANCELED",
+            "avg_price": 102.0, "executed_qty": 1.0, "orig_qty": 1.0,
+            "raw_order": {
+                "orderId": "EARLY-CLOSE", "symbol": "BTC-USDT", "positionSide": "LONG",
+                "side": "SELL", "status": "CANCELED", "time": 1_700_000_050_000,
+            },
+        },
+        "FINAL-MARKET": {
+            "status": "ok", "order_id": "FINAL-MARKET", "order_status": "FILLED",
+            "avg_price": 103.5, "executed_qty": 2.0, "orig_qty": 2.0,
+            "raw_order": {
+                "orderId": "FINAL-MARKET", "symbol": "BTC-USDT", "positionSide": "LONG",
+                "side": "SELL", "status": "FILLED", "time": 1_700_000_059_000,
+            },
+        },
+    }
+
+    def fake_get_order(symbol, order_id):
+        queried.append((symbol, str(order_id)))
+        return orders[str(order_id)]
+
+    monkeypatch.setattr(tracker, "get_order", fake_get_order)
+    monkeypatch.setattr(tracker.time, "sleep", lambda *_: None)
+
+    rebuilt, error = tracker._rebuild_data_error_close_from_order_details(closed, opened)
+
+    assert error is None
+    assert rebuilt is not None
+    assert set(order_id for _, order_id in queried) == {"ENTRY-1", "EARLY-CLOSE", "FINAL-MARKET"}
+    assert rebuilt["recovery_source"] == "BINGX_ORDER_DETAILS"
+    assert rebuilt["total_close_fill_qty"] == pytest.approx(3.0)
+    assert rebuilt["blended_exit_price"] == pytest.approx(103.0)
+    assert rebuilt["realized_pnl_pct"] == pytest.approx(3.0)
+    assert rebuilt["realized_pnl_usdt"] == pytest.approx(9.0)
+    assert rebuilt["fees_usdt"] is None
+    assert rebuilt["exit_reason"] == "POSITION_CLOSED_BY_ORDER_DETAILS"
+
+
+def test_data_error_order_detail_fallback_rejects_nonterminal_or_incomplete_orders(monkeypatch):
+    from event_engine import tracker
+
+    opened, closed, _fills = _close_fixture(incomplete=True)
+    calls = []
+
+    def fake_get_order(symbol, order_id):
+        calls.append(str(order_id))
+        if str(order_id) == "ENTRY-1":
+            return {
+                "status": "ok", "order_id": "ENTRY-1", "order_status": "FILLED",
+                "avg_price": 100.0, "executed_qty": 3.0, "orig_qty": 3.0,
+                "raw_order": {"orderId": "ENTRY-1", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "BUY"},
+            }
+        if str(order_id) == "EARLY-CLOSE":
+            return {
+                "status": "ok", "order_id": "EARLY-CLOSE", "order_status": "PARTIALLY_FILLED",
+                "avg_price": 102.0, "executed_qty": 1.0, "orig_qty": 1.0,
+                "raw_order": {"orderId": "EARLY-CLOSE", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "SELL", "time": 1_700_000_050_000},
+            }
+        return {
+            "status": "ok", "order_id": "FINAL-MARKET", "order_status": "FILLED",
+            "avg_price": 103.5, "executed_qty": 2.0, "orig_qty": 2.0,
+            "raw_order": {"orderId": "FINAL-MARKET", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "SELL", "time": 1_700_000_059_000},
+        }
+
+    monkeypatch.setattr(tracker, "get_order", fake_get_order)
+    monkeypatch.setattr(tracker.time, "sleep", lambda *_: None)
+
+    rebuilt, error = tracker._rebuild_data_error_close_from_order_details(closed, opened)
+
+    assert rebuilt is None
+    assert error.startswith("exit_order_not_terminal:EARLY-CLOSE")
+    assert calls == ["ENTRY-1", "EARLY-CLOSE"]
+
+
+def test_data_error_order_detail_fallback_requires_exact_entry_order_id(monkeypatch):
+    from event_engine import tracker
+
+    opened, closed, _fills = _close_fixture(incomplete=True)
+    opened["execution"].pop("order_id")
+    closed.pop("entry_order_id", None)
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: pytest.fail("must not query unlinked order ids"))
+
+    rebuilt, error = tracker._rebuild_data_error_close_from_order_details(closed, opened)
+
+    assert rebuilt is None
+    assert error == "missing_entry_order_id_for_reconstruction"
+
+
+def test_close_notification_distinguishes_last_exit_execution_from_aggregate_pnl():
+    from event_engine.tracker import format_trade_closed_message
+
+    message = format_trade_closed_message(
+        name="USELESS", symbol="USELESS-USDT", direction="SHORT",
+        entry_price=0.08244, exit_price=0.08249, pnl_pct=1.213,
+        realized_rr=0.173, planned_rr=1.2, duration_min=138.4,
+        peak_pnl=4.38, max_drawdown=7.48, exit_reason="BREAK_EVEN",
+        event_type="CRT_BEARISH", timeframe="1h",
+    )
+
+    assert "Последнее исполнение выхода" in message
+    assert "Совокупный PnL сделки" in message
+    assert "Вход <code>0.08244</code> → Выход" not in message
+
+
+def test_data_error_recovery_uses_exact_order_details_when_fill_history_is_empty(tmp_path, monkeypatch):
+    import event_engine.tracker as tracker
+
+    journal = tmp_path / "trades.jsonl"
+    opened, closed, _fills = _close_fixture(incomplete=True)
+    journal.write_text(json.dumps(opened) + "\n" + json.dumps(closed) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tracker, "TRADES_PATH", journal)
+    monkeypatch.setattr(tracker, "get_fill_history", lambda *_a, **_k: {
+        "status": "ok", "fills": [], "has_more": False,
+    })
+    snapshots = {
+        "ENTRY-1": {
+            "status": "ok", "order_id": "ENTRY-1", "order_status": "FILLED",
+            "avg_price": 100.0, "executed_qty": 3.0, "orig_qty": 3.0,
+            "raw_order": {"orderId": "ENTRY-1", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "BUY"},
+        },
+        "EARLY-CLOSE": {
+            "status": "ok", "order_id": "EARLY-CLOSE", "order_status": "CANCELED",
+            "avg_price": 102.0, "executed_qty": 1.0, "orig_qty": 1.0,
+            "raw_order": {"orderId": "EARLY-CLOSE", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "SELL", "time": 1_700_000_050_000},
+        },
+        "FINAL-MARKET": {
+            "status": "ok", "order_id": "FINAL-MARKET", "order_status": "FILLED",
+            "avg_price": 103.5, "executed_qty": 2.0, "orig_qty": 2.0,
+            "raw_order": {"orderId": "FINAL-MARKET", "symbol": "BTC-USDT", "positionSide": "LONG", "side": "SELL", "time": 1_700_000_059_000},
+        },
+    }
+    monkeypatch.setattr(tracker, "get_order", lambda _symbol, order_id: snapshots[str(order_id)])
+    monkeypatch.setattr(tracker.time, "sleep", lambda *_a: None)
+
+    recovered = tracker._recover_data_error_trade_closes(now_ms=1_700_000_200_000, max_records=1)
+
+    rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    close = next(row for row in rows if row.get("record_type") == "TRADE_CLOSE")
+    assert recovered == 1
+    assert close["fill_history_recovery"]["status"] == "RECOVERED"
+    assert close["fill_history_recovery"]["source"] == "BINGX_ORDER_DETAILS"
+    assert close["exit_price_source"] == "BINGX_ORDER_DETAILS_FINAL_ORDER_AVG_PRICE"
+    assert close["realized_pnl_pct_source"] == "BINGX_ORDER_DETAILS_PRICE_WEIGHTED_GROSS"
+    assert close["fees_usdt"] is None and close["funding_usdt"] is None
+    assert close["net_pnl_usdt"] is None
+    assert close["pnl_costs_status"] == "GROSS_ORDER_DETAILS_CONFIRMED_FEES_UNKNOWN_FUNDING_UNKNOWN"

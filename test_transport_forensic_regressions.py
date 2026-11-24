@@ -318,3 +318,87 @@ def test_binance_does_not_translate_unlisted_historical_spellings(monkeypatch):
     assert client.resolve_symbol("SOLUSDT") == "SOLUSDT"
     for unknown in ("TRUMPSOL", "TRUMPSOLUSDT", "TRUMPSOL-USDT", "TRUMP-SOL-USDT"):
         assert client.resolve_symbol(unknown) is None
+
+
+def test_bingx_retries_transient_109500_api_envelope_for_signed_get_only(monkeypatch):
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return _JsonResponse(200, {
+                    "code": 109500,
+                    "msg": "The system is currently busy, please try again later.",
+                    "data": None,
+                })
+            return _JsonResponse(200, {"code": 0, "msg": "ok", "data": []})
+
+    session = _Session()
+    timestamps = iter((1000, 2000))
+    monkeypatch.setattr(bingx, "FAST_SESSION", session)
+    monkeypatch.setattr(bingx, "API_KEY", "test-key")
+    monkeypatch.setattr(bingx, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(bingx, "_apply_request_timestamp", lambda params: params.update(timestamp=next(timestamps)))
+    sleeps = []
+    monkeypatch.setattr(bingx.time, "sleep", lambda delay: sleeps.append(delay))
+
+    diagnostics = {}
+    result = bingx._request(
+        "GET", bingx.INCOME_HISTORY_PATH, {}, signed=True,
+        retryable=True, response_metadata=diagnostics,
+    )
+
+    assert result == {"code": 0, "msg": "ok", "data": []}
+    assert len(session.calls) == 2
+    assert session.calls[0]["params"]["timestamp"] == 1000
+    assert session.calls[1]["params"]["timestamp"] == 2000
+    assert sleeps == [0.5]
+    assert diagnostics["transient_api_retry_count"] == 1
+    assert diagnostics["transient_api_retry_codes"] == [109500]
+
+
+def test_bingx_retries_generic_server_busy_100503_for_signed_get(monkeypatch):
+    class _Session:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _JsonResponse(200, {"code": 100503, "msg": "server busy", "data": None})
+            return _JsonResponse(200, {"code": 0, "msg": "ok", "data": []})
+
+    session = _Session()
+    monkeypatch.setattr(bingx, "FAST_SESSION", session)
+    monkeypatch.setattr(bingx, "API_KEY", "test-key")
+    monkeypatch.setattr(bingx, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(bingx, "_apply_request_timestamp", lambda params: params.update(timestamp=1000 + session.calls))
+    monkeypatch.setattr(bingx.time, "sleep", lambda *_a: None)
+
+    result = bingx._request("GET", bingx.INCOME_HISTORY_PATH, {}, signed=True, retryable=True)
+    assert result["code"] == 0
+    assert session.calls == 2
+
+
+def test_bingx_never_retries_signed_order_write_on_transient_api_error(monkeypatch):
+    class _Session:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return _JsonResponse(200, {"code": 109500, "msg": "busy", "data": None})
+
+    session = _Session()
+    monkeypatch.setattr(bingx, "FAST_SESSION", session)
+    monkeypatch.setattr(bingx, "API_KEY", "test-key")
+    monkeypatch.setattr(bingx, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(bingx, "_apply_request_timestamp", lambda params: params.update(timestamp=1000))
+    monkeypatch.setattr(bingx.time, "sleep", lambda *_: pytest.fail("writes must not be retried"))
+
+    result = bingx._request("POST", bingx.ORDER_PATH, {"symbol": "BTC-USDT"}, signed=True, retryable=True)
+
+    assert result["code"] == 109500
+    assert session.calls == 1
