@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795652532704,
+  "updated_ts": 1795652815951,
   "events": [
     {
       "event_id": "EVT_32B3C617A9B7EA24",
@@ -2701,6 +2701,39 @@
         "requires_retest": true,
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_1569A359BAD3790C",
+      "symbol": "牛来",
+      "timeframe": "4h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1795031999999,
+        "pivot_2_ts": 1795651199999,
+        "detected_at_ts": 1795651199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.04495,
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.04512,
+        "zone_high": 0.04518,
+        "zone_low": 0.0423,
+        "origin_ts": 1795031999999,
+        "failure_swing_ts": 1795276799999,
+        "failure_swing_level": 0.03788,
+        "impulse_ts": 1795363199999,
+        "bos_ts": 1795363199999,
+        "structure_level": 0.0423,
+        "structure_pivot_ts": 1795031999999,
+        "displacement_atr": 1.5086945541197323,
+        "return_tolerance_pct": 0.2,
+        "failure_swing_no_sweep": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
