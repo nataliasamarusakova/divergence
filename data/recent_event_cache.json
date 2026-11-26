@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795669910963,
+  "updated_ts": 1795670209735,
   "events": [
     {
       "event_id": "EVT_5550BC480C9A1641",
@@ -3509,6 +3509,35 @@
         "displacement_atr": 1.3967270950816129,
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_109B67435401C26A",
+      "symbol": "SYRUP",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
+      "timestamps": {
+        "pivot_1_ts": 1795665599999,
+        "pivot_2_ts": 1795669199999,
+        "detected_at_ts": 1795669199999
+      },
+      "event_fact": {
+        "detection_close_price": 0.07142,
+        "swept_level": 0.07213,
+        "sweep_depth_atr": 0.2318289649938573,
+        "reclaim_displacement_atr": 0.4014599149893701,
+        "rejection_wick_fraction": 0.5743589743589742,
+        "atr_reference": "previous_bar",
+        "atr_reference_ts": 1795665599999,
+        "lookback_bars": 20,
+        "volume_ratio": 2.088425280854464,
+        "trigger_level": 0.07213,
+        "requires_retest": true,
+        "engine": "LIQUIDITY_SWEEP",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
