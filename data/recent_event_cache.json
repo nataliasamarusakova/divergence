@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795771938661,
+  "updated_ts": 1795772209080,
   "events": [
     {
       "event_id": "EVT_33C0FD7680B8537C",
@@ -2546,6 +2546,63 @@
         "range_high": 0.03386,
         "range_low": 0.03334,
         "manipulation_depth_atr": 0.2232140708671686,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_E668748B6F7A0200",
+      "symbol": "CFG",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "ORDER_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795755599999,
+        "pivot_2_ts": 1795766399999,
+        "detected_at_ts": 1795766399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05345,
+        "engine": "ORDER_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.05209,
+        "zone_high": 0.05209,
+        "zone_low": 0.05158,
+        "bos_level": 0.05301,
+        "ob_ts": 1795762799999,
+        "displacement_atr": 1.4689032086486864,
+        "volume_ratio": 4.742195286574673,
+        "body_fraction": 0.726890756302519,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_6F7ABC5C4E54A815",
+      "symbol": "CFG",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "DONCHIAN_RETEST_BREAKOUT",
+      "timestamps": {
+        "pivot_1_ts": 1795769999999,
+        "pivot_2_ts": 1795769999999,
+        "detected_at_ts": 1795769999999
+      },
+      "event_fact": {
+        "detection_close_price": 0.05486,
+        "donchian_high": 0.0535,
+        "donchian_low": 0.04891,
+        "breakout_atr": 0.981911816313541,
+        "volume_ratio": 12.429458819438647,
+        "adx": 30.634086937923474,
+        "ema200": 0.054308047742193256,
+        "compressed_recent": true,
+        "bb_width": 0.10568148301179114,
+        "trigger_level": 0.0535,
+        "requires_retest": true,
+        "engine": "DONCHIAN_RETEST",
+        "requires_htf_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
