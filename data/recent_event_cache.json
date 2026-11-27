@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795799526722,
+  "updated_ts": 1795799807700,
   "events": [
     {
       "event_id": "EVT_A38A20F1986ED776",
@@ -4817,6 +4817,63 @@
         "range_high": 0.1356,
         "range_low": 0.1324,
         "manipulation_depth_atr": 0.24591083797129545,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_68FBF3AFC41481FB",
+      "symbol": "PIPPIN",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "VOLATILITY_SQUEEZE_RELEASE",
+      "timestamps": {
+        "pivot_1_ts": 1795798799999,
+        "pivot_2_ts": 1795798799999,
+        "detected_at_ts": 1795798799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.01785,
+        "bb_width": 0.0013730243989091354,
+        "kc_width": 0.0012436414247781538,
+        "squeeze_duration_bars": 4,
+        "compression_ratio": 1.104035593824049,
+        "engine": "VOLATILITY_SQUEEZE",
+        "requires_retest": true,
+        "trigger_level": 0.01812267928761092,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_39A299D697FBA82F",
+      "symbol": "PIPPIN",
+      "timeframe": "1h",
+      "direction": "LONG",
+      "event_type": "MITIGATION_BLOCK_BULLISH",
+      "timestamps": {
+        "pivot_1_ts": 1795532399999,
+        "pivot_2_ts": 1795798799999,
+        "detected_at_ts": 1795798799999
+      },
+      "event_fact": {
+        "detection_close_price": 0.01785,
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.01784,
+        "zone_high": 0.01903,
+        "zone_low": 0.01782,
+        "origin_ts": 1795532399999,
+        "failure_swing_ts": 1795568399999,
+        "failure_swing_level": 0.01849,
+        "impulse_ts": 1795597199999,
+        "bos_ts": 1795597199999,
+        "structure_level": 0.01903,
+        "structure_pivot_ts": 1795532399999,
+        "displacement_atr": 1.4909091942819395,
+        "return_tolerance_pct": 0.2,
+        "failure_swing_no_sweep": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
