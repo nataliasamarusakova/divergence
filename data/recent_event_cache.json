@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795754216324,
+  "updated_ts": 1795754509549,
   "events": [
     {
       "event_id": "EVT_711871E07624021D",
@@ -577,36 +577,6 @@
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_737A2801D18B14CF",
-      "symbol": "BIGTIME",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "LIQUIDATION_CASCADE_FVG_LONG",
-      "timestamps": {
-        "pivot_1_ts": 1795748399999,
-        "pivot_2_ts": 1795748399999,
-        "detected_at_ts": 1795748399999
-      },
-      "event_fact": {
-        "detection_close_price": 0.007055,
-        "engine": "LIQUIDATION_CASCADE_FVG",
-        "requires_htf_context": true,
-        "requires_retest": true,
-        "trigger_level": 0.0059889999999999995,
-        "fvg_top": 0.006156,
-        "fvg_bottom": 0.005822,
-        "fvg_mid": 0.0059889999999999995,
-        "fvg_index": 399,
-        "impulse_atr": 2.4112913837599073,
-        "impulse_pct": 13.588794075028163,
-        "volume_ratio": 6.071304566155391,
-        "liq_ratio_24h": 0.03704895104895105,
-        "research_only_24h_liquidation_context": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
@@ -4212,6 +4182,39 @@
         "requires_retest": true,
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
+        "market_data_source": "binance",
+        "execution_exchange": "BingX"
+      }
+    },
+    {
+      "event_id": "EVT_ADB8B7A3D0B00754",
+      "symbol": "AERO",
+      "timeframe": "1h",
+      "direction": "SHORT",
+      "event_type": "MITIGATION_BLOCK_BEARISH",
+      "timestamps": {
+        "pivot_1_ts": 1795517999999,
+        "pivot_2_ts": 1795748399999,
+        "detected_at_ts": 1795748399999
+      },
+      "event_fact": {
+        "detection_close_price": 0.4075,
+        "engine": "MITIGATION_BLOCK",
+        "requires_htf_context": true,
+        "requires_retest": true,
+        "trigger_level": 0.4127,
+        "zone_high": 0.4128,
+        "zone_low": 0.4077,
+        "origin_ts": 1795514399999,
+        "failure_swing_ts": 1795600799999,
+        "failure_swing_level": 0.3923,
+        "impulse_ts": 1795615199999,
+        "bos_ts": 1795615199999,
+        "structure_level": 0.4071,
+        "structure_pivot_ts": 1795517999999,
+        "displacement_atr": 1.2773652397159603,
+        "return_tolerance_pct": 0.2,
+        "failure_swing_no_sweep": true,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
