@@ -1,5 +1,5 @@
 {
-  "updated_ts": 1795867919821,
+  "updated_ts": 1795868303758,
   "events": [
     {
       "event_id": "EVT_A1B02397FDD124E6",
@@ -64,7 +64,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 63.384539363912026,
+        "htf_slope50": 0.13481783229872946,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -163,7 +167,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 3.3994875387950048,
+        "htf_slope50": 0.10368605898068495,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -196,7 +204,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 477.81207075571655,
+        "htf_slope50": -14.436944230941151,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -262,7 +274,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.003074790826066565,
+        "htf_slope50": -0.00044356694028808595,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -295,7 +311,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 2.1226943535599787,
+        "htf_slope50": 0.11744231811770067,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -328,7 +348,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 42.889872464576136,
+        "htf_slope50": 0.31840290630568546,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -394,7 +418,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 205.10914888085335,
+        "htf_slope50": 0.431919630396834,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -526,7 +554,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.4637442836125156,
+        "htf_slope50": -0.006713894305307444,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -838,7 +870,8 @@
         "range_low": 1.7775,
         "manipulation_depth_atr": 1.1347898989256353,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -867,7 +900,11 @@
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.9019663874212379,
+        "htf_slope50": 0.08818767613253387,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -891,7 +928,8 @@
         "range_low": 3.7464,
         "manipulation_depth_atr": 0.46772075435659455,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -920,7 +958,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -953,7 +1002,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.0029986029505345425,
+        "htf_slope50": -0.0004244858838062006,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -977,7 +1030,8 @@
         "range_low": 0.10076,
         "manipulation_depth_atr": 0.30889594598666154,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1006,7 +1060,11 @@
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.008115523969125854,
+        "htf_slope50": -0.0003255164048580738,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1034,7 +1092,11 @@
         "volume_ratio": 1.6387132211465707,
         "body_fraction": 0.8789808917197448,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.008115523969125854,
+        "htf_slope50": -0.0003255164048580738,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1060,7 +1122,11 @@
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 2.146667124008607,
+        "htf_slope50": 0.11679752132877086,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1093,7 +1159,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 2.146667124008607,
+        "htf_slope50": 0.11679752132877086,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1117,31 +1187,8 @@
         "range_low": 2.66,
         "manipulation_depth_atr": 0.2595065664022356,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_F501FF6D3203534F",
-      "symbol": "WLD",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1795859999999,
-        "pivot_2_ts": 1795867199999,
-        "detected_at_ts": 1795867199999
-      },
-      "event_fact": {
-        "detection_close_price": 0.2384,
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.2381,
-        "range_high": 0.2403,
-        "range_low": 0.2381,
-        "manipulation_depth_atr": 0.40856408659543775,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1170,7 +1217,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1199,7 +1257,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1228,7 +1297,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1257,7 +1337,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1286,7 +1377,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1315,7 +1417,18 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "UP_OR_FLAT",
+        "htf_trend_ok": false,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h",
+        "reversal_candidate": true
       }
     },
     {
@@ -1339,7 +1452,8 @@
         "range_low": 0.00059,
         "manipulation_depth_atr": 0.48787524467836,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1372,7 +1486,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 42.93536766204374,
+        "htf_slope50": 0.3208184786074213,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1438,7 +1556,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 205.15192735611402,
+        "htf_slope50": 0.4738051350871615,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1462,7 +1584,8 @@
         "range_low": 205.47,
         "manipulation_depth_atr": 0.2765302684241067,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1486,7 +1609,8 @@
         "range_low": 0.013645,
         "manipulation_depth_atr": 0.1405171716082773,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1515,7 +1639,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h"
       }
     },
     {
@@ -1544,7 +1678,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h"
       }
     },
     {
@@ -1573,7 +1717,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h"
       }
     },
     {
@@ -1602,7 +1756,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h"
       }
     },
     {
@@ -1631,7 +1795,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "4h",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "4h"
       }
     },
     {
@@ -1660,7 +1834,8 @@
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1689,7 +1864,10 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003
       }
     },
     {
@@ -1718,7 +1896,10 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 120.0,
+        "formation_age_min": 137.003,
+        "post_confirmation_age_min": 17.003
       }
     },
     {
@@ -1750,30 +1931,6 @@
       }
     },
     {
-      "event_id": "EVT_C8D8A248AB597E0C",
-      "symbol": "ARB",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1795859999999,
-        "pivot_2_ts": 1795867199999,
-        "detected_at_ts": 1795867199999
-      },
-      "event_fact": {
-        "detection_close_price": 0.11218,
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.11204,
-        "range_high": 0.11311,
-        "range_low": 0.11204,
-        "manipulation_depth_atr": 0.5817778731872096,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
       "event_id": "EVT_403512839C24C235",
       "symbol": "SKY",
       "timeframe": "1h",
@@ -1794,7 +1951,8 @@
         "range_low": 0.04943,
         "manipulation_depth_atr": 0.18428561735726204,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1851,7 +2009,8 @@
         "range_low": 1.0765,
         "manipulation_depth_atr": 0.4973062626238109,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1875,7 +2034,8 @@
         "range_low": 0.1215,
         "manipulation_depth_atr": 0.35610647660023664,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1899,7 +2059,8 @@
         "range_low": 0.2807,
         "manipulation_depth_atr": 0.3691534757650962,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -1928,7 +2089,11 @@
         "engine": "DONCHIAN_RETEST",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.04791977350229027,
+        "htf_slope50": 0.0007340663275322845,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1958,7 +2123,11 @@
         "liq_ratio_24h": 0.007248868778280543,
         "research_only_24h_liquidation_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.04791977350229027,
+        "htf_slope50": 0.0007340663275322845,
+        "context_timeframe": "4h"
       }
     },
     {
@@ -1982,7 +2151,8 @@
         "range_low": 0.1403,
         "manipulation_depth_atr": 0.35800356003759765,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -2011,60 +2181,8 @@
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_41A9B98FECB5C40C",
-      "symbol": "APT",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1795859999999,
-        "pivot_2_ts": 1795867199999,
-        "detected_at_ts": 1795867199999
-      },
-      "event_fact": {
-        "detection_close_price": 0.3769,
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 0.3762,
-        "range_high": 0.3791,
-        "range_low": 0.3762,
-        "manipulation_depth_atr": 0.14911933580071932,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_8521373450BEFDDA",
-      "symbol": "SENT",
-      "timeframe": "1h",
-      "direction": "SHORT",
-      "event_type": "LIQUIDITY_SWEEP_RECLAIM",
-      "timestamps": {
-        "pivot_1_ts": 1795845599999,
-        "pivot_2_ts": 1795867199999,
-        "detected_at_ts": 1795867199999
-      },
-      "event_fact": {
-        "detection_close_price": 0.02482,
-        "swept_level": 0.02484,
-        "sweep_depth_atr": 0.732815908598495,
-        "reclaim_displacement_atr": 0.03408446086505081,
-        "rejection_wick_fraction": 0.45000000000000207,
-        "atr_reference": "previous_bar",
-        "atr_reference_ts": 1795863599999,
-        "lookback_bars": 20,
-        "volume_ratio": 1.861894736060467,
-        "trigger_level": 0.02484,
-        "requires_retest": true,
-        "engine": "LIQUIDITY_SWEEP",
-        "requires_htf_context": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -2096,30 +2214,6 @@
         "displacement_atr": 1.2578550000839406,
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
-        "market_data_source": "binance",
-        "execution_exchange": "BingX"
-      }
-    },
-    {
-      "event_id": "EVT_396C9CAEF18F188B",
-      "symbol": "RENDER",
-      "timeframe": "1h",
-      "direction": "LONG",
-      "event_type": "CRT_BULLISH",
-      "timestamps": {
-        "pivot_1_ts": 1795859999999,
-        "pivot_2_ts": 1795867199999,
-        "detected_at_ts": 1795867199999
-      },
-      "event_fact": {
-        "detection_close_price": 1.339,
-        "engine": "CRT",
-        "requires_retest": true,
-        "requires_htf_context": true,
-        "trigger_level": 1.337,
-        "range_high": 1.347,
-        "range_low": 1.337,
-        "manipulation_depth_atr": 0.44463637857108157,
         "market_data_source": "binance",
         "execution_exchange": "BingX"
       }
@@ -2178,7 +2272,8 @@
         "range_low": 0.2425,
         "manipulation_depth_atr": 0.42973841290030784,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -2202,7 +2297,8 @@
         "range_low": 0.001408,
         "manipulation_depth_atr": 0.2875040728795646,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "strategy_htf_context_policy": "DEFERRED_TO_MANDATORY_3H_DEMAND_SUPPLY"
       }
     },
     {
@@ -2510,7 +2606,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 3.63330833691347,
+        "htf_slope50": -0.13991769485104255,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -2539,7 +2639,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 480.0,
+        "formation_age_min": 497.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "1d",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "1d"
       }
     },
     {
@@ -2568,7 +2678,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 480.0,
+        "formation_age_min": 497.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "1d",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "1d"
       }
     },
     {
@@ -2597,7 +2717,17 @@
         "vwap_distance_pct": null,
         "engine": "DIVERGENCE",
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "confirmation_lag_min": 480.0,
+        "formation_age_min": 497.003,
+        "post_confirmation_age_min": 17.003,
+        "context_validated": true,
+        "context_source": "1d",
+        "htf_trend": "DOWN",
+        "htf_trend_ok": true,
+        "mtf_confirmed": false,
+        "mtf_confirmation_event_id": null,
+        "mtf_confirmation_timeframe": "1d"
       }
     },
     {
@@ -2782,7 +2912,11 @@
         "volume_ratio": 1.2904776016615427,
         "body_fraction": 0.8645096056622847,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.009376861413713907,
+        "htf_slope50": -0.0001136782550584664,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3055,7 +3189,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.003532138393655788,
+        "htf_slope50": -0.00021798260287026437,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3145,7 +3283,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 23.03770421447444,
+        "htf_slope50": 0.6825071075562299,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3234,7 +3376,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.04958305467408789,
+        "htf_slope50": -0.0054489222462471495,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3323,7 +3469,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.058728828291339075,
+        "htf_slope50": -0.0031485314730739927,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3380,7 +3530,11 @@
         "range_low": 1.0785,
         "manipulation_depth_atr": 0.11050073187357701,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 1.4651627912114804,
+        "htf_slope50": -0.08372802629374299,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3455,7 +3609,11 @@
         "volume_ratio": 3.9432323945573597,
         "body_fraction": 0.908315565031983,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "UP",
+        "htf_ema50": 0.04246330217673649,
+        "htf_slope50": 0.0014278618160224535,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3669,7 +3827,11 @@
         "engine": "EMA_PULLBACK",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.6137635699581172,
+        "htf_slope50": -0.025771602022403473,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3702,7 +3864,11 @@
         "return_tolerance_pct": 0.2,
         "failure_swing_no_sweep": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 1.5308713909615221,
+        "htf_slope50": -0.04649105806217335,
+        "context_timeframe": "1d"
       }
     },
     {
@@ -3754,7 +3920,11 @@
         "engine": "LIQUIDITY_SWEEP",
         "requires_htf_context": true,
         "market_data_source": "binance",
-        "execution_exchange": "BingX"
+        "execution_exchange": "BingX",
+        "htf_trend": "DOWN",
+        "htf_ema50": 0.0007522407877775379,
+        "htf_slope50": -1.383483298731975e-05,
+        "context_timeframe": "1d"
       }
     },
     {
